@@ -27,8 +27,12 @@ interface AppState {
   addProject: (path: string) => Promise<void>;
   /** Close a project tab. */
   closeProject: (path: string) => void;
-  /** Move `fromPath`'s tab to `toPath`'s index and persist. */
-  reorderProject: (fromPath: string, toPath: string) => void;
+  /** Move `fromPath`'s tab to just before/after `toPath` and persist. */
+  reorderProject: (
+    fromPath: string,
+    toPath: string,
+    insertAfter: boolean,
+  ) => void;
   /** Make a project active (swaps the visible tree). */
   setActive: (path: string) => void;
   /** Expand/collapse a directory for the active project. */
@@ -126,16 +130,18 @@ export const useAppStore = create<AppState>((set, get) => ({
     get().persist();
   },
 
-  reorderProject: (fromPath, toPath) => {
+  reorderProject: (fromPath, toPath, insertAfter) => {
     set((s) => {
+      if (fromPath === toPath) return {};
       const fromIdx = s.projects.findIndex((p) => p.path === fromPath);
-      const toIdx = s.projects.findIndex((p) => p.path === toPath);
-      if (fromIdx === -1 || toIdx === -1 || fromIdx === toIdx) {
-        return {};
-      }
+      if (fromIdx === -1) return {};
       const projects = [...s.projects];
       const [moved] = projects.splice(fromIdx, 1);
-      projects.splice(toIdx, 0, moved);
+      // Compute the insertion point AFTER removal so no index-shift correction
+      // is needed; `toPath` still exists in the array (from !== to).
+      const targetIdx = projects.findIndex((p) => p.path === toPath);
+      if (targetIdx === -1) return {};
+      projects.splice(insertAfter ? targetIdx + 1 : targetIdx, 0, moved);
       return { projects };
     });
     get().persist();

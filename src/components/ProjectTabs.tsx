@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useState, type DragEvent } from "react";
 import { open } from "@tauri-apps/plugin-dialog";
 import { useAppStore } from "../state/store";
 import { TypeBadges } from "./TypeBadges";
@@ -14,6 +14,14 @@ export function ProjectTabs() {
   // HTML5 drag-drop reorder state (transient, view-only).
   const [draggedPath, setDraggedPath] = useState<string | null>(null);
   const [overPath, setOverPath] = useState<string | null>(null);
+  // Which side of the hovered tab the cursor is on: true = insert after it.
+  const [overAfter, setOverAfter] = useState(false);
+
+  // Cursor past a tab's horizontal midpoint -> insert after it, else before.
+  const sideAfter = (e: DragEvent) => {
+    const r = e.currentTarget.getBoundingClientRect();
+    return e.clientX > r.left + r.width / 2;
+  };
 
   const handleAdd = async () => {
     try {
@@ -26,9 +34,9 @@ export function ProjectTabs() {
     }
   };
 
-  const handleDrop = (targetPath: string) => {
+  const handleDrop = (targetPath: string, after: boolean) => {
     if (draggedPath && draggedPath !== targetPath) {
-      reorderProject(draggedPath, targetPath);
+      reorderProject(draggedPath, targetPath, after);
     }
     setDraggedPath(null);
     setOverPath(null);
@@ -54,10 +62,11 @@ export function ProjectTabs() {
               e.preventDefault();
               e.dataTransfer.dropEffect = "move";
               setOverPath(p.path);
+              setOverAfter(sideAfter(e));
             }}
             onDrop={(e) => {
               e.preventDefault();
-              handleDrop(p.path);
+              handleDrop(p.path, sideAfter(e));
             }}
             onDragEnd={() => {
               setDraggedPath(null);
@@ -67,7 +76,12 @@ export function ProjectTabs() {
             title={p.path}
             style={{
               opacity: isDragged ? 0.4 : 1,
-              boxShadow: isOver ? "inset 0 0 0 2px #4a9eff" : undefined,
+              // Insertion line on the side the tab will drop into.
+              boxShadow: isOver
+                ? overAfter
+                  ? "inset -3px 0 0 0 #4a9eff"
+                  : "inset 3px 0 0 0 #4a9eff"
+                : undefined,
             }}
           >
             <span className="tab-name">{p.name}</span>
