@@ -27,6 +27,8 @@ interface AppState {
   addProject: (path: string) => Promise<void>;
   /** Close a project tab. */
   closeProject: (path: string) => void;
+  /** Move `fromPath`'s tab to `toPath`'s index and persist. */
+  reorderProject: (fromPath: string, toPath: string) => void;
   /** Make a project active (swaps the visible tree). */
   setActive: (path: string) => void;
   /** Expand/collapse a directory for the active project. */
@@ -51,10 +53,30 @@ export const useAppStore = create<AppState>((set, get) => ({
   init: async () => {
     try {
       const ws = await invoke<WorkspaceState>("load_state");
+      const loaded = ws.open_projects ?? [];
       set({
-        projects: ws.open_projects ?? [],
+        projects: loaded,
         activeProject: ws.active_project ?? null,
       });
+
+      // Self-heal: re-detect types for every loaded project so old saved
+      // state (single `project_type`, or stale markers) normalizes to the
+      // current multi-type model. Best-effort; failures keep prior value.
+      const refreshed = await Promise.all(
+        loaded.map(async (p) => {
+          try {
+            const types = await invoke<ProjectType[]>("detect_project_types", {
+              path: p.path,
+            });
+            return { ...p, project_types: types };
+          } catch (err) {
+            console.error("detect_project_types failed", err);
+            return { ...p, project_types: p.project_types ?? [] };
+          }
+        }),
+      );
+      set({ projects: refreshed });
+      get().persist();
     } catch (err) {
       // load_state is infallible on the Rust side, but guard anyway.
       console.error("load_state failed", err);
@@ -69,17 +91,19 @@ export const useAppStore = create<AppState>((set, get) => ({
       return;
     }
 
-    let projectType: ProjectType = "Unknown";
+    let projectTypes: ProjectType[] = [];
     try {
-      projectType = await invoke<ProjectType>("detect_project_type", { path });
+      projectTypes = await invoke<ProjectType[]>("detect_project_types", {
+        path,
+      });
     } catch (err) {
-      console.error("detect_project_type failed", err);
+      console.error("detect_project_types failed", err);
     }
 
     const project: Project = {
       path,
       name: basename(path),
-      project_type: projectType,
+      project_types: projectTypes,
       tree_state: { expanded: [] },
     };
 
@@ -98,6 +122,21 @@ export const useAppStore = create<AppState>((set, get) => ({
         activeProject = projects.length > 0 ? projects[0].path : null;
       }
       return { projects, activeProject };
+    });
+    get().persist();
+  },
+
+  reorderProject: (fromPath, toPath) => {
+    set((s) => {
+      const fromIdx = s.projects.findIndex((p) => p.path === fromPath);
+      const toIdx = s.projects.findIndex((p) => p.path === toPath);
+      if (fromIdx === -1 || toIdx === -1 || fromIdx === toIdx) {
+        return {};
+      }
+      const projects = [...s.projects];
+      const [moved] = projects.splice(fromIdx, 1);
+      projects.splice(toIdx, 0, moved);
+      return { projects };
     });
     get().persist();
   },

@@ -4,8 +4,10 @@
 //! transitive link against `webkit2gtk`). That keeps it fully headless so
 //! `cargo test -p core` runs without any system GUI libraries installed.
 
+pub mod fs;
 pub mod persist;
 pub mod project_type;
 
+pub use fs::{list_dir, DirEntry};
 pub use persist::{load_state, save_state, Project, TreeState, WorkspaceState};
-pub use project_type::{detect_project_type, ProjectType};
+pub use project_type::{detect_project_types, ProjectType};

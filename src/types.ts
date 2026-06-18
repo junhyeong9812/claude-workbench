@@ -1,12 +1,21 @@
 // Mirrors the serde types exposed by the Rust `core` crate.
 
-export type ProjectType = "Rust" | "Java" | "Kotlin" | "Python" | "Unknown";
+export type ProjectType =
+  | "Rust"
+  | "Java"
+  | "Kotlin"
+  | "Python"
+  | "React"
+  | "JavaScript"
+  | "Vue"
+  | "Unknown";
 
 /** One entry in a directory listing (from the `read_dir` command). */
 export interface DirEntry {
   name: string;
   path: string;
   is_dir: boolean;
+  project_types: ProjectType[];
 }
 
 /** Per-project folder-tree UI state that survives restarts. */
@@ -19,7 +28,7 @@ export interface TreeState {
 export interface Project {
   path: string;
   name: string;
-  project_type: ProjectType;
+  project_types: ProjectType[];
   tree_state: TreeState;
 }
 

@@ -1,0 +1,116 @@
+//! Headless directory listing with per-directory project-type detection.
+//!
+//! This lives in `core` (not `src-tauri`) so directory enumeration and the
+//! submodule-badge logic can be unit-tested without any GUI/Tauri linkage.
+
+use serde::{Deserialize, Serialize};
+use std::io;
+use std::path::Path;
+
+use crate::project_type::{detect_project_types, ProjectType};
+
+/// One entry in a directory listing, sent to the webview.
+///
+/// `project_types` is populated only for directories (via
+/// [`detect_project_types`]); files always carry an empty vector.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DirEntry {
+    pub name: String,
+    pub path: String,
+    pub is_dir: bool,
+    #[serde(default)]
+    pub project_types: Vec<ProjectType>,
+}
+
+/// List the immediate children of `path`.
+///
+/// Returns `Err` (never panics) if the path is missing, not a directory, or
+/// unreadable. Directories are listed before files; each group is sorted by
+/// name (case-insensitive). For each directory entry, `project_types` is filled
+/// by probing its marker files.
+pub fn list_dir<P: AsRef<Path>>(path: P) -> io::Result<Vec<DirEntry>> {
+    let read = std::fs::read_dir(path)?;
+
+    let mut entries: Vec<DirEntry> = Vec::new();
+    for item in read {
+        let item = item?;
+        // Resolve type without following symlinks into errors we can't recover.
+        let is_dir = match item.file_type() {
+            Ok(ft) => ft.is_dir(),
+            Err(_) => false,
+        };
+        let name = item.file_name().to_string_lossy().into_owned();
+        let entry_path = item.path();
+        let project_types = if is_dir {
+            detect_project_types(&entry_path)
+        } else {
+            Vec::new()
+        };
+        entries.push(DirEntry {
+            name,
+            path: entry_path.to_string_lossy().into_owned(),
+            is_dir,
+            project_types,
+        });
+    }
+
+    entries.sort_by(|a, b| match b.is_dir.cmp(&a.is_dir) {
+        std::cmp::Ordering::Equal => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
+        other => other,
+    });
+
+    Ok(entries)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static COUNTER: AtomicUsize = AtomicUsize::new(0);
+
+    fn temp_dir(tag: &str) -> PathBuf {
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let mut p = std::env::temp_dir();
+        p.push(format!("mt_fs_{tag}_{nanos}_{n}"));
+        fs::create_dir_all(&p).unwrap();
+        p
+    }
+
+    #[test]
+    fn lists_subdir_types_and_files() {
+        let root = temp_dir("listing");
+        // A subdirectory that is a Rust project.
+        let sub = root.join("rust-proj");
+        fs::create_dir_all(&sub).unwrap();
+        fs::write(sub.join("Cargo.toml"), b"").unwrap();
+        // A plain file at the root.
+        fs::write(root.join("README.md"), b"hello").unwrap();
+
+        let entries = list_dir(&root).unwrap();
+        assert_eq!(entries.len(), 2);
+
+        // Directories sort before files.
+        let dir_entry = &entries[0];
+        assert_eq!(dir_entry.name, "rust-proj");
+        assert!(dir_entry.is_dir);
+        assert_eq!(dir_entry.project_types, vec![ProjectType::Rust]);
+
+        let file_entry = &entries[1];
+        assert_eq!(file_entry.name, "README.md");
+        assert!(!file_entry.is_dir);
+        assert!(file_entry.project_types.is_empty());
+    }
+
+    #[test]
+    fn nonexistent_path_is_err_not_panic() {
+        let p = PathBuf::from("/this/path/should/not/exist/multi-terminal-xyz");
+        assert!(list_dir(&p).is_err());
+    }
+}

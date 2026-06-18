@@ -1,6 +1,7 @@
 import { useEffect } from "react";
 import { useAppStore } from "../state/store";
 import type { DirEntry } from "../types";
+import { TypeBadges } from "./TypeBadges";
 
 function TreeNode({ entry, depth }: { entry: DirEntry; depth: number }) {
   const expanded = useAppStore((s) => {
@@ -32,6 +33,9 @@ function TreeNode({ entry, depth }: { entry: DirEntry; depth: number }) {
       >
         <span className="tree-icon">{icon}</span>
         <span className="tree-label">{entry.name}</span>
+        {entry.is_dir && entry.project_types.length > 0 && (
+          <TypeBadges types={entry.project_types} />
+        )}
       </div>
       {entry.is_dir && expanded && children && (
         <div className="tree-children">

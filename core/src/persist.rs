@@ -25,9 +25,10 @@ pub struct Project {
     pub path: String,
     /// Display name (typically the folder's file name).
     pub name: String,
-    /// Detected project type (badge).
+    /// Detected project types (badges). A folder may match several ecosystems
+    /// at once, so this is a (possibly empty) list rather than a single value.
     #[serde(default)]
-    pub project_type: ProjectType,
+    pub project_types: Vec<ProjectType>,
     /// Per-project tree state — kept isolated so one project's expansion does
     /// not affect another's.
     #[serde(default)]
@@ -99,7 +100,7 @@ mod tests {
                 Project {
                     path: "/home/u/proj-a".into(),
                     name: "proj-a".into(),
-                    project_type: ProjectType::Rust,
+                    project_types: vec![ProjectType::Rust, ProjectType::React],
                     tree_state: TreeState {
                         expanded: vec!["/home/u/proj-a/src".into()],
                     },
@@ -107,7 +108,7 @@ mod tests {
                 Project {
                     path: "/home/u/proj-b".into(),
                     name: "proj-b".into(),
-                    project_type: ProjectType::Python,
+                    project_types: vec![ProjectType::Python],
                     tree_state: TreeState { expanded: vec![] },
                 },
             ],

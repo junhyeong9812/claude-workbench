@@ -8,7 +8,7 @@
 use std::io;
 use std::path::PathBuf;
 
-use core_lib::{ProjectType, WorkspaceState};
+use core_lib::{DirEntry, ProjectType, WorkspaceState};
 use serde::Serialize;
 use tauri::{AppHandle, Manager};
 
@@ -37,53 +37,20 @@ fn io_message(action: &str, err: &io::Error) -> String {
     format!("{action}: {reason}")
 }
 
-/// One entry in a directory listing, sent to the webview.
-#[derive(Debug, Serialize)]
-pub struct DirEntry {
-    pub name: String,
-    pub path: String,
-    pub is_dir: bool,
-}
-
 /// List the immediate children of `path`.
 ///
-/// Returns `Err` (never panics) if the path is missing, not a directory, or
-/// unreadable. Directories are listed before files; each group is sorted by
-/// name (case-insensitive).
+/// Thin wrapper over [`core_lib::list_dir`]: maps the I/O error to a user-safe
+/// [`AppError`] (kind only — never the offending path). Returns `Err` (never
+/// panics) if the path is missing, not a directory, or unreadable.
 #[tauri::command]
 pub fn read_dir(path: String) -> Result<Vec<DirEntry>, AppError> {
-    let read = std::fs::read_dir(&path)
-        .map_err(|e| AppError::new(io_message("Cannot read directory", &e)))?;
-
-    let mut entries: Vec<DirEntry> = Vec::new();
-    for item in read {
-        let item = item.map_err(|e| AppError::new(io_message("Cannot read entry", &e)))?;
-        // Resolve type without following symlinks into errors we can't recover.
-        let is_dir = match item.file_type() {
-            Ok(ft) => ft.is_dir(),
-            Err(_) => false,
-        };
-        let name = item.file_name().to_string_lossy().into_owned();
-        let child_path = item.path().to_string_lossy().into_owned();
-        entries.push(DirEntry {
-            name,
-            path: child_path,
-            is_dir,
-        });
-    }
-
-    entries.sort_by(|a, b| match b.is_dir.cmp(&a.is_dir) {
-        std::cmp::Ordering::Equal => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
-        other => other,
-    });
-
-    Ok(entries)
+    core_lib::list_dir(&path).map_err(|e| AppError::new(io_message("Cannot read directory", &e)))
 }
 
-/// Detect the project type of a folder (badge). Infallible.
+/// Detect every project type present in a folder (badges). Infallible.
 #[tauri::command]
-pub fn detect_project_type(path: String) -> ProjectType {
-    core_lib::detect_project_type(path)
+pub fn detect_project_types(path: String) -> Vec<ProjectType> {
+    core_lib::detect_project_types(path)
 }
 
 /// Resolve the on-disk path of the workspace state file inside the app's
