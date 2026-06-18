@@ -5,11 +5,13 @@ import {
   type DockviewReadyEvent,
 } from "dockview-react";
 import "dockview-react/dist/styles/dockview.css";
+import { invoke } from "@tauri-apps/api/core";
 import { useAppStore } from "../state/store";
 import { PlaceholderPanel } from "./PlaceholderPanel";
+import { TerminalPanel } from "./TerminalPanel";
 
 /** dockview component registry — maps component name -> React panel. */
-const components = { placeholder: PlaceholderPanel };
+const components = { placeholder: PlaceholderPanel, terminal: TerminalPanel };
 
 type PanelKind = "terminal" | "editor";
 
@@ -53,6 +55,15 @@ export function MainArea() {
         setLayout(activeProject, api.toJSON());
       }
     });
+
+    // Real panel removal (close) -> close the PTY session (spec §0.1). Tab/
+    // project switches don't fire this, so those only detach (session lives).
+    api.onDidRemovePanel((panel) => {
+      const sessionId = (panel.params as { sessionId?: number } | undefined)?.sessionId;
+      if (typeof sessionId === "number") {
+        invoke("terminal_close", { id: sessionId }).catch(() => {});
+      }
+    });
   };
 
   const addPanel = (kind: PanelKind) => {
@@ -62,7 +73,8 @@ export function MainArea() {
     const title = `${kind[0].toUpperCase()}${kind.slice(1)} ${n}`;
     api.addPanel({
       id: `${kind}-${Date.now()}`,
-      component: "placeholder",
+      // Terminals get the real PTY panel; editor stays a stub until P3.
+      component: kind === "terminal" ? "terminal" : "placeholder",
       title,
       params: { kind, title },
     });

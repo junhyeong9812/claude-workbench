@@ -7,7 +7,9 @@
 pub mod fs;
 pub mod persist;
 pub mod project_type;
+pub mod session;
 
 pub use fs::{list_dir, DirEntry};
 pub use persist::{load_state, save_state, Project, TreeState, WorkspaceState};
 pub use project_type::{detect_project_types, ProjectType};
+pub use session::{OutputChunk, SessionId, SessionManager};
