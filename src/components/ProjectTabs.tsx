@@ -44,9 +44,15 @@ export function ProjectTabs() {
             key={p.path}
             className={`tab${p.path === activeProject ? " tab-active" : ""}`}
             draggable
-            onDragStart={() => setDraggedPath(p.path)}
+            onDragStart={(e) => {
+              setDraggedPath(p.path);
+              // WebKitGTK only initiates a drag when dataTransfer is populated.
+              e.dataTransfer.setData("text/plain", p.path);
+              e.dataTransfer.effectAllowed = "move";
+            }}
             onDragOver={(e) => {
               e.preventDefault();
+              e.dataTransfer.dropEffect = "move";
               setOverPath(p.path);
             }}
             onDrop={(e) => {
