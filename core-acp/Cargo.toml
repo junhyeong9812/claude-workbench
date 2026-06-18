@@ -1,0 +1,13 @@
+[package]
+name = "core-acp"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+agent-client-protocol = "0.4"
+async-trait = "0.1"
+tokio = { version = "1", features = ["rt", "process", "io-util", "macros", "sync"] }
+tokio-util = { version = "0.7", features = ["compat"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt", "io-util", "macros", "sync", "test-util"] }
