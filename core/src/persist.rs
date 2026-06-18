@@ -19,7 +19,11 @@ pub struct TreeState {
 }
 
 /// A single open project (one tab in the shell).
-#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+///
+/// `Eq` is intentionally *not* derived: `layout` holds an opaque
+/// [`serde_json::Value`] (which may contain floats and therefore is `PartialEq`
+/// but not `Eq`). Equality is only needed for tests, where `PartialEq` suffices.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct Project {
     /// Absolute path to the project root folder.
     pub path: String,
@@ -33,10 +37,20 @@ pub struct Project {
     /// not affect another's.
     #[serde(default)]
     pub tree_state: TreeState,
+    /// Opaque dockview layout JSON for this project's main area, persisted so
+    /// each project restores its own panel arrangement. Stored as an untyped
+    /// [`serde_json::Value`] because the shape is owned by the frontend
+    /// (`dockview` serialization), not this crate. `None` for older saved
+    /// state that predates the docking layout.
+    #[serde(default)]
+    pub layout: Option<serde_json::Value>,
 }
 
 /// The full persisted workspace: open projects + which one is active.
-#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+///
+/// `Eq` is not derived because it contains [`Project`], which is `PartialEq`
+/// only (see its docs).
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct WorkspaceState {
     #[serde(default)]
     pub open_projects: Vec<Project>,
@@ -104,12 +118,14 @@ mod tests {
                     tree_state: TreeState {
                         expanded: vec!["/home/u/proj-a/src".into()],
                     },
+                    layout: None,
                 },
                 Project {
                     path: "/home/u/proj-b".into(),
                     name: "proj-b".into(),
                     project_types: vec![ProjectType::Python],
                     tree_state: TreeState { expanded: vec![] },
+                    layout: None,
                 },
             ],
             active_project: Some("/home/u/proj-b".into()),
@@ -155,6 +171,51 @@ mod tests {
         let s = WorkspaceState::default();
         assert!(s.open_projects.is_empty());
         assert_eq!(s.active_project, None);
+    }
+
+    #[test]
+    fn layout_round_trips_losslessly() {
+        let path = temp_path("layout_roundtrip");
+        let layout = serde_json::json!({
+            "grid": { "root": { "type": "branch", "data": [] }, "width": 800, "height": 600 },
+            "panels": { "terminal-1": { "id": "terminal-1", "title": "Terminal 1" } },
+            "ratio": 0.5,
+        });
+        let state = WorkspaceState {
+            open_projects: vec![Project {
+                path: "/home/u/proj-a".into(),
+                name: "proj-a".into(),
+                project_types: vec![ProjectType::Rust],
+                tree_state: TreeState::default(),
+                layout: Some(layout.clone()),
+            }],
+            active_project: Some("/home/u/proj-a".into()),
+        };
+        save_state(&state, &path).unwrap();
+        let loaded = load_state(&path);
+        assert_eq!(loaded, state);
+        assert_eq!(loaded.open_projects[0].layout, Some(layout));
+    }
+
+    #[test]
+    fn old_state_without_layout_key_loads_as_none() {
+        let path = temp_path("layout_migration");
+        // A pre-phase-02a saved project: no `layout` key at all.
+        let json = r#"{
+            "open_projects": [
+                {
+                    "path": "/home/u/proj-a",
+                    "name": "proj-a",
+                    "project_types": ["Rust"],
+                    "tree_state": { "expanded": [] }
+                }
+            ],
+            "active_project": "/home/u/proj-a"
+        }"#;
+        fs::write(&path, json).unwrap();
+        let loaded = load_state(&path);
+        assert_eq!(loaded.open_projects.len(), 1);
+        assert_eq!(loaded.open_projects[0].layout, None);
     }
 
     #[test]

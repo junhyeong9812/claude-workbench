@@ -30,6 +30,12 @@ export interface Project {
   name: string;
   project_types: ProjectType[];
   tree_state: TreeState;
+  /**
+   * Opaque dockview layout JSON for this project's main area. Owned by the
+   * frontend (dockview serialization); the backend stores it untyped. Absent
+   * for projects that have never arranged their main area.
+   */
+  layout?: unknown;
 }
 
 /** Full persisted workspace state (round-trips through Rust). */

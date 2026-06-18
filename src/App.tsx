@@ -7,6 +7,7 @@ import {
 } from "react-resizable-panels";
 import { ProjectTabs } from "./components/ProjectTabs";
 import { FolderTree } from "./components/FolderTree";
+import { MainArea } from "./components/MainArea";
 import { useAppStore } from "./state/store";
 import "./App.css";
 
@@ -57,12 +58,7 @@ export default function App() {
         </Panel>
         <PanelResizeHandle className="resize-handle" />
         <Panel defaultSize={80} minSize={30} className="pane-main">
-          <div className="placeholder">
-            <p>Main area placeholder</p>
-            <p className="placeholder-sub">
-              Terminal and editor arrive in later phases.
-            </p>
-          </div>
+          <MainArea />
         </Panel>
       </PanelGroup>
     </div>

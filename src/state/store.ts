@@ -39,6 +39,8 @@ interface AppState {
   toggleExpanded: (dirPath: string) => void;
   /** Lazily load a directory's children via the backend. */
   loadChildren: (dirPath: string) => Promise<void>;
+  /** Save a project's dockview main-area layout (opaque JSON) and persist. */
+  setLayout: (path: string, layout: unknown) => void;
   /** Persist the current workspace to the backend. */
   persist: () => void;
 }
@@ -185,6 +187,15 @@ export const useAppStore = create<AppState>((set, get) => ({
     } finally {
       set((s) => ({ loadingDirs: { ...s.loadingDirs, [dirPath]: false } }));
     }
+  },
+
+  setLayout: (path, layout) => {
+    set((s) => ({
+      projects: s.projects.map((p) =>
+        p.path === path ? { ...p, layout } : p,
+      ),
+    }));
+    get().persist();
   },
 
   persist: () => {

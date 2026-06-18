@@ -146,7 +146,58 @@ body {
 }
 
 .pane-main {
-  overflow: auto;
+  /* dockview positions its own children; keep the pane a plain sized box. */
+  overflow: hidden;
+}
+
+/* ---- Main area (dockview) ---- */
+.main-area {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-height: 0;
+}
+
+.main-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 8px;
+  background: var(--bg-alt);
+  border-bottom: 1px solid var(--border);
+}
+
+.main-dock {
+  /* dockview needs a sized parent; take the rest of the column. */
+  flex: 1;
+  min-height: 0;
+  position: relative;
+}
+
+.dock-placeholder {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  height: 100%;
+  gap: 4px;
+  color: var(--fg-dim);
+}
+
+.dock-placeholder-kind {
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  font-size: 11px;
+  color: var(--accent);
+}
+
+.dock-placeholder-title {
+  font-size: 14px;
+  color: var(--fg);
+}
+
+.dock-placeholder-sub {
+  font-size: 12px;
 }
 
 .resize-handle {
