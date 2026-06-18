@@ -12,13 +12,17 @@
 //! turned on in S2b when their handlers exist (advertising a capability we would
 //! reject would be a protocol lie).
 
+mod host;
+pub use host::{AcpCommand, AcpEvent, AcpHost, AuthMethodInfo};
+
 use std::path::PathBuf;
 
 use agent_client_protocol::{
-    Agent, Client, ClientCapabilities, ClientSideConnection, ContentBlock, Error,
-    FileSystemCapability, InitializeRequest, InitializeResponse, NewSessionRequest, PromptRequest,
-    PromptResponse, RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse,
-    SessionId, SessionNotification, VERSION,
+    Agent, AuthMethodId, AuthenticateRequest, AuthenticateResponse, CancelNotification, Client,
+    ClientCapabilities, ClientSideConnection, ContentBlock, Error, FileSystemCapability,
+    InitializeRequest, InitializeResponse, NewSessionRequest, PromptRequest, PromptResponse,
+    RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse, SessionId,
+    SessionNotification, VERSION,
 };
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
@@ -122,6 +126,16 @@ impl AcpClient {
         Ok(resp.session_id)
     }
 
+    /// Authenticate with one of the methods advertised in `initialize`.
+    pub async fn authenticate(&self, method_id: impl Into<String>) -> Result<AuthenticateResponse, Error> {
+        self.conn
+            .authenticate(AuthenticateRequest {
+                method_id: AuthMethodId(method_id.into().into()),
+                meta: None,
+            })
+            .await
+    }
+
     /// Send a text prompt to the session.
     pub async fn prompt(
         &self,
@@ -132,6 +146,16 @@ impl AcpClient {
             .prompt(PromptRequest {
                 session_id,
                 prompt: vec![ContentBlock::from(text.into())],
+                meta: None,
+            })
+            .await
+    }
+
+    /// Cancel any in-flight turn for the session (best effort — notification).
+    pub async fn cancel(&self, session_id: SessionId) -> Result<(), Error> {
+        self.conn
+            .cancel(CancelNotification {
+                session_id,
                 meta: None,
             })
             .await

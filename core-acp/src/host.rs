@@ -1,0 +1,591 @@
+//! ACP host thread — the Send-safe bridge over the `!Send` connection.
+//!
+//! The ACP `ClientSideConnection` is `!Send` and drives its I/O via
+//! `spawn_local`, so it must live inside a `current_thread` runtime + `LocalSet`
+//! (design D1). Tauri commands, however, run on arbitrary threads and need a
+//! `Send + Sync` handle. [`AcpHost`] is that handle: it owns a dedicated OS
+//! thread hosting the runtime and talks to it over two channels:
+//!
+//! - **inbound** ([`AcpCommand`]): a `tokio` unbounded channel. Its sender's
+//!   `send` is synchronous, so Tauri commands push commands without blocking.
+//! - **outbound** ([`AcpEvent`]): a `std::sync::mpsc` channel. The async host
+//!   sends events synchronously; a Tauri relay thread drains them and re-emits
+//!   them as webview events (mirroring the PTY `terminal-output` relay).
+//!
+//! The transport-agnostic [`run`] (connect → initialize → authenticate →
+//! new_session → command/update loop) is split out so the fake-agent test can
+//! drive it over in-memory pipes with no real `npx`.
+
+use std::collections::VecDeque;
+use std::future::Future;
+use std::path::PathBuf;
+use std::process::Stdio;
+use std::rc::Rc;
+use std::sync::mpsc::Sender as StdSender;
+use std::thread::JoinHandle;
+
+use agent_client_protocol::{AuthMethod, ContentBlock, SessionId, SessionUpdate};
+use serde::Serialize;
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, BufReader};
+use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
+
+use crate::AcpClient;
+
+/// A command sent *into* the host thread (synchronous send from any thread).
+#[derive(Debug)]
+pub enum AcpCommand {
+    /// Send a user prompt to the active session.
+    Prompt { text: String },
+    /// Authenticate with the given advertised method id (gates `new_session`).
+    Authenticate { method_id: String },
+    /// Cancel the in-flight turn (best effort).
+    Cancel,
+    /// Tear down the session and kill the adapter subprocess.
+    Shutdown,
+}
+
+/// One advertised authentication method, surfaced to the UI.
+#[derive(Debug, Clone, Serialize)]
+pub struct AuthMethodInfo {
+    pub id: String,
+    pub name: String,
+}
+
+impl From<&AuthMethod> for AuthMethodInfo {
+    fn from(m: &AuthMethod) -> Self {
+        Self {
+            id: m.id.0.to_string(),
+            name: m.name.clone(),
+        }
+    }
+}
+
+/// An event emitted *out of* the host thread toward the UI. Serialized directly
+/// onto the webview event by the Tauri relay.
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum AcpEvent {
+    /// The session is live (handshake + new_session done). `session_id` is the
+    /// adapter's id, carried for later commands/persistence (S3).
+    Connected { session_id: String },
+    /// One streamed chunk of the agent's reply (S1 renders text only).
+    AgentMessageChunk { text: String },
+    /// The adapter advertised auth methods and is waiting for an
+    /// `Authenticate` command before the session can start.
+    AuthRequired { methods: Vec<AuthMethodInfo> },
+    /// A non-fatal error string for the UI (handshake/prompt failures, etc.).
+    Error { message: String },
+    /// The host thread is finished (adapter exited or shutdown). Terminal.
+    Disconnected,
+}
+
+/// A `Send + Sync` handle to a running ACP adapter on its own thread.
+///
+/// Dropping the handle (or [`AcpHost::shutdown`]) asks the host to tear down;
+/// the thread is detached (not joined on drop) so a slow adapter shutdown never
+/// blocks the Tauri command thread.
+pub struct AcpHost {
+    commands: UnboundedSender<AcpCommand>,
+    _thread: JoinHandle<()>,
+}
+
+impl AcpHost {
+    /// Spawn `npx @zed-industries/claude-code-acp` rooted at `cwd` and host its
+    /// connection on a dedicated thread. Lifecycle/error events flow to `events`.
+    /// Returns an error only if the OS thread itself cannot be created (we never
+    /// panic at the command boundary).
+    pub fn spawn(cwd: PathBuf, events: StdSender<AcpEvent>) -> std::io::Result<AcpHost> {
+        let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+        let thread = std::thread::Builder::new()
+            .name("acp-host".into())
+            .spawn(move || host_main(cwd, cmd_rx, events))?;
+        Ok(AcpHost {
+            commands: cmd_tx,
+            _thread: thread,
+        })
+    }
+
+    /// Queue a prompt (no-op if the host thread has exited).
+    pub fn prompt(&self, text: impl Into<String>) {
+        let _ = self.commands.send(AcpCommand::Prompt { text: text.into() });
+    }
+
+    /// Authenticate with an advertised method id.
+    pub fn authenticate(&self, method_id: impl Into<String>) {
+        let _ = self.commands.send(AcpCommand::Authenticate {
+            method_id: method_id.into(),
+        });
+    }
+
+    /// Cancel the in-flight turn.
+    pub fn cancel(&self) {
+        let _ = self.commands.send(AcpCommand::Cancel);
+    }
+
+    /// Ask the host to tear down (idempotent — also runs on drop).
+    pub fn shutdown(&self) {
+        let _ = self.commands.send(AcpCommand::Shutdown);
+    }
+}
+
+impl Drop for AcpHost {
+    fn drop(&mut self) {
+        // Best effort: tell the thread to exit; don't join (avoid blocking).
+        let _ = self.commands.send(AcpCommand::Shutdown);
+    }
+}
+
+/// Thread entry: build a `current_thread` runtime + `LocalSet`, spawn the
+/// adapter, run the connection, and always emit a terminal `Disconnected`.
+fn host_main(cwd: PathBuf, cmd_rx: UnboundedReceiver<AcpCommand>, events: StdSender<AcpEvent>) {
+    let rt = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(rt) => rt,
+        Err(e) => {
+            let _ = events.send(AcpEvent::Error {
+                message: format!("runtime: {e}"),
+            });
+            let _ = events.send(AcpEvent::Disconnected);
+            return;
+        }
+    };
+    let local = tokio::task::LocalSet::new();
+    local.block_on(&rt, async move {
+        // Spawn the adapter with stdout reserved for pure JSON-RPC and stderr
+        // split off (adapter logs must not corrupt the transport — spec §10).
+        let mut child = match tokio::process::Command::new("npx")
+            // `--yes` auto-confirms the first-run install prompt; without it npx
+            // would block waiting on a stdin we've wired to the JSON-RPC pipe,
+            // hanging initialize forever (spec §10 npx hygiene).
+            .arg("--yes")
+            .arg("@zed-industries/claude-code-acp")
+            .current_dir(&cwd)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+        {
+            Ok(c) => c,
+            Err(e) => {
+                let _ = events.send(AcpEvent::Error {
+                    message: format!("spawn adapter (npx): {e}"),
+                });
+                let _ = events.send(AcpEvent::Disconnected);
+                return;
+            }
+        };
+
+        let stdin = child.stdin.take().expect("piped stdin");
+        let stdout = child.stdout.take().expect("piped stdout");
+        if let Some(stderr) = child.stderr.take() {
+            // Drain stderr so a chatty adapter never blocks on a full pipe.
+            tokio::task::spawn_local(async move {
+                let mut lines = BufReader::new(stderr).lines();
+                while let Ok(Some(_)) = lines.next_line().await {}
+            });
+        }
+
+        if let Err(message) = run(stdin, stdout, cwd, cmd_rx, &events).await {
+            let _ = events.send(AcpEvent::Error { message });
+        }
+        // Best effort cleanup; `wait` reaps the child so it can't linger as a
+        // zombie once we drop the runtime below (no-op if it already exited).
+        let _ = child.start_kill();
+        let _ = child.wait().await;
+        let _ = events.send(AcpEvent::Disconnected);
+    });
+}
+
+/// Transport-agnostic connection driver: connect, handshake, (optional auth),
+/// open a session, then pump commands and session updates until shutdown or the
+/// connection closes. Factored out of [`host_main`] so the fake-agent test can
+/// drive it over in-memory pipes (no real `npx`).
+async fn run<W, R>(
+    outgoing: W,
+    incoming: R,
+    cwd: PathBuf,
+    mut cmd_rx: UnboundedReceiver<AcpCommand>,
+    events: &StdSender<AcpEvent>,
+) -> Result<(), String>
+where
+    W: AsyncWrite + Unpin + 'static,
+    R: AsyncRead + Unpin + 'static,
+{
+    let (client, io_task, mut updates) = AcpClient::new(outgoing, incoming);
+    // Drive the JSON-RPC I/O for the lifetime of the connection.
+    tokio::task::spawn_local(io_task);
+    // `Rc` so prompt/cancel can run as concurrent local tasks while the main
+    // loop keeps draining `updates` (otherwise a long turn would stall the
+    // stream — `prompt` resolves only at end-of-turn).
+    let client = Rc::new(client);
+
+    // Each handshake RPC is raced against `Shutdown`: a hung/unresponsive
+    // adapter must not pin this thread (and its subprocess) past a panel close
+    // (codex finding #1). `None` = shutdown requested mid-handshake -> bail.
+    let init = match await_or_shutdown(client.initialize(), &mut cmd_rx).await {
+        Some(r) => r.map_err(|e| format!("initialize: {e}"))?,
+        None => return Ok(()),
+    };
+
+    // Auth (kill-switch pending — spec §10): if the adapter advertises methods,
+    // surface them and wait for an explicit Authenticate command. We never
+    // auto-authenticate. Empty list = login reused (the expected path), proceed.
+    if !init.auth_methods.is_empty() {
+        let methods = init.auth_methods.iter().map(AuthMethodInfo::from).collect();
+        let _ = events.send(AcpEvent::AuthRequired { methods });
+        loop {
+            match cmd_rx.recv().await {
+                Some(AcpCommand::Authenticate { method_id }) => {
+                    match await_or_shutdown(client.authenticate(method_id), &mut cmd_rx).await {
+                        Some(r) => {
+                            r.map_err(|e| format!("authenticate: {e}"))?;
+                            break;
+                        }
+                        None => return Ok(()),
+                    }
+                }
+                Some(AcpCommand::Shutdown) | None => return Ok(()),
+                // Ignore prompts/cancels issued before authentication.
+                Some(_) => {}
+            }
+        }
+    }
+
+    let session_id = match await_or_shutdown(client.new_session(cwd), &mut cmd_rx).await {
+        Some(r) => r.map_err(|e| format!("new_session: {e}"))?,
+        None => return Ok(()),
+    };
+    let _ = events.send(AcpEvent::Connected {
+        session_id: session_id.0.to_string(),
+    });
+
+    // Serialize turns: ACP is turn-based, so we keep at most one `session/prompt`
+    // in flight and queue the rest (codex finding #3). Each prompt runs as a
+    // detached task (so updates keep streaming) and signals `done` on
+    // completion, which pulls the next queued prompt.
+    let (done_tx, mut done_rx) = mpsc::unbounded_channel::<()>();
+    let mut in_flight = false;
+    let mut queue: VecDeque<String> = VecDeque::new();
+
+    loop {
+        tokio::select! {
+            cmd = cmd_rx.recv() => match cmd {
+                Some(AcpCommand::Prompt { text }) => {
+                    if in_flight {
+                        queue.push_back(text);
+                    } else {
+                        in_flight = true;
+                        spawn_prompt(client.clone(), session_id.clone(), text, events.clone(), done_tx.clone());
+                    }
+                }
+                Some(AcpCommand::Cancel) => {
+                    let _ = client.cancel(session_id.clone()).await;
+                }
+                // Already authenticated past this point; ignore late auth.
+                Some(AcpCommand::Authenticate { .. }) => {}
+                Some(AcpCommand::Shutdown) | None => break,
+            },
+            _ = done_rx.recv() => {
+                // Current turn finished; start the next queued prompt, if any.
+                match queue.pop_front() {
+                    Some(next) => spawn_prompt(client.clone(), session_id.clone(), next, events.clone(), done_tx.clone()),
+                    None => in_flight = false,
+                }
+            }
+            note = updates.recv() => match note {
+                Some(note) => forward_update(note.update, events),
+                None => break, // connection closed (adapter exited / I/O ended)
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Await `fut`, returning `None` if a `Shutdown` (or a closed command channel)
+/// arrives first. Used to guard the handshake RPCs, which have no session to
+/// act on yet, so any other command received here is simply dropped.
+async fn await_or_shutdown<T>(
+    fut: impl Future<Output = T>,
+    cmd_rx: &mut UnboundedReceiver<AcpCommand>,
+) -> Option<T> {
+    tokio::pin!(fut);
+    loop {
+        tokio::select! {
+            out = &mut fut => return Some(out),
+            cmd = cmd_rx.recv() => match cmd {
+                Some(AcpCommand::Shutdown) | None => return None,
+                Some(_) => {} // ignore non-shutdown commands during handshake
+            }
+        }
+    }
+}
+
+/// Run a prompt as a detached local task so the main loop keeps streaming
+/// updates during the turn. Failures surface as an `Error` event; completion
+/// (success or failure) signals `done` so the next queued turn can start.
+fn spawn_prompt(
+    client: Rc<AcpClient>,
+    session_id: SessionId,
+    text: String,
+    events: StdSender<AcpEvent>,
+    done: UnboundedSender<()>,
+) {
+    tokio::task::spawn_local(async move {
+        if let Err(e) = client.prompt(session_id, text).await {
+            let _ = events.send(AcpEvent::Error {
+                message: format!("prompt: {e}"),
+            });
+        }
+        let _ = done.send(());
+    });
+}
+
+/// Map a `session/update` to a UI event. S1 only renders agent message text;
+/// tool-call events become timeline items in S2a/S2b.
+fn forward_update(update: SessionUpdate, events: &StdSender<AcpEvent>) {
+    if let SessionUpdate::AgentMessageChunk {
+        content: ContentBlock::Text(t),
+    } = update
+    {
+        let _ = events.send(AcpEvent::AgentMessageChunk { text: t.text });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use agent_client_protocol::{
+        Agent, AgentSideConnection, AuthenticateRequest, AuthenticateResponse, CancelNotification,
+        Client, Error, InitializeRequest, InitializeResponse, NewSessionRequest, NewSessionResponse,
+        PromptRequest, PromptResponse, SessionNotification, StopReason, VERSION,
+    };
+    use std::cell::RefCell;
+    use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
+
+    /// Fake agent that completes the handshake and emits one text chunk per
+    /// prompt — deterministic, no real `npx`. `concurrency` tracks
+    /// `(current, max)` simultaneous `prompt` calls so a test can assert the
+    /// host serializes turns.
+    struct FakeAgent {
+        conn: Rc<RefCell<Option<Rc<AgentSideConnection>>>>,
+        concurrency: Rc<RefCell<(u32, u32)>>,
+    }
+
+    #[async_trait::async_trait(?Send)]
+    impl Agent for FakeAgent {
+        async fn initialize(&self, _: InitializeRequest) -> Result<InitializeResponse, Error> {
+            Ok(InitializeResponse {
+                protocol_version: VERSION,
+                agent_capabilities: Default::default(),
+                auth_methods: vec![], // login reused -> no auth step
+                meta: None,
+            })
+        }
+        async fn authenticate(&self, _: AuthenticateRequest) -> Result<AuthenticateResponse, Error> {
+            Ok(AuthenticateResponse::default())
+        }
+        async fn new_session(&self, _: NewSessionRequest) -> Result<NewSessionResponse, Error> {
+            Ok(NewSessionResponse {
+                session_id: SessionId("host-session".into()),
+                modes: None,
+                meta: None,
+            })
+        }
+        async fn prompt(&self, args: PromptRequest) -> Result<PromptResponse, Error> {
+            // Enter the turn; record peak concurrency, then hold a window open
+            // (yields) so an overlapping turn would be observed if it existed.
+            {
+                let mut c = self.concurrency.borrow_mut();
+                c.0 += 1;
+                c.1 = c.1.max(c.0);
+            }
+            for _ in 0..5 {
+                tokio::task::yield_now().await;
+            }
+            if let Some(conn) = self.conn.borrow().clone() {
+                let _ = conn
+                    .session_notification(SessionNotification {
+                        session_id: args.session_id.clone(),
+                        update: SessionUpdate::AgentMessageChunk {
+                            content: ContentBlock::from("hello".to_string()),
+                        },
+                        meta: None,
+                    })
+                    .await;
+            }
+            self.concurrency.borrow_mut().0 -= 1;
+            Ok(PromptResponse {
+                stop_reason: StopReason::EndTurn,
+                meta: None,
+            })
+        }
+        async fn cancel(&self, _: CancelNotification) -> Result<(), Error> {
+            Ok(())
+        }
+    }
+
+    /// Drive the real host `run` loop over in-memory pipes: connect, prompt,
+    /// shutdown — and assert Connected + the streamed chunk reach `events`.
+    #[test]
+    fn host_run_connects_prompts_and_streams() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let local = tokio::task::LocalSet::new();
+        local.block_on(&rt, async {
+            let (client_end, agent_end) = tokio::io::duplex(8192);
+            let (c_read, c_write) = tokio::io::split(client_end);
+            let (a_read, a_write) = tokio::io::split(agent_end);
+
+            // Agent side.
+            let slot: Rc<RefCell<Option<Rc<AgentSideConnection>>>> = Rc::new(RefCell::new(None));
+            let (agent_conn, agent_io) = AgentSideConnection::new(
+                FakeAgent {
+                    conn: slot.clone(),
+                    concurrency: Rc::new(RefCell::new((0, 0))),
+                },
+                a_write.compat_write(),
+                a_read.compat(),
+                |fut| {
+                    tokio::task::spawn_local(fut);
+                },
+            );
+            *slot.borrow_mut() = Some(Rc::new(agent_conn));
+            tokio::task::spawn_local(async move {
+                let _ = agent_io.await;
+            });
+
+            // Host side: drive `run` with a command channel and event sink.
+            let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+            let (ev_tx, ev_rx) = std::sync::mpsc::channel();
+            let run_handle = tokio::task::spawn_local(async move {
+                run(c_write, c_read, PathBuf::from("/tmp"), cmd_rx, &ev_tx).await
+            });
+
+            // Mirror real usage (the UI gates prompts on `ready`): pump until
+            // `Connected`, *then* prompt. A prompt sent mid-handshake would be
+            // dropped by the shutdown-guard — the UI never does that.
+            let mut got: Vec<AcpEvent> = Vec::new();
+            for _ in 0..1000 {
+                tokio::task::yield_now().await;
+                while let Ok(ev) = ev_rx.try_recv() {
+                    got.push(ev);
+                }
+                if got.iter().any(|e| matches!(e, AcpEvent::Connected { .. })) {
+                    break;
+                }
+            }
+            cmd_tx.send(AcpCommand::Prompt { text: "hi".into() }).unwrap();
+            for _ in 0..1000 {
+                tokio::task::yield_now().await;
+                while let Ok(ev) = ev_rx.try_recv() {
+                    got.push(ev);
+                }
+                if got
+                    .iter()
+                    .any(|e| matches!(e, AcpEvent::AgentMessageChunk { .. }))
+                {
+                    break;
+                }
+            }
+            cmd_tx.send(AcpCommand::Shutdown).unwrap();
+            run_handle.await.unwrap().expect("run ok");
+            while let Ok(ev) = ev_rx.try_recv() {
+                got.push(ev);
+            }
+
+            assert!(
+                matches!(got.first(), Some(AcpEvent::Connected { session_id }) if session_id == "host-session"),
+                "first event should be Connected, got {got:?}"
+            );
+            assert!(
+                got.iter().any(|e| matches!(e, AcpEvent::AgentMessageChunk { text } if text == "hello")),
+                "expected the streamed chunk, got {got:?}"
+            );
+        });
+    }
+
+    /// Two prompts issued back-to-back must not run concurrently: ACP is
+    /// turn-based, so the host serializes them (codex finding #3). The fake
+    /// agent records peak `prompt` concurrency, which must stay at 1.
+    #[test]
+    fn host_run_serializes_prompts() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let local = tokio::task::LocalSet::new();
+        local.block_on(&rt, async {
+            let (client_end, agent_end) = tokio::io::duplex(8192);
+            let (c_read, c_write) = tokio::io::split(client_end);
+            let (a_read, a_write) = tokio::io::split(agent_end);
+
+            let slot: Rc<RefCell<Option<Rc<AgentSideConnection>>>> = Rc::new(RefCell::new(None));
+            let concurrency = Rc::new(RefCell::new((0u32, 0u32)));
+            let (agent_conn, agent_io) = AgentSideConnection::new(
+                FakeAgent {
+                    conn: slot.clone(),
+                    concurrency: concurrency.clone(),
+                },
+                a_write.compat_write(),
+                a_read.compat(),
+                |fut| {
+                    tokio::task::spawn_local(fut);
+                },
+            );
+            *slot.borrow_mut() = Some(Rc::new(agent_conn));
+            tokio::task::spawn_local(async move {
+                let _ = agent_io.await;
+            });
+
+            let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+            let (ev_tx, ev_rx) = std::sync::mpsc::channel();
+            let run_handle = tokio::task::spawn_local(async move {
+                run(c_write, c_read, PathBuf::from("/tmp"), cmd_rx, &ev_tx).await
+            });
+
+            // Pump to Connected (UI gates prompts on `ready`).
+            let mut connected = false;
+            for _ in 0..1000 {
+                tokio::task::yield_now().await;
+                while let Ok(ev) = ev_rx.try_recv() {
+                    if matches!(ev, AcpEvent::Connected { .. }) {
+                        connected = true;
+                    }
+                }
+                if connected {
+                    break;
+                }
+            }
+            assert!(connected, "session never connected");
+
+            // Fire two prompts with no gap.
+            let mut chunks = 0usize;
+            cmd_tx.send(AcpCommand::Prompt { text: "a".into() }).unwrap();
+            cmd_tx.send(AcpCommand::Prompt { text: "b".into() }).unwrap();
+
+            // Pump until both turns have streamed their chunk.
+            for _ in 0..4000 {
+                tokio::task::yield_now().await;
+                while let Ok(ev) = ev_rx.try_recv() {
+                    if matches!(ev, AcpEvent::AgentMessageChunk { .. }) {
+                        chunks += 1;
+                    }
+                }
+                if chunks >= 2 {
+                    break;
+                }
+            }
+            cmd_tx.send(AcpCommand::Shutdown).unwrap();
+            run_handle.await.unwrap().expect("run ok");
+
+            assert_eq!(chunks, 2, "both prompts should have streamed a chunk");
+            assert_eq!(
+                concurrency.borrow().1,
+                1,
+                "prompts must be serialized (peak concurrency 1)"
+            );
+        });
+    }
+}

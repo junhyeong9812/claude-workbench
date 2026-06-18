@@ -5,10 +5,14 @@
 //! the offending path or an OS-level message) so internal filesystem details
 //! and stack information are not leaked to the UI.
 
+use std::collections::HashMap;
 use std::io;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
 use std::thread;
 
+use core_acp::{AcpEvent, AcpHost};
 use core_lib::{DirEntry, ProjectType, SessionManager, WorkspaceState};
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager, State};
@@ -172,4 +176,120 @@ pub fn terminal_snapshot(
 #[tauri::command]
 pub fn terminal_close(mgr: State<'_, SessionManager>, id: u64) -> Result<(), AppError> {
     mgr.remove(id).map_err(AppError::new)
+}
+
+// ---- ACP (Claude) commands ----
+//
+// The `core_acp::AcpHost` owns the adapter subprocess + its `!Send` connection
+// on a dedicated thread (async island — design D1). These commands are thin
+// wrappers over the host's `Send` handle; the only Tauri glue is the relay
+// thread in `acp_start`, which forwards host events to the `acp-event` webview
+// event (mirroring the PTY `terminal-output` relay).
+
+/// Managed state: one [`AcpHost`] per Claude panel, keyed by a monotonic id.
+#[derive(Default)]
+pub struct AcpState {
+    hosts: Mutex<HashMap<u64, AcpHost>>,
+    next_id: AtomicU64,
+}
+
+/// A host event tagged with its panel id, emitted as the `acp-event` event.
+/// `event` is flattened, so the payload is `{ id, type, ... }`.
+#[derive(Clone, Serialize)]
+struct AcpEventPayload {
+    id: u64,
+    #[serde(flatten)]
+    event: AcpEvent,
+}
+
+fn acp_lock<'a>(
+    state: &'a State<'_, AcpState>,
+) -> Result<std::sync::MutexGuard<'a, HashMap<u64, AcpHost>>, AppError> {
+    state
+        .hosts
+        .lock()
+        .map_err(|_| AppError::new("ACP state unavailable"))
+}
+
+/// Spawn the Claude adapter rooted at `cwd` (the active project) and start
+/// relaying its events. Returns the panel id used by the other ACP commands.
+#[tauri::command]
+pub fn acp_start(
+    app: AppHandle,
+    state: State<'_, AcpState>,
+    cwd: Option<String>,
+) -> Result<u64, AppError> {
+    // Claude must be rooted at the session root; refuse rather than guess.
+    let cwd =
+        PathBuf::from(cwd.ok_or_else(|| AppError::new("Claude requires an active project"))?);
+
+    let (ev_tx, ev_rx) = std::sync::mpsc::channel::<AcpEvent>();
+    let host =
+        AcpHost::spawn(cwd, ev_tx).map_err(|e| AppError::new(io_message("Cannot start Claude", &e)))?;
+    let id = state.next_id.fetch_add(1, Ordering::Relaxed);
+
+    // Relay host events -> webview until the host thread ends (sender dropped
+    // -> recv errors -> loop exits; no leak). `Disconnected` is the last event
+    // sent before the sender drops. On exit we drop the now-dead handle from
+    // state so later commands on `id` fail loudly instead of silently no-op'ing.
+    let app = app.clone();
+    thread::spawn(move || {
+        while let Ok(event) = ev_rx.recv() {
+            let _ = app.emit("acp-event", AcpEventPayload { id, event });
+        }
+        if let Some(state) = app.try_state::<AcpState>() {
+            if let Ok(mut hosts) = state.hosts.lock() {
+                hosts.remove(&id);
+            }
+        }
+    });
+
+    acp_lock(&state)?.insert(id, host);
+    Ok(id)
+}
+
+/// Queue a prompt to a Claude session.
+#[tauri::command]
+pub fn acp_prompt(state: State<'_, AcpState>, id: u64, text: String) -> Result<(), AppError> {
+    let hosts = acp_lock(&state)?;
+    let host = hosts
+        .get(&id)
+        .ok_or_else(|| AppError::new("unknown Claude session"))?;
+    host.prompt(text);
+    Ok(())
+}
+
+/// Authenticate a session with one of its advertised auth methods.
+#[tauri::command]
+pub fn acp_authenticate(
+    state: State<'_, AcpState>,
+    id: u64,
+    method_id: String,
+) -> Result<(), AppError> {
+    let hosts = acp_lock(&state)?;
+    let host = hosts
+        .get(&id)
+        .ok_or_else(|| AppError::new("unknown Claude session"))?;
+    host.authenticate(method_id);
+    Ok(())
+}
+
+/// Cancel the in-flight turn for a session (best effort).
+#[tauri::command]
+pub fn acp_cancel(state: State<'_, AcpState>, id: u64) -> Result<(), AppError> {
+    let hosts = acp_lock(&state)?;
+    let host = hosts
+        .get(&id)
+        .ok_or_else(|| AppError::new("unknown Claude session"))?;
+    host.cancel();
+    Ok(())
+}
+
+/// Close a session: drop the host (its `Drop` asks the thread to shut down and
+/// kill the adapter). Unknown ids are a no-op.
+#[tauri::command]
+pub fn acp_close(state: State<'_, AcpState>, id: u64) -> Result<(), AppError> {
+    let host = acp_lock(&state)?.remove(&id);
+    drop(host);
+    Ok(())
 }

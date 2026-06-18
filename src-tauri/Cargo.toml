@@ -20,3 +20,5 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # Renamed to `core_lib` in code to avoid shadowing the std `core` crate.
 core_lib = { path = "../core", package = "core" }
+# ACP async island (adapter spawn + connection host) — kept out of `core`.
+core_acp = { path = "../core-acp", package = "core-acp" }

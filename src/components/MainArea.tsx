@@ -9,11 +9,16 @@ import { invoke } from "@tauri-apps/api/core";
 import { useAppStore } from "../state/store";
 import { PlaceholderPanel } from "./PlaceholderPanel";
 import { TerminalPanel } from "./TerminalPanel";
+import { ClaudePanel } from "./ClaudePanel";
 
 /** dockview component registry — maps component name -> React panel. */
-const components = { placeholder: PlaceholderPanel, terminal: TerminalPanel };
+const components = {
+  placeholder: PlaceholderPanel,
+  terminal: TerminalPanel,
+  claude: ClaudePanel,
+};
 
-type PanelKind = "terminal" | "editor";
+type PanelKind = "terminal" | "editor" | "claude";
 
 /**
  * The 80% main area, backed by dockview.
@@ -56,12 +61,15 @@ export function MainArea() {
       }
     });
 
-    // Real panel removal (close) -> close the PTY session (spec §0.1). Tab/
+    // Real panel removal (close) -> close the backing session (spec §0.1). Tab/
     // project switches don't fire this, so those only detach (session lives).
     api.onDidRemovePanel((panel) => {
-      const sessionId = (panel.params as { sessionId?: number } | undefined)?.sessionId;
-      if (typeof sessionId === "number") {
-        invoke("terminal_close", { id: sessionId }).catch(() => {});
+      const params = panel.params as { sessionId?: number; acpId?: number } | undefined;
+      if (typeof params?.sessionId === "number") {
+        invoke("terminal_close", { id: params.sessionId }).catch(() => {});
+      }
+      if (typeof params?.acpId === "number") {
+        invoke("acp_close", { id: params.acpId }).catch(() => {});
       }
     });
   };
@@ -71,10 +79,13 @@ export function MainArea() {
     if (!api) return;
     const n = ++counterRef.current;
     const title = `${kind[0].toUpperCase()}${kind.slice(1)} ${n}`;
+    // Terminals get the real PTY panel, Claude the ACP panel; editor stays a
+    // stub until P3.
+    const component =
+      kind === "terminal" ? "terminal" : kind === "claude" ? "claude" : "placeholder";
     api.addPanel({
       id: `${kind}-${Date.now()}`,
-      // Terminals get the real PTY panel; editor stays a stub until P3.
-      component: kind === "terminal" ? "terminal" : "placeholder",
+      component,
       title,
       params: { kind, title },
     });
@@ -85,6 +96,9 @@ export function MainArea() {
       <div className="main-toolbar">
         <button className="toolbar-btn" onClick={() => addPanel("terminal")}>
           + Terminal
+        </button>
+        <button className="toolbar-btn" onClick={() => addPanel("claude")}>
+          + Claude
         </button>
         <button className="toolbar-btn" onClick={() => addPanel("editor")}>
           + Editor

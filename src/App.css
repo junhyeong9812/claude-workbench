@@ -209,6 +209,127 @@ body {
   font-size: 12px;
 }
 
+/* ---- Claude (ACP) panel ---- */
+.claude-panel {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-height: 0;
+  background: var(--bg);
+  color: var(--fg);
+}
+
+.claude-status {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 8px;
+  font-size: 11px;
+  color: var(--fg-dim);
+  border-bottom: 1px solid var(--border);
+}
+
+.claude-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--fg-dim);
+}
+.claude-dot-ready {
+  background: #3fb950;
+}
+.claude-dot-starting {
+  background: #d29922;
+}
+.claude-dot-auth {
+  background: #d29922;
+}
+.claude-dot-error {
+  background: #f85149;
+}
+.claude-dot-closed {
+  background: var(--fg-dim);
+}
+
+.claude-auth {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 6px;
+  padding: 8px;
+  border-bottom: 1px solid var(--border);
+  font-size: 12px;
+}
+
+.claude-error {
+  padding: 6px 8px;
+  font-size: 12px;
+  color: #f85149;
+  background: rgba(248, 81, 73, 0.1);
+  border-bottom: 1px solid var(--border);
+}
+
+.claude-log {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.claude-msg {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.claude-role {
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--accent);
+}
+.claude-msg-user .claude-role {
+  color: var(--fg-dim);
+}
+
+.claude-text {
+  margin: 0;
+  font-family: inherit;
+  font-size: 13px;
+  line-height: 1.45;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.claude-input {
+  display: flex;
+  gap: 6px;
+  padding: 6px;
+  border-top: 1px solid var(--border);
+  background: var(--bg-alt);
+}
+
+.claude-input textarea {
+  flex: 1;
+  resize: none;
+  min-height: 38px;
+  max-height: 120px;
+  padding: 6px 8px;
+  font-family: inherit;
+  font-size: 13px;
+  color: var(--fg);
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+}
+.claude-input textarea:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+
 .resize-handle {
   width: 4px;
   background: var(--border);

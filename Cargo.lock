@@ -434,6 +434,7 @@ version = "0.1.0"
 dependencies = [
  "agent-client-protocol",
  "async-trait",
+ "serde",
  "tokio",
  "tokio-util",
 ]
@@ -1917,6 +1918,7 @@ name = "multi-terminal"
 version = "0.1.0"
 dependencies = [
  "core",
+ "core-acp",
  "serde",
  "serde_json",
  "tauri",

@@ -9,6 +9,7 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .manage(core_lib::SessionManager::new())
+        .manage(commands::AcpState::default())
         .invoke_handler(tauri::generate_handler![
             commands::read_dir,
             commands::detect_project_types,
@@ -19,6 +20,11 @@ pub fn run() {
             commands::terminal_resize,
             commands::terminal_snapshot,
             commands::terminal_close,
+            commands::acp_start,
+            commands::acp_prompt,
+            commands::acp_authenticate,
+            commands::acp_cancel,
+            commands::acp_close,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
