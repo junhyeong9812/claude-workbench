@@ -24,7 +24,7 @@ use std::rc::Rc;
 use std::sync::mpsc::Sender as StdSender;
 use std::thread::JoinHandle;
 
-use agent_client_protocol::{AuthMethod, ContentBlock, SessionId, SessionUpdate};
+use agent_client_protocol::{ContentBlock, Error, ErrorCode, SessionId, SessionUpdate};
 use serde::Serialize;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, BufReader};
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
@@ -36,28 +36,10 @@ use crate::AcpClient;
 pub enum AcpCommand {
     /// Send a user prompt to the active session.
     Prompt { text: String },
-    /// Authenticate with the given advertised method id (gates `new_session`).
-    Authenticate { method_id: String },
     /// Cancel the in-flight turn (best effort).
     Cancel,
     /// Tear down the session and kill the adapter subprocess.
     Shutdown,
-}
-
-/// One advertised authentication method, surfaced to the UI.
-#[derive(Debug, Clone, Serialize)]
-pub struct AuthMethodInfo {
-    pub id: String,
-    pub name: String,
-}
-
-impl From<&AuthMethod> for AuthMethodInfo {
-    fn from(m: &AuthMethod) -> Self {
-        Self {
-            id: m.id.0.to_string(),
-            name: m.name.clone(),
-        }
-    }
 }
 
 /// An event emitted *out of* the host thread toward the UI. Serialized directly
@@ -70,9 +52,11 @@ pub enum AcpEvent {
     Connected { session_id: String },
     /// One streamed chunk of the agent's reply (S1 renders text only).
     AgentMessageChunk { text: String },
-    /// The adapter advertised auth methods and is waiting for an
-    /// `Authenticate` command before the session can start.
-    AuthRequired { methods: Vec<AuthMethodInfo> },
+    /// The adapter reported `auth_required` (-32000): the user is not logged in.
+    /// The `@zed-industries/claude-code-acp` adapter does **not** implement the
+    /// `authenticate` RPC — login is out-of-band, so `command` is the shell
+    /// command to run in a terminal (`claude /login`) before reconnecting.
+    AuthRequired { command: String },
     /// A non-fatal error string for the UI (handshake/prompt failures, etc.).
     Error { message: String },
     /// The host thread is finished (adapter exited or shutdown). Terminal.
@@ -110,17 +94,14 @@ impl AcpHost {
         let _ = self.commands.send(AcpCommand::Prompt { text: text.into() });
     }
 
-    /// Authenticate with an advertised method id.
-    pub fn authenticate(&self, method_id: impl Into<String>) {
-        let _ = self.commands.send(AcpCommand::Authenticate {
-            method_id: method_id.into(),
-        });
-    }
-
     /// Cancel the in-flight turn.
     pub fn cancel(&self) {
         let _ = self.commands.send(AcpCommand::Cancel);
     }
+
+    // NOTE: no `authenticate` — the fixed adapter does not implement the ACP
+    // `authenticate` RPC (it always throws "Method not implemented"); login is
+    // out-of-band via `claude /login` (see `AcpEvent::AuthRequired`).
 
     /// Ask the host to tear down (idempotent — also runs on drop).
     pub fn shutdown(&self) {
@@ -162,6 +143,11 @@ fn host_main(cwd: PathBuf, cmd_rx: UnboundedReceiver<AcpCommand>, events: StdSen
             .arg("--yes")
             .arg("@zed-industries/claude-code-acp")
             .current_dir(&cwd)
+            // The adapter spawns its own Claude Code, which refuses to run
+            // "inside another Claude Code session". If our app was launched from
+            // a Claude Code terminal, that marker is inherited and aborts
+            // `session/new`; drop it so the adapter's child starts cleanly.
+            .env_remove("CLAUDECODE")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -180,10 +166,14 @@ fn host_main(cwd: PathBuf, cmd_rx: UnboundedReceiver<AcpCommand>, events: StdSen
         let stdin = child.stdin.take().expect("piped stdin");
         let stdout = child.stdout.take().expect("piped stdout");
         if let Some(stderr) = child.stderr.take() {
-            // Drain stderr so a chatty adapter never blocks on a full pipe.
+            // Drain stderr so a chatty adapter never blocks on a full pipe, and
+            // surface its lines on our own stderr (prefixed) for diagnosis —
+            // these are adapter logs, kept off the JSON-RPC stdout (spec §10).
             tokio::task::spawn_local(async move {
                 let mut lines = BufReader::new(stderr).lines();
-                while let Ok(Some(_)) = lines.next_line().await {}
+                while let Ok(Some(line)) = lines.next_line().await {
+                    eprintln!("[claude-acp] {line}");
+                }
             });
         }
 
@@ -224,37 +214,24 @@ where
     // Each handshake RPC is raced against `Shutdown`: a hung/unresponsive
     // adapter must not pin this thread (and its subprocess) past a panel close
     // (codex finding #1). `None` = shutdown requested mid-handshake -> bail.
-    let init = match await_or_shutdown(client.initialize(), &mut cmd_rx).await {
-        Some(r) => r.map_err(|e| format!("initialize: {e}"))?,
-        None => return Ok(()),
-    };
-
-    // Auth (kill-switch pending — spec §10): if the adapter advertises methods,
-    // surface them and wait for an explicit Authenticate command. We never
-    // auto-authenticate. Empty list = login reused (the expected path), proceed.
-    if !init.auth_methods.is_empty() {
-        let methods = init.auth_methods.iter().map(AuthMethodInfo::from).collect();
-        let _ = events.send(AcpEvent::AuthRequired { methods });
-        loop {
-            match cmd_rx.recv().await {
-                Some(AcpCommand::Authenticate { method_id }) => {
-                    match await_or_shutdown(client.authenticate(method_id), &mut cmd_rx).await {
-                        Some(r) => {
-                            r.map_err(|e| format!("authenticate: {e}"))?;
-                            break;
-                        }
-                        None => return Ok(()),
-                    }
-                }
-                Some(AcpCommand::Shutdown) | None => return Ok(()),
-                // Ignore prompts/cancels issued before authentication.
-                Some(_) => {}
-            }
+    match await_or_shutdown(client.initialize(), &mut cmd_rx).await {
+        Some(r) => {
+            r.map_err(|e| format!("initialize: {e}"))?;
         }
+        None => return Ok(()),
     }
 
+    // We deliberately ignore the advertised `auth_methods`: the fixed adapter
+    // always advertises `claude-login` but its `authenticate` RPC is a stub
+    // that throws (kill-switch finding, 2026-06-19). Login is out-of-band
+    // (`claude /login`), and the real "not logged in" signal is the
+    // `auth_required` (-32000) error returned by `new_session`/`prompt` below.
     let session_id = match await_or_shutdown(client.new_session(cwd), &mut cmd_rx).await {
-        Some(r) => r.map_err(|e| format!("new_session: {e}"))?,
+        Some(Ok(sid)) => sid,
+        Some(Err(e)) => {
+            let _ = events.send(error_event("new_session", &e));
+            return Ok(()); // host exits; `Disconnected` follows in host_main
+        }
         None => return Ok(()),
     };
     let _ = events.send(AcpEvent::Connected {
@@ -283,8 +260,6 @@ where
                 Some(AcpCommand::Cancel) => {
                     let _ = client.cancel(session_id.clone()).await;
                 }
-                // Already authenticated past this point; ignore late auth.
-                Some(AcpCommand::Authenticate { .. }) => {}
                 Some(AcpCommand::Shutdown) | None => break,
             },
             _ = done_rx.recv() => {
@@ -334,12 +309,25 @@ fn spawn_prompt(
 ) {
     tokio::task::spawn_local(async move {
         if let Err(e) = client.prompt(session_id, text).await {
-            let _ = events.send(AcpEvent::Error {
-                message: format!("prompt: {e}"),
-            });
+            let _ = events.send(error_event("prompt", &e));
         }
         let _ = done.send(());
     });
+}
+
+/// Classify an ACP error into a UI event: `auth_required` (-32000) becomes an
+/// actionable [`AcpEvent::AuthRequired`] pointing at the out-of-band login
+/// command; anything else is a generic [`AcpEvent::Error`].
+fn error_event(context: &str, e: &Error) -> AcpEvent {
+    if e.code == ErrorCode::AUTH_REQUIRED.code {
+        AcpEvent::AuthRequired {
+            command: "claude /login".to_string(),
+        }
+    } else {
+        AcpEvent::Error {
+            message: format!("{context}: {}", e.message),
+        }
+    }
 }
 
 /// Map a `session/update` to a UI event. S1 only renders agent message text;
@@ -367,10 +355,12 @@ mod tests {
     /// Fake agent that completes the handshake and emits one text chunk per
     /// prompt — deterministic, no real `npx`. `concurrency` tracks
     /// `(current, max)` simultaneous `prompt` calls so a test can assert the
-    /// host serializes turns.
+    /// host serializes turns. `auth_required` makes `new_session` return the
+    /// `-32000` error the real adapter raises when the user is not logged in.
     struct FakeAgent {
         conn: Rc<RefCell<Option<Rc<AgentSideConnection>>>>,
         concurrency: Rc<RefCell<(u32, u32)>>,
+        auth_required: bool,
     }
 
     #[async_trait::async_trait(?Send)]
@@ -387,6 +377,9 @@ mod tests {
             Ok(AuthenticateResponse::default())
         }
         async fn new_session(&self, _: NewSessionRequest) -> Result<NewSessionResponse, Error> {
+            if self.auth_required {
+                return Err(Error::auth_required());
+            }
             Ok(NewSessionResponse {
                 session_id: SessionId("host-session".into()),
                 modes: None,
@@ -445,6 +438,7 @@ mod tests {
                 FakeAgent {
                     conn: slot.clone(),
                     concurrency: Rc::new(RefCell::new((0, 0))),
+                    auth_required: false,
                 },
                 a_write.compat_write(),
                 a_read.compat(),
@@ -527,6 +521,7 @@ mod tests {
                 FakeAgent {
                     conn: slot.clone(),
                     concurrency: concurrency.clone(),
+                    auth_required: false,
                 },
                 a_write.compat_write(),
                 a_read.compat(),
@@ -585,6 +580,59 @@ mod tests {
                 concurrency.borrow().1,
                 1,
                 "prompts must be serialized (peak concurrency 1)"
+            );
+        });
+    }
+
+    /// When the adapter reports `auth_required` (-32000) from `new_session` —
+    /// what the real adapter does when the user is not logged in — the host
+    /// surfaces an actionable `AuthRequired` (with the login command), not a
+    /// raw error, and never `Connected`.
+    #[test]
+    fn host_run_surfaces_auth_required() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let local = tokio::task::LocalSet::new();
+        local.block_on(&rt, async {
+            let (client_end, agent_end) = tokio::io::duplex(8192);
+            let (c_read, c_write) = tokio::io::split(client_end);
+            let (a_read, a_write) = tokio::io::split(agent_end);
+
+            let slot: Rc<RefCell<Option<Rc<AgentSideConnection>>>> = Rc::new(RefCell::new(None));
+            let (agent_conn, agent_io) = AgentSideConnection::new(
+                FakeAgent {
+                    conn: slot.clone(),
+                    concurrency: Rc::new(RefCell::new((0, 0))),
+                    auth_required: true,
+                },
+                a_write.compat_write(),
+                a_read.compat(),
+                |fut| {
+                    tokio::task::spawn_local(fut);
+                },
+            );
+            *slot.borrow_mut() = Some(Rc::new(agent_conn));
+            tokio::task::spawn_local(async move {
+                let _ = agent_io.await;
+            });
+
+            let (_cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+            let (ev_tx, ev_rx) = std::sync::mpsc::channel();
+            let run_handle = tokio::task::spawn_local(async move {
+                run(c_write, c_read, PathBuf::from("/tmp"), cmd_rx, &ev_tx).await
+            });
+            // `new_session` fails -> run returns Ok and drops ev_tx; the loop ends.
+            run_handle.await.unwrap().expect("run returns ok even on auth error");
+
+            let got: Vec<AcpEvent> = ev_rx.try_iter().collect();
+            assert!(
+                got.iter().any(|e| matches!(e, AcpEvent::AuthRequired { command } if command == "claude /login")),
+                "expected AuthRequired with login command, got {got:?}"
+            );
+            assert!(
+                !got.iter().any(|e| matches!(e, AcpEvent::Connected { .. })),
+                "must not report Connected when auth is required, got {got:?}"
             );
         });
     }

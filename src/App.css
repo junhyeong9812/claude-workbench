@@ -304,6 +304,36 @@ body {
   word-break: break-word;
 }
 
+.claude-thinking {
+  display: flex;
+  gap: 4px;
+  align-items: center;
+  padding: 2px 0;
+}
+.claude-thinking span {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--fg-dim);
+  animation: claude-blink 1.2s infinite ease-in-out both;
+}
+.claude-thinking span:nth-child(2) {
+  animation-delay: 0.2s;
+}
+.claude-thinking span:nth-child(3) {
+  animation-delay: 0.4s;
+}
+@keyframes claude-blink {
+  0%,
+  80%,
+  100% {
+    opacity: 0.2;
+  }
+  40% {
+    opacity: 1;
+  }
+}
+
 .claude-input {
   display: flex;
   gap: 6px;

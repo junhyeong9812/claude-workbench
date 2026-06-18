@@ -13,7 +13,7 @@
 //! reject would be a protocol lie).
 
 mod host;
-pub use host::{AcpCommand, AcpEvent, AcpHost, AuthMethodInfo};
+pub use host::{AcpCommand, AcpEvent, AcpHost};
 
 use std::path::PathBuf;
 

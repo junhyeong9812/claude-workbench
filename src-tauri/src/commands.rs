@@ -259,19 +259,15 @@ pub fn acp_prompt(state: State<'_, AcpState>, id: u64, text: String) -> Result<(
     Ok(())
 }
 
-/// Authenticate a session with one of its advertised auth methods.
+/// Whether a Claude session id is still live. Sessions survive tab/project
+/// switches (the host lives in `AcpState`) but **not** an app restart, which
+/// empties the process-local map — a re-attaching panel uses this to tell a
+/// live session from a stale persisted id.
 #[tauri::command]
-pub fn acp_authenticate(
-    state: State<'_, AcpState>,
-    id: u64,
-    method_id: String,
-) -> Result<(), AppError> {
-    let hosts = acp_lock(&state)?;
-    let host = hosts
-        .get(&id)
-        .ok_or_else(|| AppError::new("unknown Claude session"))?;
-    host.authenticate(method_id);
-    Ok(())
+pub fn acp_alive(state: State<'_, AcpState>, id: u64) -> bool {
+    acp_lock(&state)
+        .map(|hosts| hosts.contains_key(&id))
+        .unwrap_or(false)
 }
 
 /// Cancel the in-flight turn for a session (best effort).
