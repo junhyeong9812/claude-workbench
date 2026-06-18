@@ -1,0 +1,154 @@
+import { create } from "zustand";
+import { invoke } from "@tauri-apps/api/core";
+import type { DirEntry, Project, ProjectType, WorkspaceState } from "../types";
+
+/**
+ * Global shell state.
+ *
+ * Invariants:
+ *  - `projects` is the set of open tabs; `activeProject` is the path of the
+ *    active one (or null).
+ *  - Tree expansion is stored *per project* (`project.tree_state.expanded`) so
+ *    manipulating one project's tree never affects another's.
+ *  - `childrenCache` is keyed by absolute directory path. It is pure filesystem
+ *    data (project-independent) and is NOT persisted.
+ */
+interface AppState {
+  projects: Project[];
+  activeProject: string | null;
+  /** dirPath -> its immediate children (transient cache). */
+  childrenCache: Record<string, DirEntry[]>;
+  /** dirPath -> in-flight read_dir guard. */
+  loadingDirs: Record<string, boolean>;
+
+  /** Load persisted state from the backend on startup. */
+  init: () => Promise<void>;
+  /** Open a folder as a new project tab (or focus it if already open). */
+  addProject: (path: string) => Promise<void>;
+  /** Close a project tab. */
+  closeProject: (path: string) => void;
+  /** Make a project active (swaps the visible tree). */
+  setActive: (path: string) => void;
+  /** Expand/collapse a directory for the active project. */
+  toggleExpanded: (dirPath: string) => void;
+  /** Lazily load a directory's children via the backend. */
+  loadChildren: (dirPath: string) => Promise<void>;
+  /** Persist the current workspace to the backend. */
+  persist: () => void;
+}
+
+function basename(path: string): string {
+  const parts = path.split(/[\\/]/).filter(Boolean);
+  return parts.length > 0 ? parts[parts.length - 1] : path;
+}
+
+export const useAppStore = create<AppState>((set, get) => ({
+  projects: [],
+  activeProject: null,
+  childrenCache: {},
+  loadingDirs: {},
+
+  init: async () => {
+    try {
+      const ws = await invoke<WorkspaceState>("load_state");
+      set({
+        projects: ws.open_projects ?? [],
+        activeProject: ws.active_project ?? null,
+      });
+    } catch (err) {
+      // load_state is infallible on the Rust side, but guard anyway.
+      console.error("load_state failed", err);
+    }
+  },
+
+  addProject: async (path) => {
+    // Already open -> just focus it.
+    if (get().projects.some((p) => p.path === path)) {
+      set({ activeProject: path });
+      get().persist();
+      return;
+    }
+
+    let projectType: ProjectType = "Unknown";
+    try {
+      projectType = await invoke<ProjectType>("detect_project_type", { path });
+    } catch (err) {
+      console.error("detect_project_type failed", err);
+    }
+
+    const project: Project = {
+      path,
+      name: basename(path),
+      project_type: projectType,
+      tree_state: { expanded: [] },
+    };
+
+    set((s) => ({
+      projects: [...s.projects, project],
+      activeProject: path,
+    }));
+    get().persist();
+  },
+
+  closeProject: (path) => {
+    set((s) => {
+      const projects = s.projects.filter((p) => p.path !== path);
+      let activeProject = s.activeProject;
+      if (activeProject === path) {
+        activeProject = projects.length > 0 ? projects[0].path : null;
+      }
+      return { projects, activeProject };
+    });
+    get().persist();
+  },
+
+  setActive: (path) => {
+    set({ activeProject: path });
+    get().persist();
+  },
+
+  toggleExpanded: (dirPath) => {
+    set((s) => ({
+      projects: s.projects.map((p) => {
+        if (p.path !== s.activeProject) return p;
+        const expanded = p.tree_state.expanded;
+        const next = expanded.includes(dirPath)
+          ? expanded.filter((d) => d !== dirPath)
+          : [...expanded, dirPath];
+        return { ...p, tree_state: { ...p.tree_state, expanded: next } };
+      }),
+    }));
+    get().persist();
+  },
+
+  loadChildren: async (dirPath) => {
+    const { childrenCache, loadingDirs } = get();
+    if (childrenCache[dirPath] || loadingDirs[dirPath]) return;
+
+    set((s) => ({ loadingDirs: { ...s.loadingDirs, [dirPath]: true } }));
+    try {
+      const entries = await invoke<DirEntry[]>("read_dir", { path: dirPath });
+      set((s) => ({
+        childrenCache: { ...s.childrenCache, [dirPath]: entries },
+      }));
+    } catch (err) {
+      // Surface as an empty (but resolved) listing; do not crash the tree.
+      console.error("read_dir failed", err);
+      set((s) => ({
+        childrenCache: { ...s.childrenCache, [dirPath]: [] },
+      }));
+    } finally {
+      set((s) => ({ loadingDirs: { ...s.loadingDirs, [dirPath]: false } }));
+    }
+  },
+
+  persist: () => {
+    const state: WorkspaceState = {
+      open_projects: get().projects,
+      active_project: get().activeProject,
+    };
+    invoke("save_state", { state }).catch((err) => {
+      console.error("save_state failed", err);
+    });
+  },
+}));
