@@ -3,6 +3,27 @@
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
+/// Marker files that identify a directory as a project root. Mirrors the
+/// ecosystem probes in [`detect_project_types`] (kept as a flat list so the
+/// timeline label helper can ask "is *any* project rooted here?" — see
+/// `crate::label::nearest_project_marker`).
+pub const PROJECT_MARKERS: &[&str] = &[
+    "Cargo.toml",
+    "package.json",
+    "pyproject.toml",
+    "requirements.txt",
+    "setup.py",
+    "pom.xml",
+    "build.gradle",
+    "build.gradle.kts",
+    "settings.gradle.kts",
+];
+
+/// Whether `dir` directly contains any [`PROJECT_MARKERS`] file.
+pub fn has_project_marker(dir: &Path) -> bool {
+    PROJECT_MARKERS.iter().any(|m| dir.join(m).exists())
+}
+
 /// The detected build/ecosystem type of a project folder.
 ///
 /// Serializes as a plain string (`"Rust"`, `"Java"`, ...) so the webview can
