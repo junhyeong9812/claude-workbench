@@ -108,9 +108,15 @@ export function ClaudePanel(props: IDockviewPanelProps<ClaudeParams>) {
   const [tlTurns, setTlTurns] = useState<Map<number, string>>(new Map());
   const [tlAnswers, setTlAnswers] = useState<Map<number, string>>(new Map());
   const [showTimeline, setShowTimeline] = useState(true);
-  // The timeline item whose content is shown in the viewer that splits the chat
-  // area (B4). Null = no viewer (chat takes the full width).
+  // The highlighted/anchored timeline item — persists when the viewer closes so
+  // ↑/↓ keeps navigating from there (B4). `viewerOpen` controls the viewer pane
+  // separately, so Esc can hide the diff while keeping the selection.
   const [selectedItem, setSelectedItem] = useState<TimelineItem | null>(null);
+  const [viewerOpen, setViewerOpen] = useState(false);
+  const selectItem = (it: TimelineItem) => {
+    setSelectedItem(it);
+    setViewerOpen(true);
+  };
   const panelRef = useRef<HTMLDivElement>(null);
 
   // Ctrl+←/→ moves focus across the panes (chat → viewer → timeline), so the
@@ -120,11 +126,12 @@ export function ClaudePanel(props: IDockviewPanelProps<ClaudeParams>) {
     const root = panelRef.current;
     if (!root) return;
 
-    if (e.key === "Escape" && selectedItem) {
+    if (e.key === "Escape" && viewerOpen) {
       const inChat = root.querySelector(".claude-main")?.contains(document.activeElement);
       if (!inChat) {
         e.preventDefault();
-        setSelectedItem(null);
+        // Keep the selection highlighted so ↑/↓ resumes from this line.
+        setViewerOpen(false);
         root.querySelector<HTMLElement>(".timeline-list")?.focus();
         return;
       }
@@ -560,14 +567,14 @@ export function ClaudePanel(props: IDockviewPanelProps<ClaudeParams>) {
         </button>
       </div>
       </div>
-      {selectedItem && (
+      {viewerOpen && selectedItem && (
         <div className="claude-viewer">
           <div className="claude-viewer-head">
             <span>변경 내용</span>
             <button
               className="claude-viewer-close"
-              onClick={() => setSelectedItem(null)}
-              title="뷰어 닫기"
+              onClick={() => setViewerOpen(false)}
+              title="뷰어 닫기 (Esc)"
             >
               ✕
             </button>
@@ -587,7 +594,7 @@ export function ClaudePanel(props: IDockviewPanelProps<ClaudeParams>) {
             turns={tlTurns}
             answers={tlAnswers}
             selectedId={selectedItem?.tool_call_id ?? null}
-            onSelect={setSelectedItem}
+            onSelect={selectItem}
           />
         </div>
       )}

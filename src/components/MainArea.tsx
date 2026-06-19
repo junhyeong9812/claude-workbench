@@ -1,4 +1,4 @@
-import { useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
   DockviewReact,
   DockviewDefaultTab,
@@ -171,6 +171,29 @@ export function MainArea() {
     setPicker(null);
     addPanel("claude", { title: name });
   };
+
+  // Alt+←/→/↑/↓ cycles the active session tab (dockview panel). Left/Up = prev,
+  // Right/Down = next (wraps). Distinct from a Claude panel's Ctrl+←/→ pane focus.
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (!e.altKey) return;
+      const isNext = e.key === "ArrowRight" || e.key === "ArrowDown";
+      const isPrev = e.key === "ArrowLeft" || e.key === "ArrowUp";
+      if (!isNext && !isPrev) return;
+      const api = apiRef.current;
+      if (!api) return;
+      const panels = api.panels;
+      if (panels.length < 2) return;
+      const idx = api.activePanel ? panels.indexOf(api.activePanel) : -1;
+      const next = isNext
+        ? (idx + 1) % panels.length
+        : (idx - 1 + panels.length) % panels.length;
+      e.preventDefault();
+      panels[next].api.setActive();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, []);
 
   return (
     <div className="main-area">
