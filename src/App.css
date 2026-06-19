@@ -326,11 +326,46 @@ body {
 /* ---- Claude (ACP) panel ---- */
 .claude-panel {
   display: flex;
-  flex-direction: column;
+  flex-direction: row;
   height: 100%;
   min-height: 0;
   background: var(--bg);
   color: var(--fg);
+}
+.claude-main {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+}
+.claude-timeline-col {
+  display: flex;
+  flex-direction: column;
+  width: 280px;
+  min-width: 220px;
+  border-left: 1px solid var(--border);
+  background: var(--bg);
+}
+.claude-timeline-head {
+  padding: 4px 8px;
+  font-size: 11px;
+  color: var(--fg-dim);
+  border-bottom: 1px solid var(--border);
+}
+.claude-tl-toggle {
+  margin-left: auto;
+  font-size: 10px;
+  padding: 1px 8px;
+  background: var(--bg-alt);
+  color: var(--fg-dim);
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  cursor: pointer;
+}
+.claude-tl-toggle:hover {
+  color: var(--fg);
+  border-color: var(--accent);
 }
 
 .claude-status {

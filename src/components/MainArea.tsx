@@ -10,17 +10,15 @@ import { useAppStore } from "../state/store";
 import { PlaceholderPanel } from "./PlaceholderPanel";
 import { TerminalPanel } from "./TerminalPanel";
 import { ClaudePanel } from "./ClaudePanel";
-import { TimelinePanel } from "./TimelinePanel";
 
 /** dockview component registry — maps component name -> React panel. */
 const components = {
   placeholder: PlaceholderPanel,
   terminal: TerminalPanel,
   claude: ClaudePanel,
-  timeline: TimelinePanel,
 };
 
-type PanelKind = "terminal" | "editor" | "claude" | "timeline";
+type PanelKind = "terminal" | "editor" | "claude";
 
 /**
  * The 80% main area, backed by dockview.
@@ -81,16 +79,10 @@ export function MainArea() {
     if (!api) return;
     const n = ++counterRef.current;
     const title = `${kind[0].toUpperCase()}${kind.slice(1)} ${n}`;
-    // Terminals get the real PTY panel, Claude the ACP panel, timeline the
-    // change sidebar; editor stays a stub until P3.
+    // Terminals get the real PTY panel, Claude the ACP panel (with its own
+    // embedded change timeline); editor stays a stub until P3.
     const component =
-      kind === "terminal"
-        ? "terminal"
-        : kind === "claude"
-          ? "claude"
-          : kind === "timeline"
-            ? "timeline"
-            : "placeholder";
+      kind === "terminal" ? "terminal" : kind === "claude" ? "claude" : "placeholder";
     api.addPanel({
       id: `${kind}-${Date.now()}`,
       component,
@@ -107,9 +99,6 @@ export function MainArea() {
         </button>
         <button className="toolbar-btn" onClick={() => addPanel("claude")}>
           + Claude
-        </button>
-        <button className="toolbar-btn" onClick={() => addPanel("timeline")}>
-          + Timeline
         </button>
         <button className="toolbar-btn" onClick={() => addPanel("editor")}>
           + Editor

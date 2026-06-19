@@ -8,6 +8,7 @@
 
 pub mod acp_map;
 pub mod fs;
+pub mod history;
 pub mod label;
 pub mod persist;
 pub mod project_type;

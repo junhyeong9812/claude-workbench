@@ -3,6 +3,7 @@ import type { IDockviewPanelProps } from "dockview-react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { useAppStore } from "../state/store";
+import { TimelineView, type TimelineItem } from "./TimelineView";
 
 /** Params attached to a Claude panel. `acpId` is persisted into the dockview
  * layout so a remount (tab/project switch) re-attaches the same session. */
@@ -33,6 +34,8 @@ type AcpEvent =
       locations: string[];
       options: PermOption[];
     }
+  | ({ id: number; type: "timeline_item" } & TimelineItem)
+  | { id: number; type: "turn_started"; turn: number; prompt: string; session_id: string }
   | { id: number; type: "error"; message: string }
   | { id: number; type: "disconnected" };
 
@@ -90,6 +93,10 @@ export function ClaudePanel(props: IDockviewPanelProps<ClaudeParams>) {
   const [thinking, setThinking] = useState(false);
   // Pending tool approvals (S2b-2). Claude ran nothing until the user decides.
   const [pendingPerms, setPendingPerms] = useState<PermissionRequest[]>([]);
+  // This session's change timeline (S3), shown in a toggleable side column.
+  const [tlItems, setTlItems] = useState<Map<string, TimelineItem>>(new Map());
+  const [tlTurns, setTlTurns] = useState<Map<number, string>>(new Map());
+  const [showTimeline, setShowTimeline] = useState(true);
 
   // The panel's ACP id; a ref so the listener (registered before `acp_start`
   // resolves) can filter without re-subscribing.
@@ -108,6 +115,8 @@ export function ClaudePanel(props: IDockviewPanelProps<ClaudeParams>) {
     setAuthCommand(null);
     setThinking(false);
     setPendingPerms([]);
+    setTlItems(new Map());
+    setTlTurns(new Map());
     setStatus("starting");
     const cwd = useAppStore.getState().activeProject ?? null;
     try {
@@ -171,6 +180,12 @@ export function ClaudePanel(props: IDockviewPanelProps<ClaudeParams>) {
               options: ev.options,
             },
           ]);
+          break;
+        case "turn_started":
+          setTlTurns((prev) => new Map(prev).set(ev.turn, ev.prompt));
+          break;
+        case "timeline_item":
+          setTlItems((prev) => new Map(prev).set(ev.tool_call_id, ev));
           break;
         case "error":
           setThinking(false);
@@ -272,9 +287,17 @@ export function ClaudePanel(props: IDockviewPanelProps<ClaudeParams>) {
 
   return (
     <div className="claude-panel">
+      <div className="claude-main">
       <div className="claude-status">
         <span className={`claude-dot claude-dot-${status}`} />
         {statusLabel[status]}
+        <button
+          className="claude-tl-toggle"
+          onClick={() => setShowTimeline((v) => !v)}
+          title="이 세션의 변경 타임라인"
+        >
+          {showTimeline ? "타임라인 닫기" : `타임라인 열기${tlItems.size ? ` (${tlItems.size})` : ""}`}
+        </button>
       </div>
 
       {status === "auth" && (
@@ -388,6 +411,14 @@ export function ClaudePanel(props: IDockviewPanelProps<ClaudeParams>) {
           Send
         </button>
       </div>
+      </div>
+
+      {showTimeline && (
+        <div className="claude-timeline-col">
+          <div className="claude-timeline-head">변경 타임라인 · {tlItems.size}</div>
+          <TimelineView items={[...tlItems.values()]} turns={tlTurns} />
+        </div>
+      )}
     </div>
   );
 }
