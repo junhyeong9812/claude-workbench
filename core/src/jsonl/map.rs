@@ -13,6 +13,7 @@
 //! if `is_error`, else `Completed`). Both reuse the shared accumulator
 //! primitives [`Timeline::entry`] / [`Timeline::item_mut`].
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use serde_json::Value;
@@ -23,9 +24,21 @@ use crate::timeline::{AgentStatus, FileDiff, ItemKind, Timeline};
 /// A [`Timeline`] fed line-by-line from one session's JSONL file. One file is
 /// one session; `session_id` is the file's UUID, used as a fallback when a
 /// record omits its own `sessionId`.
+///
+/// Besides the tool-call timeline, the mapper derives **conversation turns** so
+/// the UI can group changes by prompt: a bare-string user record opens a new
+/// turn (`current_turn += 1`) and records its prompt; assistant `text` blocks
+/// accumulate as that turn's answer; each tool item is stamped with the turn it
+/// occurred in. (In architecture A the terminal already renders the chat, so
+/// the prompt/answer text is supplementary — but deriving it keeps the existing
+/// timeline UI contract, which carries `turns`/`answers`/`dates`.)
 pub struct JsonlMapper {
     timeline: Timeline,
     session_id: String,
+    current_turn: u64,
+    turns: BTreeMap<u64, String>,
+    answers: BTreeMap<u64, String>,
+    dates: BTreeMap<u64, String>,
 }
 
 impl JsonlMapper {
@@ -33,15 +46,66 @@ impl JsonlMapper {
         Self {
             timeline: Timeline::new(root),
             session_id: session_id.into(),
+            current_turn: 0,
+            turns: BTreeMap::new(),
+            answers: BTreeMap::new(),
+            dates: BTreeMap::new(),
         }
     }
 
     /// Parse and apply one transcript line. Malformed / non-timeline lines are
-    /// skipped (empty result). Returns the indices of items touched.
+    /// skipped (empty result). Returns the indices of tool items touched (a
+    /// prompt-only record touches none but still advances the turn).
     pub fn apply_line(&mut self, line: &str) -> Vec<usize> {
-        match RawRecord::parse_line(line) {
-            Some(rec) => apply_record(&mut self.timeline, &rec, &self.session_id),
-            None => Vec::new(),
+        let Some(rec) = RawRecord::parse_line(line) else {
+            return Vec::new();
+        };
+        let session = rec
+            .session_id
+            .clone()
+            .unwrap_or_else(|| self.session_id.clone());
+        // The record's UTC day (YYYY-MM-DD) for date dividers in the UI.
+        let date = rec.timestamp.as_deref().and_then(|t| t.get(..10)).map(str::to_string);
+        // Dispatch on the author, not just the content shape: only a *user* bare
+        // string is a prompt, and only *assistant* text is answer (codex B-2c).
+        let role = rec
+            .message
+            .as_ref()
+            .and_then(|m| m.role.as_deref())
+            .or(rec.kind.as_deref());
+        let is_user = role == Some("user");
+        let is_assistant = role == Some("assistant");
+
+        match rec.message.as_ref().and_then(|m| m.content.as_ref()) {
+            // A bare-string user record is a typed prompt — it opens a new turn.
+            Some(Content::Text(prompt)) if is_user && !prompt.trim().is_empty() => {
+                self.current_turn += 1;
+                self.turns.insert(self.current_turn, prompt.clone());
+                if let Some(d) = date {
+                    self.dates.entry(self.current_turn).or_insert(d);
+                }
+                Vec::new()
+            }
+            // Assistant / tool-result blocks belong to the current turn.
+            Some(Content::Blocks(blocks)) => {
+                let (touched, answer) =
+                    apply_blocks(&mut self.timeline, &session, self.current_turn, is_assistant, blocks);
+                if let Some(a) = answer {
+                    let entry = self.answers.entry(self.current_turn).or_default();
+                    if !entry.is_empty() {
+                        entry.push('\n');
+                    }
+                    entry.push_str(&a);
+                }
+                if !touched.is_empty() {
+                    if let Some(d) = date {
+                        self.dates.entry(self.current_turn).or_insert(d);
+                    }
+                }
+                touched
+            }
+            // A bare prompt that's empty, an object-shaped content, or no message.
+            _ => Vec::new(),
         }
     }
 
@@ -52,35 +116,47 @@ impl JsonlMapper {
     pub fn into_timeline(self) -> Timeline {
         self.timeline
     }
+
+    /// turn → user prompt text.
+    pub fn turns(&self) -> &BTreeMap<u64, String> {
+        &self.turns
+    }
+
+    /// turn → concatenated assistant answer text.
+    pub fn answers(&self) -> &BTreeMap<u64, String> {
+        &self.answers
+    }
+
+    /// turn → YYYY-MM-DD (the record's UTC day).
+    pub fn dates(&self) -> &BTreeMap<u64, String> {
+        &self.dates
+    }
+
+    pub fn current_turn(&self) -> u64 {
+        self.current_turn
+    }
 }
 
-/// Apply one parsed record to `timeline`, returning the indices of touched
-/// items (empty for records that carry no `tool_use` / `tool_result`).
-/// `fallback_session` is used when the record omits `sessionId`.
-pub fn apply_record(
+/// Apply one record's content blocks at `turn`. Returns `(touched item indices,
+/// concatenated assistant answer text from this record)`. Each block is parsed
+/// individually so one malformed/odd element is skipped without losing its valid
+/// siblings (spec ⑤).
+fn apply_blocks(
     timeline: &mut Timeline,
-    rec: &RawRecord,
-    fallback_session: &str,
-) -> Vec<usize> {
-    let session = rec.session_id.as_deref().unwrap_or(fallback_session);
-
-    let blocks = match rec.message.as_ref().and_then(|m| m.content.as_ref()) {
-        Some(Content::Blocks(b)) => b,
-        // A bare-string prompt or a record without message content carries no
-        // timeline items.
-        _ => return Vec::new(),
-    };
-
+    session: &str,
+    turn: u64,
+    is_assistant: bool,
+    blocks: &[Value],
+) -> (Vec<usize>, Option<String>) {
     let mut touched = Vec::new();
+    let mut answer = String::new();
     for value in blocks {
-        // Parse each block individually so one malformed/odd element is skipped
-        // without losing its valid siblings in the same record (spec ⑤).
         let Ok(block) = serde_json::from_value::<ContentBlock>(value.clone()) else {
             continue;
         };
         match block {
             ContentBlock::ToolUse { id, name, input } => {
-                touched.push(open_tool_use(timeline, session, &id, &name, &input));
+                touched.push(open_tool_use(timeline, session, turn, &id, &name, &input));
             }
             ContentBlock::ToolResult {
                 tool_use_id,
@@ -90,23 +166,34 @@ pub fn apply_record(
                 touched.push(complete_tool_result(
                     timeline,
                     session,
+                    turn,
                     &tool_use_id,
                     &content,
                     is_error,
                 ));
             }
-            // Text (turn answer) and thinking (reasoning) are not timeline items
-            // in Phase A; unknown blocks are ignored.
+            // Assistant prose is the turn's answer (the terminal also shows it).
+            // Only count text from an assistant record (codex B-2c).
+            ContentBlock::Text { text } => {
+                if is_assistant && !text.trim().is_empty() {
+                    if !answer.is_empty() {
+                        answer.push('\n');
+                    }
+                    answer.push_str(&text);
+                }
+            }
+            // thinking / unknown blocks are not timeline items.
             _ => {}
         }
     }
-    touched
+    (touched, (!answer.is_empty()).then_some(answer))
 }
 
 /// Open (or, for a re-sent id, refresh) the timeline item for a `tool_use`.
 fn open_tool_use(
     timeline: &mut Timeline,
     session: &str,
+    turn: u64,
     id: &str,
     name: &str,
     input: &Value,
@@ -118,6 +205,9 @@ fn open_tool_use(
 
     let (idx, is_new) = timeline.entry(session, id);
     let item = timeline.item_mut(idx);
+    if is_new {
+        item.turn = turn;
+    }
     item.kind = map_tool_kind(name);
     item.title = title;
     item.locations = locations;
@@ -143,14 +233,18 @@ fn open_tool_use(
 fn complete_tool_result(
     timeline: &mut Timeline,
     session: &str,
+    turn: u64,
     tool_use_id: &str,
     content: &Value,
     is_error: Option<bool>,
 ) -> usize {
     let text = extract_result_text(content);
 
-    let (idx, _is_new) = timeline.entry(session, tool_use_id);
+    let (idx, is_new) = timeline.entry(session, tool_use_id);
     let item = timeline.item_mut(idx);
+    if is_new {
+        item.turn = turn;
+    }
     item.agent_status = if is_error == Some(true) {
         AgentStatus::Failed
     } else {
@@ -567,6 +661,108 @@ mod tests {
         });
         let tl = map_lines(&[line(rec)]);
         assert!(tl.items().is_empty());
+    }
+
+    // B-2c: bare-string user prompts open turns; assistant text is the answer;
+    // tool items are stamped with the turn they occurred in; dates from
+    // timestamp.
+    #[test]
+    fn derives_turns_prompts_answers_dates() {
+        let prompt1 = json!({
+            "type": "user", "sessionId": SID, "timestamp": "2026-06-19T08:00:00.000Z",
+            "message": { "role": "user", "content": "do the first thing" }
+        });
+        let asst1 = json!({
+            "type": "assistant", "sessionId": SID, "timestamp": "2026-06-19T08:00:01.000Z",
+            "message": { "role": "assistant", "content": [
+                { "type": "text", "text": "working on it" },
+                { "type": "tool_use", "id": "t1", "name": "Read", "input": { "file_path": "/a" } }
+            ] }
+        });
+        let prompt2 = json!({
+            "type": "user", "sessionId": SID, "timestamp": "2026-06-20T09:00:00.000Z",
+            "message": { "role": "user", "content": "now the second thing" }
+        });
+        let asst2 = json!({
+            "type": "assistant", "sessionId": SID, "timestamp": "2026-06-20T09:00:01.000Z",
+            "message": { "role": "assistant", "content": [
+                { "type": "tool_use", "id": "t2", "name": "Bash", "input": { "command": "ls" } }
+            ] }
+        });
+        let lines = [line(prompt1), line(asst1), line(prompt2), line(asst2)];
+        let mut m = JsonlMapper::new(ROOT, SID);
+        for l in &lines {
+            m.apply_line(l);
+        }
+        // Items carry their turn.
+        let tl = m.timeline();
+        assert_eq!(tl.items()[0].tool_call_id, "t1");
+        assert_eq!(tl.items()[0].turn, 1);
+        assert_eq!(tl.items()[1].tool_call_id, "t2");
+        assert_eq!(tl.items()[1].turn, 2);
+        // Prompts, answers, dates by turn.
+        assert_eq!(m.turns().get(&1).map(String::as_str), Some("do the first thing"));
+        assert_eq!(m.turns().get(&2).map(String::as_str), Some("now the second thing"));
+        assert_eq!(m.answers().get(&1).map(String::as_str), Some("working on it"));
+        assert_eq!(m.answers().get(&2), None, "turn 2 had no assistant text");
+        assert_eq!(m.dates().get(&1).map(String::as_str), Some("2026-06-19"));
+        assert_eq!(m.dates().get(&2).map(String::as_str), Some("2026-06-20"));
+        assert_eq!(m.current_turn(), 2);
+    }
+
+    // A tool item's turn is fixed at first sighting; a later result in a
+    // different current turn doesn't move it.
+    #[test]
+    fn item_turn_is_fixed_at_first_sighting() {
+        let lines = [
+            line(json!({ "type": "user", "sessionId": SID,
+                "message": { "role": "user", "content": "prompt A" } })),
+            line(asst(json!([
+                { "type": "tool_use", "id": "t1", "name": "Read", "input": { "file_path": "/a" } }
+            ]))),
+            // A new prompt advances the turn BEFORE t1's result arrives.
+            line(json!({ "type": "user", "sessionId": SID,
+                "message": { "role": "user", "content": "prompt B" } })),
+            line(user(json!([
+                { "type": "tool_result", "tool_use_id": "t1", "content": "done" }
+            ]))),
+        ];
+        let mut m = JsonlMapper::new(ROOT, SID);
+        for l in &lines {
+            m.apply_line(l);
+        }
+        // t1 opened in turn 1; its later result (current turn 2) keeps turn 1.
+        assert_eq!(m.timeline().items()[0].turn, 1);
+        assert_eq!(m.timeline().items()[0].agent_status, AgentStatus::Completed);
+        assert_eq!(m.current_turn(), 2);
+    }
+
+    // codex B-2c: only a *user* bare-string opens a turn. A non-user record with
+    // bare-string content (hypothetical assistant/system) must not bump the turn,
+    // and non-assistant text blocks must not be counted as an answer.
+    #[test]
+    fn only_user_bare_string_opens_a_turn() {
+        let assistant_string = json!({
+            "type": "assistant", "sessionId": SID,
+            "message": { "role": "assistant", "content": "I am not a prompt" }
+        });
+        let system_string = json!({
+            "type": "system", "sessionId": SID,
+            "message": { "role": "system", "content": "system note" }
+        });
+        let mut m = JsonlMapper::new(ROOT, SID);
+        m.apply_line(&line(assistant_string));
+        m.apply_line(&line(system_string));
+        assert_eq!(m.current_turn(), 0, "no user prompt -> no turn");
+        assert!(m.turns().is_empty());
+
+        // A real user prompt then does open turn 1.
+        m.apply_line(&line(json!({
+            "type": "user", "sessionId": SID,
+            "message": { "role": "user", "content": "the real prompt" }
+        })));
+        assert_eq!(m.current_turn(), 1);
+        assert_eq!(m.turns().get(&1).map(String::as_str), Some("the real prompt"));
     }
 
     // A record that omits sessionId falls back to the file's session uuid.

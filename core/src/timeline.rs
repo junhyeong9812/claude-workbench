@@ -74,6 +74,11 @@ pub struct FileDiff {
 pub struct TimelineItem {
     pub session_id: String,
     pub tool_call_id: String,
+    /// The conversation turn this tool call belongs to (the Nth user prompt).
+    /// Assigned once, on first sighting, from the mapper's current turn. `0`
+    /// means "before any prompt" / not turn-tracked (the ACP mapper leaves it 0
+    /// and tracks turns out-of-band).
+    pub turn: u64,
     /// Monotonic client receive order (assigned once, on first sighting).
     pub seq: u64,
     pub kind: ItemKind,
@@ -102,6 +107,7 @@ impl TimelineItem {
         Self {
             session_id: session_id.to_string(),
             tool_call_id: tool_call_id.to_string(),
+            turn: 0,
             seq,
             kind: ItemKind::Other,
             title: String::new(),

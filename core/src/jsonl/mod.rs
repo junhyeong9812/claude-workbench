@@ -23,6 +23,6 @@ mod record;
 mod tail;
 
 pub use locate::{claude_projects_root, find_session_jsonl};
-pub use map::{apply_record, JsonlMapper};
+pub use map::JsonlMapper;
 pub use record::{Content, ContentBlock, Message, RawRecord};
 pub use tail::{JsonlTail, SessionTail};
