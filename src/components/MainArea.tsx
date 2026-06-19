@@ -1,16 +1,18 @@
 import { useRef, useState } from "react";
 import {
   DockviewReact,
+  DockviewDefaultTab,
   type DockviewApi,
   type DockviewReadyEvent,
+  type IDockviewPanelHeaderProps,
 } from "dockview-react";
 import "dockview-react/dist/styles/dockview.css";
 import { invoke } from "@tauri-apps/api/core";
 import { useAppStore } from "../state/store";
+import { useClaudeUi } from "../state/claudeUi";
 import { PlaceholderPanel } from "./PlaceholderPanel";
 import { TerminalPanel } from "./TerminalPanel";
 import { ClaudePanel } from "./ClaudePanel";
-import { ClaudeTab } from "./ClaudeTab";
 
 /** A saved Claude session, for the "+ Claude" picker (S3c). */
 interface SessionSummary {
@@ -18,6 +20,25 @@ interface SessionSummary {
   date: string;
   title: string;
   count: number;
+}
+
+/** Default tab for all panels. Claude panels keep the standard tab look but
+ * override its × to raise a close request (-> 닫기/삭제 modal, B3-1); this
+ * applies to restored panels too. */
+function AppTab(props: IDockviewPanelHeaderProps) {
+  if (props.params.kind === "claude") {
+    const sessionId =
+      (props.params.sessionId as string) ?? (props.params.loadSessionId as string) ?? null;
+    return (
+      <DockviewDefaultTab
+        {...props}
+        closeActionOverride={() =>
+          useClaudeUi.getState().requestClose({ panelId: props.api.id, sessionId })
+        }
+      />
+    );
+  }
+  return <DockviewDefaultTab {...props} />;
 }
 
 /** dockview component registry — maps component name -> React panel. */
@@ -47,6 +68,9 @@ export function MainArea() {
   const counterRef = useRef(0);
   // Saved-session picker for "+ Claude" (null = closed).
   const [picker, setPicker] = useState<SessionSummary[] | null>(null);
+  // Close request raised by a Claude tab's × (B3-1).
+  const closeRequest = useClaudeUi((s) => s.closeRequest);
+  const clearClose = useClaudeUi((s) => s.clearClose);
 
   // The layout for the project this mount belongs to (read once at onReady).
   const savedLayout = projects.find((p) => p.path === activeProject)?.layout;
@@ -98,10 +122,22 @@ export function MainArea() {
       id: `${kind}-${Date.now()}`,
       component,
       title,
-      // Claude panels get the custom tab (× -> 닫기/삭제 menu, B3-1).
-      ...(kind === "claude" ? { tabComponent: "claudeTab" } : {}),
       params: { kind, title, ...(opts?.loadSessionId ? { loadSessionId: opts.loadSessionId } : {}) },
     });
+  };
+
+  // Resolve a close request from a Claude tab's × (B3-1): 닫기 keeps the saved
+  // history, 삭제 also removes it; both close the panel.
+  const resolveClose = (deleteHistory: boolean) => {
+    const req = closeRequest;
+    clearClose();
+    if (!req) return;
+    if (deleteHistory && req.sessionId && activeProject) {
+      invoke("acp_delete_session", { project: activeProject, sessionId: req.sessionId }).catch(
+        () => {},
+      );
+    }
+    apiRef.current?.getPanel(req.panelId)?.api.close();
   };
 
   /** Session ids currently open in a panel (live `sessionId` or read-only
@@ -181,9 +217,29 @@ export function MainArea() {
         key={activeProject ?? "none"}
         className="dockview-theme-dark main-dock"
         components={components}
-        tabComponents={{ claudeTab: ClaudeTab }}
+        defaultTabComponent={AppTab}
         onReady={onReady}
       />
+
+      {closeRequest && (
+        <div className="claude-modal-backdrop" onClick={() => clearClose()}>
+          <div className="claude-modal" onClick={(e) => e.stopPropagation()}>
+            <div className="claude-modal-title">이 Claude 세션을 어떻게 할까요?</div>
+            <button className="claude-modal-opt" onClick={() => resolveClose(false)}>
+              닫기 <span className="claude-modal-hint">세션 히스토리 보존 (나중에 다시 열기)</span>
+            </button>
+            <button
+              className="claude-modal-opt claude-modal-del"
+              onClick={() => resolveClose(true)}
+            >
+              삭제 <span className="claude-modal-hint">히스토리까지 영구 삭제</span>
+            </button>
+            <button className="claude-modal-opt claude-modal-cancel" onClick={() => clearClose()}>
+              취소
+            </button>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

@@ -234,6 +234,60 @@ body {
   color: var(--fg-dim);
 }
 
+/* Claude close/delete modal (B3-1) */
+.claude-modal-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 100;
+  background: rgba(0, 0, 0, 0.45);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.claude-modal {
+  display: flex;
+  flex-direction: column;
+  min-width: 300px;
+  background: var(--bg-alt);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.5);
+  overflow: hidden;
+}
+.claude-modal-title {
+  padding: 10px 14px;
+  font-size: 13px;
+  color: var(--fg);
+  border-bottom: 1px solid var(--border);
+}
+.claude-modal-opt {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 2px;
+  padding: 10px 14px;
+  background: none;
+  border: none;
+  border-bottom: 1px solid var(--border);
+  color: var(--fg);
+  text-align: left;
+  cursor: pointer;
+}
+.claude-modal-opt:hover {
+  background: var(--bg-hover);
+}
+.claude-modal-del:hover {
+  color: #f85149;
+}
+.claude-modal-cancel {
+  color: var(--fg-dim);
+  border-bottom: none;
+}
+.claude-modal-hint {
+  font-size: 10px;
+  color: var(--fg-dim);
+}
+
 /* "+ Claude" saved-session picker (S3c) */
 .claude-picker {
   position: absolute;
