@@ -222,6 +222,7 @@ pub fn acp_start(
     // Claude must be rooted at the session root; refuse rather than guess.
     let cwd =
         PathBuf::from(cwd.ok_or_else(|| AppError::new("Claude requires an active project"))?);
+    let project = cwd.to_string_lossy().to_string();
 
     let (ev_tx, ev_rx) = std::sync::mpsc::channel::<AcpEvent>();
     let host =
@@ -230,11 +231,13 @@ pub fn acp_start(
 
     // Relay host events -> webview until the host thread ends (sender dropped
     // -> recv errors -> loop exits; no leak). `Disconnected` is the last event
-    // sent before the sender drops. On exit we drop the now-dead handle from
-    // state so later commands on `id` fail loudly instead of silently no-op'ing.
+    // sent before the sender drops. Timeline events are also persisted (S3b).
+    // On exit we drop the now-dead handle from state so later commands on `id`
+    // fail loudly instead of silently no-op'ing.
     let app = app.clone();
     thread::spawn(move || {
         while let Ok(event) = ev_rx.recv() {
+            persist_event(&app, &project, &event);
             let _ = app.emit("acp-event", AcpEventPayload { id, event });
         }
         if let Some(state) = app.try_state::<AcpState>() {
@@ -299,10 +302,133 @@ pub fn acp_cancel(state: State<'_, AcpState>, id: u64) -> Result<(), AppError> {
 }
 
 /// Close a session: drop the host (its `Drop` asks the thread to shut down and
-/// kill the adapter). Unknown ids are a no-op.
+/// kill the adapter). The persisted timeline is **kept** (the `닫기` action).
 #[tauri::command]
 pub fn acp_close(state: State<'_, AcpState>, id: u64) -> Result<(), AppError> {
     let host = acp_lock(&state)?.remove(&id);
     drop(host);
     Ok(())
+}
+
+// ---- Timeline persistence + session management (S3b/S3c) ----
+
+/// Persist a timeline event (`TurnStarted` / `TimelineItem`) to the project's
+/// app-data history as one JSON line, tagged with today's date. Other events
+/// are not persisted. Best effort — never blocks the relay.
+fn persist_event(app: &AppHandle, project: &str, event: &AcpEvent) {
+    // Serialize the event (tagged) and only keep the timeline kinds.
+    let mut val = match serde_json::to_value(event) {
+        Ok(v) => v,
+        Err(_) => return,
+    };
+    let kind = val.get("type").and_then(|v| v.as_str()).unwrap_or("");
+    if kind != "timeline_item" && kind != "turn_started" {
+        return;
+    }
+    let Some(session) = val
+        .get("session_id")
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+    else {
+        return;
+    };
+    let Ok(base) = app.path().app_data_dir() else {
+        return;
+    };
+    let date = chrono::Local::now().format("%Y-%m-%d").to_string();
+    if let Some(obj) = val.as_object_mut() {
+        obj.insert("date".into(), serde_json::Value::String(date.clone()));
+    }
+    if let Ok(line) = serde_json::to_string(&val) {
+        let _ = core_lib::history::append(&base, project, &date, &session, &line);
+    }
+}
+
+/// A saved session, summarized for the "open" picker (S3c).
+#[derive(Serialize)]
+pub struct SessionSummary {
+    session_id: String,
+    date: String,
+    /// The first prompt of the session (its first turn), as a title.
+    title: String,
+    /// Number of timeline (tool-call) items recorded.
+    count: usize,
+}
+
+/// List the saved Claude sessions for `project`, newest first.
+#[tauri::command]
+pub fn acp_sessions(app: AppHandle, project: String) -> Vec<SessionSummary> {
+    let Ok(base) = app.path().app_data_dir() else {
+        return vec![];
+    };
+    let mut out: Vec<SessionSummary> = Vec::new();
+    for file in core_lib::history::session_files(&base, &project) {
+        let Ok(content) = std::fs::read_to_string(&file) else {
+            continue;
+        };
+        let mut session_id = String::new();
+        let mut date = String::new();
+        let mut title = String::new();
+        let mut count = 0usize;
+        for line in content.lines() {
+            let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+                continue;
+            };
+            if session_id.is_empty() {
+                session_id = v.get("session_id").and_then(|x| x.as_str()).unwrap_or("").to_string();
+                date = v.get("date").and_then(|x| x.as_str()).unwrap_or("").to_string();
+            }
+            match v.get("type").and_then(|x| x.as_str()) {
+                Some("turn_started") if title.is_empty() => {
+                    title = v.get("prompt").and_then(|x| x.as_str()).unwrap_or("").to_string();
+                }
+                Some("timeline_item") => count += 1,
+                _ => {}
+            }
+        }
+        if !session_id.is_empty() {
+            out.push(SessionSummary {
+                session_id,
+                date,
+                title,
+                count,
+            });
+        }
+    }
+    // Newest first (by date desc, then discovery order).
+    out.sort_by(|a, b| b.date.cmp(&a.date));
+    out
+}
+
+/// Return a saved session's timeline as JSON event lines (parsed), for the UI
+/// to replay into a read-only timeline view (S3c reopen).
+#[tauri::command]
+pub fn acp_session_timeline(
+    app: AppHandle,
+    project: String,
+    session_id: String,
+) -> Vec<serde_json::Value> {
+    let Ok(base) = app.path().app_data_dir() else {
+        return vec![];
+    };
+    core_lib::history::load_session(&base, &project, &session_id)
+        .into_iter()
+        .filter_map(|l| serde_json::from_str(&l).ok())
+        .collect()
+}
+
+/// Delete a saved session's persisted history (the `삭제` action). The live
+/// host, if any, should be closed separately via `acp_close`.
+#[tauri::command]
+pub fn acp_delete_session(
+    app: AppHandle,
+    project: String,
+    session_id: String,
+) -> Result<(), AppError> {
+    let base = app
+        .path()
+        .app_data_dir()
+        .map_err(|_| AppError::new("Cannot resolve app data directory"))?;
+    core_lib::history::delete_session(&base, &project, &session_id)
+        .map_err(|e| AppError::new(io_message("Cannot delete session", &e)))
 }

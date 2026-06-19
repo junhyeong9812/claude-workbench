@@ -61,8 +61,13 @@ pub enum AcpEvent {
     /// One streamed chunk of the agent's reply (S1 renders text only).
     AgentMessageChunk { text: String },
     /// A new turn began (the user's prompt was sent). The timeline groups each
-    /// turn's tool calls under this prompt (S3).
-    TurnStarted { turn: u64, prompt: String },
+    /// turn's tool calls under this prompt (S3). `session_id` lets persistence
+    /// key turns by session like items.
+    TurnStarted {
+        turn: u64,
+        prompt: String,
+        session_id: String,
+    },
     /// The agent wants to run a tool; awaiting the user's approval (S2b-2).
     /// Answer with `AcpCommand::PermissionResponse { request_id, option_id }`.
     PermissionRequest {
@@ -333,7 +338,7 @@ where
                     } else {
                         in_flight = true;
                         current_turn += 1;
-                        let _ = events.send(AcpEvent::TurnStarted { turn: current_turn, prompt: text.clone() });
+                        let _ = events.send(AcpEvent::TurnStarted { turn: current_turn, prompt: text.clone(), session_id: session.clone() });
                         spawn_prompt(client.clone(), session_id.clone(), text, events.clone(), done_tx.clone());
                     }
                 }
@@ -358,7 +363,7 @@ where
                 match queue.pop_front() {
                     Some(next) => {
                         current_turn += 1;
-                        let _ = events.send(AcpEvent::TurnStarted { turn: current_turn, prompt: next.clone() });
+                        let _ = events.send(AcpEvent::TurnStarted { turn: current_turn, prompt: next.clone(), session_id: session.clone() });
                         spawn_prompt(client.clone(), session_id.clone(), next, events.clone(), done_tx.clone());
                     }
                     None => in_flight = false,

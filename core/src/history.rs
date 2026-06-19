@@ -78,6 +78,58 @@ pub fn load(base: &Path, project_path: &str) -> Vec<String> {
     out
 }
 
+/// All persisted session files for a project (`<date>/<session>.jsonl`), sorted
+/// by date then session.
+pub fn session_files(base: &Path, project_path: &str) -> Vec<PathBuf> {
+    let root = base
+        .join("projects")
+        .join(project_key(project_path))
+        .join("timeline");
+    let mut dates = read_dir_sorted(&root);
+    dates.sort();
+    let mut files = Vec::new();
+    for date_dir in dates {
+        let mut fs = read_dir_sorted(&date_dir);
+        fs.sort();
+        for f in fs {
+            if f.extension().and_then(|e| e.to_str()) == Some("jsonl") {
+                files.push(f);
+            }
+        }
+    }
+    files
+}
+
+/// JSON lines for a single session (by its `session_id`, across dates).
+pub fn load_session(base: &Path, project_path: &str, session_id: &str) -> Vec<String> {
+    let target = format!("{}.jsonl", sanitize(session_id));
+    let mut out = Vec::new();
+    for f in session_files(base, project_path) {
+        if f.file_name().and_then(|n| n.to_str()) == Some(target.as_str()) {
+            if let Ok(content) = fs::read_to_string(&f) {
+                out.extend(content.lines().filter(|l| !l.trim().is_empty()).map(String::from));
+            }
+        }
+    }
+    out
+}
+
+/// Delete a session's persisted history (the `삭제` action). Missing files are
+/// not an error.
+pub fn delete_session(base: &Path, project_path: &str, session_id: &str) -> io::Result<()> {
+    let target = format!("{}.jsonl", sanitize(session_id));
+    for f in session_files(base, project_path) {
+        if f.file_name().and_then(|n| n.to_str()) == Some(target.as_str()) {
+            match fs::remove_file(&f) {
+                Ok(()) => {}
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e),
+            }
+        }
+    }
+    Ok(())
+}
+
 fn read_dir_sorted(dir: &Path) -> Vec<PathBuf> {
     fs::read_dir(dir)
         .map(|rd| rd.flatten().map(|e| e.path()).collect())
@@ -139,6 +191,25 @@ mod tests {
 
         // A different project is isolated.
         assert!(load(&base, "/home/x/other").is_empty());
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn load_and_delete_single_session() {
+        let base = tempdir();
+        let proj = "/home/x/acp-test";
+        append(&base, proj, "2026-06-19", "sess-A", r#"{"a":1}"#).unwrap();
+        append(&base, proj, "2026-06-19", "sess-A", r#"{"a":2}"#).unwrap();
+        append(&base, proj, "2026-06-19", "sess-B", r#"{"b":1}"#).unwrap();
+
+        assert_eq!(load_session(&base, proj, "sess-A"), vec![r#"{"a":1}"#, r#"{"a":2}"#]);
+        assert_eq!(session_files(&base, proj).len(), 2);
+
+        delete_session(&base, proj, "sess-A").unwrap();
+        assert!(load_session(&base, proj, "sess-A").is_empty());
+        assert_eq!(load_session(&base, proj, "sess-B"), vec![r#"{"b":1}"#]);
+        // Deleting a missing session is a no-op, not an error.
+        delete_session(&base, proj, "nope").unwrap();
         let _ = fs::remove_dir_all(&base);
     }
 }

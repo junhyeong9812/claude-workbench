@@ -1919,6 +1919,7 @@ dependencies = [
 name = "multi-terminal"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "core",
  "core-acp",
  "serde",
