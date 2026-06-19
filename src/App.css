@@ -460,11 +460,15 @@ body {
   outline: 1px solid var(--accent);
   outline-offset: -1px;
 }
-/* Date divider (B6), sticky so the current date stays visible in a long list (B7). */
+/* Date divider (B6), sticky so the current date stays visible in a long list
+ * (B7), clickable to fold/unfold its turns (B8). */
 .timeline-date {
   position: sticky;
   top: 0;
   z-index: 1;
+  display: flex;
+  align-items: center;
+  gap: 5px;
   font-size: 10px;
   font-weight: 600;
   letter-spacing: 0.03em;
@@ -472,6 +476,15 @@ body {
   background: var(--bg);
   padding: 4px 6px 3px;
   border-bottom: 1px solid var(--border);
+  cursor: pointer;
+  user-select: none;
+}
+.timeline-date:hover {
+  color: var(--fg);
+}
+.timeline-date-caret {
+  font-size: 8px;
+  width: 8px;
 }
 .timeline-detail-head {
   font-size: 12px;

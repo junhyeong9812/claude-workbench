@@ -66,11 +66,21 @@ export function TimelineView({
     ...new Set<number>([...turns.keys(), ...answers.keys(), ...items.map((it) => it.turn)]),
   ].sort((a, b) => b - a);
 
+  // Collapsed date groups (B8): clicking a date header folds/unfolds its turns.
+  const [collapsedDates, setCollapsedDates] = useState<Set<string>>(new Set());
+  const toggleDate = (date: string) =>
+    setCollapsedDates((prev) => {
+      const next = new Set(prev);
+      if (next.has(date)) next.delete(date);
+      else next.add(date);
+      return next;
+    });
+
   // Flat display order (matches the rendered order: newest turn first, then seq
-  // asc within a turn) for ↑/↓ navigation (B4).
-  const orderedItems = turnNos.flatMap((turn) =>
-    items.filter((it) => it.turn === turn).sort((a, b) => a.seq - b.seq),
-  );
+  // asc within a turn) for ↑/↓ navigation (B4). Skips collapsed date groups (B8).
+  const orderedItems = turnNos
+    .filter((turn) => !collapsedDates.has(dates.get(turn) ?? ""))
+    .flatMap((turn) => items.filter((it) => it.turn === turn).sort((a, b) => a.seq - b.seq));
 
   const listRef = useRef<HTMLDivElement>(null);
 
@@ -116,12 +126,23 @@ export function TimelineView({
         <div className="timeline-empty">Claude에게 질문하면 여기에 쌓입니다.</div>
       )}
       {turnRows.map(({ turn, date, showDate }) => {
+        const collapsed = collapsedDates.has(date);
         const turnItems = items.filter((it) => it.turn === turn).sort((a, b) => a.seq - b.seq);
         const prompt = turns.get(turn);
         const answer = answers.get(turn);
         return (
           <Fragment key={turn}>
-            {showDate && <div className="timeline-date">{date}</div>}
+            {showDate && (
+              <div
+                className="timeline-date"
+                onClick={() => toggleDate(date)}
+                title={collapsed ? "펼치기" : "접기"}
+              >
+                <span className="timeline-date-caret">{collapsed ? "▸" : "▾"}</span>
+                {date}
+              </div>
+            )}
+            {!collapsed && (
           <div className="timeline-turn">
             <div className="timeline-turn-head" title={prompt ?? ""}>
               <span className="timeline-turn-q">Q{turn}</span>
@@ -159,6 +180,7 @@ export function TimelineView({
               </div>
             ))}
           </div>
+            )}
           </Fragment>
         );
       })}
