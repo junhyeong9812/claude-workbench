@@ -448,31 +448,11 @@ body {
   color: var(--fg-dim);
   border-bottom: 1px solid var(--border);
 }
-/* Right column splits: list (top) + viewer (bottom) — B4 */
-.timeline-wrap {
-  display: flex;
-  flex-direction: column;
+.timeline-list {
   flex: 1;
   min-height: 0;
-}
-.timeline-list {
-  flex: 0 1 42%;
-  min-height: 64px;
   overflow-y: auto;
   padding: 4px;
-}
-.timeline-viewer {
-  flex: 1 1 58%;
-  min-height: 0;
-  overflow-y: auto;
-  padding: 6px;
-  border-top: 2px solid var(--border);
-  background: var(--bg-alt);
-}
-.timeline-viewer-empty {
-  font-size: 11px;
-  color: var(--fg-dim);
-  padding: 8px 4px;
 }
 .timeline-detail-head {
   font-size: 12px;
@@ -662,6 +642,15 @@ body {
   background: var(--bg);
   color: var(--fg);
 }
+/* The chat + viewer area splits left/right; the timeline column stays separate
+ * on the right as one list (B4). */
+.claude-main-area {
+  display: flex;
+  flex-direction: row;
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+}
 .claude-main {
   display: flex;
   flex-direction: column;
@@ -669,11 +658,48 @@ body {
   min-width: 0;
   min-height: 0;
 }
+/* Diff/content viewer that opens beside the chat when a timeline item is
+ * clicked (B4). */
+.claude-viewer {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+  border-left: 1px solid var(--border);
+  background: var(--bg-alt);
+}
+.claude-viewer-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 4px 8px;
+  font-size: 11px;
+  color: var(--fg-dim);
+  border-bottom: 1px solid var(--border);
+}
+.claude-viewer-close {
+  background: none;
+  border: none;
+  color: var(--fg-dim);
+  cursor: pointer;
+  font-size: 13px;
+  padding: 0 4px;
+}
+.claude-viewer-close:hover {
+  color: var(--fg);
+}
+.claude-viewer-body {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 8px;
+}
 .claude-timeline-col {
   display: flex;
   flex-direction: column;
-  width: 440px;
-  min-width: 280px;
+  width: 320px;
+  min-width: 220px;
   border-left: 1px solid var(--border);
   background: var(--bg);
 }

@@ -3,7 +3,7 @@ import type { IDockviewPanelProps } from "dockview-react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { useAppStore } from "../state/store";
-import { TimelineView, type TimelineItem } from "./TimelineView";
+import { TimelineView, ItemDetail, type TimelineItem } from "./TimelineView";
 
 /** Params attached to a Claude panel. `acpId` is persisted into the dockview
  * layout so a remount (tab/project switch) re-attaches the same session. */
@@ -108,6 +108,9 @@ export function ClaudePanel(props: IDockviewPanelProps<ClaudeParams>) {
   const [tlTurns, setTlTurns] = useState<Map<number, string>>(new Map());
   const [tlAnswers, setTlAnswers] = useState<Map<number, string>>(new Map());
   const [showTimeline, setShowTimeline] = useState(true);
+  // The timeline item whose content is shown in the viewer that splits the chat
+  // area (B4). Null = no viewer (chat takes the full width).
+  const [selectedItem, setSelectedItem] = useState<TimelineItem | null>(null);
 
   // The panel's ACP id; a ref so the listener (registered before `acp_start`
   // resolves) can filter without re-subscribing.
@@ -389,6 +392,7 @@ export function ClaudePanel(props: IDockviewPanelProps<ClaudeParams>) {
 
   return (
     <div className="claude-panel">
+      <div className="claude-main-area">
       <div className="claude-main">
       <div className="claude-status">
         <span className={`claude-dot claude-dot-${status}`} />
@@ -514,11 +518,35 @@ export function ClaudePanel(props: IDockviewPanelProps<ClaudeParams>) {
         </button>
       </div>
       </div>
+      {selectedItem && (
+        <div className="claude-viewer">
+          <div className="claude-viewer-head">
+            <span>변경 내용</span>
+            <button
+              className="claude-viewer-close"
+              onClick={() => setSelectedItem(null)}
+              title="뷰어 닫기"
+            >
+              ✕
+            </button>
+          </div>
+          <div className="claude-viewer-body">
+            <ItemDetail item={selectedItem} />
+          </div>
+        </div>
+      )}
+      </div>
 
       {showTimeline && (
         <div className="claude-timeline-col">
           <div className="claude-timeline-head">변경 타임라인 · {tlItems.size}</div>
-          <TimelineView items={[...tlItems.values()]} turns={tlTurns} answers={tlAnswers} />
+          <TimelineView
+            items={[...tlItems.values()]}
+            turns={tlTurns}
+            answers={tlAnswers}
+            selectedId={selectedItem?.tool_call_id ?? null}
+            onSelect={setSelectedItem}
+          />
         </div>
       )}
     </div>
