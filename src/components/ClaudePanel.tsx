@@ -40,6 +40,7 @@ type AcpEvent =
   | ({ id: number; type: "timeline_item" } & TimelineItem)
   | { id: number; type: "turn_started"; turn: number; prompt: string; session_id: string }
   | { id: number; type: "turn_answer"; turn: number; text: string; session_id: string }
+  | { id: number; type: "turn_finished"; turn: number; session_id: string }
   | { id: number; type: "error"; message: string }
   | { id: number; type: "disconnected" };
 
@@ -98,9 +99,25 @@ export function ClaudePanel(props: IDockviewPanelProps<ClaudeParams>) {
   const [authCommand, setAuthCommand] = useState<string | null>(null);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const [input, setInput] = useState("");
-  // True from sending a prompt until its first streamed token — drives the
-  // "Claude is thinking…" indicator (the wait before tokens arrive).
-  const [thinking, setThinking] = useState(false);
+  // Live progress (P2b-3 P1): `busy` is true from a prompt's submit until its
+  // `turn_finished` (or error/disconnect) — drives a progress line showing the
+  // current activity verb and elapsed seconds, mirroring the real terminal's
+  // spinner. `turnStartRef` anchors the elapsed clock; `elapsed` is ticked 1/s.
+  const [busy, setBusy] = useState(false);
+  const [activity, setActivity] = useState("");
+  const [elapsed, setElapsed] = useState(0);
+  const turnStartRef = useRef<number | null>(null);
+  const startProgress = (verb: string) => {
+    turnStartRef.current = Date.now();
+    setElapsed(0);
+    setActivity(verb);
+    setBusy(true);
+  };
+  const stopProgress = () => {
+    turnStartRef.current = null;
+    setActivity("");
+    setBusy(false);
+  };
   // Pending tool approvals (S2b-2). Claude ran nothing until the user decides.
   const [pendingPerms, setPendingPerms] = useState<PermissionRequest[]>([]);
   // This session's change timeline (S3), shown in a toggleable side column.
@@ -192,7 +209,7 @@ export function ClaudePanel(props: IDockviewPanelProps<ClaudeParams>) {
     setMessages([]);
     setErrorMsg(null);
     setAuthCommand(null);
-    setThinking(false);
+    stopProgress();
     setPendingPerms([]);
     setTlItems(new Map());
     setTlTurns(new Map());
@@ -244,17 +261,17 @@ export function ClaudePanel(props: IDockviewPanelProps<ClaudeParams>) {
           setAuthCommand(null);
           break;
         case "agent_message_chunk":
-          setThinking(false); // first token arrived
+          setActivity("응답 중"); // tokens streaming (turn still in flight)
           appendChunk(ev.text);
           break;
         case "auth_required":
-          setThinking(false);
+          stopProgress();
           setAuthCommand(ev.command);
           setStatus("auth");
           break;
         case "permission_request":
-          // Claude is now blocked on our approval, not thinking.
-          setThinking(false);
+          // Claude is now blocked on our approval — still in the turn.
+          setActivity("승인 대기 중");
           setPendingPerms((prev) => [
             ...prev,
             {
@@ -271,21 +288,27 @@ export function ClaudePanel(props: IDockviewPanelProps<ClaudeParams>) {
           // Stamp the live turn with today's local date (YYYY-MM-DD) for B6.
           const today = new Date().toLocaleDateString("en-CA");
           setTlDates((prev) => new Map(prev).set(ev.turn, today));
+          startProgress("작업 중"); // (re)anchor the progress clock to this turn
           break;
         }
         case "turn_answer":
           setTlAnswers((prev) => new Map(prev).set(ev.turn, ev.text));
           break;
+        case "turn_finished":
+          stopProgress(); // turn settled — clear the live progress line
+          break;
         case "timeline_item":
           setTlItems((prev) => new Map(prev).set(ev.tool_call_id, ev));
+          // Reflect the running tool as the current activity (live only).
+          setActivity(ev.title || ev.kind);
           break;
         case "error":
-          setThinking(false);
+          stopProgress();
           setErrorMsg(ev.message);
           setStatus("error");
           break;
         case "disconnected":
-          setThinking(false);
+          stopProgress();
           setPendingPerms([]); // host gone — approvals are moot
           // Auth/error states own the message; don't overwrite them.
           setStatus((s) => (s === "error" || s === "auth" ? s : "closed"));
@@ -386,11 +409,25 @@ export function ClaudePanel(props: IDockviewPanelProps<ClaudeParams>) {
     };
   }, [connect]);
 
-  // Keep the log pinned to the latest message (and to the thinking indicator).
+  // Keep the log pinned to the latest message (and to the progress line).
   useEffect(() => {
     const el = logRef.current;
     if (el) el.scrollTop = el.scrollHeight;
-  }, [messages, thinking]);
+  }, [messages, busy]);
+
+  // Tick the elapsed clock once per second while a turn is in flight (P1). The
+  // interval is the only thing re-rendering on the second; it's torn down the
+  // moment `busy` clears, so no timer survives a finished/cancelled turn (F1).
+  useEffect(() => {
+    if (!busy) return;
+    const tick = () => {
+      const t0 = turnStartRef.current;
+      if (t0 != null) setElapsed(Math.floor((Date.now() - t0) / 1000));
+    };
+    tick();
+    const h = setInterval(tick, 1000);
+    return () => clearInterval(h);
+  }, [busy]);
 
   const send = () => {
     const text = input.trim();
@@ -398,7 +435,7 @@ export function ClaudePanel(props: IDockviewPanelProps<ClaudeParams>) {
     if (!text || id == null || status !== "ready") return;
     setMessages((prev) => [...prev, { role: "user", text }]);
     setInput("");
-    setThinking(true);
+    startProgress("작업 중"); // optimistic; turn_started will re-anchor
     // Persist the session name on its first prompt (so empty sessions stay
     // unsaved, B3-4/B3-5).
     if (!namePersistedRef.current) {
@@ -406,7 +443,7 @@ export function ClaudePanel(props: IDockviewPanelProps<ClaudeParams>) {
       persistName((paramsRef.current.title as string) ?? "Claude");
     }
     invoke("acp_prompt", { id, text }).catch((err) => {
-      setThinking(false);
+      stopProgress();
       setErrorMsg(errString(err));
     });
   };
@@ -434,7 +471,7 @@ export function ClaudePanel(props: IDockviewPanelProps<ClaudeParams>) {
       const label = perm?.title || "도구 실행";
       const verb = isCancel ? "취소됨" : "거부됨";
       setMessages((prev) => [...prev, { role: "system", text: `✖ ${verb}: ${label}` }]);
-      setThinking(false);
+      stopProgress(); // reject/cancel interrupts the turn (no further events)
     }
     if (id == null) return;
     invoke("acp_respond", { id, requestId, optionId }).catch((err) => {
@@ -494,13 +531,13 @@ export function ClaudePanel(props: IDockviewPanelProps<ClaudeParams>) {
             </div>
           ),
         )}
-        {thinking && (
+        {busy && (
           <div className="claude-msg claude-msg-assistant">
             <span className="claude-role">Claude</span>
-            <div className="claude-thinking" aria-label="Claude is thinking">
-              <span />
-              <span />
-              <span />
+            <div className="claude-progress" aria-label="진행 중" aria-live="polite">
+              <span className="claude-progress-spinner" aria-hidden />
+              <span className="claude-progress-activity">{activity || "작업 중"}</span>
+              <span className="claude-progress-elapsed">· {elapsed}s</span>
             </div>
           </div>
         )}

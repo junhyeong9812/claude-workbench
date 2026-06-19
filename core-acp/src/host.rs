@@ -76,6 +76,11 @@ pub enum AcpEvent {
         text: String,
         session_id: String,
     },
+    /// A turn fully settled (the prompt's `done` fired) — sent **unconditionally**
+    /// after the optional `TurnAnswer`, so the UI's live progress indicator clears
+    /// even when a turn produced no answer text (tool-only / cancelled / error).
+    /// Transient: not persisted (see `persist_event`'s allow-list).
+    TurnFinished { turn: u64, session_id: String },
     /// The agent wants to run a tool; awaiting the user's approval (S2b-2).
     /// Answer with `AcpCommand::PermissionResponse { request_id, option_id }`.
     PermissionRequest {
@@ -393,6 +398,12 @@ where
                         session_id: session.clone(),
                     });
                 }
+                // Always signal the turn settled so the UI clears its live
+                // progress line even when the turn produced no answer text.
+                let _ = events.send(AcpEvent::TurnFinished {
+                    turn: current_turn,
+                    session_id: session.clone(),
+                });
                 // Current turn finished; start the next queued prompt, if any.
                 match queue.pop_front() {
                     Some(next) => {
