@@ -14,6 +14,7 @@ pub mod label;
 pub mod persist;
 pub mod project_type;
 pub mod session;
+pub mod snapshot;
 pub mod timeline;
 
 pub use timeline::{AgentStatus, FileDiff, ItemKind, Timeline, TimelineItem, WriteStatus};
