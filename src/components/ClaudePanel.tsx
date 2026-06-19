@@ -114,11 +114,23 @@ export function ClaudePanel(props: IDockviewPanelProps<ClaudeParams>) {
   const panelRef = useRef<HTMLDivElement>(null);
 
   // Ctrl+←/→ moves focus across the panes (chat → viewer → timeline), so the
-  // keyboard can reach the open change view and get back to the chat (B4).
-  const movePane = (e: React.KeyboardEvent<HTMLDivElement>) => {
-    if (!e.ctrlKey || (e.key !== "ArrowLeft" && e.key !== "ArrowRight")) return;
+  // keyboard can reach the open change view and get back to the chat; Esc (while
+  // focused in the timeline/viewer, not the chat) closes the viewer (B4).
+  const onPanelKey = (e: React.KeyboardEvent<HTMLDivElement>) => {
     const root = panelRef.current;
     if (!root) return;
+
+    if (e.key === "Escape" && selectedItem) {
+      const inChat = root.querySelector(".claude-main")?.contains(document.activeElement);
+      if (!inChat) {
+        e.preventDefault();
+        setSelectedItem(null);
+        root.querySelector<HTMLElement>(".timeline-list")?.focus();
+        return;
+      }
+    }
+
+    if (!e.ctrlKey || (e.key !== "ArrowLeft" && e.key !== "ArrowRight")) return;
     const panes = [
       { container: ".claude-main", focus: ".claude-input textarea" },
       { container: ".claude-viewer", focus: ".claude-viewer-body" },
@@ -421,7 +433,7 @@ export function ClaudePanel(props: IDockviewPanelProps<ClaudeParams>) {
   };
 
   return (
-    <div className="claude-panel" ref={panelRef} onKeyDown={movePane}>
+    <div className="claude-panel" ref={panelRef} onKeyDown={onPanelKey}>
       <div className="claude-main-area">
       <div className="claude-main">
       <div className="claude-status">
