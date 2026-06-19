@@ -548,6 +548,27 @@ body {
 .timeline-diff-block {
   margin-bottom: 6px;
 }
+.timeline-detail-label {
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--fg-dim);
+  padding: 2px 0;
+}
+.timeline-detail-text {
+  margin: 0;
+  font-family: monospace;
+  font-size: 11px;
+  line-height: 1.45;
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 280px;
+  overflow-y: auto;
+  padding: 4px 6px;
+  border-radius: 3px;
+  background: var(--bg-alt);
+  color: var(--fg);
+}
 .timeline-diff-old,
 .timeline-diff-new {
   margin: 0;

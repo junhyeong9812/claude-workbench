@@ -15,6 +15,8 @@ export interface TimelineItem {
   locations: string[];
   project_label: string | null;
   diffs: { path: string; old_text: string | null; new_text: string }[];
+  content_text: string | null;
+  raw_input: unknown;
   agent_status: string;
   write_status: string;
   revision: number;
@@ -117,26 +119,26 @@ export function TimelineView({
   );
 }
 
-/** The expanded change content for a clicked item (B4): file diffs (이전→이후)
- * for edits, otherwise the touched locations. Monospace, terminal-like. */
+/** The expanded content for a clicked item (B4): the tool's input (명령/경로),
+ * file diffs (이전→이후) for edits, its text content (read result, output,
+ * 작성 내용), and touched locations. Monospace, terminal-like. */
 function ItemDetail({ item }: { item: TimelineItem }) {
-  if (item.diffs.length === 0) {
-    return (
-      <div className="timeline-detail">
-        {item.locations.length > 0 ? (
-          item.locations.map((p, i) => (
-            <div key={i} className="timeline-detail-path">
-              {p}
-            </div>
-          ))
-        ) : (
-          <div className="timeline-detail-empty">표시할 변경 내용이 없습니다.</div>
-        )}
-      </div>
-    );
-  }
+  const rawInput =
+    item.raw_input != null ? JSON.stringify(item.raw_input, null, 2) : null;
+  const hasAny =
+    rawInput != null ||
+    item.diffs.length > 0 ||
+    (item.content_text != null && item.content_text !== "") ||
+    item.locations.length > 0;
+
   return (
     <div className="timeline-detail">
+      {rawInput != null && (
+        <div className="timeline-diff-block">
+          <div className="timeline-detail-label">입력</div>
+          <pre className="timeline-detail-text">{rawInput}</pre>
+        </div>
+      )}
       {item.diffs.map((d, i) => (
         <div key={i} className="timeline-diff-block">
           <div className="timeline-detail-path">{d.path}</div>
@@ -146,6 +148,19 @@ function ItemDetail({ item }: { item: TimelineItem }) {
           <pre className="timeline-diff-new">{d.new_text}</pre>
         </div>
       ))}
+      {item.content_text != null && item.content_text !== "" && (
+        <div className="timeline-diff-block">
+          <div className="timeline-detail-label">내용</div>
+          <pre className="timeline-detail-text">{item.content_text}</pre>
+        </div>
+      )}
+      {item.diffs.length === 0 &&
+        item.locations.map((p, i) => (
+          <div key={i} className="timeline-detail-path">
+            {p}
+          </div>
+        ))}
+      {!hasAny && <div className="timeline-detail-empty">표시할 내용이 없습니다.</div>}
     </div>
   );
 }

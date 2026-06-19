@@ -21,7 +21,8 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 use agent_client_protocol_schema::{
-    SessionUpdate, ToolCall, ToolCallContent, ToolCallStatus, ToolCallUpdate, ToolKind,
+    ContentBlock, SessionUpdate, ToolCall, ToolCallContent, ToolCallStatus, ToolCallUpdate,
+    ToolKind,
 };
 use serde::{Deserialize, Serialize};
 
@@ -86,6 +87,11 @@ pub struct TimelineItem {
     /// are no locations yet.
     pub project_label: Option<String>,
     pub diffs: Vec<FileDiff>,
+    /// Text the tool produced — a read's content, a search/exec output, an
+    /// explanation — for the detail view (B4). Concatenated text content blocks.
+    pub content_text: Option<String>,
+    /// Raw tool input (the command, the path, …), for the detail view (B4).
+    pub raw_input: Option<serde_json::Value>,
     pub agent_status: AgentStatus,
     pub write_status: WriteStatus,
     /// Bumped on every merged update (audit of how many revisions we saw).
@@ -133,6 +139,7 @@ impl Timeline {
         let locations: Vec<PathBuf> = tc.locations.iter().map(|l| l.path.clone()).collect();
         let project_label = self.label_for(&locations);
         let diffs = extract_diffs(&tc.content);
+        let content_text = extract_content_text(&tc.content);
 
         if let Some(&idx) = self.index.get(&key) {
             // A re-sent full tool_call (e.g. a retry reusing the id) is the new
@@ -143,6 +150,10 @@ impl Timeline {
             item.locations = locations;
             item.project_label = project_label;
             item.diffs = diffs;
+            item.content_text = content_text;
+            if tc.raw_input.is_some() {
+                item.raw_input = tc.raw_input.clone();
+            }
             item.agent_status = map_status(tc.status);
             item.revision += 1;
             return idx;
@@ -158,6 +169,8 @@ impl Timeline {
             locations,
             project_label,
             diffs,
+            content_text,
+            raw_input: tc.raw_input.clone(),
             agent_status: map_status(tc.status),
             write_status: WriteStatus::None,
             revision: 0,
@@ -182,6 +195,8 @@ impl Timeline {
                     locations: Vec::new(),
                     project_label: None,
                     diffs: Vec::new(),
+                    content_text: None,
+                    raw_input: None,
                     agent_status: AgentStatus::Pending,
                     write_status: WriteStatus::None,
                     revision: 0,
@@ -202,6 +217,7 @@ impl Timeline {
             (paths.clone(), self.label_for(&paths))
         });
         let new_diffs = f.content.as_ref().map(|c| extract_diffs(c));
+        let new_content_text = f.content.as_ref().map(|c| extract_content_text(c));
 
         let item = &mut self.items[idx];
         if let Some(k) = f.kind {
@@ -218,9 +234,15 @@ impl Timeline {
             item.project_label = label;
         }
         // ACP overwrites collections: a present `content` field replaces diffs
-        // (even with an empty/diff-less set); an absent field leaves them.
+        // and content text (even with an empty set); an absent field leaves them.
         if let Some(diffs) = new_diffs {
             item.diffs = diffs;
+        }
+        if let Some(text) = new_content_text {
+            item.content_text = text;
+        }
+        if let Some(input) = &f.raw_input {
+            item.raw_input = Some(input.clone());
         }
         item.revision += 1;
         idx
@@ -337,6 +359,25 @@ fn extract_diffs(content: &[ToolCallContent]) -> Vec<FileDiff> {
             _ => None,
         })
         .collect()
+}
+
+/// Concatenate the text content blocks of a tool call (a read's content, a
+/// search/exec output, an explanation) for the detail view (B4). `None` if there
+/// is no text content.
+fn extract_content_text(content: &[ToolCallContent]) -> Option<String> {
+    let mut out = String::new();
+    for c in content {
+        if let ToolCallContent::Content {
+            content: ContentBlock::Text(t),
+        } = c
+        {
+            if !out.is_empty() {
+                out.push('\n');
+            }
+            out.push_str(&t.text);
+        }
+    }
+    (!out.is_empty()).then_some(out)
 }
 
 #[cfg(test)]
