@@ -322,7 +322,7 @@ fn persist_event(app: &AppHandle, project: &str, event: &AcpEvent) {
         Err(_) => return,
     };
     let kind = val.get("type").and_then(|v| v.as_str()).unwrap_or("");
-    if kind != "timeline_item" && kind != "turn_started" {
+    if kind != "timeline_item" && kind != "turn_started" && kind != "turn_answer" {
         return;
     }
     let Some(session) = val

@@ -40,26 +40,38 @@ const AGENT_BADGE: Record<string, string> = {
 export function TimelineView({
   items,
   turns,
+  answers,
 }: {
   items: TimelineItem[];
   turns: Map<number, string>;
+  answers: Map<number, string>;
 }) {
-  const turnNos = [...new Set(items.map((it) => it.turn))].sort((a, b) => a - b);
+  // Every turn shows, even one with no tool calls (a plain Q&A): derive the
+  // turn list from the union of prompts, answers, and items (B3).
+  const turnNos = [
+    ...new Set<number>([...turns.keys(), ...answers.keys(), ...items.map((it) => it.turn)]),
+  ].sort((a, b) => a - b);
 
   return (
     <div className="timeline-list">
-      {items.length === 0 && (
-        <div className="timeline-empty">Claude가 도구를 실행하면 여기에 쌓입니다.</div>
+      {turnNos.length === 0 && (
+        <div className="timeline-empty">Claude에게 질문하면 여기에 쌓입니다.</div>
       )}
       {turnNos.map((turn) => {
         const turnItems = items.filter((it) => it.turn === turn).sort((a, b) => a.seq - b.seq);
         const prompt = turns.get(turn);
+        const answer = answers.get(turn);
         return (
           <div key={turn} className="timeline-turn">
             <div className="timeline-turn-head" title={prompt ?? ""}>
               <span className="timeline-turn-q">Q{turn}</span>
               {prompt ?? "(질문)"}
             </div>
+            {answer && (
+              <div className="timeline-answer" title={answer}>
+                {answer.length > 140 ? `${answer.slice(0, 140)}…` : answer}
+              </div>
+            )}
             {turnItems.map((it) => (
               <div
                 key={it.tool_call_id}

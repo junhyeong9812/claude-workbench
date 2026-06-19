@@ -39,13 +39,15 @@ type AcpEvent =
     }
   | ({ id: number; type: "timeline_item" } & TimelineItem)
   | { id: number; type: "turn_started"; turn: number; prompt: string; session_id: string }
+  | { id: number; type: "turn_answer"; turn: number; text: string; session_id: string }
   | { id: number; type: "error"; message: string }
   | { id: number; type: "disconnected" };
 
 /** A persisted timeline record (from `acp_session_timeline`, S3c reopen). */
 type TimelineRecord =
   | ({ type: "timeline_item" } & TimelineItem)
-  | { type: "turn_started"; turn: number; prompt: string; session_id: string };
+  | { type: "turn_started"; turn: number; prompt: string; session_id: string }
+  | { type: "turn_answer"; turn: number; text: string; session_id: string };
 
 /** A pending tool approval awaiting the user's decision (S2b-2). */
 interface PermissionRequest {
@@ -104,6 +106,7 @@ export function ClaudePanel(props: IDockviewPanelProps<ClaudeParams>) {
   // This session's change timeline (S3), shown in a toggleable side column.
   const [tlItems, setTlItems] = useState<Map<string, TimelineItem>>(new Map());
   const [tlTurns, setTlTurns] = useState<Map<number, string>>(new Map());
+  const [tlAnswers, setTlAnswers] = useState<Map<number, string>>(new Map());
   const [showTimeline, setShowTimeline] = useState(true);
 
   // The panel's ACP id; a ref so the listener (registered before `acp_start`
@@ -133,6 +136,7 @@ export function ClaudePanel(props: IDockviewPanelProps<ClaudeParams>) {
     setPendingPerms([]);
     setTlItems(new Map());
     setTlTurns(new Map());
+    setTlAnswers(new Map());
     setStatus("starting");
     const cwd = useAppStore.getState().activeProject ?? null;
     try {
@@ -204,6 +208,9 @@ export function ClaudePanel(props: IDockviewPanelProps<ClaudeParams>) {
         case "turn_started":
           setTlTurns((prev) => new Map(prev).set(ev.turn, ev.prompt));
           break;
+        case "turn_answer":
+          setTlAnswers((prev) => new Map(prev).set(ev.turn, ev.text));
+          break;
         case "timeline_item":
           setTlItems((prev) => new Map(prev).set(ev.tool_call_id, ev));
           break;
@@ -242,12 +249,15 @@ export function ClaudePanel(props: IDockviewPanelProps<ClaudeParams>) {
         }).catch(() => [] as TimelineRecord[]);
         if (disposed) return;
         const tt = new Map<number, string>();
+        const ta = new Map<number, string>();
         const ti = new Map<string, TimelineItem>();
         for (const ev of events) {
           if (ev.type === "turn_started") tt.set(ev.turn, ev.prompt);
+          else if (ev.type === "turn_answer") ta.set(ev.turn, ev.text);
           else if (ev.type === "timeline_item") ti.set(ev.tool_call_id, ev);
         }
         setTlTurns(tt);
+        setTlAnswers(ta);
         setTlItems(ti);
         setShowTimeline(true);
         setStatus("closed");
@@ -455,7 +465,7 @@ export function ClaudePanel(props: IDockviewPanelProps<ClaudeParams>) {
       {showTimeline && (
         <div className="claude-timeline-col">
           <div className="claude-timeline-head">변경 타임라인 · {tlItems.size}</div>
-          <TimelineView items={[...tlItems.values()]} turns={tlTurns} />
+          <TimelineView items={[...tlItems.values()]} turns={tlTurns} answers={tlAnswers} />
         </div>
       )}
     </div>

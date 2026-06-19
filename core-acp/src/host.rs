@@ -68,6 +68,14 @@ pub enum AcpEvent {
         prompt: String,
         session_id: String,
     },
+    /// A turn finished; `text` is the agent's accumulated answer for it (B3).
+    /// Persisted and shown under the turn so a reopened session shows Q+A even
+    /// when the turn made no changes.
+    TurnAnswer {
+        turn: u64,
+        text: String,
+        session_id: String,
+    },
     /// The agent wants to run a tool; awaiting the user's approval (S2b-2).
     /// Answer with `AcpCommand::PermissionResponse { request_id, option_id }`.
     PermissionRequest {
@@ -328,6 +336,8 @@ where
     // item's turn at first sighting so later updates keep the same group.
     let mut current_turn: u64 = 0;
     let mut turn_of: HashMap<u64, u64> = HashMap::new();
+    // The agent's answer text accumulated for the in-flight turn (B3).
+    let mut current_answer = String::new();
 
     loop {
         tokio::select! {
@@ -359,6 +369,14 @@ where
                 Some(AcpCommand::Shutdown) | None => break,
             },
             _ = done_rx.recv() => {
+                // The finished turn's answer is now complete — persist/show it.
+                if !current_answer.is_empty() {
+                    let _ = events.send(AcpEvent::TurnAnswer {
+                        turn: current_turn,
+                        text: std::mem::take(&mut current_answer),
+                        session_id: session.clone(),
+                    });
+                }
                 // Current turn finished; start the next queued prompt, if any.
                 match queue.pop_front() {
                     Some(next) => {
@@ -399,6 +417,13 @@ where
                     // item (S3). `apply` borrows; `forward` then moves the update.
                     let idx = timeline.apply(&session, &note.update);
                     emit_item(&timeline, idx, current_turn, &mut turn_of, events);
+                    // Accumulate the agent's answer for the current turn (B3).
+                    if let SessionUpdate::AgentMessageChunk {
+                        content: ContentBlock::Text(t),
+                    } = &note.update
+                    {
+                        current_answer.push_str(&t.text);
+                    }
                     forward_update(note.update, events);
                 }
                 None => break, // connection closed (adapter exited / I/O ended)
