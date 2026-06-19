@@ -44,34 +44,62 @@ interface ClaudeStarted {
   id: number;
   session_uuid: string;
 }
+/** Full timeline snapshot for this session (the backend re-sends the whole
+ * modest state on any change), so plain Q&A turns show too, not just tools. */
 interface ClaudeTimelineEvent {
   id: number;
-  item: TimelineItem;
+  items: TimelineItem[];
+  turns: [number, string][];
+  answers: [number, string][];
+  dates: [number, string][];
 }
-
-/** Shared empty maps — first cut shows tool items grouped by turn number; the
- * prompt/answer text lives in the terminal, so these stay empty. */
-const EMPTY_MAP = new Map<number, string>();
 
 export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
   const hostRef = useRef<HTMLDivElement | null>(null);
   const [items, setItems] = useState<TimelineItem[]>([]);
+  const [turns, setTurns] = useState<Map<number, string>>(new Map());
+  const [answers, setAnswers] = useState<Map<number, string>>(new Map());
+  const [dates, setDates] = useState<Map<number, string>>(new Map());
   const [selectedId, setSelectedId] = useState<string | null>(null);
-  const itemsRef = useRef<Map<string, TimelineItem>>(new Map());
-
-  const upsert = (item: TimelineItem) => {
-    itemsRef.current.set(item.tool_call_id, item);
-    setItems([...itemsRef.current.values()].sort((a, b) => a.seq - b.seq));
-  };
 
   useEffect(() => {
     const host = hostRef.current;
     if (!host) return;
 
     const term = new Terminal({
-      fontFamily: "monospace",
+      // A CJK-capable monospace stack so Hangul in Claude's TUI renders cleanly,
+      // falling back through common Linux fonts.
+      fontFamily:
+        "'JetBrains Mono', 'DejaVu Sans Mono', 'Noto Sans Mono CJK KR', 'Noto Sans Mono', monospace",
       fontSize: 13,
-      theme: { background: "#1e1e1e" },
+      lineHeight: 1.15,
+      cursorBlink: true,
+      cursorStyle: "block",
+      scrollback: 10000,
+      // Catppuccin Mocha — a clean dark palette (Terminus-grade).
+      theme: {
+        background: "#1e1e2e",
+        foreground: "#cdd6f4",
+        cursor: "#f5e0dc",
+        cursorAccent: "#1e1e2e",
+        selectionBackground: "#585b70",
+        black: "#45475a",
+        red: "#f38ba8",
+        green: "#a6e3a1",
+        yellow: "#f9e2af",
+        blue: "#89b4fa",
+        magenta: "#f5c2e7",
+        cyan: "#94e2d5",
+        white: "#bac2de",
+        brightBlack: "#585b70",
+        brightRed: "#f38ba8",
+        brightGreen: "#a6e3a1",
+        brightYellow: "#f9e2af",
+        brightBlue: "#89b4fa",
+        brightMagenta: "#f5c2e7",
+        brightCyan: "#94e2d5",
+        brightWhite: "#a6adc8",
+      },
     });
     const fit = new FitAddon();
     term.loadAddon(fit);
@@ -109,7 +137,10 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
       });
       unlistenTl = await listen<ClaudeTimelineEvent>("claude-timeline", (e) => {
         if (sessionId == null || e.payload.id !== sessionId) return;
-        upsert(e.payload.item);
+        setItems([...e.payload.items].sort((a, b) => a.seq - b.seq));
+        setTurns(new Map(e.payload.turns));
+        setAnswers(new Map(e.payload.answers));
+        setDates(new Map(e.payload.dates));
       });
       if (disposed) return;
 
@@ -189,9 +220,9 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
       <div className="claudeterm-timeline">
         <TimelineView
           items={items}
-          turns={EMPTY_MAP}
-          answers={EMPTY_MAP}
-          dates={EMPTY_MAP}
+          turns={turns}
+          answers={answers}
+          dates={dates}
           selectedId={selectedId}
           onSelect={(it) => setSelectedId(it.tool_call_id)}
         />

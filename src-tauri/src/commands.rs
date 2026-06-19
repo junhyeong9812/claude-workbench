@@ -337,12 +337,18 @@ pub struct ClaudeStarted {
     session_uuid: String,
 }
 
-/// One timeline item produced by tailing the session JSONL, tagged with its
-/// panel's PTY session id, emitted as the `claude-timeline` event.
+/// The full timeline snapshot for a Claude session, emitted as `claude-timeline`
+/// whenever a poll observed any change. Carries the change items **and** the
+/// derived conversation turns/answers/dates, so the UI shows plain Q&A turns
+/// (no tool calls) too — not only tool items. Re-sending the whole (modest)
+/// state keeps the frontend a simple replace.
 #[derive(Clone, Serialize)]
 struct ClaudeTimelinePayload {
     id: u64,
-    item: TimelineItem,
+    items: Vec<TimelineItem>,
+    turns: Vec<(u64, String)>,
+    answers: Vec<(u64, String)>,
+    dates: Vec<(u64, String)>,
 }
 
 /// Generate a fresh session UUID for `--session-id`. Linux-only (the app's
@@ -432,6 +438,10 @@ fn run_timeline_poll(app: AppHandle, id: u64, cwd: String, uuid: String, stop: A
         return;
     };
     let mut tail: Option<core_lib::jsonl::SessionTail> = None;
+    // Cheap fingerprint of the last emitted state. A prompt- or answer-only
+    // record advances turns/answers without touching any tool item, so we can't
+    // key off `poll`'s touched indices alone — compare the whole shape.
+    let mut last_fp: (usize, u32, usize, usize, usize) = (0, 0, 0, 0, 0);
 
     while !stop.load(Ordering::Relaxed) {
         thread::sleep(Duration::from_millis(150));
@@ -449,29 +459,36 @@ fn run_timeline_poll(app: AppHandle, id: u64, cwd: String, uuid: String, stop: A
             }
         }
         let Some(t) = tail.as_mut() else { continue };
-        let touched = match t.poll() {
-            Ok(idx) => idx,
-            Err(_) => continue, // transient read error — retry next tick
-        };
-        if touched.is_empty() {
-            continue;
+        if t.poll().is_err() {
+            continue; // transient read error — retry next tick
         }
+
         let items = t.timeline().items();
-        for &i in &touched {
-            if let Some(item) = items.get(i) {
-                // First cut: live emit only. Persistence (D-1) / reopen is the
-                // next increment — codex B-2b #2/#3 flagged that re-persisting the
-                // resume replay duplicates history, so the persist model (our own
-                // copy vs treating the CLI JSONL as the source) is being revisited.
-                let _ = app.emit(
-                    "claude-timeline",
-                    ClaudeTimelinePayload {
-                        id,
-                        item: item.clone(),
-                    },
-                );
-            }
+        let fp = (
+            items.len(),
+            items.iter().map(|i| i.revision).sum(),
+            t.turns().len(),
+            t.answers().values().map(|s| s.len()).sum(),
+            t.dates().len(),
+        );
+        if fp == last_fp {
+            continue; // nothing changed this tick
         }
+        last_fp = fp;
+
+        // First cut: live emit only (persistence/reopen is the next increment —
+        // codex B-2b F2/F3: re-persisting the resume replay duplicates history,
+        // so the persist model is being revisited).
+        let _ = app.emit(
+            "claude-timeline",
+            ClaudeTimelinePayload {
+                id,
+                items: items.to_vec(),
+                turns: t.turns().iter().map(|(k, v)| (*k, v.clone())).collect(),
+                answers: t.answers().iter().map(|(k, v)| (*k, v.clone())).collect(),
+                dates: t.dates().iter().map(|(k, v)| (*k, v.clone())).collect(),
+            },
+        );
     }
 
     // Drop our stop-flag entry so a later id collision can't see a stale flag.

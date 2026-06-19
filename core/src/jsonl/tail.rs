@@ -16,6 +16,7 @@
 //! question of interactive-mode flush granularity affects latency, not
 //! correctness; phase-b-spec §2).
 
+use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
@@ -127,6 +128,21 @@ impl SessionTail {
 
     pub fn timeline(&self) -> &Timeline {
         self.mapper.timeline()
+    }
+
+    /// turn → user prompt text (delegated to the mapper).
+    pub fn turns(&self) -> &BTreeMap<u64, String> {
+        self.mapper.turns()
+    }
+
+    /// turn → concatenated assistant answer text.
+    pub fn answers(&self) -> &BTreeMap<u64, String> {
+        self.mapper.answers()
+    }
+
+    /// turn → YYYY-MM-DD.
+    pub fn dates(&self) -> &BTreeMap<u64, String> {
+        self.mapper.dates()
     }
 }
 

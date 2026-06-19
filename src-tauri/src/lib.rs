@@ -46,6 +46,31 @@ fn align_ime_module() {
     }
 }
 
+/// Strip the Claude Code "nested session" environment markers so that every
+/// `claude` we spawn in a PTY runs as a **fresh top-level session** — writing its
+/// own `~/.claude/projects/<slug>/<uuid>.jsonl` transcript that the timeline tail
+/// can follow.
+///
+/// Why: if this app is launched from inside a Claude session (e.g. while
+/// dogfooding), the process inherits `CLAUDECODE=1`,
+/// `CLAUDE_CODE_CHILD_SESSION=1`, and the parent's `CLAUDE_CODE_SESSION_ID`.
+/// A `claude` spawned with those set behaves as a *child* of that session and
+/// does **not** create a normal project transcript — so `find_session_jsonl`
+/// finds nothing and the change timeline stays empty. The app orchestrates
+/// Claude sessions; it must never present itself as a Claude child. Mutating our
+/// own process env here is safe (children inherit the cleaned env); a normally
+/// launched app has none of these set, so this is a no-op there.
+fn strip_nested_claude_env() {
+    for key in [
+        "CLAUDECODE",
+        "CLAUDE_CODE_CHILD_SESSION",
+        "CLAUDE_CODE_SESSION_ID",
+        "CLAUDE_CODE_ENTRYPOINT",
+    ] {
+        std::env::remove_var(key);
+    }
+}
+
 /// Build and run the Tauri application.
 ///
 /// Registers the dialog plugin (folder picker) and the shell + terminal + ACP
@@ -54,6 +79,7 @@ fn align_ime_module() {
 pub fn run() {
     #[cfg(target_os = "linux")]
     align_ime_module();
+    strip_nested_claude_env();
 
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())

@@ -76,17 +76,32 @@ impl JsonlMapper {
         let is_user = role == Some("user");
         let is_assistant = role == Some("assistant");
 
-        match rec.message.as_ref().and_then(|m| m.content.as_ref()) {
-            // A bare-string user record is a typed prompt — it opens a new turn.
-            Some(Content::Text(prompt)) if is_user && !prompt.trim().is_empty() => {
+        let content = rec.message.as_ref().and_then(|m| m.content.as_ref());
+
+        // A user prompt is the user's *text* — recorded either as a bare string
+        // (headless `-p`) or as `text` blocks in an array (interactive). A user
+        // array of `tool_result` blocks carries no text and is NOT a prompt.
+        // (Interactive Claude writes prompts as `[{type:"text",...}]`, not bare
+        // strings — measured; the bare-string-only check missed every
+        // interactive prompt.)
+        if is_user {
+            let prompt = match content {
+                Some(Content::Text(s)) => (!s.trim().is_empty()).then(|| s.clone()),
+                Some(Content::Blocks(b)) => concat_text_blocks(b),
+                _ => None,
+            };
+            if let Some(p) = prompt {
                 self.current_turn += 1;
-                self.turns.insert(self.current_turn, prompt.clone());
+                self.turns.insert(self.current_turn, p);
                 if let Some(d) = date {
                     self.dates.entry(self.current_turn).or_insert(d);
                 }
-                Vec::new()
+                return Vec::new();
             }
-            // Assistant / tool-result blocks belong to the current turn.
+        }
+
+        // Otherwise: assistant tool_use + text(answer), or user tool_result blocks.
+        match content {
             Some(Content::Blocks(blocks)) => {
                 let (touched, answer) =
                     apply_blocks(&mut self.timeline, &session, self.current_turn, is_assistant, blocks);
@@ -104,7 +119,6 @@ impl JsonlMapper {
                 }
                 touched
             }
-            // A bare prompt that's empty, an object-shaped content, or no message.
             _ => Vec::new(),
         }
     }
@@ -351,6 +365,24 @@ fn derive_title(name: &str, input: &Value) -> String {
         return format!("{name} {p}");
     }
     name.to_string()
+}
+
+/// Concatenate the `text` blocks of a content array (a user prompt or assistant
+/// answer recorded as blocks). `None` if there are no text blocks (e.g. a
+/// `tool_result`-only user array, which is not a prompt).
+fn concat_text_blocks(blocks: &[Value]) -> Option<String> {
+    let mut out = String::new();
+    for v in blocks {
+        if v.get("type").and_then(Value::as_str) == Some("text") {
+            if let Some(t) = v.get("text").and_then(Value::as_str) {
+                if !out.is_empty() {
+                    out.push('\n');
+                }
+                out.push_str(t);
+            }
+        }
+    }
+    (!out.trim().is_empty()).then_some(out)
 }
 
 /// Pull display text out of a `tool_result` content value, which is either a
@@ -763,6 +795,29 @@ mod tests {
         })));
         assert_eq!(m.current_turn(), 1);
         assert_eq!(m.turns().get(&1).map(String::as_str), Some("the real prompt"));
+    }
+
+    // Interactive Claude records a prompt as a text-block ARRAY (not a bare
+    // string). It must still open a turn; a tool_result array must not.
+    #[test]
+    fn user_text_blocks_open_a_turn() {
+        let prompt = json!({
+            "type": "user", "sessionId": SID, "timestamp": "2026-06-19T08:00:00.000Z",
+            "message": { "role": "user", "content": [{ "type": "text", "text": "fix the bug" }] }
+        });
+        let tool_result = json!({
+            "type": "user", "sessionId": SID,
+            "message": { "role": "user", "content": [
+                { "type": "tool_result", "tool_use_id": "x", "content": "ok" }
+            ] }
+        });
+        let mut m = JsonlMapper::new(ROOT, SID);
+        m.apply_line(&line(prompt));
+        assert_eq!(m.current_turn(), 1);
+        assert_eq!(m.turns().get(&1).map(String::as_str), Some("fix the bug"));
+        m.apply_line(&line(tool_result));
+        assert_eq!(m.current_turn(), 1, "a tool_result array is not a new prompt");
+        assert_eq!(m.turns().len(), 1);
     }
 
     // A record that omits sessionId falls back to the file's session uuid.
