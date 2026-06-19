@@ -92,7 +92,7 @@ export function ClaudePanel(props: IDockviewPanelProps<ClaudeParams>) {
   // `Connected` event already fired on first mount and won't repeat, so start
   // optimistically `ready` (a dead session surfaces via a prompt error).
   const [status, setStatus] = useState<Status>(
-    props.params.loadSessionId != null ? "closed" : props.params.acpId != null ? "ready" : "starting",
+    props.params.acpId != null ? "ready" : "starting",
   );
   const [messages, setMessages] = useState<Message[]>([]);
   const [authCommand, setAuthCommand] = useState<string | null>(null);
@@ -119,9 +119,12 @@ export function ClaudePanel(props: IDockviewPanelProps<ClaudeParams>) {
   // The adapter session id (for delete/persistence). Known up-front for a
   // reopened session; captured from the `connected` event for a live one.
   const sessionIdRef = useRef<string | null>(props.params.loadSessionId ?? null);
-  const readOnly = props.params.loadSessionId != null;
+  // A reopened (resumed) session — its history is loaded and it connects with
+  // `resume` so the conversation continues (B3-6).
+  const reopened = props.params.loadSessionId != null;
   // Whether this session's name has been persisted yet (on first prompt, B3-5).
-  const namePersistedRef = useRef(readOnly);
+  // A reopened session is already named.
+  const namePersistedRef = useRef(reopened);
   const mountedRef = useRef(true);
   const logRef = useRef<HTMLDivElement | null>(null);
   // True while an IME composition is in progress (Hangul/CJK). Enter must not
@@ -241,28 +244,60 @@ export function ClaudePanel(props: IDockviewPanelProps<ClaudeParams>) {
       }
       unlisten = fn;
 
-      if (readOnly && props.params.loadSessionId) {
-        // Reopen a saved session read-only: load its persisted timeline; no
-        // live adapter connection (S3c).
+      if (reopened && props.params.loadSessionId) {
+        // Reopen + **resume** (B3-6): load the saved timeline/chat, then connect
+        // a resumed live session (Claude keeps its context) so the user can
+        // continue. New turns continue past the loaded ones (startTurn).
+        const sessionId = props.params.loadSessionId;
         const project = useAppStore.getState().activeProject ?? null;
         const events = await invoke<TimelineRecord[]>("acp_session_timeline", {
           project,
-          sessionId: props.params.loadSessionId,
+          sessionId,
         }).catch(() => [] as TimelineRecord[]);
         if (disposed) return;
         const tt = new Map<number, string>();
         const ta = new Map<number, string>();
         const ti = new Map<string, TimelineItem>();
+        let maxTurn = 0;
         for (const ev of events) {
-          if (ev.type === "turn_started") tt.set(ev.turn, ev.prompt);
-          else if (ev.type === "turn_answer") ta.set(ev.turn, ev.text);
-          else if (ev.type === "timeline_item") ti.set(ev.tool_call_id, ev);
+          if (ev.type === "turn_started") {
+            tt.set(ev.turn, ev.prompt);
+            maxTurn = Math.max(maxTurn, ev.turn);
+          } else if (ev.type === "turn_answer") {
+            ta.set(ev.turn, ev.text);
+            maxTurn = Math.max(maxTurn, ev.turn);
+          } else if (ev.type === "timeline_item") {
+            ti.set(ev.tool_call_id, ev);
+          }
         }
         setTlTurns(tt);
         setTlAnswers(ta);
         setTlItems(ti);
+        // Reconstruct the chat (Q+A) from the saved turns.
+        const msgs: Message[] = [];
+        for (const t of [...tt.keys()].sort((a, b) => a - b)) {
+          msgs.push({ role: "user", text: tt.get(t) ?? "" });
+          if (ta.has(t)) msgs.push({ role: "assistant", text: ta.get(t) ?? "" });
+        }
+        setMessages(msgs);
         setShowTimeline(true);
-        setStatus("closed");
+        // Connect a resumed session continuing turn numbering past the history.
+        try {
+          const id = await invoke<number>("acp_start", {
+            cwd: project,
+            resume: sessionId,
+            startTurn: maxTurn,
+          });
+          if (disposed) {
+            invoke("acp_close", { id }).catch(() => {});
+            return;
+          }
+          acpIdRef.current = id;
+          props.api.updateParameters({ ...paramsRef.current, acpId: id });
+        } catch (err) {
+          setErrorMsg(errString(err));
+          setStatus("error");
+        }
       } else if (acpIdRef.current == null) {
         // Fresh panel -> start a new session.
         await connect();
@@ -349,7 +384,7 @@ export function ClaudePanel(props: IDockviewPanelProps<ClaudeParams>) {
     auth: "Sign-in required",
     ready: "Ready",
     error: "Error",
-    closed: readOnly ? "저장된 세션 (읽기 전용)" : "Disconnected",
+    closed: "Disconnected",
   };
 
   return (

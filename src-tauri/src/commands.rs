@@ -218,6 +218,8 @@ pub fn acp_start(
     app: AppHandle,
     state: State<'_, AcpState>,
     cwd: Option<String>,
+    resume: Option<String>,
+    start_turn: Option<u64>,
 ) -> Result<u64, AppError> {
     // Claude must be rooted at the session root; refuse rather than guess.
     let cwd =
@@ -225,8 +227,8 @@ pub fn acp_start(
     let project = cwd.to_string_lossy().to_string();
 
     let (ev_tx, ev_rx) = std::sync::mpsc::channel::<AcpEvent>();
-    let host =
-        AcpHost::spawn(cwd, ev_tx).map_err(|e| AppError::new(io_message("Cannot start Claude", &e)))?;
+    let host = AcpHost::spawn(cwd, ev_tx, resume, start_turn.unwrap_or(0))
+        .map_err(|e| AppError::new(io_message("Cannot start Claude", &e)))?;
     let id = state.next_id.fetch_add(1, Ordering::Relaxed);
 
     // Relay host events -> webview until the host thread ends (sender dropped

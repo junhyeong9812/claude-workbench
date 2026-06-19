@@ -213,14 +213,23 @@ impl AcpClient {
             .await
     }
 
-    /// Create a session rooted at `cwd` (the active project = session root).
-    pub async fn new_session(&self, cwd: PathBuf) -> Result<SessionId, Error> {
+    /// Create a session rooted at `cwd` (the active project = session root). If
+    /// `resume` is set, ask the adapter to continue that saved session (B3-6):
+    /// its SDK context is restored (no event replay) and the id is preserved.
+    pub async fn new_session(
+        &self,
+        cwd: PathBuf,
+        resume: Option<String>,
+    ) -> Result<SessionId, Error> {
+        let meta = resume.map(|sid| {
+            serde_json::json!({ "claudeCode": { "options": { "resume": sid } } })
+        });
         let resp = self
             .conn
             .new_session(NewSessionRequest {
                 cwd,
                 mcp_servers: vec![],
-                meta: None,
+                meta,
             })
             .await?;
         Ok(resp.session_id)
@@ -376,7 +385,7 @@ mod tests {
             assert_eq!(init.protocol_version, VERSION);
 
             let sid = client
-                .new_session(PathBuf::from("/tmp"))
+                .new_session(PathBuf::from("/tmp"), None)
                 .await
                 .expect("new_session");
             assert_eq!(&*sid.0, "fake-session");

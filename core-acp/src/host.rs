@@ -146,11 +146,16 @@ impl AcpHost {
     /// connection on a dedicated thread. Lifecycle/error events flow to `events`.
     /// Returns an error only if the OS thread itself cannot be created (we never
     /// panic at the command boundary).
-    pub fn spawn(cwd: PathBuf, events: StdSender<AcpEvent>) -> std::io::Result<AcpHost> {
+    pub fn spawn(
+        cwd: PathBuf,
+        events: StdSender<AcpEvent>,
+        resume: Option<String>,
+        start_turn: u64,
+    ) -> std::io::Result<AcpHost> {
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
         let thread = std::thread::Builder::new()
             .name("acp-host".into())
-            .spawn(move || host_main(cwd, cmd_rx, events))?;
+            .spawn(move || host_main(cwd, cmd_rx, events, resume, start_turn))?;
         Ok(AcpHost {
             commands: cmd_tx,
             _thread: thread,
@@ -194,7 +199,13 @@ impl Drop for AcpHost {
 
 /// Thread entry: build a `current_thread` runtime + `LocalSet`, spawn the
 /// adapter, run the connection, and always emit a terminal `Disconnected`.
-fn host_main(cwd: PathBuf, cmd_rx: UnboundedReceiver<AcpCommand>, events: StdSender<AcpEvent>) {
+fn host_main(
+    cwd: PathBuf,
+    cmd_rx: UnboundedReceiver<AcpCommand>,
+    events: StdSender<AcpEvent>,
+    resume: Option<String>,
+    start_turn: u64,
+) {
     let rt = match tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -253,7 +264,7 @@ fn host_main(cwd: PathBuf, cmd_rx: UnboundedReceiver<AcpCommand>, events: StdSen
             });
         }
 
-        if let Err(message) = run(stdin, stdout, cwd, cmd_rx, &events).await {
+        if let Err(message) = run(stdin, stdout, cwd, cmd_rx, &events, resume, start_turn).await {
             let _ = events.send(AcpEvent::Error { message });
         }
         // Best effort cleanup; `wait` reaps the child so it can't linger as a
@@ -268,12 +279,15 @@ fn host_main(cwd: PathBuf, cmd_rx: UnboundedReceiver<AcpCommand>, events: StdSen
 /// open a session, then pump commands and session updates until shutdown or the
 /// connection closes. Factored out of [`host_main`] so the fake-agent test can
 /// drive it over in-memory pipes (no real `npx`).
+#[allow(clippy::too_many_arguments)]
 async fn run<W, R>(
     outgoing: W,
     incoming: R,
     cwd: PathBuf,
     mut cmd_rx: UnboundedReceiver<AcpCommand>,
     events: &StdSender<AcpEvent>,
+    resume: Option<String>,
+    start_turn: u64,
 ) -> Result<(), String>
 where
     W: AsyncWrite + Unpin + 'static,
@@ -303,7 +317,7 @@ where
     // that throws (kill-switch finding, 2026-06-19). Login is out-of-band
     // (`claude /login`), and the real "not logged in" signal is the
     // `auth_required` (-32000) error returned by `new_session`/`prompt` below.
-    let session_id = match await_or_shutdown(client.new_session(cwd), &mut cmd_rx).await {
+    let session_id = match await_or_shutdown(client.new_session(cwd, resume), &mut cmd_rx).await {
         Some(Ok(sid)) => sid,
         Some(Err(e)) => {
             let _ = events.send(error_event("new_session", &e));
@@ -334,7 +348,9 @@ where
     // Turn tracking (S3): each prompt opens a turn; tool calls that arrive while
     // it runs (turns are serialized) are attributed to it. `turn_of` pins each
     // item's turn at first sighting so later updates keep the same group.
-    let mut current_turn: u64 = 0;
+    // Resumed sessions continue turn numbering past the persisted history so the
+    // new turns don't collide with the loaded ones (B3-6).
+    let mut current_turn: u64 = start_turn;
     let mut turn_of: HashMap<u64, u64> = HashMap::new();
     // The agent's answer text accumulated for the in-flight turn (B3).
     let mut current_answer = String::new();
@@ -753,7 +769,7 @@ mod tests {
             let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
             let (ev_tx, ev_rx) = std::sync::mpsc::channel();
             let run_handle = tokio::task::spawn_local(async move {
-                run(c_write, c_read, PathBuf::from("/tmp"), cmd_rx, &ev_tx).await
+                run(c_write, c_read, PathBuf::from("/tmp"), cmd_rx, &ev_tx, None, 0).await
             });
 
             // Mirror real usage (the UI gates prompts on `ready`): pump until
@@ -836,7 +852,7 @@ mod tests {
             let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
             let (ev_tx, ev_rx) = std::sync::mpsc::channel();
             let run_handle = tokio::task::spawn_local(async move {
-                run(c_write, c_read, PathBuf::from("/tmp"), cmd_rx, &ev_tx).await
+                run(c_write, c_read, PathBuf::from("/tmp"), cmd_rx, &ev_tx, None, 0).await
             });
 
             // Pump to Connected (UI gates prompts on `ready`).
@@ -920,7 +936,7 @@ mod tests {
             let (_cmd_tx, cmd_rx) = mpsc::unbounded_channel();
             let (ev_tx, ev_rx) = std::sync::mpsc::channel();
             let run_handle = tokio::task::spawn_local(async move {
-                run(c_write, c_read, PathBuf::from("/tmp"), cmd_rx, &ev_tx).await
+                run(c_write, c_read, PathBuf::from("/tmp"), cmd_rx, &ev_tx, None, 0).await
             });
             // `new_session` fails -> run returns Ok and drops ev_tx; the loop ends.
             run_handle.await.unwrap().expect("run returns ok even on auth error");
@@ -984,7 +1000,7 @@ mod tests {
             let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
             let (ev_tx, ev_rx) = std::sync::mpsc::channel();
             let run_handle = tokio::task::spawn_local(async move {
-                run(c_write, c_read, PathBuf::from("/work"), cmd_rx, &ev_tx).await
+                run(c_write, c_read, PathBuf::from("/work"), cmd_rx, &ev_tx, None, 0).await
             });
 
             // Connect, then prompt (the fake agent issues the write mid-turn).
