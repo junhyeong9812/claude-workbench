@@ -17,10 +17,12 @@
 //! `parentUuid`, and `isSidechain` are parsed onto the record but not yet
 //! surfaced as a tree (Phase E).
 
+mod locate;
 mod map;
 mod record;
 mod tail;
 
+pub use locate::{claude_projects_root, find_session_jsonl};
 pub use map::{apply_record, JsonlMapper};
 pub use record::{Content, ContentBlock, Message, RawRecord};
 pub use tail::{JsonlTail, SessionTail};
