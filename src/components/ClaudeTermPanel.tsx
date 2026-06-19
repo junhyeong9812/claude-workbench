@@ -6,7 +6,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import "@xterm/xterm/css/xterm.css";
 import { useAppStore } from "../state/store";
-import { TimelineView, type TimelineItem } from "./TimelineView";
+import { TimelineView, ItemDetail, type TimelineItem } from "./TimelineView";
 
 /**
  * Architecture A Claude panel: the **real** `claude` CLI in an xterm PTY (left)
@@ -155,7 +155,22 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
     let sessionId: number | null = null;
     let lastApplied = 0;
     let ready = false;
+    // Set once a live timeline event arrives, so a slower snapshot-seed (reopen /
+    // re-attach restore) doesn't overwrite newer live state.
+    let gotLive = false;
     const pending: TerminalOutputEvent[] = [];
+
+    const applySnapshot = (s: {
+      items: TimelineItem[];
+      turns: [number, string][];
+      answers: [number, string][];
+      dates: [number, string][];
+    }) => {
+      setItems([...s.items].sort((a, b) => a.seq - b.seq));
+      setTurns(new Map(s.turns));
+      setAnswers(new Map(s.answers));
+      setDates(new Map(s.dates));
+    };
 
     const write = (bytes: number[]) => {
       if (!disposed) term.write(new Uint8Array(bytes));
@@ -176,10 +191,8 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
       });
       unlistenTl = await listen<ClaudeTimelineEvent>("claude-timeline", (e) => {
         if (sessionId == null || e.payload.id !== sessionId) return;
-        setItems([...e.payload.items].sort((a, b) => a.seq - b.seq));
-        setTurns(new Map(e.payload.turns));
-        setAnswers(new Map(e.payload.answers));
-        setDates(new Map(e.payload.dates));
+        gotLive = true;
+        applySnapshot(e.payload);
       });
       if (disposed) return;
 
@@ -201,6 +214,7 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
         const started = await invoke<ClaudeStarted>("claude_start", {
           cwd,
           resume: props.params.loadSessionId ?? null,
+          name: (props.params.title as string) ?? null,
           cols: term.cols,
           rows: term.rows,
         });
@@ -215,6 +229,24 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
       ready = true;
       for (const ev of pending) applyLive(ev);
       pending.length = 0;
+
+      // Seed the timeline from the saved snapshot (reopen or tab-switch
+      // re-attach) so it isn't empty until the next live change — unless a live
+      // event already arrived (which is newer).
+      const seedUuid = props.params.sessionUuid ?? props.params.loadSessionId;
+      const project = useAppStore.getState().activeProject ?? null;
+      if (seedUuid && project) {
+        invoke<{
+          items: TimelineItem[];
+          turns: [number, string][];
+          answers: [number, string][];
+          dates: [number, string][];
+        } | null>("claude_session_snapshot", { project, uuid: seedUuid })
+          .then((snap) => {
+            if (snap && !gotLive && !disposed) applySnapshot(snap);
+          })
+          .catch(() => {});
+      }
     })();
 
     const onData = term.onData((d) => {
@@ -259,9 +291,32 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  const selectedItem = selectedId
+    ? (items.find((it) => it.tool_call_id === selectedId) ?? null)
+    : null;
+
   return (
     <div className="claudeterm">
       <div className="claudeterm-term" ref={hostRef} />
+      {selectedItem && (
+        <div className="claudeterm-viewer">
+          <div className="claudeterm-viewer-head">
+            <span className="claudeterm-viewer-title">
+              {selectedItem.title || selectedItem.kind}
+            </span>
+            <span
+              className="claudeterm-viewer-x"
+              title="닫기"
+              onClick={() => setSelectedId(null)}
+            >
+              ×
+            </span>
+          </div>
+          <div className="claudeterm-viewer-body">
+            <ItemDetail item={selectedItem} />
+          </div>
+        </div>
+      )}
       <div className="claudeterm-timeline">
         <TimelineView
           items={items}

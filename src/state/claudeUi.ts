@@ -7,6 +7,8 @@ import { create } from "zustand";
 export interface ClaudeCloseRequest {
   panelId: string;
   sessionId: string | null;
+  /** Which backend owns the session, so the modal calls the right delete. */
+  kind: "claude" | "claudeterm";
 }
 
 interface ClaudeUiState {

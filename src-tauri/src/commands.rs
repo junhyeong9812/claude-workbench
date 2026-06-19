@@ -364,12 +364,14 @@ fn new_session_uuid() -> Result<String, AppError> {
 /// emit `claude-timeline` items. `resume` continues an existing session by its
 /// UUID (same file, append); omitting it starts a new `--session-id` session.
 #[tauri::command]
+#[allow(clippy::too_many_arguments)] // Tauri injects State + the panel's params
 pub fn claude_start(
     app: AppHandle,
     mgr: State<'_, SessionManager>,
     claude: State<'_, ClaudeState>,
     cwd: Option<String>,
     resume: Option<String>,
+    name: Option<String>,
     cols: u16,
     rows: u16,
 ) -> Result<ClaudeStarted, AppError> {
@@ -418,12 +420,13 @@ pub fn claude_start(
         });
     }
 
-    // (b) Tail the session JSONL -> emit timeline items.
+    // (b) Tail the session JSONL -> emit timeline items + persist snapshot.
     {
         let app = app.clone();
         let cwd = cwd.clone();
         let uuid = session_uuid.clone();
-        thread::spawn(move || run_timeline_poll(app, id, cwd, uuid, stop));
+        let name = name.unwrap_or_else(|| "Claude".to_string());
+        thread::spawn(move || run_timeline_poll(app, id, cwd, uuid, name, stop));
     }
 
     Ok(ClaudeStarted { id, session_uuid })
@@ -433,7 +436,14 @@ pub fn claude_start(
 /// session JSONL to appear (the CLI creates it after init), then polls a
 /// `SessionTail` every ~150ms, emitting and persisting newly-touched items.
 /// Ends when the stop flag is set (`claude_close`).
-fn run_timeline_poll(app: AppHandle, id: u64, cwd: String, uuid: String, stop: Arc<AtomicBool>) {
+fn run_timeline_poll(
+    app: AppHandle,
+    id: u64,
+    cwd: String,
+    uuid: String,
+    initial_name: String,
+    stop: Arc<AtomicBool>,
+) {
     let Some(root) = core_lib::jsonl::claude_projects_root() else {
         return;
     };
@@ -476,19 +486,43 @@ fn run_timeline_poll(app: AppHandle, id: u64, cwd: String, uuid: String, stop: A
         }
         last_fp = fp;
 
-        // First cut: live emit only (persistence/reopen is the next increment —
-        // codex B-2b F2/F3: re-persisting the resume replay duplicates history,
-        // so the persist model is being revisited).
+        let items_v = items.to_vec();
+        let turns_v: Vec<(u64, String)> = t.turns().iter().map(|(k, v)| (*k, v.clone())).collect();
+        let answers_v: Vec<(u64, String)> =
+            t.answers().iter().map(|(k, v)| (*k, v.clone())).collect();
+        let dates_v: Vec<(u64, String)> = t.dates().iter().map(|(k, v)| (*k, v.clone())).collect();
+
         let _ = app.emit(
             "claude-timeline",
             ClaudeTimelinePayload {
                 id,
-                items: items.to_vec(),
-                turns: t.turns().iter().map(|(k, v)| (*k, v.clone())).collect(),
-                answers: t.answers().iter().map(|(k, v)| (*k, v.clone())).collect(),
-                dates: t.dates().iter().map(|(k, v)| (*k, v.clone())).collect(),
+                items: items_v.clone(),
+                turns: turns_v.clone(),
+                answers: answers_v.clone(),
+                dates: dates_v.clone(),
             },
         );
+
+        // Persist a whole-session snapshot (D-1): overwrite, so the session
+        // survives restart and can be listed/reopened, without the append
+        // duplication. A rename (claude_rename writes the snapshot's name) is
+        // preserved by reading the existing name back here.
+        if let Ok(base) = app.path().app_data_dir() {
+            let name = core_lib::snapshot::load(&base, &cwd, &uuid)
+                .map(|s| s.name)
+                .unwrap_or_else(|| initial_name.clone());
+            let date = chrono::Local::now().format("%Y-%m-%d").to_string();
+            let snap = core_lib::snapshot::SessionSnapshot {
+                uuid: uuid.clone(),
+                name,
+                date,
+                items: items_v,
+                turns: turns_v,
+                answers: answers_v,
+                dates: dates_v,
+            };
+            let _ = core_lib::snapshot::save(&base, &cwd, &snap);
+        }
     }
 
     // Drop our stop-flag entry so a later id collision can't see a stale flag.
@@ -497,6 +531,59 @@ fn run_timeline_poll(app: AppHandle, id: u64, cwd: String, uuid: String, stop: A
             polls.remove(&id);
         }
     }
+}
+
+/// List the saved Claude (A) sessions for `project`, newest first (for the
+/// "+ Claude(A)" reopen picker).
+#[tauri::command]
+pub fn claude_sessions(app: AppHandle, project: String) -> Vec<core_lib::snapshot::SnapshotSummary> {
+    let Ok(base) = app.path().app_data_dir() else {
+        return vec![];
+    };
+    core_lib::snapshot::list(&base, &project)
+}
+
+/// Load a saved session's full timeline snapshot, to seed the panel on reopen.
+#[tauri::command]
+pub fn claude_session_snapshot(
+    app: AppHandle,
+    project: String,
+    uuid: String,
+) -> Option<core_lib::snapshot::SessionSnapshot> {
+    let base = app.path().app_data_dir().ok()?;
+    core_lib::snapshot::load(&base, &project, &uuid)
+}
+
+/// Rename a saved session (persists in its snapshot; the poll thread reads the
+/// name back so it isn't clobbered).
+#[tauri::command]
+pub fn claude_rename(
+    app: AppHandle,
+    project: String,
+    uuid: String,
+    name: String,
+) -> Result<(), AppError> {
+    let base = app
+        .path()
+        .app_data_dir()
+        .map_err(|_| AppError::new("Cannot resolve app data directory"))?;
+    let mut snap = core_lib::snapshot::load(&base, &project, &uuid)
+        .ok_or_else(|| AppError::new("unknown session"))?;
+    snap.name = name;
+    core_lib::snapshot::save(&base, &project, &snap)
+        .map_err(|e| AppError::new(io_message("Cannot rename session", &e)))
+}
+
+/// Delete a saved session's snapshot (the `삭제` action). The live session, if
+/// any, should be closed separately via `claude_close`.
+#[tauri::command]
+pub fn claude_delete(app: AppHandle, project: String, uuid: String) -> Result<(), AppError> {
+    let base = app
+        .path()
+        .app_data_dir()
+        .map_err(|_| AppError::new("Cannot resolve app data directory"))?;
+    core_lib::snapshot::delete(&base, &project, &uuid)
+        .map_err(|e| AppError::new(io_message("Cannot delete session", &e)))
 }
 
 /// Close a Claude session: stop its polling thread and kill the PTY (which ends

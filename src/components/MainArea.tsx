@@ -16,20 +16,22 @@ import { ClaudePanel } from "./ClaudePanel";
 import { ClaudeTermPanel } from "./ClaudeTermPanel";
 import { ClaudeTab } from "./ClaudeTab";
 
-/** A saved Claude session, for the "+ Claude" picker (S3c). */
+/** A saved session normalized for the reopen picker (ACP `claude` or A
+ * `claudeterm`). `id` is the session UUID. */
 interface SessionSummary {
-  session_id: string;
+  id: string;
   date: string;
   name: string;
   title: string;
   count: number;
 }
 
-/** Default tab for all panels. Claude panels keep the standard tab look but
- * override its × to raise a close request (-> 닫기/삭제 modal, B3-1); this
- * applies to restored panels too. */
+/** Default tab for all panels. Both Claude panel kinds (ACP `claude` and the
+ * architecture-A `claudeterm`) use the custom tab — its × raises a 닫기/삭제
+ * modal and its title renames inline (B3-1/B3-5). */
 function AppTab(props: IDockviewPanelHeaderProps) {
-  if (props.params.kind === "claude") return <ClaudeTab {...props} />;
+  const kind = props.params.kind;
+  if (kind === "claude" || kind === "claudeterm") return <ClaudeTab {...props} />;
   return <DockviewDefaultTab {...props} />;
 }
 
@@ -62,6 +64,8 @@ export function MainArea() {
   // Saved-session picker for "+ Claude" (null = closed) + the name a "새 세션"
   // would get (B3-4: per-project "Claude N", computed when the picker opens).
   const [picker, setPicker] = useState<SessionSummary[] | null>(null);
+  // Which kind the open picker creates/reopens: ACP `claude` or A `claudeterm`.
+  const [pickerKind, setPickerKind] = useState<"claude" | "claudeterm">("claudeterm");
   const [newName, setNewName] = useState("Claude 1");
   // Close request raised by a Claude tab's × (B3-1).
   const closeRequest = useClaudeUi((s) => s.closeRequest);
@@ -139,50 +143,79 @@ export function MainArea() {
     clearClose();
     if (!req) return;
     if (deleteHistory && req.sessionId && activeProject) {
-      invoke("acp_delete_session", { project: activeProject, sessionId: req.sessionId }).catch(
-        () => {},
-      );
+      const cmd = req.kind === "claudeterm" ? "claude_delete" : "acp_delete_session";
+      const args =
+        req.kind === "claudeterm"
+          ? { project: activeProject, uuid: req.sessionId }
+          : { project: activeProject, sessionId: req.sessionId };
+      invoke(cmd, args).catch(() => {});
     }
     apiRef.current?.getPanel(req.panelId)?.api.close();
   };
 
-  /** Session ids currently open in a panel (live `sessionId` or read-only
-   * `loadSessionId`), so the picker can exclude them (B3-2). */
+  /** Session ids currently open in a panel (live `sessionId`/`sessionUuid` or
+   * read-only `loadSessionId`), so the picker can exclude them (B3-2). */
   const openSessionIds = (): Set<string> => {
     const ids = new Set<string>();
     for (const p of apiRef.current?.panels ?? []) {
-      const prm = p.params as { sessionId?: string; loadSessionId?: string } | undefined;
-      if (prm?.sessionId) ids.add(prm.sessionId);
+      const prm = p.params as
+        | { sessionId?: string; sessionUuid?: string; loadSessionId?: string }
+        | undefined;
+      // claude panels carry a string sessionId; claudeterm's sessionId is the
+      // numeric PTY id, so its session UUID is `sessionUuid`.
+      if (typeof prm?.sessionId === "string") ids.add(prm.sessionId);
+      if (prm?.sessionUuid) ids.add(prm.sessionUuid);
       if (prm?.loadSessionId) ids.add(prm.loadSessionId);
     }
     return ids;
   };
 
-  /** Open Claude panels (for numbering): empty sessions never persist, so the
-   * next number is saved sessions + currently-open Claude panels + 1 (B3-4). */
-  const openClaudeCount = (): number =>
+  /** Open panels of `kind` (for numbering): empty sessions never persist, so the
+   * next number is saved sessions + currently-open panels of that kind + 1. */
+  const openKindCount = (kind: PanelKind): number =>
     (apiRef.current?.panels ?? []).filter(
-      (p) => (p.params as { kind?: string } | undefined)?.kind === "claude",
+      (p) => (p.params as { kind?: string } | undefined)?.kind === kind,
     ).length;
 
-  // "+ Claude": always open the picker — name a new session or reopen a saved
-  // (not-already-open) one (B3-2/B3-5).
-  const openClaude = async () => {
+  // "+ Claude" / "+ Claude(A)": open the picker — name a new session or reopen a
+  // saved (not-already-open) one. Normalizes both backends to `SessionSummary`.
+  const openPicker = async (kind: "claude" | "claudeterm") => {
+    setPickerKind(kind);
     let sessions: SessionSummary[] = [];
     if (activeProject) {
-      sessions = await invoke<SessionSummary[]>("acp_sessions", { project: activeProject }).catch(
-        () => [],
-      );
+      if (kind === "claudeterm") {
+        const raw = await invoke<
+          { uuid: string; name: string; title: string; date: string; count: number }[]
+        >("claude_sessions", { project: activeProject }).catch(() => []);
+        sessions = raw.map((s) => ({
+          id: s.uuid,
+          name: s.name,
+          title: s.title,
+          date: s.date,
+          count: s.count,
+        }));
+      } else {
+        const raw = await invoke<
+          { session_id: string; name: string; title: string; date: string; count: number }[]
+        >("acp_sessions", { project: activeProject }).catch(() => []);
+        sessions = raw.map((s) => ({
+          id: s.session_id,
+          name: s.name,
+          title: s.title,
+          date: s.date,
+          count: s.count,
+        }));
+      }
     }
-    setNewName(`Claude ${sessions.length + openClaudeCount() + 1}`);
+    setNewName(`Claude ${sessions.length + openKindCount(kind) + 1}`);
     const open = openSessionIds();
-    setPicker(sessions.filter((s) => !open.has(s.session_id)));
+    setPicker(sessions.filter((s) => !open.has(s.id)));
   };
 
-  const createNewClaude = () => {
+  const createNewSession = () => {
     const name = newName.trim() || "Claude";
     setPicker(null);
-    addPanel("claude", { title: name });
+    addPanel(pickerKind, { title: name });
   };
 
   // Alt+←/→/↑/↓ cycles the active session tab (dockview panel). Left/Up = prev,
@@ -214,10 +247,10 @@ export function MainArea() {
         <button className="toolbar-btn" onClick={() => addPanel("terminal")}>
           + Terminal
         </button>
-        <button className="toolbar-btn" onClick={openClaude}>
+        <button className="toolbar-btn" onClick={() => openPicker("claude")}>
           + Claude
         </button>
-        <button className="toolbar-btn" onClick={() => addPanel("claudeterm")}>
+        <button className="toolbar-btn" onClick={() => openPicker("claudeterm")}>
           + Claude(A)
         </button>
         <button className="toolbar-btn" onClick={() => addPanel("editor")}>
@@ -233,23 +266,23 @@ export function MainArea() {
                 placeholder="새 세션 이름"
                 onChange={(e) => setNewName(e.target.value)}
                 onKeyDown={(e) => {
-                  if (e.key === "Enter") createNewClaude();
+                  if (e.key === "Enter") createNewSession();
                   else if (e.key === "Escape") setPicker(null);
                 }}
               />
-              <button className="claude-picker-create" onClick={createNewClaude}>
+              <button className="claude-picker-create" onClick={createNewSession}>
                 + 만들기
               </button>
             </div>
             {picker.length > 0 && <div className="claude-picker-sep">저장된 세션</div>}
             {picker.map((s) => (
               <button
-                key={s.session_id}
+                key={s.id}
                 className="claude-picker-item"
                 onClick={() => {
                   setPicker(null);
-                  addPanel("claude", {
-                    loadSessionId: s.session_id,
+                  addPanel(pickerKind, {
+                    loadSessionId: s.id,
                     title: s.name || s.title?.slice(0, 24) || s.date,
                   });
                 }}

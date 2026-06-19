@@ -12,8 +12,13 @@ import { useClaudeUi } from "../state/claudeUi";
  */
 export function ClaudeTab(props: IDockviewPanelHeaderProps) {
   const title = (props.params.title as string) ?? "Claude";
+  const kind = (props.params.kind as string) === "claudeterm" ? "claudeterm" : "claude";
+  // The session UUID to rename/delete. ACP panels key by `sessionId`; the
+  // architecture-A terminal keys by `sessionUuid` (its Claude session id).
   const sessionId =
-    (props.params.sessionId as string) ?? (props.params.loadSessionId as string) ?? null;
+    kind === "claudeterm"
+      ? ((props.params.sessionUuid as string) ?? (props.params.loadSessionId as string) ?? null)
+      : ((props.params.sessionId as string) ?? (props.params.loadSessionId as string) ?? null);
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState(title);
 
@@ -25,7 +30,12 @@ export function ClaudeTab(props: IDockviewPanelHeaderProps) {
     props.api.updateParameters({ ...props.params, title: next });
     const project = useAppStore.getState().activeProject ?? null;
     if (sessionId && project) {
-      invoke("acp_rename_session", { project, sessionId, name: next }).catch(() => {});
+      const cmd = kind === "claudeterm" ? "claude_rename" : "acp_rename_session";
+      const args =
+        kind === "claudeterm"
+          ? { project, uuid: sessionId, name: next }
+          : { project, sessionId, name: next };
+      invoke(cmd, args).catch(() => {});
     }
   };
 
@@ -70,7 +80,7 @@ export function ClaudeTab(props: IDockviewPanelHeaderProps) {
         onMouseDown={(e) => e.stopPropagation()}
         onClick={(e) => {
           e.stopPropagation();
-          useClaudeUi.getState().requestClose({ panelId: props.api.id, sessionId });
+          useClaudeUi.getState().requestClose({ panelId: props.api.id, sessionId, kind });
         }}
       >
         ×
