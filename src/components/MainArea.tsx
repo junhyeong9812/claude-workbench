@@ -66,8 +66,10 @@ export function MainArea() {
   const apiRef = useRef<DockviewApi | null>(null);
   // Monotonic per-mount counter for human-friendly panel titles.
   const counterRef = useRef(0);
-  // Saved-session picker for "+ Claude" (null = closed).
+  // Saved-session picker for "+ Claude" (null = closed) + the name a "새 세션"
+  // would get (B3-4: per-project "Claude N", computed when the picker opens).
   const [picker, setPicker] = useState<SessionSummary[] | null>(null);
+  const [newName, setNewName] = useState("Claude 1");
   // Close request raised by a Claude tab's × (B3-1).
   const closeRequest = useClaudeUi((s) => s.closeRequest);
   const clearClose = useClaudeUi((s) => s.clearClose);
@@ -152,6 +154,13 @@ export function MainArea() {
     return ids;
   };
 
+  /** Open Claude panels (for numbering): empty sessions never persist, so the
+   * next number is saved sessions + currently-open Claude panels + 1 (B3-4). */
+  const openClaudeCount = (): number =>
+    (apiRef.current?.panels ?? []).filter(
+      (p) => (p.params as { kind?: string } | undefined)?.kind === "claude",
+    ).length;
+
   // "+ Claude": offer to reopen a saved (and not-already-open) session, else new.
   const openClaude = async () => {
     let sessions: SessionSummary[] = [];
@@ -160,10 +169,15 @@ export function MainArea() {
         () => [],
       );
     }
+    const name = `Claude ${sessions.length + openClaudeCount() + 1}`;
     const open = openSessionIds();
-    sessions = sessions.filter((s) => !open.has(s.session_id));
-    if (sessions.length === 0) addPanel("claude");
-    else setPicker(sessions);
+    const available = sessions.filter((s) => !open.has(s.session_id));
+    if (available.length === 0) {
+      addPanel("claude", { title: name });
+    } else {
+      setNewName(name);
+      setPicker(available);
+    }
   };
 
   return (
@@ -184,10 +198,10 @@ export function MainArea() {
               className="claude-picker-item claude-picker-new"
               onClick={() => {
                 setPicker(null);
-                addPanel("claude");
+                addPanel("claude", { title: newName });
               }}
             >
-              + 새 세션
+              + 새 세션 <span className="claude-picker-meta">{newName}</span>
             </button>
             {picker.map((s) => (
               <button
