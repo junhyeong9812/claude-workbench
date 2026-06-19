@@ -168,6 +168,72 @@ body {
   position: relative;
 }
 
+/* Custom Claude tab with ×→닫기/삭제 menu (B3-1) */
+.claude-tab {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 0 8px;
+  height: 100%;
+  position: relative;
+}
+.claude-tab-title {
+  font-size: 13px;
+}
+.claude-tab-x {
+  cursor: pointer;
+  color: var(--fg-dim);
+  font-size: 14px;
+  line-height: 1;
+  padding: 0 2px;
+  border-radius: 3px;
+}
+.claude-tab-x:hover {
+  color: var(--fg);
+  background: var(--bg-hover);
+}
+.claude-tab-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 30;
+}
+.claude-tab-menu {
+  position: absolute;
+  top: 100%;
+  right: 0;
+  z-index: 31;
+  margin-top: 2px;
+  display: flex;
+  flex-direction: column;
+  min-width: 160px;
+  background: var(--bg-alt);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.4);
+}
+.claude-tab-opt {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 8px;
+  padding: 6px 10px;
+  background: none;
+  border: none;
+  color: var(--fg);
+  text-align: left;
+  cursor: pointer;
+}
+.claude-tab-opt:hover {
+  background: var(--bg-hover);
+}
+.claude-tab-del:hover {
+  color: #f85149;
+}
+.claude-tab-hint {
+  font-size: 10px;
+  color: var(--fg-dim);
+}
+
 /* "+ Claude" saved-session picker (S3c) */
 .claude-picker {
   position: absolute;

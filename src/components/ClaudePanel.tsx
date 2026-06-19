@@ -109,6 +109,10 @@ export function ClaudePanel(props: IDockviewPanelProps<ClaudeParams>) {
   // The panel's ACP id; a ref so the listener (registered before `acp_start`
   // resolves) can filter without re-subscribing.
   const acpIdRef = useRef<number | null>(props.params.acpId ?? null);
+  // Latest params (updated every render) so writes never clobber fields set by
+  // an earlier `updateParameters` captured in a stale closure.
+  const paramsRef = useRef(props.params);
+  paramsRef.current = props.params;
   // The adapter session id (for delete/persistence). Known up-front for a
   // reopened session; captured from the `connected` event for a live one.
   const sessionIdRef = useRef<string | null>(props.params.loadSessionId ?? null);
@@ -168,6 +172,9 @@ export function ClaudePanel(props: IDockviewPanelProps<ClaudeParams>) {
       switch (ev.type) {
         case "connected":
           sessionIdRef.current = ev.session_id;
+          // Publish the session id into params so the tab (×→삭제) and the
+          // "+ Claude" open-filter can see it.
+          props.api.updateParameters({ ...paramsRef.current, sessionId: ev.session_id });
           setStatus("ready");
           setAuthCommand(null);
           break;
@@ -309,20 +316,6 @@ export function ClaudePanel(props: IDockviewPanelProps<ClaudeParams>) {
     });
   };
 
-  // Close the panel (닫기): keep the persisted history; the live host, if any,
-  // is closed by MainArea's onDidRemovePanel.
-  const closePanel = () => props.api.close();
-
-  // Delete (삭제): remove this session's persisted history, then close.
-  const deletePanel = () => {
-    const sid = sessionIdRef.current;
-    const project = useAppStore.getState().activeProject ?? null;
-    if (sid && project) {
-      invoke("acp_delete_session", { project, sessionId: sid }).catch(() => {});
-    }
-    props.api.close();
-  };
-
   const statusLabel: Record<Status, string> = {
     starting: "Connecting…",
     auth: "Sign-in required",
@@ -343,16 +336,6 @@ export function ClaudePanel(props: IDockviewPanelProps<ClaudeParams>) {
           title="이 세션의 변경 타임라인"
         >
           {showTimeline ? "타임라인 닫기" : `타임라인 열기${tlItems.size ? ` (${tlItems.size})` : ""}`}
-        </button>
-        <button className="claude-tl-toggle" onClick={closePanel} title="세션 유지하고 닫기">
-          닫기
-        </button>
-        <button
-          className="claude-tl-toggle claude-del"
-          onClick={deletePanel}
-          title="히스토리까지 삭제"
-        >
-          삭제
         </button>
       </div>
 

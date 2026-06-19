@@ -10,6 +10,7 @@ import { useAppStore } from "../state/store";
 import { PlaceholderPanel } from "./PlaceholderPanel";
 import { TerminalPanel } from "./TerminalPanel";
 import { ClaudePanel } from "./ClaudePanel";
+import { ClaudeTab } from "./ClaudeTab";
 
 /** A saved Claude session, for the "+ Claude" picker (S3c). */
 interface SessionSummary {
@@ -97,11 +98,25 @@ export function MainArea() {
       id: `${kind}-${Date.now()}`,
       component,
       title,
+      // Claude panels get the custom tab (× -> 닫기/삭제 menu, B3-1).
+      ...(kind === "claude" ? { tabComponent: "claudeTab" } : {}),
       params: { kind, title, ...(opts?.loadSessionId ? { loadSessionId: opts.loadSessionId } : {}) },
     });
   };
 
-  // "+ Claude": offer to reopen a saved session for this project, else open new.
+  /** Session ids currently open in a panel (live `sessionId` or read-only
+   * `loadSessionId`), so the picker can exclude them (B3-2). */
+  const openSessionIds = (): Set<string> => {
+    const ids = new Set<string>();
+    for (const p of apiRef.current?.panels ?? []) {
+      const prm = p.params as { sessionId?: string; loadSessionId?: string } | undefined;
+      if (prm?.sessionId) ids.add(prm.sessionId);
+      if (prm?.loadSessionId) ids.add(prm.loadSessionId);
+    }
+    return ids;
+  };
+
+  // "+ Claude": offer to reopen a saved (and not-already-open) session, else new.
   const openClaude = async () => {
     let sessions: SessionSummary[] = [];
     if (activeProject) {
@@ -109,6 +124,8 @@ export function MainArea() {
         () => [],
       );
     }
+    const open = openSessionIds();
+    sessions = sessions.filter((s) => !open.has(s.session_id));
     if (sessions.length === 0) addPanel("claude");
     else setPicker(sessions);
   };
@@ -164,6 +181,7 @@ export function MainArea() {
         key={activeProject ?? "none"}
         className="dockview-theme-dark main-dock"
         components={components}
+        tabComponents={{ claudeTab: ClaudeTab }}
         onReady={onReady}
       />
     </div>
