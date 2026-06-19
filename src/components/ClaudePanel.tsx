@@ -11,6 +11,9 @@ export interface ClaudeParams {
   kind?: string;
   title?: string;
   acpId?: number;
+  /** If set, the panel opens a **saved** session read-only (S3c reopen): it
+   * loads that session's persisted timeline instead of starting a live one. */
+  loadSessionId?: string;
 }
 
 /** Mirror of `core_acp::AcpEvent` (serde tag = "type", snake_case) plus the
@@ -38,6 +41,11 @@ type AcpEvent =
   | { id: number; type: "turn_started"; turn: number; prompt: string; session_id: string }
   | { id: number; type: "error"; message: string }
   | { id: number; type: "disconnected" };
+
+/** A persisted timeline record (from `acp_session_timeline`, S3c reopen). */
+type TimelineRecord =
+  | ({ type: "timeline_item" } & TimelineItem)
+  | { type: "turn_started"; turn: number; prompt: string; session_id: string };
 
 /** A pending tool approval awaiting the user's decision (S2b-2). */
 interface PermissionRequest {
@@ -82,7 +90,7 @@ export function ClaudePanel(props: IDockviewPanelProps<ClaudeParams>) {
   // `Connected` event already fired on first mount and won't repeat, so start
   // optimistically `ready` (a dead session surfaces via a prompt error).
   const [status, setStatus] = useState<Status>(
-    props.params.acpId != null ? "ready" : "starting",
+    props.params.loadSessionId != null ? "closed" : props.params.acpId != null ? "ready" : "starting",
   );
   const [messages, setMessages] = useState<Message[]>([]);
   const [authCommand, setAuthCommand] = useState<string | null>(null);
@@ -101,6 +109,10 @@ export function ClaudePanel(props: IDockviewPanelProps<ClaudeParams>) {
   // The panel's ACP id; a ref so the listener (registered before `acp_start`
   // resolves) can filter without re-subscribing.
   const acpIdRef = useRef<number | null>(props.params.acpId ?? null);
+  // The adapter session id (for delete/persistence). Known up-front for a
+  // reopened session; captured from the `connected` event for a live one.
+  const sessionIdRef = useRef<string | null>(props.params.loadSessionId ?? null);
+  const readOnly = props.params.loadSessionId != null;
   const mountedRef = useRef(true);
   const logRef = useRef<HTMLDivElement | null>(null);
   // True while an IME composition is in progress (Hangul/CJK). Enter must not
@@ -155,6 +167,7 @@ export function ClaudePanel(props: IDockviewPanelProps<ClaudeParams>) {
       if (ev.id !== acpIdRef.current) return;
       switch (ev.type) {
         case "connected":
+          sessionIdRef.current = ev.session_id;
           setStatus("ready");
           setAuthCommand(null);
           break;
@@ -212,7 +225,26 @@ export function ClaudePanel(props: IDockviewPanelProps<ClaudeParams>) {
       }
       unlisten = fn;
 
-      if (acpIdRef.current == null) {
+      if (readOnly && props.params.loadSessionId) {
+        // Reopen a saved session read-only: load its persisted timeline; no
+        // live adapter connection (S3c).
+        const project = useAppStore.getState().activeProject ?? null;
+        const events = await invoke<TimelineRecord[]>("acp_session_timeline", {
+          project,
+          sessionId: props.params.loadSessionId,
+        }).catch(() => [] as TimelineRecord[]);
+        if (disposed) return;
+        const tt = new Map<number, string>();
+        const ti = new Map<string, TimelineItem>();
+        for (const ev of events) {
+          if (ev.type === "turn_started") tt.set(ev.turn, ev.prompt);
+          else if (ev.type === "timeline_item") ti.set(ev.tool_call_id, ev);
+        }
+        setTlTurns(tt);
+        setTlItems(ti);
+        setShowTimeline(true);
+        setStatus("closed");
+      } else if (acpIdRef.current == null) {
         // Fresh panel -> start a new session.
         await connect();
       } else {
@@ -277,12 +309,26 @@ export function ClaudePanel(props: IDockviewPanelProps<ClaudeParams>) {
     });
   };
 
+  // Close the panel (닫기): keep the persisted history; the live host, if any,
+  // is closed by MainArea's onDidRemovePanel.
+  const closePanel = () => props.api.close();
+
+  // Delete (삭제): remove this session's persisted history, then close.
+  const deletePanel = () => {
+    const sid = sessionIdRef.current;
+    const project = useAppStore.getState().activeProject ?? null;
+    if (sid && project) {
+      invoke("acp_delete_session", { project, sessionId: sid }).catch(() => {});
+    }
+    props.api.close();
+  };
+
   const statusLabel: Record<Status, string> = {
     starting: "Connecting…",
     auth: "Sign-in required",
     ready: "Ready",
     error: "Error",
-    closed: "Disconnected",
+    closed: readOnly ? "저장된 세션 (읽기 전용)" : "Disconnected",
   };
 
   return (
@@ -297,6 +343,16 @@ export function ClaudePanel(props: IDockviewPanelProps<ClaudeParams>) {
           title="이 세션의 변경 타임라인"
         >
           {showTimeline ? "타임라인 닫기" : `타임라인 열기${tlItems.size ? ` (${tlItems.size})` : ""}`}
+        </button>
+        <button className="claude-tl-toggle" onClick={closePanel} title="세션 유지하고 닫기">
+          닫기
+        </button>
+        <button
+          className="claude-tl-toggle claude-del"
+          onClick={deletePanel}
+          title="히스토리까지 삭제"
+        >
+          삭제
         </button>
       </div>
 

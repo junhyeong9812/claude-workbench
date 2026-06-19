@@ -1,4 +1,4 @@
-import { useRef } from "react";
+import { useRef, useState } from "react";
 import {
   DockviewReact,
   type DockviewApi,
@@ -10,6 +10,14 @@ import { useAppStore } from "../state/store";
 import { PlaceholderPanel } from "./PlaceholderPanel";
 import { TerminalPanel } from "./TerminalPanel";
 import { ClaudePanel } from "./ClaudePanel";
+
+/** A saved Claude session, for the "+ Claude" picker (S3c). */
+interface SessionSummary {
+  session_id: string;
+  date: string;
+  title: string;
+  count: number;
+}
 
 /** dockview component registry — maps component name -> React panel. */
 const components = {
@@ -36,6 +44,8 @@ export function MainArea() {
   const apiRef = useRef<DockviewApi | null>(null);
   // Monotonic per-mount counter for human-friendly panel titles.
   const counterRef = useRef(0);
+  // Saved-session picker for "+ Claude" (null = closed).
+  const [picker, setPicker] = useState<SessionSummary[] | null>(null);
 
   // The layout for the project this mount belongs to (read once at onReady).
   const savedLayout = projects.find((p) => p.path === activeProject)?.layout;
@@ -74,11 +84,11 @@ export function MainArea() {
     });
   };
 
-  const addPanel = (kind: PanelKind) => {
+  const addPanel = (kind: PanelKind, opts?: { loadSessionId?: string; title?: string }) => {
     const api = apiRef.current;
     if (!api) return;
     const n = ++counterRef.current;
-    const title = `${kind[0].toUpperCase()}${kind.slice(1)} ${n}`;
+    const title = opts?.title ?? `${kind[0].toUpperCase()}${kind.slice(1)} ${n}`;
     // Terminals get the real PTY panel, Claude the ACP panel (with its own
     // embedded change timeline); editor stays a stub until P3.
     const component =
@@ -87,8 +97,20 @@ export function MainArea() {
       id: `${kind}-${Date.now()}`,
       component,
       title,
-      params: { kind, title },
+      params: { kind, title, ...(opts?.loadSessionId ? { loadSessionId: opts.loadSessionId } : {}) },
     });
+  };
+
+  // "+ Claude": offer to reopen a saved session for this project, else open new.
+  const openClaude = async () => {
+    let sessions: SessionSummary[] = [];
+    if (activeProject) {
+      sessions = await invoke<SessionSummary[]>("acp_sessions", { project: activeProject }).catch(
+        () => [],
+      );
+    }
+    if (sessions.length === 0) addPanel("claude");
+    else setPicker(sessions);
   };
 
   return (
@@ -97,12 +119,46 @@ export function MainArea() {
         <button className="toolbar-btn" onClick={() => addPanel("terminal")}>
           + Terminal
         </button>
-        <button className="toolbar-btn" onClick={() => addPanel("claude")}>
+        <button className="toolbar-btn" onClick={openClaude}>
           + Claude
         </button>
         <button className="toolbar-btn" onClick={() => addPanel("editor")}>
           + Editor
         </button>
+        {picker && (
+          <div className="claude-picker">
+            <button
+              className="claude-picker-item claude-picker-new"
+              onClick={() => {
+                setPicker(null);
+                addPanel("claude");
+              }}
+            >
+              + 새 세션
+            </button>
+            {picker.map((s) => (
+              <button
+                key={s.session_id}
+                className="claude-picker-item"
+                onClick={() => {
+                  setPicker(null);
+                  addPanel("claude", {
+                    loadSessionId: s.session_id,
+                    title: s.title ? s.title.slice(0, 24) : s.date,
+                  });
+                }}
+              >
+                <span className="claude-picker-title">{s.title || "(제목 없음)"}</span>
+                <span className="claude-picker-meta">
+                  {s.date} · 변경 {s.count}
+                </span>
+              </button>
+            ))}
+            <button className="claude-picker-item claude-picker-cancel" onClick={() => setPicker(null)}>
+              취소
+            </button>
+          </div>
+        )}
       </div>
       <DockviewReact
         key={activeProject ?? "none"}
