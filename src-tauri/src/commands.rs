@@ -344,15 +344,40 @@ fn persist_event(app: &AppHandle, project: &str, event: &AcpEvent) {
     }
 }
 
-/// A saved session, summarized for the "open" picker (S3c).
+/// A saved session, summarized for the "open" picker (S3c/B3-5).
 #[derive(Serialize)]
 pub struct SessionSummary {
     session_id: String,
     date: String,
-    /// The first prompt of the session (its first turn), as a title.
+    /// User-facing name ("Claude N" or a rename). Falls back to the title.
+    name: String,
+    /// The first prompt of the session (its first turn), shown as subtext.
     title: String,
     /// Number of timeline (tool-call) items recorded.
     count: usize,
+}
+
+/// Persist a session's display name (B3-5). Appended as a `session_name` record;
+/// the latest one wins on load. Called on the first prompt (so empty sessions
+/// stay unsaved) and on rename.
+#[tauri::command]
+pub fn acp_rename_session(
+    app: AppHandle,
+    project: String,
+    session_id: String,
+    name: String,
+) -> Result<(), AppError> {
+    let base = app
+        .path()
+        .app_data_dir()
+        .map_err(|_| AppError::new("Cannot resolve app data directory"))?;
+    let date = chrono::Local::now().format("%Y-%m-%d").to_string();
+    let line = serde_json::json!({
+        "type": "session_name", "session_id": session_id, "name": name, "date": date,
+    })
+    .to_string();
+    core_lib::history::append(&base, &project, &date, &session_id, &line)
+        .map_err(|e| AppError::new(io_message("Cannot rename session", &e)))
 }
 
 /// List the saved Claude sessions for `project`, newest first.
@@ -369,6 +394,7 @@ pub fn acp_sessions(app: AppHandle, project: String) -> Vec<SessionSummary> {
         let mut session_id = String::new();
         let mut date = String::new();
         let mut title = String::new();
+        let mut name = String::new();
         let mut count = 0usize;
         for line in content.lines() {
             let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
@@ -382,14 +408,22 @@ pub fn acp_sessions(app: AppHandle, project: String) -> Vec<SessionSummary> {
                 Some("turn_started") if title.is_empty() => {
                     title = v.get("prompt").and_then(|x| x.as_str()).unwrap_or("").to_string();
                 }
+                // Latest session_name wins.
+                Some("session_name") => {
+                    name = v.get("name").and_then(|x| x.as_str()).unwrap_or("").to_string();
+                }
                 Some("timeline_item") => count += 1,
                 _ => {}
             }
         }
         if !session_id.is_empty() {
+            if name.is_empty() {
+                name = title.clone();
+            }
             out.push(SessionSummary {
                 session_id,
                 date,
+                name,
                 title,
                 count,
             });

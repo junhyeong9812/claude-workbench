@@ -18,6 +18,7 @@ import { ClaudePanel } from "./ClaudePanel";
 interface SessionSummary {
   session_id: string;
   date: string;
+  name: string;
   title: string;
   count: number;
 }
@@ -211,12 +212,13 @@ export function MainArea() {
                   setPicker(null);
                   addPanel("claude", {
                     loadSessionId: s.session_id,
-                    title: s.title ? s.title.slice(0, 24) : s.date,
+                    title: s.name || s.title?.slice(0, 24) || s.date,
                   });
                 }}
               >
-                <span className="claude-picker-title">{s.title || "(제목 없음)"}</span>
+                <span className="claude-picker-title">{s.name || "(이름 없음)"}</span>
                 <span className="claude-picker-meta">
+                  {s.title ? `${s.title.slice(0, 40)} · ` : ""}
                   {s.date} · 변경 {s.count}
                 </span>
               </button>

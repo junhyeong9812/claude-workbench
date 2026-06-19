@@ -78,6 +78,7 @@ pub fn run() {
             commands::acp_sessions,
             commands::acp_session_timeline,
             commands::acp_delete_session,
+            commands::acp_rename_session,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

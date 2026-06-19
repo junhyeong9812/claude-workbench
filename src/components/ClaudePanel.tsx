@@ -120,6 +120,8 @@ export function ClaudePanel(props: IDockviewPanelProps<ClaudeParams>) {
   // reopened session; captured from the `connected` event for a live one.
   const sessionIdRef = useRef<string | null>(props.params.loadSessionId ?? null);
   const readOnly = props.params.loadSessionId != null;
+  // Whether this session's name has been persisted yet (on first prompt, B3-5).
+  const namePersistedRef = useRef(readOnly);
   const mountedRef = useRef(true);
   const logRef = useRef<HTMLDivElement | null>(null);
   // True while an IME composition is in progress (Hangul/CJK). Enter must not
@@ -299,10 +301,35 @@ export function ClaudePanel(props: IDockviewPanelProps<ClaudeParams>) {
     setMessages((prev) => [...prev, { role: "user", text }]);
     setInput("");
     setThinking(true);
+    // Persist the session name on its first prompt (so empty sessions stay
+    // unsaved, B3-4/B3-5).
+    if (!namePersistedRef.current) {
+      namePersistedRef.current = true;
+      persistName((paramsRef.current.title as string) ?? "Claude");
+    }
     invoke("acp_prompt", { id, text }).catch((err) => {
       setThinking(false);
       setErrorMsg(errString(err));
     });
+  };
+
+  // Persist this session's display name (B3-5), if we know the session id.
+  const persistName = (name: string) => {
+    const sid = sessionIdRef.current;
+    const project = useAppStore.getState().activeProject ?? null;
+    if (sid && project) {
+      invoke("acp_rename_session", { project, sessionId: sid, name }).catch(() => {});
+    }
+  };
+
+  // Rename: prompt for a new name, update the tab title and persist it.
+  const rename = () => {
+    const current = (paramsRef.current.title as string) ?? "Claude";
+    const next = window.prompt("세션 이름", current)?.trim();
+    if (!next || next === current) return;
+    props.api.setTitle(next);
+    props.api.updateParameters({ ...paramsRef.current, title: next });
+    persistName(next);
   };
 
   const respondPerm = (requestId: number, optionId: string) => {
@@ -340,6 +367,11 @@ export function ClaudePanel(props: IDockviewPanelProps<ClaudeParams>) {
       <div className="claude-status">
         <span className={`claude-dot claude-dot-${status}`} />
         {statusLabel[status]}
+        {!readOnly && (
+          <button className="claude-tl-toggle" onClick={rename} title="세션 이름 변경">
+            ✎ 이름
+          </button>
+        )}
         <button
           className="claude-tl-toggle"
           onClick={() => setShowTimeline((v) => !v)}
