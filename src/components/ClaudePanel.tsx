@@ -111,6 +111,36 @@ export function ClaudePanel(props: IDockviewPanelProps<ClaudeParams>) {
   // The timeline item whose content is shown in the viewer that splits the chat
   // area (B4). Null = no viewer (chat takes the full width).
   const [selectedItem, setSelectedItem] = useState<TimelineItem | null>(null);
+  const panelRef = useRef<HTMLDivElement>(null);
+
+  // Ctrl+←/→ moves focus across the panes (chat → viewer → timeline), so the
+  // keyboard can reach the open change view and get back to the chat (B4).
+  const movePane = (e: React.KeyboardEvent<HTMLDivElement>) => {
+    if (!e.ctrlKey || (e.key !== "ArrowLeft" && e.key !== "ArrowRight")) return;
+    const root = panelRef.current;
+    if (!root) return;
+    const panes = [
+      { container: ".claude-main", focus: ".claude-input textarea" },
+      { container: ".claude-viewer", focus: ".claude-viewer-body" },
+      { container: ".claude-timeline-col", focus: ".timeline-list" },
+    ]
+      .map((p) => ({
+        container: root.querySelector<HTMLElement>(p.container),
+        target: root.querySelector<HTMLElement>(p.focus),
+      }))
+      .filter((p): p is { container: HTMLElement; target: HTMLElement } =>
+        Boolean(p.container && p.target),
+      );
+    if (panes.length < 2) return;
+    const active = document.activeElement;
+    let idx = panes.findIndex((p) => p.container.contains(active));
+    if (idx === -1) idx = 0;
+    const nextIdx =
+      e.key === "ArrowRight" ? Math.min(idx + 1, panes.length - 1) : Math.max(idx - 1, 0);
+    if (nextIdx === idx) return;
+    e.preventDefault();
+    panes[nextIdx].target.focus();
+  };
 
   // The panel's ACP id; a ref so the listener (registered before `acp_start`
   // resolves) can filter without re-subscribing.
@@ -391,7 +421,7 @@ export function ClaudePanel(props: IDockviewPanelProps<ClaudeParams>) {
   };
 
   return (
-    <div className="claude-panel">
+    <div className="claude-panel" ref={panelRef} onKeyDown={movePane}>
       <div className="claude-main-area">
       <div className="claude-main">
       <div className="claude-status">
@@ -530,7 +560,7 @@ export function ClaudePanel(props: IDockviewPanelProps<ClaudeParams>) {
               ✕
             </button>
           </div>
-          <div className="claude-viewer-body">
+          <div className="claude-viewer-body" tabIndex={0}>
             <ItemDetail item={selectedItem} />
           </div>
         </div>

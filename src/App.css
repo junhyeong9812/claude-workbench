@@ -701,6 +701,11 @@ body {
   overflow-y: auto;
   padding: 8px;
 }
+.claude-viewer-body:focus,
+.claude-viewer-body:focus-visible {
+  outline: 1px solid var(--accent);
+  outline-offset: -1px;
+}
 .claude-timeline-col {
   display: flex;
   flex-direction: column;
