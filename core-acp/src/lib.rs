@@ -21,8 +21,8 @@ use agent_client_protocol::{
     Agent, AuthMethodId, AuthenticateRequest, AuthenticateResponse, CancelNotification, Client,
     ClientCapabilities, ClientSideConnection, ContentBlock, Error, FileSystemCapability,
     InitializeRequest, InitializeResponse, NewSessionRequest, PromptRequest, PromptResponse,
-    RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse, SessionId,
-    SessionNotification, VERSION,
+    ReadTextFileRequest, ReadTextFileResponse, RequestPermissionOutcome, RequestPermissionRequest,
+    RequestPermissionResponse, SessionId, SessionNotification, VERSION,
 };
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
@@ -52,6 +52,35 @@ impl Client for ClientHandler {
         // Drop is fine if the receiver is gone (panel closed).
         let _ = self.updates.send(args);
         Ok(())
+    }
+
+    /// Serve the agent's file reads from disk (S2b-1). Reads don't mutate state,
+    /// so they need no approval gate — only the write path (S2b-2) does. The
+    /// adapter routes Claude's Read tool through here once we advertise the
+    /// `fs.readTextFile` capability, giving us a faithful view of what it reads.
+    async fn read_text_file(
+        &self,
+        args: ReadTextFileRequest,
+    ) -> Result<ReadTextFileResponse, Error> {
+        let content = std::fs::read_to_string(&args.path).map_err(Error::into_internal_error)?;
+        Ok(ReadTextFileResponse {
+            content: slice_lines(&content, args.line, args.limit),
+            meta: None,
+        })
+    }
+}
+
+/// Apply ACP's optional 1-based `line` start and `limit` line count to file
+/// content. With neither set, returns the content unchanged (exact bytes).
+fn slice_lines(content: &str, line: Option<u32>, limit: Option<u32>) -> String {
+    if line.is_none() && limit.is_none() {
+        return content.to_string();
+    }
+    let start = line.unwrap_or(1).max(1) as usize - 1;
+    let selected = content.lines().skip(start);
+    match limit {
+        Some(n) => selected.take(n as usize).collect::<Vec<_>>().join("\n"),
+        None => selected.collect::<Vec<_>>().join("\n"),
     }
 }
 
@@ -99,9 +128,10 @@ impl AcpClient {
             .initialize(InitializeRequest {
                 protocol_version: VERSION,
                 client_capabilities: ClientCapabilities {
-                    // S1: handlers not implemented yet -> advertise false (S2b flips on).
                     fs: FileSystemCapability {
-                        read_text_file: false,
+                        // S2b-1: serve reads (no mutation, no gate). Writes stay
+                        // built-in until S2b-2 adds the approval gate + disk write.
+                        read_text_file: true,
                         write_text_file: false,
                         meta: None,
                     },
@@ -225,6 +255,16 @@ mod tests {
         async fn cancel(&self, _: CancelNotification) -> Result<(), Error> {
             Ok(())
         }
+    }
+
+    #[test]
+    fn slice_lines_honors_line_and_limit() {
+        let c = "a\nb\nc\nd";
+        assert_eq!(slice_lines(c, None, None), "a\nb\nc\nd"); // exact, unchanged
+        assert_eq!(slice_lines(c, Some(2), None), "b\nc\nd"); // from line 2
+        assert_eq!(slice_lines(c, Some(2), Some(2)), "b\nc"); // 2 lines from line 2
+        assert_eq!(slice_lines(c, None, Some(2)), "a\nb"); // first 2 lines
+        assert_eq!(slice_lines(c, Some(99), None), ""); // past end
     }
 
     #[test]
