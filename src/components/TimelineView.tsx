@@ -58,12 +58,14 @@ export function TimelineView({
   onSelect: (item: TimelineItem) => void;
 }) {
   // Every turn shows, even one with no tool calls (a plain Q&A): derive the
-  // turn list from the union of prompts, answers, and items (B3).
+  // turn list from the union of prompts, answers, and items (B3). Newest turn
+  // first — the current question sits at the top, older history below (B5).
   const turnNos = [
     ...new Set<number>([...turns.keys(), ...answers.keys(), ...items.map((it) => it.turn)]),
-  ].sort((a, b) => a - b);
+  ].sort((a, b) => b - a);
 
-  // Flat display order (turn asc, then seq asc) for ↑/↓ navigation (B4).
+  // Flat display order (matches the rendered order: newest turn first, then seq
+  // asc within a turn) for ↑/↓ navigation (B4).
   const orderedItems = turnNos.flatMap((turn) =>
     items.filter((it) => it.turn === turn).sort((a, b) => a.seq - b.seq),
   );
@@ -77,6 +79,12 @@ export function TimelineView({
       .querySelector(`[data-tcid="${CSS.escape(selectedId)}"]`)
       ?.scrollIntoView({ block: "nearest" });
   }, [selectedId]);
+
+  // A new question arrives at the top — scroll there so the current Q is in view (B5).
+  const newestTurn = turnNos[0] ?? 0;
+  useEffect(() => {
+    listRef.current?.scrollTo({ top: 0 });
+  }, [newestTurn]);
 
   const onKeyDown = (e: React.KeyboardEvent<HTMLDivElement>) => {
     if (e.key !== "ArrowDown" && e.key !== "ArrowUp") return;
