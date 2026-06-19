@@ -1,6 +1,9 @@
 /** One Claude session's change timeline, grouped by turn (the prompt that
  * produced the changes). Presentational — the owning ClaudePanel feeds it the
- * items/turns it accumulated for *its* session. */
+ * items/turns it accumulated for *its* session. Clicking an item expands its
+ * change content (diff / locations) inline, in timeline order (B4). */
+
+import { useState } from "react";
 
 export interface TimelineItem {
   turn: number;
@@ -46,6 +49,16 @@ export function TimelineView({
   turns: Map<number, string>;
   answers: Map<number, string>;
 }) {
+  // Which items are expanded to show their change content (B4).
+  const [expanded, setExpanded] = useState<Set<string>>(new Set());
+  const toggle = (id: string) =>
+    setExpanded((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+
   // Every turn shows, even one with no tool calls (a plain Q&A): derive the
   // turn list from the union of prompts, answers, and items (B3).
   const turnNos = [
@@ -72,28 +85,67 @@ export function TimelineView({
                 {answer.length > 140 ? `${answer.slice(0, 140)}…` : answer}
               </div>
             )}
-            {turnItems.map((it) => (
-              <div
-                key={it.tool_call_id}
-                className={`timeline-item ts-${it.agent_status}`}
-                title={it.locations.join("\n")}
-              >
-                <span className="timeline-icon">{KIND_ICON[it.kind] ?? "•"}</span>
-                <span className="timeline-title">{it.title || it.kind}</span>
-                {it.project_label && <span className="timeline-label">{it.project_label}</span>}
-                {it.diffs.length > 0 && <span className="timeline-diff">±{it.diffs.length}</span>}
-                {it.write_status === "written" && <span className="timeline-write">💾</span>}
-                {it.write_status === "write_failed" && (
-                  <span className="timeline-write timeline-write-fail">⚠</span>
-                )}
-                <span className={`timeline-status ts-${it.agent_status}`}>
-                  {AGENT_BADGE[it.agent_status] ?? ""}
-                </span>
-              </div>
-            ))}
+            {turnItems.map((it) => {
+              const open = expanded.has(it.tool_call_id);
+              return (
+                <div key={it.tool_call_id}>
+                  <div
+                    className={`timeline-item ts-${it.agent_status} ${open ? "timeline-item-open" : ""}`}
+                    title={it.locations.join("\n")}
+                    onClick={() => toggle(it.tool_call_id)}
+                  >
+                    <span className="timeline-icon">{KIND_ICON[it.kind] ?? "•"}</span>
+                    <span className="timeline-title">{it.title || it.kind}</span>
+                    {it.project_label && <span className="timeline-label">{it.project_label}</span>}
+                    {it.diffs.length > 0 && <span className="timeline-diff">±{it.diffs.length}</span>}
+                    {it.write_status === "written" && <span className="timeline-write">💾</span>}
+                    {it.write_status === "write_failed" && (
+                      <span className="timeline-write timeline-write-fail">⚠</span>
+                    )}
+                    <span className={`timeline-status ts-${it.agent_status}`}>
+                      {AGENT_BADGE[it.agent_status] ?? ""}
+                    </span>
+                  </div>
+                  {open && <ItemDetail item={it} />}
+                </div>
+              );
+            })}
           </div>
         );
       })}
+    </div>
+  );
+}
+
+/** The expanded change content for a clicked item (B4): file diffs (이전→이후)
+ * for edits, otherwise the touched locations. Monospace, terminal-like. */
+function ItemDetail({ item }: { item: TimelineItem }) {
+  if (item.diffs.length === 0) {
+    return (
+      <div className="timeline-detail">
+        {item.locations.length > 0 ? (
+          item.locations.map((p, i) => (
+            <div key={i} className="timeline-detail-path">
+              {p}
+            </div>
+          ))
+        ) : (
+          <div className="timeline-detail-empty">표시할 변경 내용이 없습니다.</div>
+        )}
+      </div>
+    );
+  }
+  return (
+    <div className="timeline-detail">
+      {item.diffs.map((d, i) => (
+        <div key={i} className="timeline-diff-block">
+          <div className="timeline-detail-path">{d.path}</div>
+          {d.old_text != null && d.old_text !== "" && (
+            <pre className="timeline-diff-old">{d.old_text}</pre>
+          )}
+          <pre className="timeline-diff-new">{d.new_text}</pre>
+        </div>
+      ))}
     </div>
   );
 }

@@ -518,10 +518,56 @@ body {
   padding: 3px 6px;
   border-radius: 3px;
   font-size: 12px;
-  cursor: default;
+  cursor: pointer;
 }
 .timeline-item:hover {
   background: var(--bg-hover);
+}
+.timeline-item-open {
+  background: var(--bg-hover);
+}
+
+/* Expanded change content (B4) — terminal-like diff view */
+.timeline-detail {
+  margin: 2px 0 6px 18px;
+  border-left: 2px solid var(--accent);
+  padding-left: 6px;
+}
+.timeline-detail-path {
+  font-family: monospace;
+  font-size: 11px;
+  color: var(--accent);
+  word-break: break-all;
+  padding: 2px 0;
+}
+.timeline-detail-empty {
+  font-size: 11px;
+  color: var(--fg-dim);
+  padding: 2px 0;
+}
+.timeline-diff-block {
+  margin-bottom: 6px;
+}
+.timeline-diff-old,
+.timeline-diff-new {
+  margin: 0;
+  font-family: monospace;
+  font-size: 11px;
+  line-height: 1.45;
+  white-space: pre;
+  overflow-x: auto;
+  max-height: 240px;
+  overflow-y: auto;
+  padding: 4px 6px;
+  border-radius: 3px;
+}
+.timeline-diff-old {
+  background: rgba(248, 81, 73, 0.12);
+  color: #f0a0a0;
+}
+.timeline-diff-new {
+  background: rgba(63, 185, 80, 0.12);
+  color: #a8d8a8;
 }
 .timeline-item.ts-canceled,
 .timeline-item.ts-failed {
@@ -574,8 +620,8 @@ body {
 .claude-timeline-col {
   display: flex;
   flex-direction: column;
-  width: 280px;
-  min-width: 220px;
+  width: 360px;
+  min-width: 240px;
   border-left: 1px solid var(--border);
   background: var(--bg);
 }
