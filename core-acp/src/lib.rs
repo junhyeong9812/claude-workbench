@@ -20,30 +20,71 @@ use std::path::PathBuf;
 use agent_client_protocol::{
     Agent, AuthMethodId, AuthenticateRequest, AuthenticateResponse, CancelNotification, Client,
     ClientCapabilities, ClientSideConnection, ContentBlock, Error, FileSystemCapability,
-    InitializeRequest, InitializeResponse, NewSessionRequest, PromptRequest, PromptResponse,
-    ReadTextFileRequest, ReadTextFileResponse, RequestPermissionOutcome, RequestPermissionRequest,
-    RequestPermissionResponse, SessionId, SessionNotification, VERSION,
+    InitializeRequest, InitializeResponse, NewSessionRequest, PermissionOption, PermissionOptionId,
+    PromptRequest, PromptResponse, ReadTextFileRequest, ReadTextFileResponse,
+    RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse, SessionId,
+    SessionNotification, ToolCallUpdate, VERSION, WriteTextFileRequest, WriteTextFileResponse,
 };
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
+use tokio::sync::oneshot;
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 
-/// Handles agent -> client requests. S1 only consumes `session/update`
-/// notifications (forwarded to a channel) and declines permission (no UI yet —
-/// never auto-allows; S2b surfaces it to the user).
+/// A client request that needs the host loop to act (it owns the UI events, the
+/// user approval gate, and the timeline). The thin handler forwards these and
+/// awaits the reply on the embedded oneshot.
+pub enum ClientRequest {
+    /// `session/request_permission`: the agent wants to run a tool. The host
+    /// surfaces it for approval and replies with the chosen option (or `None`
+    /// to cancel). This is the real gate for **every** tool (edit, write, exec).
+    Permission {
+        tool_call: ToolCallUpdate,
+        options: Vec<PermissionOption>,
+        respond: oneshot::Sender<Option<PermissionOptionId>>,
+    },
+    /// `fs/write_text_file`: permission was already granted via `Permission`,
+    /// so the host just performs the disk write and records the timeline.
+    Write {
+        path: PathBuf,
+        content: String,
+        respond: oneshot::Sender<Result<(), String>>,
+    },
+}
+
+/// Handles agent -> client requests. Kept deliberately thin: notifications and
+/// approval/write requests are forwarded to the host loop; only the
+/// side-effect-free read is served inline. It never auto-approves (spec
+/// invariant — the user decides every tool via `request_permission`).
 struct ClientHandler {
     updates: UnboundedSender<SessionNotification>,
+    requests: UnboundedSender<ClientRequest>,
 }
 
 #[async_trait::async_trait(?Send)]
 impl Client for ClientHandler {
+    /// The approval gate for every tool the agent wants to run (S2b-2). We never
+    /// auto-allow: the host surfaces the request to the user and we return the
+    /// option they pick (or `Cancelled` if they decline / the host is gone).
     async fn request_permission(
         &self,
-        _args: RequestPermissionRequest,
+        args: RequestPermissionRequest,
     ) -> Result<RequestPermissionResponse, Error> {
-        // S1: decline rather than auto-allow (spec invariant — no auto-approve).
+        let (respond, outcome) = oneshot::channel();
+        let req = ClientRequest::Permission {
+            tool_call: args.tool_call,
+            options: args.options,
+            respond,
+        };
+        let chosen = if self.requests.send(req).is_err() {
+            None
+        } else {
+            outcome.await.ok().flatten()
+        };
         Ok(RequestPermissionResponse {
-            outcome: RequestPermissionOutcome::Cancelled,
+            outcome: match chosen {
+                Some(option_id) => RequestPermissionOutcome::Selected { option_id },
+                None => RequestPermissionOutcome::Cancelled,
+            },
             meta: None,
         })
     }
@@ -67,6 +108,29 @@ impl Client for ClientHandler {
             content: slice_lines(&content, args.line, args.limit),
             meta: None,
         })
+    }
+
+    /// Execute a file write (S2b-2). Permission was already granted via
+    /// `request_permission`, so the host loop just performs the disk write and
+    /// records it to the timeline; we report the outcome back to the agent.
+    async fn write_text_file(
+        &self,
+        args: WriteTextFileRequest,
+    ) -> Result<WriteTextFileResponse, Error> {
+        let (respond, outcome) = oneshot::channel();
+        let req = ClientRequest::Write {
+            path: args.path,
+            content: args.content,
+            respond,
+        };
+        if self.requests.send(req).is_err() {
+            return Err(Error::internal_error());
+        }
+        match outcome.await {
+            Ok(Ok(())) => Ok(WriteTextFileResponse { meta: None }),
+            Ok(Err(msg)) => Err(Error::internal_error().with_data(msg)),
+            Err(_) => Err(Error::internal_error()), // host loop gone
+        }
     }
 }
 
@@ -92,6 +156,7 @@ pub struct AcpClient {
 }
 
 impl AcpClient {
+    #[allow(clippy::type_complexity)]
     pub fn new<W, R>(
         outgoing: W,
         incoming: R,
@@ -99,13 +164,18 @@ impl AcpClient {
         AcpClient,
         impl std::future::Future<Output = ()>,
         UnboundedReceiver<SessionNotification>,
+        UnboundedReceiver<ClientRequest>,
     )
     where
         W: AsyncWrite + Unpin + 'static,
         R: AsyncRead + Unpin + 'static,
     {
         let (tx, rx) = mpsc::unbounded_channel();
-        let handler = ClientHandler { updates: tx };
+        let (req_tx, req_rx) = mpsc::unbounded_channel();
+        let handler = ClientHandler {
+            updates: tx,
+            requests: req_tx,
+        };
         // The ACP crate speaks `futures` AsyncRead/Write; bridge from tokio.
         let (conn, io_task) = ClientSideConnection::new(
             handler,
@@ -119,7 +189,7 @@ impl AcpClient {
         let driver = async move {
             let _ = io_task.await;
         };
-        (AcpClient { conn }, driver, rx)
+        (AcpClient { conn }, driver, rx, req_rx)
     }
 
     /// `initialize` handshake — negotiate version, advertise client capabilities.
@@ -129,10 +199,10 @@ impl AcpClient {
                 protocol_version: VERSION,
                 client_capabilities: ClientCapabilities {
                     fs: FileSystemCapability {
-                        // S2b-1: serve reads (no mutation, no gate). Writes stay
-                        // built-in until S2b-2 adds the approval gate + disk write.
+                        // S2b: serve reads inline; route writes through the host
+                        // loop's approval gate (`write_text_file` handler).
                         read_text_file: true,
-                        write_text_file: false,
+                        write_text_file: true,
                         meta: None,
                     },
                     terminal: false,
@@ -297,7 +367,7 @@ mod tests {
             });
 
             // Client side.
-            let (client, client_io, mut updates) = AcpClient::new(c_write, c_read);
+            let (client, client_io, mut updates, _writes) = AcpClient::new(c_write, c_read);
             tokio::task::spawn_local(async move {
                 let _ = client_io.await;
             });

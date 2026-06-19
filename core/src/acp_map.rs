@@ -256,6 +256,30 @@ impl Timeline {
         }
     }
 
+    /// Correlate an `fs/write_text_file` to a timeline item by **path** and
+    /// record our write outcome. The ACP write request carries no
+    /// `tool_call_id`, so we attach it to the most recent (highest-seq) item
+    /// whose locations or diffs reference `path`. Returns the matched index.
+    pub fn set_write_status_by_path(
+        &mut self,
+        path: &std::path::Path,
+        status: WriteStatus,
+    ) -> Option<usize> {
+        let idx = self
+            .items
+            .iter()
+            .enumerate()
+            .rev()
+            .find(|(_, it)| {
+                it.locations.iter().any(|p| p == path) || it.diffs.iter().any(|d| d.path == path)
+            })
+            .map(|(i, _)| i)?;
+        let item = &mut self.items[idx];
+        item.write_status = status;
+        item.revision += 1;
+        Some(idx)
+    }
+
     fn label_for(&self, locations: &[PathBuf]) -> Option<String> {
         locations
             .first()
@@ -453,6 +477,27 @@ mod tests {
         assert_eq!(item.diffs[0].path, PathBuf::from("/work/a.rs"));
         assert_eq!(item.diffs[0].old_text.as_deref(), Some("old"));
         assert_eq!(item.diffs[0].new_text, "new");
+    }
+
+    #[test]
+    fn set_write_status_by_path_attaches_to_latest_match() {
+        let mut tl = Timeline::new("/work");
+        tl.apply("s1", &tool_call("t1", "edit", "completed", "/work/a.rs"));
+        tl.apply("s1", &tool_call("t2", "edit", "completed", "/work/b.rs"));
+        // A later edit re-touching a.rs — the write should attach to the latest.
+        tl.apply("s1", &tool_call("t3", "edit", "in_progress", "/work/a.rs"));
+
+        let idx = tl
+            .set_write_status_by_path(std::path::Path::new("/work/a.rs"), WriteStatus::Written)
+            .expect("a path match");
+        assert_eq!(tl.items()[idx].tool_call_id, "t3");
+        assert_eq!(tl.items()[idx].write_status, WriteStatus::Written);
+        // The earlier a.rs item is untouched.
+        assert_eq!(tl.items()[0].write_status, WriteStatus::None);
+        // Unknown path -> no match.
+        assert!(tl
+            .set_write_status_by_path(std::path::Path::new("/work/zzz"), WriteStatus::Written)
+            .is_none());
     }
 
     #[test]

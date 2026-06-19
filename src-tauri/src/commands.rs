@@ -270,6 +270,23 @@ pub fn acp_alive(state: State<'_, AcpState>, id: u64) -> bool {
         .unwrap_or(false)
 }
 
+/// Answer a pending tool approval (S2b-2). `option_id` is the chosen permission
+/// option; an empty string declines (Cancelled).
+#[tauri::command]
+pub fn acp_respond(
+    state: State<'_, AcpState>,
+    id: u64,
+    request_id: u64,
+    option_id: String,
+) -> Result<(), AppError> {
+    let hosts = acp_lock(&state)?;
+    let host = hosts
+        .get(&id)
+        .ok_or_else(|| AppError::new("unknown Claude session"))?;
+    host.respond_permission(request_id, option_id);
+    Ok(())
+}
+
 /// Cancel the in-flight turn for a session (best effort).
 #[tauri::command]
 pub fn acp_cancel(state: State<'_, AcpState>, id: u64) -> Result<(), AppError> {

@@ -7,6 +7,9 @@ edition = "2021"
 agent-client-protocol = "0.4"
 async-trait = "0.1"
 serde = { version = "1", features = ["derive"] }
+# Pure timeline mapping (sync) lives in `core`; the async host applies updates
+# and records write outcomes through it.
+core_lib = { path = "../core", package = "core" }
 tokio = { version = "1", features = ["rt", "process", "io-util", "macros", "sync", "time"] }
 tokio-util = { version = "0.7", features = ["compat"] }
 

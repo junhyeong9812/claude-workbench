@@ -72,6 +72,7 @@ pub fn run() {
             commands::acp_start,
             commands::acp_prompt,
             commands::acp_alive,
+            commands::acp_respond,
             commands::acp_cancel,
             commands::acp_close,
         ])

@@ -14,12 +14,36 @@ export interface ClaudeParams {
 
 /** Mirror of `core_acp::AcpEvent` (serde tag = "type", snake_case) plus the
  * relay's `id`. */
+interface PermOption {
+  id: string;
+  name: string;
+  kind: string; // allow_once | allow_always | reject_once | reject_always
+}
+
 type AcpEvent =
   | { id: number; type: "connected"; session_id: string }
   | { id: number; type: "agent_message_chunk"; text: string }
   | { id: number; type: "auth_required"; command: string }
+  | {
+      id: number;
+      type: "permission_request";
+      request_id: number;
+      title: string;
+      preview: string;
+      locations: string[];
+      options: PermOption[];
+    }
   | { id: number; type: "error"; message: string }
   | { id: number; type: "disconnected" };
+
+/** A pending tool approval awaiting the user's decision (S2b-2). */
+interface PermissionRequest {
+  request_id: number;
+  title: string;
+  preview: string;
+  locations: string[];
+  options: PermOption[];
+}
 
 type Status = "starting" | "auth" | "ready" | "error" | "closed";
 
@@ -34,7 +58,7 @@ function errString(err: unknown): string {
 }
 
 interface Message {
-  role: "user" | "assistant";
+  role: "user" | "assistant" | "system";
   text: string;
 }
 
@@ -64,6 +88,8 @@ export function ClaudePanel(props: IDockviewPanelProps<ClaudeParams>) {
   // True from sending a prompt until its first streamed token — drives the
   // "Claude is thinking…" indicator (the wait before tokens arrive).
   const [thinking, setThinking] = useState(false);
+  // Pending tool approvals (S2b-2). Claude ran nothing until the user decides.
+  const [pendingPerms, setPendingPerms] = useState<PermissionRequest[]>([]);
 
   // The panel's ACP id; a ref so the listener (registered before `acp_start`
   // resolves) can filter without re-subscribing.
@@ -81,6 +107,7 @@ export function ClaudePanel(props: IDockviewPanelProps<ClaudeParams>) {
     setErrorMsg(null);
     setAuthCommand(null);
     setThinking(false);
+    setPendingPerms([]);
     setStatus("starting");
     const cwd = useAppStore.getState().activeProject ?? null;
     try {
@@ -131,6 +158,20 @@ export function ClaudePanel(props: IDockviewPanelProps<ClaudeParams>) {
           setAuthCommand(ev.command);
           setStatus("auth");
           break;
+        case "permission_request":
+          // Claude is now blocked on our approval, not thinking.
+          setThinking(false);
+          setPendingPerms((prev) => [
+            ...prev,
+            {
+              request_id: ev.request_id,
+              title: ev.title,
+              preview: ev.preview,
+              locations: ev.locations,
+              options: ev.options,
+            },
+          ]);
+          break;
         case "error":
           setThinking(false);
           setErrorMsg(ev.message);
@@ -138,6 +179,7 @@ export function ClaudePanel(props: IDockviewPanelProps<ClaudeParams>) {
           break;
         case "disconnected":
           setThinking(false);
+          setPendingPerms([]); // host gone — approvals are moot
           // Auth/error states own the message; don't overwrite them.
           setStatus((s) => (s === "error" || s === "auth" ? s : "closed"));
           break;
@@ -199,6 +241,27 @@ export function ClaudePanel(props: IDockviewPanelProps<ClaudeParams>) {
     });
   };
 
+  const respondPerm = (requestId: number, optionId: string) => {
+    const id = acpIdRef.current;
+    const perm = pendingPerms.find((p) => p.request_id === requestId);
+    const opt = perm?.options.find((o) => o.id === optionId);
+    // Empty id = cancel; a reject_* option = decline. Either way the adapter
+    // interrupts the turn (no agent message follows), so we note it locally.
+    const isCancel = optionId === "";
+    const isReject = !isCancel && (opt?.kind.startsWith("reject") ?? false);
+    setPendingPerms((prev) => prev.filter((p) => p.request_id !== requestId));
+    if (isCancel || isReject) {
+      const label = perm?.title || "도구 실행";
+      const verb = isCancel ? "취소됨" : "거부됨";
+      setMessages((prev) => [...prev, { role: "system", text: `✖ ${verb}: ${label}` }]);
+      setThinking(false);
+    }
+    if (id == null) return;
+    invoke("acp_respond", { id, requestId, optionId }).catch((err) => {
+      setErrorMsg(errString(err));
+    });
+  };
+
   const statusLabel: Record<Status, string> = {
     starting: "Connecting…",
     auth: "Sign-in required",
@@ -230,12 +293,18 @@ export function ClaudePanel(props: IDockviewPanelProps<ClaudeParams>) {
       {errorMsg && <div className="claude-error">{errorMsg}</div>}
 
       <div className="claude-log" ref={logRef}>
-        {messages.map((m, i) => (
-          <div key={i} className={`claude-msg claude-msg-${m.role}`}>
-            <span className="claude-role">{m.role === "user" ? "You" : "Claude"}</span>
-            <pre className="claude-text">{m.text}</pre>
-          </div>
-        ))}
+        {messages.map((m, i) =>
+          m.role === "system" ? (
+            <div key={i} className="claude-system">
+              {m.text}
+            </div>
+          ) : (
+            <div key={i} className={`claude-msg claude-msg-${m.role}`}>
+              <span className="claude-role">{m.role === "user" ? "You" : "Claude"}</span>
+              <pre className="claude-text">{m.text}</pre>
+            </div>
+          ),
+        )}
         {thinking && (
           <div className="claude-msg claude-msg-assistant">
             <span className="claude-role">Claude</span>
@@ -247,6 +316,43 @@ export function ClaudePanel(props: IDockviewPanelProps<ClaudeParams>) {
           </div>
         )}
       </div>
+
+      {pendingPerms.length > 0 && (
+        <div className="claude-approvals">
+          {pendingPerms.map((p) => (
+            <div key={p.request_id} className="claude-approval">
+              <div className="claude-approval-head">
+                ✎ {p.title || "Claude가 도구를 실행하려 합니다"}
+                {p.locations[0] && (
+                  <>
+                    {" — "}
+                    <code>{p.locations[0]}</code>
+                  </>
+                )}
+              </div>
+              {p.preview && (
+                <pre className="claude-approval-preview">
+                  {p.preview.length > 4000 ? `${p.preview.slice(0, 4000)}\n…` : p.preview}
+                </pre>
+              )}
+              <div className="claude-approval-actions">
+                {p.options.map((o) => (
+                  <button
+                    key={o.id}
+                    className={`toolbar-btn ${o.kind.startsWith("reject") ? "btn-reject" : ""}`}
+                    onClick={() => respondPerm(p.request_id, o.id)}
+                  >
+                    {o.name}
+                  </button>
+                ))}
+                <button className="toolbar-btn" onClick={() => respondPerm(p.request_id, "")}>
+                  취소
+                </button>
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
 
       <div className="claude-input">
         <textarea

@@ -16,7 +16,7 @@
 //! new_session → command/update loop) is split out so the fake-agent test can
 //! drive it over in-memory pipes with no real `npx`.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::path::PathBuf;
 use std::process::Stdio;
@@ -24,18 +24,26 @@ use std::rc::Rc;
 use std::sync::mpsc::Sender as StdSender;
 use std::thread::JoinHandle;
 
-use agent_client_protocol::{ContentBlock, Error, ErrorCode, SessionId, SessionUpdate};
+use agent_client_protocol::{
+    ContentBlock, Error, ErrorCode, PermissionOption, PermissionOptionId, SessionId, SessionUpdate,
+    ToolCallContent, ToolCallUpdate,
+};
+use core_lib::{Timeline, WriteStatus};
 use serde::Serialize;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, BufReader};
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
+use tokio::sync::oneshot;
 
-use crate::AcpClient;
+use crate::{AcpClient, ClientRequest};
 
 /// A command sent *into* the host thread (synchronous send from any thread).
 #[derive(Debug)]
 pub enum AcpCommand {
     /// Send a user prompt to the active session.
     Prompt { text: String },
+    /// The user's decision on a pending tool approval (S2b-2). `option_id` is
+    /// the chosen `PermissionOption` id; an empty string cancels/declines.
+    PermissionResponse { request_id: u64, option_id: String },
     /// Cancel the in-flight turn (best effort).
     Cancel,
     /// Tear down the session and kill the adapter subprocess.
@@ -52,6 +60,16 @@ pub enum AcpEvent {
     Connected { session_id: String },
     /// One streamed chunk of the agent's reply (S1 renders text only).
     AgentMessageChunk { text: String },
+    /// The agent wants to run a tool; awaiting the user's approval (S2b-2).
+    /// Answer with `AcpCommand::PermissionResponse { request_id, option_id }`.
+    PermissionRequest {
+        request_id: u64,
+        title: String,
+        /// Best-effort preview (an edit's new text, or text content).
+        preview: String,
+        locations: Vec<String>,
+        options: Vec<PermissionOptionDto>,
+    },
     /// The adapter reported `auth_required` (-32000): the user is not logged in.
     /// The `@zed-industries/claude-code-acp` adapter does **not** implement the
     /// `authenticate` RPC — login is out-of-band, so `command` is the shell
@@ -61,6 +79,32 @@ pub enum AcpEvent {
     Error { message: String },
     /// The host thread is finished (adapter exited or shutdown). Terminal.
     Disconnected,
+}
+
+/// A permission option surfaced to the UI (mirrors ACP `PermissionOption`).
+#[derive(Debug, Clone, Serialize)]
+pub struct PermissionOptionDto {
+    pub id: String,
+    pub name: String,
+    /// `allow_once` | `allow_always` | `reject_once` | `reject_always`.
+    pub kind: String,
+}
+
+impl From<&PermissionOption> for PermissionOptionDto {
+    fn from(o: &PermissionOption) -> Self {
+        use agent_client_protocol::PermissionOptionKind as K;
+        let kind = match o.kind {
+            K::AllowOnce => "allow_once",
+            K::AllowAlways => "allow_always",
+            K::RejectOnce => "reject_once",
+            K::RejectAlways => "reject_always",
+        };
+        Self {
+            id: o.id.0.to_string(),
+            name: o.name.clone(),
+            kind: kind.to_string(),
+        }
+    }
 }
 
 /// A `Send + Sync` handle to a running ACP adapter on its own thread.
@@ -92,6 +136,14 @@ impl AcpHost {
     /// Queue a prompt (no-op if the host thread has exited).
     pub fn prompt(&self, text: impl Into<String>) {
         let _ = self.commands.send(AcpCommand::Prompt { text: text.into() });
+    }
+
+    /// Answer a pending tool approval (S2b-2). An empty `option_id` declines.
+    pub fn respond_permission(&self, request_id: u64, option_id: impl Into<String>) {
+        let _ = self.commands.send(AcpCommand::PermissionResponse {
+            request_id,
+            option_id: option_id.into(),
+        });
     }
 
     /// Cancel the in-flight turn.
@@ -203,7 +255,8 @@ where
     W: AsyncWrite + Unpin + 'static,
     R: AsyncRead + Unpin + 'static,
 {
-    let (client, io_task, mut updates) = AcpClient::new(outgoing, incoming);
+    let timeline_root = cwd.clone();
+    let (client, io_task, mut updates, mut requests_rx) = AcpClient::new(outgoing, incoming);
     // Drive the JSON-RPC I/O for the lifetime of the connection.
     tokio::task::spawn_local(io_task);
     // `Rc` so prompt/cancel can run as concurrent local tasks while the main
@@ -246,6 +299,15 @@ where
     let mut in_flight = false;
     let mut queue: VecDeque<String> = VecDeque::new();
 
+    // The change timeline (S2a mapping) + the in-flight tool approvals (S2b-2).
+    // `request_permission` is the gate; `write_text_file` is execute-only and
+    // correlates to a timeline item by path (it carries no tool_call_id).
+    let session = session_id.0.to_string();
+    let mut timeline = Timeline::new(timeline_root);
+    let mut pending_perms: HashMap<u64, oneshot::Sender<Option<PermissionOptionId>>> =
+        HashMap::new();
+    let mut next_request_id: u64 = 0;
+
     loop {
         tokio::select! {
             cmd = cmd_rx.recv() => match cmd {
@@ -255,6 +317,17 @@ where
                     } else {
                         in_flight = true;
                         spawn_prompt(client.clone(), session_id.clone(), text, events.clone(), done_tx.clone());
+                    }
+                }
+                Some(AcpCommand::PermissionResponse { request_id, option_id }) => {
+                    if let Some(respond) = pending_perms.remove(&request_id) {
+                        // Empty id = the user declined -> `None` -> Cancelled.
+                        let choice = if option_id.is_empty() {
+                            None
+                        } else {
+                            Some(PermissionOptionId(option_id.into()))
+                        };
+                        let _ = respond.send(choice);
                     }
                 }
                 Some(AcpCommand::Cancel) => {
@@ -269,13 +342,92 @@ where
                     None => in_flight = false,
                 }
             }
+            req = requests_rx.recv() => match req {
+                // The gate: surface the tool for approval, park the responder
+                // until the user picks an option (never auto-approve).
+                Some(ClientRequest::Permission { tool_call, options, respond }) => {
+                    let request_id = next_request_id;
+                    next_request_id += 1;
+                    let (title, preview, locations) = describe_tool(&tool_call);
+                    let _ = events.send(AcpEvent::PermissionRequest {
+                        request_id,
+                        title,
+                        preview,
+                        locations,
+                        options: options.iter().map(PermissionOptionDto::from).collect(),
+                    });
+                    pending_perms.insert(request_id, respond);
+                }
+                // Execute-only: permission was already granted via the gate.
+                Some(ClientRequest::Write { path, content, respond }) => {
+                    let result = perform_write(&mut timeline, &path, &content);
+                    let _ = respond.send(result);
+                }
+                None => break, // client/handler dropped
+            },
             note = updates.recv() => match note {
-                Some(note) => forward_update(note.update, events),
+                Some(note) => {
+                    // Feed tool calls into the timeline (S2a) before forwarding
+                    // the message text. `apply` borrows; `forward` then moves.
+                    timeline.apply(&session, &note.update);
+                    forward_update(note.update, events);
+                }
                 None => break, // connection closed (adapter exited / I/O ended)
             }
         }
     }
     Ok(())
+}
+
+/// Perform a (already-approved) disk write and record the outcome on the
+/// timeline by path. The approval happened earlier via `request_permission`.
+fn perform_write(
+    timeline: &mut Timeline,
+    path: &std::path::Path,
+    content: &str,
+) -> Result<(), String> {
+    match std::fs::write(path, content) {
+        Ok(()) => {
+            timeline.set_write_status_by_path(path, WriteStatus::Written);
+            Ok(())
+        }
+        Err(e) => {
+            timeline.set_write_status_by_path(path, WriteStatus::WriteFailed);
+            Err(format!("write failed: {e}"))
+        }
+    }
+}
+
+/// Extract a UI-friendly `(title, preview, locations)` from a tool-call update
+/// for the approval prompt. `preview` is the diff's new text or text content.
+fn describe_tool(tu: &ToolCallUpdate) -> (String, String, Vec<String>) {
+    let f = &tu.fields;
+    let title = f.title.clone().unwrap_or_default();
+    let preview = f
+        .content
+        .as_ref()
+        .map(|c| preview_content(c))
+        .unwrap_or_default();
+    let locations = f
+        .locations
+        .as_ref()
+        .map(|ls| ls.iter().map(|l| l.path.display().to_string()).collect())
+        .unwrap_or_default();
+    (title, preview, locations)
+}
+
+/// First diff `new_text` (or first text content) in a tool call's content.
+fn preview_content(content: &[ToolCallContent]) -> String {
+    for c in content {
+        match c {
+            ToolCallContent::Diff { diff } => return diff.new_text.clone(),
+            ToolCallContent::Content {
+                content: ContentBlock::Text(t),
+            } => return t.text.clone(),
+            _ => {}
+        }
+    }
+    String::new()
 }
 
 /// Await `fut`, returning `None` if a `Shutdown` (or a closed command channel)
@@ -346,8 +498,12 @@ mod tests {
     use super::*;
     use agent_client_protocol::{
         Agent, AgentSideConnection, AuthenticateRequest, AuthenticateResponse, CancelNotification,
-        Client, Error, InitializeRequest, InitializeResponse, NewSessionRequest, NewSessionResponse,
-        PromptRequest, PromptResponse, SessionNotification, StopReason, VERSION,
+        Client, Diff, Error, InitializeRequest, InitializeResponse, NewSessionRequest,
+        NewSessionResponse, PermissionOption, PermissionOptionId, PermissionOptionKind,
+        PromptRequest, PromptResponse, RequestPermissionOutcome, RequestPermissionRequest,
+        RequestPermissionResponse, SessionNotification, StopReason, ToolCallContent, ToolCallId,
+        ToolCallLocation, ToolCallUpdate, ToolCallUpdateFields, ToolKind, WriteTextFileRequest,
+        VERSION,
     };
     use std::cell::RefCell;
     use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
@@ -361,6 +517,9 @@ mod tests {
         conn: Rc<RefCell<Option<Rc<AgentSideConnection>>>>,
         concurrency: Rc<RefCell<(u32, u32)>>,
         auth_required: bool,
+        /// If set, `prompt` calls `fs/write_text_file` for this path (content
+        /// "WRITTEN"), blocking on the client's approval gate.
+        write_path: Option<PathBuf>,
     }
 
     #[async_trait::async_trait(?Send)]
@@ -408,6 +567,70 @@ mod tests {
                     })
                     .await;
             }
+            // Optionally exercise the gate: ask permission for an edit, then —
+            // only if approved — write the file. Blocks on the host's approval.
+            if let Some(path) = self.write_path.clone() {
+                if let Some(conn) = self.conn.borrow().clone() {
+                    let resp = conn
+                        .request_permission(RequestPermissionRequest {
+                            session_id: args.session_id.clone(),
+                            tool_call: ToolCallUpdate {
+                                id: ToolCallId("edit-1".into()),
+                                fields: ToolCallUpdateFields {
+                                    kind: Some(ToolKind::Edit),
+                                    title: Some("Edit sample".into()),
+                                    content: Some(vec![ToolCallContent::Diff {
+                                        diff: Diff {
+                                            path: path.clone(),
+                                            old_text: None,
+                                            new_text: "WRITTEN".into(),
+                                            meta: None,
+                                        },
+                                    }]),
+                                    locations: Some(vec![ToolCallLocation {
+                                        path: path.clone(),
+                                        line: None,
+                                        meta: None,
+                                    }]),
+                                    ..Default::default()
+                                },
+                                meta: None,
+                            },
+                            options: vec![
+                                PermissionOption {
+                                    id: PermissionOptionId("allow".into()),
+                                    name: "Allow".into(),
+                                    kind: PermissionOptionKind::AllowOnce,
+                                    meta: None,
+                                },
+                                PermissionOption {
+                                    id: PermissionOptionId("reject".into()),
+                                    name: "Reject".into(),
+                                    kind: PermissionOptionKind::RejectOnce,
+                                    meta: None,
+                                },
+                            ],
+                            meta: None,
+                        })
+                        .await;
+                    if let Ok(RequestPermissionResponse {
+                        outcome: RequestPermissionOutcome::Selected { option_id },
+                        ..
+                    }) = resp
+                    {
+                        if &*option_id.0 == "allow" {
+                            let _ = conn
+                                .write_text_file(WriteTextFileRequest {
+                                    session_id: args.session_id.clone(),
+                                    path,
+                                    content: "WRITTEN".to_string(),
+                                    meta: None,
+                                })
+                                .await;
+                        }
+                    }
+                }
+            }
             self.concurrency.borrow_mut().0 -= 1;
             Ok(PromptResponse {
                 stop_reason: StopReason::EndTurn,
@@ -439,6 +662,7 @@ mod tests {
                     conn: slot.clone(),
                     concurrency: Rc::new(RefCell::new((0, 0))),
                     auth_required: false,
+                    write_path: None,
                 },
                 a_write.compat_write(),
                 a_read.compat(),
@@ -522,6 +746,7 @@ mod tests {
                     conn: slot.clone(),
                     concurrency: concurrency.clone(),
                     auth_required: false,
+                    write_path: None,
                 },
                 a_write.compat_write(),
                 a_read.compat(),
@@ -605,6 +830,7 @@ mod tests {
                     conn: slot.clone(),
                     concurrency: Rc::new(RefCell::new((0, 0))),
                     auth_required: true,
+                    write_path: None,
                 },
                 a_write.compat_write(),
                 a_read.compat(),
@@ -635,5 +861,116 @@ mod tests {
                 "must not report Connected when auth is required, got {got:?}"
             );
         });
+    }
+
+    /// The tool approval gate (S2b-2): a `request_permission` surfaces a
+    /// `PermissionRequest` and the agent's edit writes **nothing** until the
+    /// user selects an allow option; then the file lands on disk.
+    #[test]
+    fn host_run_gates_tool_then_writes_on_approval() {
+        let tmp = {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static N: AtomicU64 = AtomicU64::new(0);
+            std::env::temp_dir().join(format!(
+                "mt-acp-write-{}-{}.txt",
+                std::process::id(),
+                N.fetch_add(1, Ordering::Relaxed)
+            ))
+        };
+        let _ = std::fs::remove_file(&tmp);
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let local = tokio::task::LocalSet::new();
+        local.block_on(&rt, async {
+            let (client_end, agent_end) = tokio::io::duplex(8192);
+            let (c_read, c_write) = tokio::io::split(client_end);
+            let (a_read, a_write) = tokio::io::split(agent_end);
+
+            let slot: Rc<RefCell<Option<Rc<AgentSideConnection>>>> = Rc::new(RefCell::new(None));
+            let (agent_conn, agent_io) = AgentSideConnection::new(
+                FakeAgent {
+                    conn: slot.clone(),
+                    concurrency: Rc::new(RefCell::new((0, 0))),
+                    auth_required: false,
+                    write_path: Some(tmp.clone()),
+                },
+                a_write.compat_write(),
+                a_read.compat(),
+                |fut| {
+                    tokio::task::spawn_local(fut);
+                },
+            );
+            *slot.borrow_mut() = Some(Rc::new(agent_conn));
+            tokio::task::spawn_local(async move {
+                let _ = agent_io.await;
+            });
+
+            let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+            let (ev_tx, ev_rx) = std::sync::mpsc::channel();
+            let run_handle = tokio::task::spawn_local(async move {
+                run(c_write, c_read, PathBuf::from("/work"), cmd_rx, &ev_tx).await
+            });
+
+            // Connect, then prompt (the fake agent issues the write mid-turn).
+            let mut connected = false;
+            for _ in 0..1000 {
+                tokio::task::yield_now().await;
+                while let Ok(ev) = ev_rx.try_recv() {
+                    if matches!(ev, AcpEvent::Connected { .. }) {
+                        connected = true;
+                    }
+                }
+                if connected {
+                    break;
+                }
+            }
+            assert!(connected, "never connected");
+            cmd_tx.send(AcpCommand::Prompt { text: "go".into() }).unwrap();
+
+            // Wait for the permission request; nothing must be written yet.
+            let mut request_id = None;
+            for _ in 0..4000 {
+                tokio::task::yield_now().await;
+                while let Ok(ev) = ev_rx.try_recv() {
+                    if let AcpEvent::PermissionRequest {
+                        request_id: rid,
+                        preview,
+                        options,
+                        ..
+                    } = &ev
+                    {
+                        assert_eq!(preview, "WRITTEN");
+                        assert!(options.iter().any(|o| o.id == "allow"));
+                        request_id = Some(*rid);
+                    }
+                }
+                if request_id.is_some() {
+                    break;
+                }
+            }
+            let request_id = request_id.expect("a PermissionRequest");
+            assert!(!tmp.exists(), "must not write before approval");
+
+            // Select the allow option -> the agent then writes the file.
+            cmd_tx
+                .send(AcpCommand::PermissionResponse {
+                    request_id,
+                    option_id: "allow".into(),
+                })
+                .unwrap();
+            for _ in 0..4000 {
+                tokio::task::yield_now().await;
+                if tmp.exists() {
+                    break;
+                }
+            }
+            cmd_tx.send(AcpCommand::Shutdown).unwrap();
+            run_handle.await.unwrap().expect("run ok");
+
+            assert_eq!(std::fs::read_to_string(&tmp).unwrap(), "WRITTEN");
+        });
+        let _ = std::fs::remove_file(&tmp);
     }
 }

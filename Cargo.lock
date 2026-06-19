@@ -435,6 +435,7 @@ version = "0.1.0"
 dependencies = [
  "agent-client-protocol",
  "async-trait",
+ "core",
  "serde",
  "tokio",
  "tokio-util",

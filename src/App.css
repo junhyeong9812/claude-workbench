@@ -304,6 +304,15 @@ body {
   word-break: break-word;
 }
 
+.claude-system {
+  align-self: center;
+  font-size: 11px;
+  color: #f0883e;
+  background: rgba(240, 136, 62, 0.1);
+  border-radius: 10px;
+  padding: 2px 10px;
+}
+
 .claude-thinking {
   display: flex;
   gap: 4px;
@@ -332,6 +341,59 @@ body {
   40% {
     opacity: 1;
   }
+}
+
+.claude-approvals {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 6px 8px;
+  border-top: 1px solid var(--border);
+  background: rgba(210, 153, 34, 0.08);
+  max-height: 40%;
+  overflow-y: auto;
+}
+
+.claude-approval {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  border: 1px solid #d29922;
+  border-radius: 4px;
+  padding: 6px;
+}
+
+.claude-approval-head {
+  font-size: 12px;
+  color: var(--fg);
+}
+.claude-approval-head code {
+  color: #d29922;
+  word-break: break-all;
+}
+
+.claude-approval-preview {
+  margin: 0;
+  max-height: 160px;
+  overflow: auto;
+  font-size: 12px;
+  line-height: 1.4;
+  white-space: pre-wrap;
+  word-break: break-word;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  padding: 4px 6px;
+}
+
+.claude-approval-actions {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+.claude-approval-actions .btn-reject {
+  border-color: #f85149;
+  color: #f85149;
 }
 
 .claude-input {
