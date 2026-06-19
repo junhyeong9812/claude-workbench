@@ -77,6 +77,7 @@ pub fn run() {
             commands::acp_close,
             commands::acp_sessions,
             commands::acp_session_timeline,
+            commands::acp_read_file,
             commands::acp_delete_session,
             commands::acp_rename_session,
         ])

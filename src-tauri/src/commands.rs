@@ -453,6 +453,21 @@ pub fn acp_session_timeline(
         .collect()
 }
 
+/// Read a file's current text for the timeline detail viewer (B4) — e.g.
+/// clicking a `read` item shows the file itself. Capped to keep the viewer
+/// responsive; refuses binary/oversized files rather than flooding the UI.
+#[tauri::command]
+pub fn acp_read_file(path: String) -> Result<String, AppError> {
+    const MAX: u64 = 512 * 1024;
+    let meta = std::fs::metadata(&path)
+        .map_err(|e| AppError::new(io_message("Cannot read file", &e)))?;
+    if meta.len() > MAX {
+        return Err(AppError::new("파일이 너무 커서 미리보기를 생략합니다 (512KB 초과)"));
+    }
+    std::fs::read_to_string(&path)
+        .map_err(|e| AppError::new(io_message("Cannot read file", &e)))
+}
+
 /// Delete a saved session's persisted history (the `삭제` action). The live
 /// host, if any, should be closed separately via `acp_close`.
 #[tauri::command]
