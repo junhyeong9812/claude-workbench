@@ -59,6 +59,7 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .manage(core_lib::SessionManager::new())
         .manage(commands::AcpState::default())
+        .manage(commands::ClaudeState::default())
         .invoke_handler(tauri::generate_handler![
             commands::read_dir,
             commands::detect_project_types,
@@ -69,6 +70,8 @@ pub fn run() {
             commands::terminal_resize,
             commands::terminal_snapshot,
             commands::terminal_close,
+            commands::claude_start,
+            commands::claude_close,
             commands::acp_start,
             commands::acp_prompt,
             commands::acp_alive,

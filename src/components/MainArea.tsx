@@ -13,6 +13,7 @@ import { useClaudeUi } from "../state/claudeUi";
 import { PlaceholderPanel } from "./PlaceholderPanel";
 import { TerminalPanel } from "./TerminalPanel";
 import { ClaudePanel } from "./ClaudePanel";
+import { ClaudeTermPanel } from "./ClaudeTermPanel";
 import { ClaudeTab } from "./ClaudeTab";
 
 /** A saved Claude session, for the "+ Claude" picker (S3c). */
@@ -37,9 +38,10 @@ const components = {
   placeholder: PlaceholderPanel,
   terminal: TerminalPanel,
   claude: ClaudePanel,
+  claudeterm: ClaudeTermPanel,
 };
 
-type PanelKind = "terminal" | "editor" | "claude";
+type PanelKind = "terminal" | "editor" | "claude" | "claudeterm";
 
 /**
  * The 80% main area, backed by dockview.
@@ -92,9 +94,14 @@ export function MainArea() {
     // Real panel removal (close) -> close the backing session (spec §0.1). Tab/
     // project switches don't fire this, so those only detach (session lives).
     api.onDidRemovePanel((panel) => {
-      const params = panel.params as { sessionId?: number; acpId?: number } | undefined;
+      const params = panel.params as
+        | { kind?: string; sessionId?: number; acpId?: number }
+        | undefined;
       if (typeof params?.sessionId === "number") {
-        invoke("terminal_close", { id: params.sessionId }).catch(() => {});
+        // claudeterm sessions also need their poll thread stopped (claude_close);
+        // plain terminals just close the PTY.
+        const cmd = params.kind === "claudeterm" ? "claude_close" : "terminal_close";
+        invoke(cmd, { id: params.sessionId }).catch(() => {});
       }
       if (typeof params?.acpId === "number") {
         invoke("acp_close", { id: params.acpId }).catch(() => {});
@@ -110,7 +117,13 @@ export function MainArea() {
     // Terminals get the real PTY panel, Claude the ACP panel (with its own
     // embedded change timeline); editor stays a stub until P3.
     const component =
-      kind === "terminal" ? "terminal" : kind === "claude" ? "claude" : "placeholder";
+      kind === "terminal"
+        ? "terminal"
+        : kind === "claude"
+          ? "claude"
+          : kind === "claudeterm"
+            ? "claudeterm"
+            : "placeholder";
     api.addPanel({
       id: `${kind}-${Date.now()}`,
       component,
@@ -203,6 +216,9 @@ export function MainArea() {
         </button>
         <button className="toolbar-btn" onClick={openClaude}>
           + Claude
+        </button>
+        <button className="toolbar-btn" onClick={() => addPanel("claudeterm")}>
+          + Claude(A)
         </button>
         <button className="toolbar-btn" onClick={() => addPanel("editor")}>
           + Editor

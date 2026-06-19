@@ -407,6 +407,31 @@ body {
   background: #1e1e1e;
 }
 
+/* Architecture A Claude panel: real terminal (left) | live change timeline
+ * (right). The terminal flexes; the timeline is a fixed-width scroll column. */
+.claudeterm {
+  display: flex;
+  height: 100%;
+  min-height: 0;
+}
+.claudeterm-term {
+  flex: 1 1 auto;
+  min-width: 0;
+  height: 100%;
+  padding: 2px 4px;
+  box-sizing: border-box;
+  background: #1e1e1e;
+}
+.claudeterm-timeline {
+  flex: 0 0 360px;
+  height: 100%;
+  min-height: 0;
+  border-left: 1px solid var(--border, #333);
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+}
+
 .dock-placeholder {
   display: flex;
   flex-direction: column;

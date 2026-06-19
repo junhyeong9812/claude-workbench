@@ -8,12 +8,13 @@
 use std::collections::HashMap;
 use std::io;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread;
+use std::time::Duration;
 
 use core_acp::{AcpEvent, AcpHost};
-use core_lib::{DirEntry, ProjectType, SessionManager, WorkspaceState};
+use core_lib::{DirEntry, ProjectType, SessionManager, TimelineItem, WorkspaceState};
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager, State};
 
@@ -310,6 +311,191 @@ pub fn acp_close(state: State<'_, AcpState>, id: u64) -> Result<(), AppError> {
     let host = acp_lock(&state)?.remove(&id);
     drop(host);
     Ok(())
+}
+
+// ---- Claude (architecture A: real terminal + session-JSONL tail) ----
+//
+// Instead of the ACP adapter, we spawn the **real** `claude` CLI in a PTY (so
+// xterm renders its full TUI — perfect terminal parity) and tail the session
+// JSONL transcript the CLI writes (`~/.claude/projects/<slug>/<uuid>.jsonl`) to
+// build the change timeline. `claude_start` does both: it reuses the PTY relay
+// (the `terminal-output` event, exactly like `terminal_create`) and spawns a
+// polling thread that drives a `SessionTail` and emits `claude-timeline` events.
+
+/// Managed state: the stop flag for each Claude session's polling thread, keyed
+/// by the PTY session id. Setting it (on `claude_close`) ends the thread.
+#[derive(Default)]
+pub struct ClaudeState {
+    polls: Mutex<HashMap<u64, Arc<AtomicBool>>>,
+}
+
+/// Returned by `claude_start`: the PTY session id (used by the panel for output
+/// filtering, input, and close) and the Claude session UUID we generated.
+#[derive(Serialize)]
+pub struct ClaudeStarted {
+    id: u64,
+    session_uuid: String,
+}
+
+/// One timeline item produced by tailing the session JSONL, tagged with its
+/// panel's PTY session id, emitted as the `claude-timeline` event.
+#[derive(Clone, Serialize)]
+struct ClaudeTimelinePayload {
+    id: u64,
+    item: TimelineItem,
+}
+
+/// Generate a fresh session UUID for `--session-id`. Linux-only (the app's
+/// platform): reads the kernel's random UUID source.
+fn new_session_uuid() -> Result<String, AppError> {
+    std::fs::read_to_string("/proc/sys/kernel/random/uuid")
+        .map(|s| s.trim().to_string())
+        .map_err(|_| AppError::new("Cannot generate a session id"))
+}
+
+/// Spawn the real `claude` CLI in a PTY rooted at `cwd` and start (a) relaying
+/// its output to `terminal-output` (xterm) and (b) tailing its session JSONL to
+/// emit `claude-timeline` items. `resume` continues an existing session by its
+/// UUID (same file, append); omitting it starts a new `--session-id` session.
+#[tauri::command]
+pub fn claude_start(
+    app: AppHandle,
+    mgr: State<'_, SessionManager>,
+    claude: State<'_, ClaudeState>,
+    cwd: Option<String>,
+    resume: Option<String>,
+    cols: u16,
+    rows: u16,
+) -> Result<ClaudeStarted, AppError> {
+    // Claude must be rooted at the project; refuse rather than guess.
+    let cwd = cwd.ok_or_else(|| AppError::new("Claude requires an active project"))?;
+    // Resume reuses the original id (same JSONL file); a new session gets a
+    // fresh UUID we pass via --session-id (so we know exactly which file to tail).
+    let session_uuid = match &resume {
+        Some(u) => u.clone(),
+        None => new_session_uuid()?,
+    };
+    let flag = if resume.is_some() { "--resume" } else { "--session-id" };
+    let cmd = vec!["claude".to_string(), flag.to_string(), session_uuid.clone()];
+
+    let id = mgr
+        .create(Some(cmd), Some(cwd.clone()), cols, rows)
+        .map_err(AppError::new)?;
+    let rx = mgr.subscribe(id).map_err(AppError::new)?;
+
+    let stop = Arc::new(AtomicBool::new(false));
+    claude
+        .polls
+        .lock()
+        .map_err(|_| AppError::new("Claude state unavailable"))?
+        .insert(id, stop.clone());
+
+    // (a) Relay PTY output -> webview, like `terminal_create`. When the PTY dies
+    // (claude exits on its own, or failed to start), the sender drops and this
+    // loop ends — we then set `stop` so the poll thread doesn't tail forever
+    // (codex B-2b #1).
+    {
+        let app = app.clone();
+        let stop = stop.clone();
+        thread::spawn(move || {
+            while let Ok(chunk) = rx.recv() {
+                let _ = app.emit(
+                    "terminal-output",
+                    TerminalOutput {
+                        session_id: id,
+                        seq: chunk.seq,
+                        data: chunk.bytes,
+                    },
+                );
+            }
+            stop.store(true, Ordering::Relaxed);
+        });
+    }
+
+    // (b) Tail the session JSONL -> emit timeline items.
+    {
+        let app = app.clone();
+        let cwd = cwd.clone();
+        let uuid = session_uuid.clone();
+        thread::spawn(move || run_timeline_poll(app, id, cwd, uuid, stop));
+    }
+
+    Ok(ClaudeStarted { id, session_uuid })
+}
+
+/// The polling loop for one Claude session (its own thread). Waits for the
+/// session JSONL to appear (the CLI creates it after init), then polls a
+/// `SessionTail` every ~150ms, emitting and persisting newly-touched items.
+/// Ends when the stop flag is set (`claude_close`).
+fn run_timeline_poll(app: AppHandle, id: u64, cwd: String, uuid: String, stop: Arc<AtomicBool>) {
+    let Some(root) = core_lib::jsonl::claude_projects_root() else {
+        return;
+    };
+    let mut tail: Option<core_lib::jsonl::SessionTail> = None;
+
+    while !stop.load(Ordering::Relaxed) {
+        thread::sleep(Duration::from_millis(150));
+
+        // Resolve the file once it appears, then keep tailing it.
+        if tail.is_none() {
+            if let Ok(Some(path)) = core_lib::jsonl::find_session_jsonl(&root, &uuid) {
+                tail = Some(core_lib::jsonl::SessionTail::new(
+                    cwd.clone(),
+                    uuid.clone(),
+                    path,
+                ));
+            } else {
+                continue;
+            }
+        }
+        let Some(t) = tail.as_mut() else { continue };
+        let touched = match t.poll() {
+            Ok(idx) => idx,
+            Err(_) => continue, // transient read error — retry next tick
+        };
+        if touched.is_empty() {
+            continue;
+        }
+        let items = t.timeline().items();
+        for &i in &touched {
+            if let Some(item) = items.get(i) {
+                // First cut: live emit only. Persistence (D-1) / reopen is the
+                // next increment — codex B-2b #2/#3 flagged that re-persisting the
+                // resume replay duplicates history, so the persist model (our own
+                // copy vs treating the CLI JSONL as the source) is being revisited.
+                let _ = app.emit(
+                    "claude-timeline",
+                    ClaudeTimelinePayload {
+                        id,
+                        item: item.clone(),
+                    },
+                );
+            }
+        }
+    }
+
+    // Drop our stop-flag entry so a later id collision can't see a stale flag.
+    if let Some(state) = app.try_state::<ClaudeState>() {
+        if let Ok(mut polls) = state.polls.lock() {
+            polls.remove(&id);
+        }
+    }
+}
+
+/// Close a Claude session: stop its polling thread and kill the PTY (which ends
+/// the output relay). The persisted timeline is kept (the `닫기` action).
+#[tauri::command]
+pub fn claude_close(
+    mgr: State<'_, SessionManager>,
+    claude: State<'_, ClaudeState>,
+    id: u64,
+) -> Result<(), AppError> {
+    if let Ok(mut polls) = claude.polls.lock() {
+        if let Some(stop) = polls.remove(&id) {
+            stop.store(true, Ordering::Relaxed);
+        }
+    }
+    mgr.remove(id).map_err(AppError::new)
 }
 
 // ---- Timeline persistence + session management (S3b/S3c) ----
