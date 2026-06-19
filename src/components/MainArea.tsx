@@ -13,6 +13,7 @@ import { useClaudeUi } from "../state/claudeUi";
 import { PlaceholderPanel } from "./PlaceholderPanel";
 import { TerminalPanel } from "./TerminalPanel";
 import { ClaudePanel } from "./ClaudePanel";
+import { ClaudeTab } from "./ClaudeTab";
 
 /** A saved Claude session, for the "+ Claude" picker (S3c). */
 interface SessionSummary {
@@ -27,18 +28,7 @@ interface SessionSummary {
  * override its × to raise a close request (-> 닫기/삭제 modal, B3-1); this
  * applies to restored panels too. */
 function AppTab(props: IDockviewPanelHeaderProps) {
-  if (props.params.kind === "claude") {
-    const sessionId =
-      (props.params.sessionId as string) ?? (props.params.loadSessionId as string) ?? null;
-    return (
-      <DockviewDefaultTab
-        {...props}
-        closeActionOverride={() =>
-          useClaudeUi.getState().requestClose({ panelId: props.api.id, sessionId })
-        }
-      />
-    );
-  }
+  if (props.params.kind === "claude") return <ClaudeTab {...props} />;
   return <DockviewDefaultTab {...props} />;
 }
 
@@ -162,7 +152,8 @@ export function MainArea() {
       (p) => (p.params as { kind?: string } | undefined)?.kind === "claude",
     ).length;
 
-  // "+ Claude": offer to reopen a saved (and not-already-open) session, else new.
+  // "+ Claude": always open the picker — name a new session or reopen a saved
+  // (not-already-open) one (B3-2/B3-5).
   const openClaude = async () => {
     let sessions: SessionSummary[] = [];
     if (activeProject) {
@@ -170,15 +161,15 @@ export function MainArea() {
         () => [],
       );
     }
-    const name = `Claude ${sessions.length + openClaudeCount() + 1}`;
+    setNewName(`Claude ${sessions.length + openClaudeCount() + 1}`);
     const open = openSessionIds();
-    const available = sessions.filter((s) => !open.has(s.session_id));
-    if (available.length === 0) {
-      addPanel("claude", { title: name });
-    } else {
-      setNewName(name);
-      setPicker(available);
-    }
+    setPicker(sessions.filter((s) => !open.has(s.session_id)));
+  };
+
+  const createNewClaude = () => {
+    const name = newName.trim() || "Claude";
+    setPicker(null);
+    addPanel("claude", { title: name });
   };
 
   return (
@@ -193,17 +184,25 @@ export function MainArea() {
         <button className="toolbar-btn" onClick={() => addPanel("editor")}>
           + Editor
         </button>
-        {picker && (
+        {picker !== null && (
           <div className="claude-picker">
-            <button
-              className="claude-picker-item claude-picker-new"
-              onClick={() => {
-                setPicker(null);
-                addPanel("claude", { title: newName });
-              }}
-            >
-              + 새 세션 <span className="claude-picker-meta">{newName}</span>
-            </button>
+            <div className="claude-picker-new-row">
+              <input
+                className="claude-picker-input"
+                value={newName}
+                autoFocus
+                placeholder="새 세션 이름"
+                onChange={(e) => setNewName(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter") createNewClaude();
+                  else if (e.key === "Escape") setPicker(null);
+                }}
+              />
+              <button className="claude-picker-create" onClick={createNewClaude}>
+                + 만들기
+              </button>
+            </div>
+            {picker.length > 0 && <div className="claude-picker-sep">저장된 세션</div>}
             {picker.map((s) => (
               <button
                 key={s.session_id}

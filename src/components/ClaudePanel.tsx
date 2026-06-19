@@ -322,15 +322,6 @@ export function ClaudePanel(props: IDockviewPanelProps<ClaudeParams>) {
     }
   };
 
-  // Rename: prompt for a new name, update the tab title and persist it.
-  const rename = () => {
-    const current = (paramsRef.current.title as string) ?? "Claude";
-    const next = window.prompt("세션 이름", current)?.trim();
-    if (!next || next === current) return;
-    props.api.setTitle(next);
-    props.api.updateParameters({ ...paramsRef.current, title: next });
-    persistName(next);
-  };
 
   const respondPerm = (requestId: number, optionId: string) => {
     const id = acpIdRef.current;
@@ -367,11 +358,6 @@ export function ClaudePanel(props: IDockviewPanelProps<ClaudeParams>) {
       <div className="claude-status">
         <span className={`claude-dot claude-dot-${status}`} />
         {statusLabel[status]}
-        {!readOnly && (
-          <button className="claude-tl-toggle" onClick={rename} title="세션 이름 변경">
-            ✎ 이름
-          </button>
-        )}
         <button
           className="claude-tl-toggle"
           onClick={() => setShowTimeline((v) => !v)}

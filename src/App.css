@@ -288,6 +288,57 @@ body {
   color: var(--fg-dim);
 }
 
+/* Inline tab rename input (B3-5) */
+.claude-tab-input {
+  width: 120px;
+  font-size: 13px;
+  padding: 0 4px;
+  color: var(--fg);
+  background: var(--bg);
+  border: 1px solid var(--accent);
+  border-radius: 3px;
+}
+
+/* "+ Claude" picker: new-session name row (B3-5) */
+.claude-picker-new-row {
+  display: flex;
+  gap: 4px;
+  padding: 6px;
+  border-bottom: 1px solid var(--border);
+}
+.claude-picker-input {
+  flex: 1;
+  min-width: 0;
+  font-size: 12px;
+  padding: 4px 6px;
+  color: var(--fg);
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 3px;
+}
+.claude-picker-input:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+.claude-picker-create {
+  font-size: 12px;
+  padding: 4px 10px;
+  white-space: nowrap;
+  color: var(--accent);
+  background: var(--bg-alt);
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  cursor: pointer;
+}
+.claude-picker-create:hover {
+  border-color: var(--accent);
+}
+.claude-picker-sep {
+  padding: 4px 10px 2px;
+  font-size: 10px;
+  color: var(--fg-dim);
+}
+
 /* "+ Claude" saved-session picker (S3c) */
 .claude-picker {
   position: absolute;
