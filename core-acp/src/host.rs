@@ -60,6 +60,9 @@ pub enum AcpEvent {
     Connected { session_id: String },
     /// One streamed chunk of the agent's reply (S1 renders text only).
     AgentMessageChunk { text: String },
+    /// A new turn began (the user's prompt was sent). The timeline groups each
+    /// turn's tool calls under this prompt (S3).
+    TurnStarted { turn: u64, prompt: String },
     /// The agent wants to run a tool; awaiting the user's approval (S2b-2).
     /// Answer with `AcpCommand::PermissionResponse { request_id, option_id }`.
     PermissionRequest {
@@ -77,6 +80,14 @@ pub enum AcpEvent {
     AuthRequired { command: String },
     /// A non-fatal error string for the UI (handshake/prompt failures, etc.).
     Error { message: String },
+    /// A change-timeline item was created or updated (S3). Carries the merged
+    /// item plus the `turn` it belongs to; the UI upserts by
+    /// `(session_id, tool_call_id)`, groups by `turn`, and orders by `seq`.
+    TimelineItem {
+        #[serde(flatten)]
+        item: core_lib::TimelineItem,
+        turn: u64,
+    },
     /// The host thread is finished (adapter exited or shutdown). Terminal.
     Disconnected,
 }
@@ -307,6 +318,11 @@ where
     let mut pending_perms: HashMap<u64, oneshot::Sender<Option<PermissionOptionId>>> =
         HashMap::new();
     let mut next_request_id: u64 = 0;
+    // Turn tracking (S3): each prompt opens a turn; tool calls that arrive while
+    // it runs (turns are serialized) are attributed to it. `turn_of` pins each
+    // item's turn at first sighting so later updates keep the same group.
+    let mut current_turn: u64 = 0;
+    let mut turn_of: HashMap<u64, u64> = HashMap::new();
 
     loop {
         tokio::select! {
@@ -316,6 +332,8 @@ where
                         queue.push_back(text);
                     } else {
                         in_flight = true;
+                        current_turn += 1;
+                        let _ = events.send(AcpEvent::TurnStarted { turn: current_turn, prompt: text.clone() });
                         spawn_prompt(client.clone(), session_id.clone(), text, events.clone(), done_tx.clone());
                     }
                 }
@@ -338,7 +356,11 @@ where
             _ = done_rx.recv() => {
                 // Current turn finished; start the next queued prompt, if any.
                 match queue.pop_front() {
-                    Some(next) => spawn_prompt(client.clone(), session_id.clone(), next, events.clone(), done_tx.clone()),
+                    Some(next) => {
+                        current_turn += 1;
+                        let _ = events.send(AcpEvent::TurnStarted { turn: current_turn, prompt: next.clone() });
+                        spawn_prompt(client.clone(), session_id.clone(), next, events.clone(), done_tx.clone());
+                    }
                     None => in_flight = false,
                 }
             }
@@ -360,16 +382,18 @@ where
                 }
                 // Execute-only: permission was already granted via the gate.
                 Some(ClientRequest::Write { path, content, respond }) => {
-                    let result = perform_write(&mut timeline, &path, &content);
+                    let (result, idx) = perform_write(&mut timeline, &path, &content);
+                    emit_item(&timeline, idx, current_turn, &mut turn_of, events);
                     let _ = respond.send(result);
                 }
                 None => break, // client/handler dropped
             },
             note = updates.recv() => match note {
                 Some(note) => {
-                    // Feed tool calls into the timeline (S2a) before forwarding
-                    // the message text. `apply` borrows; `forward` then moves.
-                    timeline.apply(&session, &note.update);
+                    // Feed tool calls into the timeline (S2a) and emit the merged
+                    // item (S3). `apply` borrows; `forward` then moves the update.
+                    let idx = timeline.apply(&session, &note.update);
+                    emit_item(&timeline, idx, current_turn, &mut turn_of, events);
                     forward_update(note.update, events);
                 }
                 None => break, // connection closed (adapter exited / I/O ended)
@@ -381,20 +405,40 @@ where
 
 /// Perform a (already-approved) disk write and record the outcome on the
 /// timeline by path. The approval happened earlier via `request_permission`.
+/// Returns the write result plus the affected timeline item index (if matched).
 fn perform_write(
     timeline: &mut Timeline,
     path: &std::path::Path,
     content: &str,
-) -> Result<(), String> {
+) -> (Result<(), String>, Option<usize>) {
     match std::fs::write(path, content) {
         Ok(()) => {
-            timeline.set_write_status_by_path(path, WriteStatus::Written);
-            Ok(())
+            let idx = timeline.set_write_status_by_path(path, WriteStatus::Written);
+            (Ok(()), idx)
         }
         Err(e) => {
-            timeline.set_write_status_by_path(path, WriteStatus::WriteFailed);
-            Err(format!("write failed: {e}"))
+            let idx = timeline.set_write_status_by_path(path, WriteStatus::WriteFailed);
+            (Err(format!("write failed: {e}")), idx)
         }
+    }
+}
+
+/// Emit the timeline item at `idx` (if any) to the UI, attributing it to the
+/// turn it was first seen in (pinned in `turn_of` so updates keep their group).
+fn emit_item(
+    timeline: &Timeline,
+    idx: Option<usize>,
+    current_turn: u64,
+    turn_of: &mut HashMap<u64, u64>,
+    events: &StdSender<AcpEvent>,
+) {
+    if let Some(idx) = idx {
+        let item = &timeline.items()[idx];
+        let turn = *turn_of.entry(item.seq).or_insert(current_turn);
+        let _ = events.send(AcpEvent::TimelineItem {
+            item: item.clone(),
+            turn,
+        });
     }
 }
 

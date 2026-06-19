@@ -209,6 +209,120 @@ body {
   font-size: 12px;
 }
 
+/* ---- Change timeline panel (S3) ---- */
+.timeline-panel {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-height: 0;
+  background: var(--bg);
+  color: var(--fg);
+}
+.timeline-head {
+  padding: 4px 8px;
+  font-size: 11px;
+  color: var(--fg-dim);
+  border-bottom: 1px solid var(--border);
+}
+.timeline-list {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 4px;
+}
+.timeline-empty {
+  padding: 12px 8px;
+  font-size: 12px;
+  color: var(--fg-dim);
+}
+.timeline-session {
+  margin-bottom: 8px;
+}
+.timeline-session-head {
+  position: sticky;
+  top: 0;
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--accent);
+  background: var(--bg);
+  padding: 3px 4px;
+  border-bottom: 1px solid var(--border);
+  z-index: 1;
+}
+.timeline-turn {
+  margin: 4px 0 4px 2px;
+  border-left: 2px solid var(--border);
+  padding-left: 6px;
+}
+.timeline-turn-head {
+  display: flex;
+  gap: 6px;
+  align-items: baseline;
+  font-size: 12px;
+  color: var(--fg);
+  padding: 2px 4px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.timeline-turn-q {
+  font-size: 10px;
+  font-weight: 600;
+  color: var(--accent);
+  flex-shrink: 0;
+}
+.timeline-label {
+  font-size: 10px;
+  color: var(--fg-dim);
+  background: var(--bg-alt);
+  border-radius: 8px;
+  padding: 0 6px;
+}
+.timeline-item {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 6px;
+  border-radius: 3px;
+  font-size: 12px;
+  cursor: default;
+}
+.timeline-item:hover {
+  background: var(--bg-hover);
+}
+.timeline-item.ts-canceled,
+.timeline-item.ts-failed {
+  opacity: 0.6;
+}
+.timeline-icon {
+  width: 14px;
+  text-align: center;
+}
+.timeline-title {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.timeline-diff {
+  font-size: 10px;
+  color: #3fb950;
+}
+.timeline-write-fail {
+  filter: none;
+}
+.timeline-status.ts-completed {
+  color: #3fb950;
+}
+.timeline-status.ts-failed {
+  color: #f85149;
+}
+.timeline-status.ts-in_progress,
+.timeline-status.ts-pending {
+  color: #d29922;
+}
+
 /* ---- Claude (ACP) panel ---- */
 .claude-panel {
   display: flex;
