@@ -77,6 +77,9 @@ fn strip_nested_claude_env() {
 /// commands, all thin wrappers over the `core`/`core-acp` crates.
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // Required for Korean/CJK composition in the webview (confirmed: without it
+    // Hangul doesn't compose at all). The input *duplication* is handled at the
+    // xterm/onData layer in ClaudeTermPanel, not here.
     #[cfg(target_os = "linux")]
     align_ime_module();
     strip_nested_claude_env();

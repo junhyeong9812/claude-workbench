@@ -110,6 +110,45 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
       /* host not laid out yet — ResizeObserver fits shortly */
     }
 
+    // Korean/CJK IME fix (attempt 2): in WebKitGTK, xterm's `onData` fires for
+    // the in-progress composition (preedit), so each partial syllable is sent
+    // and the composed text duplicates ("프로젝트" -> "프로로젝로젝"). We track
+    // the composition on xterm's hidden textarea and **drop onData while
+    // composing**; the `compositionend` listener is registered in the CAPTURE
+    // phase so `composing` is cleared *before* xterm's own (bubble-phase) handler
+    // emits the final composed text via onData — so the final lands exactly once.
+    // Korean/CJK IME fix (measured WebKitGTK flow): Hangul fires a *separate*
+    // `compositionend` per syllable, and `composing` is already false by the time
+    // onData runs — so "skip while composing" never helps. Worse, after each
+    // compositionend xterm emits the syllable via onData AND a redundant
+    // cumulative chunk ("로", then "로젝", then "로젝트"), duplicating input.
+    //
+    // Since `compositionend.data` is the exact syllable, we send it ourselves
+    // once and then drop the onData burst it triggers (`justComposed`, cleared on
+    // the next macrotask). Non-composed input (English, control keys, escape
+    // sequences) has no compositionend, so it flows through onData untouched.
+    // Korean/CJK IME fix (measured WebKitGTK flow): the webview fires a separate
+    // `compositionend` per composed syllable whose `.data` is exactly correct,
+    // but ALSO emits bursts of duplicate/cumulative `onData` for the same text
+    // ("로", then "로젝", then "로젝트") — which duplicate the input. So we send
+    // the composed text once here on `compositionend`, and in `onData` (below) we
+    // drop any multi-byte (non-ASCII) data: terminal keyboard input is
+    // ASCII/control only, so any CJK in onData is an IME duplicate we already
+    // handled. English, arrows, space, enter, and escape sequences are ASCII and
+    // pass through untouched.
+    const ta = term.textarea;
+    if (ta) {
+      ta.addEventListener("compositionend", (e) => {
+        const text = (e as CompositionEvent).data;
+        if (text && sessionId != null) {
+          invoke("terminal_write", {
+            id: sessionId,
+            data: Array.from(new TextEncoder().encode(text)),
+          }).catch(() => {});
+        }
+      });
+    }
+
     let disposed = false;
     let unlistenTerm: UnlistenFn | undefined;
     let unlistenTl: UnlistenFn | undefined;
@@ -180,6 +219,12 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
 
     const onData = term.onData((d) => {
       if (sessionId == null) return;
+      // Drop IME composition output (multi-byte / non-ASCII) — Hangul only
+      // arrives legitimately via `compositionend` (handled above); any CJK here
+      // is a duplicate. Keyboard input through onData is ASCII/control only.
+      for (const ch of d) {
+        if ((ch.codePointAt(0) ?? 0) > 0x7f) return;
+      }
       const bytes = Array.from(new TextEncoder().encode(d));
       invoke("terminal_write", { id: sessionId, data: bytes }).catch(() => {});
     });
