@@ -1,127 +1,35 @@
 //! Map ACP `session/update` tool-call events to internal **timeline items**
 //! (P2b-2 S2a).
 //!
-//! This is the synchronous, deterministic heart of the change timeline: it
-//! turns the agent's `tool_call` / `tool_call_update` notifications into a
-//! merged, ordered list of [`TimelineItem`]s. It performs **no disk writes and
-//! no async** — the only filesystem touch is read-only marker probing for the
-//! project label (see [`crate::label`]). Keeping it here in the headless `core`
-//! lets `cargo test -p core` cover the mapping with recorded fixtures, with no
+//! This is the synchronous, deterministic ACP mapper: it turns the agent's
+//! `tool_call` / `tool_call_update` notifications into merged [`TimelineItem`]s
+//! on a shared [`Timeline`]. It performs **no disk writes and no async** — the
+//! only filesystem touch is read-only marker probing for the project label (via
+//! [`Timeline::label_for`]). Keeping it in the headless `core` lets
+//! `cargo test -p core` cover the mapping with recorded fixtures, with no
 //! `npx`/runtime in the loop (design D1 / spec §2).
+//!
+//! The timeline **types** and **accumulator mechanics** live in
+//! [`crate::timeline`]; this module owns only the ACP-specific field extraction.
+//! It drives the accumulator through [`Timeline::entry`] / [`Timeline::item_mut`]
+//! — the same primitives the JSONL mapper ([`crate::jsonl`]) uses (P2b-4).
 //!
 //! Merge model (spec §2, codex #7/#8):
 //! - Items are keyed by `(session_id, tool_call_id)`; a `tool_call_update`
 //!   merges into the existing item, bumping `revision` (even after `completed`).
 //! - `seq` is assigned once, on first sighting, in client **receive order**.
-//! - `agent_status` (from the agent) and `write_status` (the result of *our*
-//!   disk write, set in S2b) are tracked **separately**.
 //! - `cancel_open` closes still-running items as `Canceled` (≠ `Failed`).
 
-use std::collections::HashMap;
 use std::path::PathBuf;
 
 use agent_client_protocol_schema::{
     ContentBlock, SessionUpdate, ToolCall, ToolCallContent, ToolCallStatus, ToolCallUpdate,
     ToolKind,
 };
-use serde::{Deserialize, Serialize};
 
-use crate::label::nearest_project_marker;
-
-/// Lifecycle of a tool call as reported by the **agent**.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum AgentStatus {
-    Pending,
-    InProgress,
-    Completed,
-    Failed,
-    /// Closed by us on `session/cancel` or adapter death (not an agent state).
-    Canceled,
-}
-
-/// Result of **our** disk write for an edit, tracked independently of the
-/// agent's status. Stays `None` until S2b performs the write.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum WriteStatus {
-    None,
-    Written,
-    WriteFailed,
-}
-
-/// Category of a tool call (mirrors ACP `ToolKind`), for icons/grouping.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ItemKind {
-    Read,
-    Edit,
-    Delete,
-    Move,
-    Search,
-    Execute,
-    Think,
-    Fetch,
-    Other,
-}
-
-/// A single-file modification carried by an edit tool call.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct FileDiff {
-    pub path: PathBuf,
-    pub old_text: Option<String>,
-    pub new_text: String,
-}
-
-/// One entry in the change timeline — the merged view of a tool call.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct TimelineItem {
-    pub session_id: String,
-    pub tool_call_id: String,
-    /// Monotonic client receive order (assigned once, on first sighting).
-    pub seq: u64,
-    pub kind: ItemKind,
-    pub title: String,
-    pub locations: Vec<PathBuf>,
-    /// Nearest project marker for the first location (spec §2). `None` if there
-    /// are no locations yet.
-    pub project_label: Option<String>,
-    pub diffs: Vec<FileDiff>,
-    /// Text the tool produced — a read's content, a search/exec output, an
-    /// explanation — for the detail view (B4). Concatenated text content blocks.
-    pub content_text: Option<String>,
-    /// Raw tool input (the command, the path, …), for the detail view (B4).
-    pub raw_input: Option<serde_json::Value>,
-    pub agent_status: AgentStatus,
-    pub write_status: WriteStatus,
-    /// Bumped on every merged update (audit of how many revisions we saw).
-    pub revision: u32,
-}
-
-/// Accumulates timeline items for **one session root**, merging updates and
-/// assigning receive-order `seq`. The persistence layer (S3) consumes
-/// [`Timeline::items`]; this type owns only the in-memory model.
-pub struct Timeline {
-    root: PathBuf,
-    items: Vec<TimelineItem>,
-    index: HashMap<(String, String), usize>,
-    next_seq: u64,
-}
+use crate::timeline::{AgentStatus, FileDiff, ItemKind, Timeline};
 
 impl Timeline {
-    pub fn new(root: impl Into<PathBuf>) -> Self {
-        Self {
-            root: root.into(),
-            items: Vec::new(),
-            index: HashMap::new(),
-            next_seq: 0,
-        }
-    }
-
-    pub fn items(&self) -> &[TimelineItem] {
-        &self.items
-    }
-
     /// Apply one `session/update`. Returns the affected item's index for
     /// `tool_call` / `tool_call_update`; other update kinds (message, plan,
     /// thought, …) are not timeline items and return `None`.
@@ -135,76 +43,37 @@ impl Timeline {
 
     /// Insert (or, for a re-sent id, merge) a full `tool_call`.
     fn upsert_call(&mut self, session_id: &str, tc: &ToolCall) -> usize {
-        let key = (session_id.to_string(), tc.id.0.to_string());
         let locations: Vec<PathBuf> = tc.locations.iter().map(|l| l.path.clone()).collect();
         let project_label = self.label_for(&locations);
         let diffs = extract_diffs(&tc.content);
         let content_text = extract_content_text(&tc.content);
 
-        if let Some(&idx) = self.index.get(&key) {
-            // A re-sent full tool_call (e.g. a retry reusing the id) is the new
-            // authoritative state, so every collection is overwritten.
-            let item = &mut self.items[idx];
-            item.kind = map_kind(tc.kind);
-            item.title = tc.title.clone();
-            item.locations = locations;
-            item.project_label = project_label;
-            item.diffs = diffs;
-            item.content_text = content_text;
-            if tc.raw_input.is_some() {
-                item.raw_input = tc.raw_input.clone();
-            }
-            item.agent_status = map_status(tc.status);
-            item.revision += 1;
-            return idx;
+        // A re-sent full tool_call (e.g. a retry reusing the id) is the new
+        // authoritative state, so every collection is overwritten and revision
+        // bumped; a first sighting fills the blank shell and stays revision 0.
+        let (idx, is_new) = self.entry(session_id, tc.id.0.as_ref());
+        let item = self.item_mut(idx);
+        item.kind = map_kind(tc.kind);
+        item.title = tc.title.clone();
+        item.locations = locations;
+        item.project_label = project_label;
+        item.diffs = diffs;
+        item.content_text = content_text;
+        if tc.raw_input.is_some() {
+            item.raw_input = tc.raw_input.clone();
         }
-
-        let seq = self.take_seq();
-        let item = TimelineItem {
-            session_id: session_id.to_string(),
-            tool_call_id: tc.id.0.to_string(),
-            seq,
-            kind: map_kind(tc.kind),
-            title: tc.title.clone(),
-            locations,
-            project_label,
-            diffs,
-            content_text,
-            raw_input: tc.raw_input.clone(),
-            agent_status: map_status(tc.status),
-            write_status: WriteStatus::None,
-            revision: 0,
-        };
-        self.push(key, item)
+        item.agent_status = map_status(tc.status);
+        if !is_new {
+            item.revision += 1;
+        }
+        idx
     }
 
     /// Merge a `tool_call_update`. If the id is unknown (ACP allows a call to be
-    /// described purely by updates), construct a fresh item from it.
+    /// described purely by updates), [`Timeline::entry`] constructs a fresh item
+    /// first; `merge_fields` then bumps its revision.
     fn apply_update(&mut self, session_id: &str, tu: &ToolCallUpdate) -> usize {
-        let key = (session_id.to_string(), tu.id.0.to_string());
-        let idx = match self.index.get(&key) {
-            Some(&idx) => idx,
-            None => {
-                let seq = self.take_seq();
-                let item = TimelineItem {
-                    session_id: session_id.to_string(),
-                    tool_call_id: tu.id.0.to_string(),
-                    seq,
-                    kind: ItemKind::Other,
-                    title: String::new(),
-                    locations: Vec::new(),
-                    project_label: None,
-                    diffs: Vec::new(),
-                    content_text: None,
-                    raw_input: None,
-                    agent_status: AgentStatus::Pending,
-                    write_status: WriteStatus::None,
-                    revision: 0,
-                };
-                let new_idx = self.push(key, item);
-                return self.merge_fields(new_idx, tu);
-            }
-        };
+        let (idx, _is_new) = self.entry(session_id, tu.id.0.as_ref());
         self.merge_fields(idx, tu)
     }
 
@@ -219,7 +88,7 @@ impl Timeline {
         let new_diffs = f.content.as_ref().map(|c| extract_diffs(c));
         let new_content_text = f.content.as_ref().map(|c| extract_content_text(c));
 
-        let item = &mut self.items[idx];
+        let item = self.item_mut(idx);
         if let Some(k) = f.kind {
             item.kind = map_kind(k);
         }
@@ -245,79 +114,6 @@ impl Timeline {
             item.raw_input = Some(input.clone());
         }
         item.revision += 1;
-        idx
-    }
-
-    /// Close every still-running item as `Canceled` (`session/cancel` or adapter
-    /// death). Completed/failed items are left untouched (codex #8).
-    pub fn cancel_open(&mut self) {
-        for item in &mut self.items {
-            if matches!(item.agent_status, AgentStatus::Pending | AgentStatus::InProgress) {
-                item.agent_status = AgentStatus::Canceled;
-                item.revision += 1;
-            }
-        }
-    }
-
-    /// Record the outcome of our own disk write for an item (S2b). Independent
-    /// of `agent_status`. Returns whether the item was found.
-    pub fn set_write_status(
-        &mut self,
-        session_id: &str,
-        tool_call_id: &str,
-        status: WriteStatus,
-    ) -> bool {
-        let key = (session_id.to_string(), tool_call_id.to_string());
-        if let Some(&idx) = self.index.get(&key) {
-            let item = &mut self.items[idx];
-            item.write_status = status;
-            item.revision += 1;
-            true
-        } else {
-            false
-        }
-    }
-
-    /// Correlate an `fs/write_text_file` to a timeline item by **path** and
-    /// record our write outcome. The ACP write request carries no
-    /// `tool_call_id`, so we attach it to the most recent (highest-seq) item
-    /// whose locations or diffs reference `path`. Returns the matched index.
-    pub fn set_write_status_by_path(
-        &mut self,
-        path: &std::path::Path,
-        status: WriteStatus,
-    ) -> Option<usize> {
-        let idx = self
-            .items
-            .iter()
-            .enumerate()
-            .rev()
-            .find(|(_, it)| {
-                it.locations.iter().any(|p| p == path) || it.diffs.iter().any(|d| d.path == path)
-            })
-            .map(|(i, _)| i)?;
-        let item = &mut self.items[idx];
-        item.write_status = status;
-        item.revision += 1;
-        Some(idx)
-    }
-
-    fn label_for(&self, locations: &[PathBuf]) -> Option<String> {
-        locations
-            .first()
-            .and_then(|p| nearest_project_marker(p, &self.root))
-    }
-
-    fn take_seq(&mut self) -> u64 {
-        let seq = self.next_seq;
-        self.next_seq += 1;
-        seq
-    }
-
-    fn push(&mut self, key: (String, String), item: TimelineItem) -> usize {
-        let idx = self.items.len();
-        self.items.push(item);
-        self.index.insert(key, idx);
         idx
     }
 }
@@ -383,6 +179,7 @@ fn extract_content_text(content: &[ToolCallContent]) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::timeline::WriteStatus;
     use serde_json::json;
 
     // Build a SessionUpdate from a JSON value (a recorded `session/update`

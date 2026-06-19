@@ -9,12 +9,14 @@
 pub mod acp_map;
 pub mod fs;
 pub mod history;
+pub mod jsonl;
 pub mod label;
 pub mod persist;
 pub mod project_type;
 pub mod session;
+pub mod timeline;
 
-pub use acp_map::{AgentStatus, FileDiff, ItemKind, TimelineItem, Timeline, WriteStatus};
+pub use timeline::{AgentStatus, FileDiff, ItemKind, Timeline, TimelineItem, WriteStatus};
 pub use fs::{list_dir, DirEntry};
 pub use label::nearest_project_marker;
 pub use persist::{load_state, save_state, Project, TreeState, WorkspaceState};
