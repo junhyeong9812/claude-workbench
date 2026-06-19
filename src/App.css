@@ -460,6 +460,19 @@ body {
   outline: 1px solid var(--accent);
   outline-offset: -1px;
 }
+/* Date divider (B6), sticky so the current date stays visible in a long list (B7). */
+.timeline-date {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.03em;
+  color: var(--fg-dim);
+  background: var(--bg);
+  padding: 4px 6px 3px;
+  border-bottom: 1px solid var(--border);
+}
 .timeline-detail-head {
   font-size: 12px;
   font-weight: 600;

@@ -46,7 +46,7 @@ type AcpEvent =
 /** A persisted timeline record (from `acp_session_timeline`, S3c reopen). */
 type TimelineRecord =
   | ({ type: "timeline_item" } & TimelineItem)
-  | { type: "turn_started"; turn: number; prompt: string; session_id: string }
+  | { type: "turn_started"; turn: number; prompt: string; session_id: string; date?: string }
   | { type: "turn_answer"; turn: number; text: string; session_id: string };
 
 /** A pending tool approval awaiting the user's decision (S2b-2). */
@@ -107,6 +107,9 @@ export function ClaudePanel(props: IDockviewPanelProps<ClaudeParams>) {
   const [tlItems, setTlItems] = useState<Map<string, TimelineItem>>(new Map());
   const [tlTurns, setTlTurns] = useState<Map<number, string>>(new Map());
   const [tlAnswers, setTlAnswers] = useState<Map<number, string>>(new Map());
+  // Per-turn local date (YYYY-MM-DD) for the timeline's date dividers (B6). Live
+  // turns are stamped on arrival; reopened turns use the persisted `date`.
+  const [tlDates, setTlDates] = useState<Map<number, string>>(new Map());
   const [showTimeline, setShowTimeline] = useState(true);
   // The highlighted/anchored timeline item — persists when the viewer closes so
   // ↑/↓ keeps navigating from there (B4). `viewerOpen` controls the viewer pane
@@ -194,6 +197,7 @@ export function ClaudePanel(props: IDockviewPanelProps<ClaudeParams>) {
     setTlItems(new Map());
     setTlTurns(new Map());
     setTlAnswers(new Map());
+    setTlDates(new Map());
     setStatus("starting");
     const cwd = useAppStore.getState().activeProject ?? null;
     try {
@@ -262,9 +266,13 @@ export function ClaudePanel(props: IDockviewPanelProps<ClaudeParams>) {
             },
           ]);
           break;
-        case "turn_started":
+        case "turn_started": {
           setTlTurns((prev) => new Map(prev).set(ev.turn, ev.prompt));
+          // Stamp the live turn with today's local date (YYYY-MM-DD) for B6.
+          const today = new Date().toLocaleDateString("en-CA");
+          setTlDates((prev) => new Map(prev).set(ev.turn, today));
           break;
+        }
         case "turn_answer":
           setTlAnswers((prev) => new Map(prev).set(ev.turn, ev.text));
           break;
@@ -310,10 +318,12 @@ export function ClaudePanel(props: IDockviewPanelProps<ClaudeParams>) {
         const tt = new Map<number, string>();
         const ta = new Map<number, string>();
         const ti = new Map<string, TimelineItem>();
+        const td = new Map<number, string>();
         let maxTurn = 0;
         for (const ev of events) {
           if (ev.type === "turn_started") {
             tt.set(ev.turn, ev.prompt);
+            if (ev.date) td.set(ev.turn, ev.date);
             maxTurn = Math.max(maxTurn, ev.turn);
           } else if (ev.type === "turn_answer") {
             ta.set(ev.turn, ev.text);
@@ -325,6 +335,7 @@ export function ClaudePanel(props: IDockviewPanelProps<ClaudeParams>) {
         setTlTurns(tt);
         setTlAnswers(ta);
         setTlItems(ti);
+        setTlDates(td);
         // Reconstruct the chat (Q+A) from the saved turns.
         const msgs: Message[] = [];
         for (const t of [...tt.keys()].sort((a, b) => a - b)) {
@@ -593,6 +604,7 @@ export function ClaudePanel(props: IDockviewPanelProps<ClaudeParams>) {
             items={[...tlItems.values()]}
             turns={tlTurns}
             answers={tlAnswers}
+            dates={tlDates}
             selectedId={selectedItem?.tool_call_id ?? null}
             onSelect={selectItem}
           />

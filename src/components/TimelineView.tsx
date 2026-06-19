@@ -4,7 +4,7 @@
  * that splits the chat area (left), keeping this list as a single column.
  * Presentational; ClaudePanel feeds it the items/turns for *its* session. */
 
-import { useEffect, useRef, useState } from "react";
+import { Fragment, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 
 export interface TimelineItem {
@@ -48,12 +48,14 @@ export function TimelineView({
   items,
   turns,
   answers,
+  dates,
   selectedId,
   onSelect,
 }: {
   items: TimelineItem[];
   turns: Map<number, string>;
   answers: Map<number, string>;
+  dates: Map<number, string>;
   selectedId: string | null;
   onSelect: (item: TimelineItem) => void;
 }) {
@@ -98,17 +100,29 @@ export function TimelineView({
     onSelect(orderedItems[next]);
   };
 
+  // Insert a date divider whenever the date changes between turns (B6). Turns
+  // are newest-first, so dates read newest→oldest down the list.
+  let prevDate: string | null = null;
+  const turnRows = turnNos.map((turn) => {
+    const date = dates.get(turn) ?? "";
+    const showDate = date !== "" && date !== prevDate;
+    prevDate = date;
+    return { turn, date, showDate };
+  });
+
   return (
     <div className="timeline-list" ref={listRef} tabIndex={0} onKeyDown={onKeyDown}>
       {turnNos.length === 0 && (
         <div className="timeline-empty">Claude에게 질문하면 여기에 쌓입니다.</div>
       )}
-      {turnNos.map((turn) => {
+      {turnRows.map(({ turn, date, showDate }) => {
         const turnItems = items.filter((it) => it.turn === turn).sort((a, b) => a.seq - b.seq);
         const prompt = turns.get(turn);
         const answer = answers.get(turn);
         return (
-          <div key={turn} className="timeline-turn">
+          <Fragment key={turn}>
+            {showDate && <div className="timeline-date">{date}</div>}
+          <div className="timeline-turn">
             <div className="timeline-turn-head" title={prompt ?? ""}>
               <span className="timeline-turn-q">Q{turn}</span>
               {prompt ?? "(질문)"}
@@ -145,6 +159,7 @@ export function TimelineView({
               </div>
             ))}
           </div>
+          </Fragment>
         );
       })}
     </div>
