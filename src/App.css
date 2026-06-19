@@ -454,6 +454,12 @@ body {
   overflow-y: auto;
   padding: 4px;
 }
+/* Focused list: ↑/↓ navigate items (B4). */
+.timeline-list:focus,
+.timeline-list:focus-visible {
+  outline: 1px solid var(--accent);
+  outline-offset: -1px;
+}
 .timeline-detail-head {
   font-size: 12px;
   font-weight: 600;

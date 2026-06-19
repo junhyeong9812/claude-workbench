@@ -4,7 +4,7 @@
  * that splits the chat area (left), keeping this list as a single column.
  * Presentational; ClaudePanel feeds it the items/turns for *its* session. */
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 
 export interface TimelineItem {
@@ -63,8 +63,35 @@ export function TimelineView({
     ...new Set<number>([...turns.keys(), ...answers.keys(), ...items.map((it) => it.turn)]),
   ].sort((a, b) => a - b);
 
+  // Flat display order (turn asc, then seq asc) for ↑/↓ navigation (B4).
+  const orderedItems = turnNos.flatMap((turn) =>
+    items.filter((it) => it.turn === turn).sort((a, b) => a.seq - b.seq),
+  );
+
+  const listRef = useRef<HTMLDivElement>(null);
+
+  // Keep the selected row scrolled into view as the user arrows through it.
+  useEffect(() => {
+    if (!selectedId || !listRef.current) return;
+    listRef.current
+      .querySelector(`[data-tcid="${CSS.escape(selectedId)}"]`)
+      ?.scrollIntoView({ block: "nearest" });
+  }, [selectedId]);
+
+  const onKeyDown = (e: React.KeyboardEvent<HTMLDivElement>) => {
+    if (e.key !== "ArrowDown" && e.key !== "ArrowUp") return;
+    if (orderedItems.length === 0) return;
+    e.preventDefault();
+    const idx = orderedItems.findIndex((it) => it.tool_call_id === selectedId);
+    let next: number;
+    if (idx === -1) next = e.key === "ArrowDown" ? 0 : orderedItems.length - 1;
+    else if (e.key === "ArrowDown") next = Math.min(idx + 1, orderedItems.length - 1);
+    else next = Math.max(idx - 1, 0);
+    onSelect(orderedItems[next]);
+  };
+
   return (
-    <div className="timeline-list">
+    <div className="timeline-list" ref={listRef} tabIndex={0} onKeyDown={onKeyDown}>
       {turnNos.length === 0 && (
         <div className="timeline-empty">Claude에게 질문하면 여기에 쌓입니다.</div>
       )}
@@ -86,11 +113,15 @@ export function TimelineView({
             {turnItems.map((it) => (
               <div
                 key={it.tool_call_id}
+                data-tcid={it.tool_call_id}
                 className={`timeline-item ts-${it.agent_status} ${
                   selectedId === it.tool_call_id ? "timeline-item-sel" : ""
                 }`}
                 title={it.locations.join("\n")}
-                onClick={() => onSelect(it)}
+                onClick={() => {
+                  onSelect(it);
+                  listRef.current?.focus();
+                }}
               >
                 <span className="timeline-icon">{KIND_ICON[it.kind] ?? "•"}</span>
                 <span className="timeline-title">{it.title || it.kind}</span>
