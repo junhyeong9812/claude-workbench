@@ -78,6 +78,9 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
   const [answers, setAnswers] = useState<Map<number, string>>(new Map());
   const [dates, setDates] = useState<Map<number, string>>(new Map());
   const [selectedId, setSelectedId] = useState<string | null>(null);
+  // A plain text (e.g. a turn's full answer) shown in the detail viewer when the
+  // timeline truncates it. Mutually exclusive with `selectedId`.
+  const [textView, setTextView] = useState<{ title: string; text: string } | null>(null);
   // Per-subagent change lists [agentId, parentToolCallId|null, turn, items] (B1).
   const [subagents, setSubagents] = useState<[string, string | null, number, TimelineItem[]][]>(
     [],
@@ -88,8 +91,9 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
     input: 0,
     output: 0,
   });
-  // Width (px) of the detail viewer pane; drag the splitter to resize.
+  // Width (px) of the detail viewer + timeline panes; drag splitters to resize.
   const [viewerWidth, setViewerWidth] = useState(480);
+  const [timelineWidth, setTimelineWidth] = useState(360);
 
   // Ctrl+←/→ moves focus between the panes: terminal → (viewer) → timeline.
   // The current pane is derived from `document.activeElement` (not a counter) so
@@ -128,6 +132,22 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
     const onMove = (ev: MouseEvent) => {
       const w = rect.right - TIMELINE_W - ev.clientX;
       setViewerWidth(Math.max(240, Math.min(rect.width - TIMELINE_W - 240, w)));
+    };
+    const onUp = () => {
+      window.removeEventListener("mousemove", onMove);
+      window.removeEventListener("mouseup", onUp);
+    };
+    window.addEventListener("mousemove", onMove);
+    window.addEventListener("mouseup", onUp);
+  };
+  // Drag the timeline splitter to resize the timeline column.
+  const startDragTimeline = (e: React.MouseEvent) => {
+    e.preventDefault();
+    const container = containerRef.current;
+    if (!container) return;
+    const rect = container.getBoundingClientRect();
+    const onMove = (ev: MouseEvent) => {
+      setTimelineWidth(Math.max(220, Math.min(rect.width - 240, rect.right - ev.clientX)));
     };
     const onUp = () => {
       window.removeEventListener("mousemove", onMove);
@@ -411,7 +431,7 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
         <div className="claudeterm-term" ref={hostRef} />
       </div>
 
-      {selectedItem && (
+      {(selectedItem || textView) && (
         <>
           <div
             className="claudeterm-splitter"
@@ -438,24 +458,36 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
           >
             <div className="claudeterm-pane-head">
               <span className="claudeterm-pane-head-title">
-                변경 상세 — {selectedItem.title || selectedItem.kind}
+                {textView ? textView.title : `변경 상세 — ${selectedItem!.title || selectedItem!.kind}`}
               </span>
               <span
                 className="claudeterm-viewer-x"
                 title="닫기"
-                onClick={() => setSelectedId(null)}
+                onClick={() => {
+                  setSelectedId(null);
+                  setTextView(null);
+                }}
               >
                 ×
               </span>
             </div>
             <div className="claudeterm-viewer-body">
-              <ItemDetail item={selectedItem} />
+              {textView ? (
+                <pre className="claudeterm-text">{textView.text}</pre>
+              ) : (
+                <ItemDetail item={selectedItem!} />
+              )}
             </div>
           </div>
         </>
       )}
 
-      <div className="claudeterm-pane claudeterm-timeline-pane" ref={timelineRef}>
+      <div className="claudeterm-splitter" title="드래그로 크기 조절" onMouseDown={startDragTimeline} />
+      <div
+        className="claudeterm-pane claudeterm-timeline-pane"
+        ref={timelineRef}
+        style={{ flex: `0 0 ${timelineWidth}px` }}
+      >
         <div className="claudeterm-pane-head">타임라인</div>
         <div className="claudeterm-timeline">
           <TimelineView
@@ -465,7 +497,14 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
             dates={dates}
             subagents={subagents}
             selectedId={selectedId}
-            onSelect={(it) => setSelectedId(it.tool_call_id)}
+            onSelect={(it) => {
+              setSelectedId(it.tool_call_id);
+              setTextView(null);
+            }}
+            onSelectAnswer={(turn) => {
+              setTextView({ title: `답변 (Q${turn})`, text: answers.get(turn) ?? "" });
+              setSelectedId(null);
+            }}
           />
         </div>
       </div>

@@ -52,6 +52,7 @@ export function TimelineView({
   subagents,
   selectedId,
   onSelect,
+  onSelectAnswer,
 }: {
   items: TimelineItem[];
   turns: Map<number, string>;
@@ -62,6 +63,8 @@ export function TimelineView({
   subagents?: [string, string | null, number, TimelineItem[]][];
   selectedId: string | null;
   onSelect: (item: TimelineItem) => void;
+  /** Click a (possibly truncated) turn answer to view it in full (detail pane). */
+  onSelectAnswer?: (turn: number) => void;
 }) {
   // Collapsed subagent groups (B1), keyed by agentId.
   const [collapsedAgents, setCollapsedAgents] = useState<Set<string>>(new Set());
@@ -224,7 +227,12 @@ export function TimelineView({
               {prompt ?? "(질문)"}
             </div>
             {answer && (
-              <div className="timeline-answer" title={answer}>
+              <div
+                className="timeline-answer"
+                title="클릭하면 전체 답변 보기"
+                onClick={() => onSelectAnswer?.(turn)}
+                style={{ cursor: onSelectAnswer ? "pointer" : undefined }}
+              >
                 {answer.length > 140 ? `${answer.slice(0, 140)}…` : answer}
               </div>
             )}
