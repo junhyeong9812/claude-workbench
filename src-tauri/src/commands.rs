@@ -877,3 +877,66 @@ pub fn write_file(path: String, content: String) -> Result<(), AppError> {
     })
 }
 
+
+// ---- Git panel (G1) — thin wrappers over core_lib::git (system `git` CLI) ----
+
+/// Working-tree status for `cwd` (infallible — non-repo yields `is_repo: false`).
+#[tauri::command]
+pub fn git_status(cwd: String) -> core_lib::git::GitStatus {
+    core_lib::git::status(&cwd)
+}
+
+/// Local branches + current.
+#[tauri::command]
+pub fn git_branches(cwd: String) -> Result<core_lib::git::Branches, AppError> {
+    core_lib::git::branches(&cwd).map_err(AppError::new)
+}
+
+/// Switch to an existing branch.
+#[tauri::command]
+pub fn git_checkout(cwd: String, branch: String) -> Result<(), AppError> {
+    core_lib::git::checkout(&cwd, &branch).map(|_| ()).map_err(AppError::new)
+}
+
+/// Create and switch to a new branch.
+#[tauri::command]
+pub fn git_create_branch(cwd: String, name: String) -> Result<(), AppError> {
+    core_lib::git::create_branch(&cwd, &name).map(|_| ()).map_err(AppError::new)
+}
+
+/// Stage one path.
+#[tauri::command]
+pub fn git_stage(cwd: String, path: String) -> Result<(), AppError> {
+    core_lib::git::stage(&cwd, &path).map(|_| ()).map_err(AppError::new)
+}
+
+/// Stage all changes.
+#[tauri::command]
+pub fn git_stage_all(cwd: String) -> Result<(), AppError> {
+    core_lib::git::stage_all(&cwd).map(|_| ()).map_err(AppError::new)
+}
+
+/// Unstage one path.
+#[tauri::command]
+pub fn git_unstage(cwd: String, path: String) -> Result<(), AppError> {
+    core_lib::git::unstage(&cwd, &path).map(|_| ()).map_err(AppError::new)
+}
+
+/// Commit staged changes with `message`. Returns git's stdout for feedback.
+#[tauri::command]
+pub fn git_commit(cwd: String, message: String) -> Result<String, AppError> {
+    core_lib::git::commit(&cwd, &message).map_err(AppError::new)
+}
+
+/// Push the current branch (sets upstream on `origin` if none). Explicit user
+/// action only — never called automatically.
+#[tauri::command]
+pub fn git_push(cwd: String) -> Result<String, AppError> {
+    core_lib::git::push(&cwd).map_err(AppError::new)
+}
+
+/// Recent commits across all refs (newest first) for the history graph.
+#[tauri::command]
+pub fn git_log(cwd: String, limit: Option<u32>) -> Result<Vec<core_lib::git::Commit>, AppError> {
+    core_lib::git::log(&cwd, limit.unwrap_or(200)).map_err(AppError::new)
+}

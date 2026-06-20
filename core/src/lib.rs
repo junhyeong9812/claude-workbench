@@ -6,6 +6,7 @@
 //! GUI libraries installed.
 
 pub mod fs;
+pub mod git;
 pub mod history;
 pub mod jsonl;
 pub mod label;
