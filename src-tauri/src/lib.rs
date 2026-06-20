@@ -87,7 +87,6 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .manage(core_lib::SessionManager::new())
-        .manage(commands::AcpState::default())
         .manage(commands::ClaudeState::default())
         .invoke_handler(tauri::generate_handler![
             commands::read_dir,
@@ -109,17 +108,7 @@ pub fn run() {
             commands::claude_set_task_meta,
             commands::claude_rename,
             commands::claude_delete,
-            commands::acp_start,
-            commands::acp_prompt,
-            commands::acp_alive,
-            commands::acp_respond,
-            commands::acp_cancel,
-            commands::acp_close,
-            commands::acp_sessions,
-            commands::acp_session_timeline,
             commands::acp_read_file,
-            commands::acp_delete_session,
-            commands::acp_rename_session,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

@@ -12,7 +12,6 @@ import { useAppStore } from "../state/store";
 import { useClaudeUi } from "../state/claudeUi";
 import { PlaceholderPanel } from "./PlaceholderPanel";
 import { TerminalPanel } from "./TerminalPanel";
-import { ClaudePanel } from "./ClaudePanel";
 import { ClaudeTermPanel } from "./ClaudeTermPanel";
 import { ClaudeTab } from "./ClaudeTab";
 
@@ -36,7 +35,7 @@ interface SessionSummary {
  * modal and its title renames inline (B3-1/B3-5). */
 function AppTab(props: IDockviewPanelHeaderProps) {
   const kind = props.params.kind;
-  if (kind === "claude" || kind === "claudeterm") return <ClaudeTab {...props} />;
+  if (kind === "claudeterm") return <ClaudeTab {...props} />;
   return <DockviewDefaultTab {...props} />;
 }
 
@@ -44,11 +43,10 @@ function AppTab(props: IDockviewPanelHeaderProps) {
 const components = {
   placeholder: PlaceholderPanel,
   terminal: TerminalPanel,
-  claude: ClaudePanel,
   claudeterm: ClaudeTermPanel,
 };
 
-type PanelKind = "terminal" | "editor" | "claude" | "claudeterm";
+type PanelKind = "terminal" | "editor" | "claudeterm";
 
 /**
  * The 80% main area, backed by dockview.
@@ -70,7 +68,6 @@ export function MainArea() {
   // would get (B3-4: per-project "Claude N", computed when the picker opens).
   const [picker, setPicker] = useState<SessionSummary[] | null>(null);
   // Which kind the open picker creates/reopens: ACP `claude` or A `claudeterm`.
-  const [pickerKind, setPickerKind] = useState<"claude" | "claudeterm">("claudeterm");
   const [newName, setNewName] = useState("Claude 1");
   // Expanded task chains in the picker (by head uuid) — collapsed shows only the
   // latest task of each chain; expand reveals its previous tasks.
@@ -113,17 +110,12 @@ export function MainArea() {
     // Real panel removal (close) -> close the backing session (spec §0.1). Tab/
     // project switches don't fire this, so those only detach (session lives).
     api.onDidRemovePanel((panel) => {
-      const params = panel.params as
-        | { kind?: string; sessionId?: number; acpId?: number }
-        | undefined;
+      const params = panel.params as { kind?: string; sessionId?: number } | undefined;
       if (typeof params?.sessionId === "number") {
         // claudeterm sessions also need their poll thread stopped (claude_close);
         // plain terminals just close the PTY.
         const cmd = params.kind === "claudeterm" ? "claude_close" : "terminal_close";
         invoke(cmd, { id: params.sessionId }).catch(() => {});
-      }
-      if (typeof params?.acpId === "number") {
-        invoke("acp_close", { id: params.acpId }).catch(() => {});
       }
     });
   };
@@ -136,16 +128,10 @@ export function MainArea() {
     if (!api) return;
     const n = ++counterRef.current;
     const title = opts?.title ?? `${kind[0].toUpperCase()}${kind.slice(1)} ${n}`;
-    // Terminals get the real PTY panel, Claude the ACP panel (with its own
-    // embedded change timeline); editor stays a stub until P3.
+    // Terminals get the real PTY panel, claudeterm the real claude CLI + timeline;
+    // editor stays a stub until the editor phase.
     const component =
-      kind === "terminal"
-        ? "terminal"
-        : kind === "claude"
-          ? "claude"
-          : kind === "claudeterm"
-            ? "claudeterm"
-            : "placeholder";
+      kind === "terminal" ? "terminal" : kind === "claudeterm" ? "claudeterm" : "placeholder";
     api.addPanel({
       id: `${kind}-${Date.now()}`,
       component,
@@ -180,11 +166,6 @@ export function MainArea() {
           uuid: req.sessionId,
         }).catch(() => {});
       }
-    } else if (deleteHistory && req.sessionId && project) {
-      await invoke("acp_delete_session", {
-        project,
-        sessionId: req.sessionId,
-      }).catch(() => {});
     }
     apiRef.current?.getPanel(req.panelId)?.api.close();
   };
@@ -213,66 +194,44 @@ export function MainArea() {
       (p) => (p.params as { kind?: string } | undefined)?.kind === kind,
     ).length;
 
-  // "+ Claude" / "+ Claude(A)": open the picker — name a new session or reopen a
-  // saved (not-already-open) one. Normalizes both backends to `SessionSummary`.
-  const openPicker = async (kind: "claude" | "claudeterm") => {
-    setPickerKind(kind);
+  // "+ Claude(A)": open the picker — name a new task session or reopen a saved
+  // (not-already-open) one, grouped into task chains. Per-project (active project).
+  const openPicker = async () => {
     setExpandedChains(new Set());
     let sessions: SessionSummary[] = [];
-    if (kind === "claudeterm") {
-      // Per-project: list only the active project's saved task sessions (tasks are
-      // managed per project — mixing other projects' tasks here is confusing).
-      if (activeProject) {
-        const raw = await invoke<
-          {
-            uuid: string;
-            name: string;
-            title: string;
-            date: string;
-            count: number;
-            prev_uuid?: string | null;
-          }[]
-        >("claude_sessions", { project: activeProject }).catch(() => []);
-        sessions = raw.map((s) => ({
-          id: s.uuid,
-          name: s.name,
-          title: s.title,
-          date: s.date,
-          count: s.count,
-          prev_uuid: s.prev_uuid ?? null,
-          project: activeProject,
-        }));
-      }
-    } else if (activeProject) {
+    if (activeProject) {
       const raw = await invoke<
-        { session_id: string; name: string; title: string; date: string; count: number }[]
-      >("acp_sessions", { project: activeProject }).catch(() => []);
+        {
+          uuid: string;
+          name: string;
+          title: string;
+          date: string;
+          count: number;
+          prev_uuid?: string | null;
+        }[]
+      >("claude_sessions", { project: activeProject }).catch(() => []);
       sessions = raw.map((s) => ({
-        id: s.session_id,
+        id: s.uuid,
         name: s.name,
         title: s.title,
         date: s.date,
         count: s.count,
-        prev_uuid: null,
+        prev_uuid: s.prev_uuid ?? null,
         project: activeProject,
       }));
     }
-    setNewName(`Claude ${sessions.length + openKindCount(kind) + 1}`);
+    setNewName(`Claude ${sessions.length + openKindCount("claudeterm") + 1}`);
     setPicker(sessions); // open-session filtering + chain grouping happen at render
   };
 
-  // Picker rows: claudeterm groups into task chains (head + collapsed previous
-  // tasks); others are a flat list. Already-open sessions never appear as rows
-  // (their predecessors still surface via the fallback below). Note: chain
-  // indexing keys on uuid alone — handoff uuids are random v4 (globally unique),
-  // so a (project, uuid) compound key is unnecessary; the React row key is still
-  // compounded with project to be safe (codex P2 F2).
+  // Picker rows: group saved task sessions into chains (head + collapsed previous
+  // tasks). Already-open sessions never appear as rows (their predecessors still
+  // surface via the fallback below). Chain indexing keys on uuid alone — handoff
+  // uuids are random v4 (globally unique); the React row key is still compounded
+  // with project to be safe (codex P2 F2).
   const pickerRows = (): { s: SessionSummary; depth: number; hasPrev: boolean }[] => {
     if (picker == null) return [];
     const open = openSessionIds();
-    if (pickerKind !== "claudeterm") {
-      return picker.filter((s) => !open.has(s.id)).map((s) => ({ s, depth: 0, hasPrev: false }));
-    }
     const byUuid = new Map(picker.map((s) => [s.id, s]));
     const referenced = new Set(picker.map((s) => s.prev_uuid).filter(Boolean) as string[]);
     const rows: { s: SessionSummary; depth: number; hasPrev: boolean }[] = [];
@@ -315,7 +274,7 @@ export function MainArea() {
   const createNewSession = () => {
     const name = newName.trim() || "Claude";
     setPicker(null);
-    addPanel(pickerKind, { title: name });
+    addPanel("claudeterm", { title: name });
   };
 
   // Alt+←/→/↑/↓ cycles the active session tab (dockview panel). Left/Up = prev,
@@ -347,11 +306,8 @@ export function MainArea() {
         <button className="toolbar-btn" onClick={() => addPanel("terminal")}>
           + Terminal
         </button>
-        <button className="toolbar-btn" onClick={() => openPicker("claude")}>
+        <button className="toolbar-btn" onClick={() => openPicker()}>
           + Claude
-        </button>
-        <button className="toolbar-btn" onClick={() => openPicker("claudeterm")}>
-          + Claude(A)
         </button>
         <button className="toolbar-btn" onClick={() => addPanel("editor")}>
           + Editor
@@ -379,9 +335,7 @@ export function MainArea() {
               if (rows.length === 0) return null;
               return (
                 <>
-                  <div className="claude-picker-sep">
-                    {pickerKind === "claudeterm" ? "저장된 task" : "저장된 세션"}
-                  </div>
+                  <div className="claude-picker-sep">저장된 task</div>
                   {rows.map(({ s, depth, hasPrev }) => (
                     <div
                       key={`${s.project}:${s.id}`}
@@ -404,7 +358,7 @@ export function MainArea() {
                         className="claude-picker-item"
                         onClick={() => {
                           setPicker(null);
-                          addPanel(pickerKind, {
+                          addPanel("claudeterm", {
                             loadSessionId: s.id,
                             project: s.project,
                             title: s.name || s.title?.slice(0, 24) || s.date,

@@ -8,12 +8,11 @@
 use std::collections::HashMap;
 use std::io;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use core_acp::{AcpEvent, AcpHost};
 use core_lib::{DirEntry, ProjectType, SessionManager, TimelineItem, TokenUsage, WorkspaceState};
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager, State};
@@ -177,140 +176,6 @@ pub fn terminal_snapshot(
 #[tauri::command]
 pub fn terminal_close(mgr: State<'_, SessionManager>, id: u64) -> Result<(), AppError> {
     mgr.remove(id).map_err(AppError::new)
-}
-
-// ---- ACP (Claude) commands ----
-//
-// The `core_acp::AcpHost` owns the adapter subprocess + its `!Send` connection
-// on a dedicated thread (async island — design D1). These commands are thin
-// wrappers over the host's `Send` handle; the only Tauri glue is the relay
-// thread in `acp_start`, which forwards host events to the `acp-event` webview
-// event (mirroring the PTY `terminal-output` relay).
-
-/// Managed state: one [`AcpHost`] per Claude panel, keyed by a monotonic id.
-#[derive(Default)]
-pub struct AcpState {
-    hosts: Mutex<HashMap<u64, AcpHost>>,
-    next_id: AtomicU64,
-}
-
-/// A host event tagged with its panel id, emitted as the `acp-event` event.
-/// `event` is flattened, so the payload is `{ id, type, ... }`.
-#[derive(Clone, Serialize)]
-struct AcpEventPayload {
-    id: u64,
-    #[serde(flatten)]
-    event: AcpEvent,
-}
-
-fn acp_lock<'a>(
-    state: &'a State<'_, AcpState>,
-) -> Result<std::sync::MutexGuard<'a, HashMap<u64, AcpHost>>, AppError> {
-    state
-        .hosts
-        .lock()
-        .map_err(|_| AppError::new("ACP state unavailable"))
-}
-
-/// Spawn the Claude adapter rooted at `cwd` (the active project) and start
-/// relaying its events. Returns the panel id used by the other ACP commands.
-#[tauri::command]
-pub fn acp_start(
-    app: AppHandle,
-    state: State<'_, AcpState>,
-    cwd: Option<String>,
-    resume: Option<String>,
-    start_turn: Option<u64>,
-) -> Result<u64, AppError> {
-    // Claude must be rooted at the session root; refuse rather than guess.
-    let cwd =
-        PathBuf::from(cwd.ok_or_else(|| AppError::new("Claude requires an active project"))?);
-    let project = cwd.to_string_lossy().to_string();
-
-    let (ev_tx, ev_rx) = std::sync::mpsc::channel::<AcpEvent>();
-    let host = AcpHost::spawn(cwd, ev_tx, resume, start_turn.unwrap_or(0))
-        .map_err(|e| AppError::new(io_message("Cannot start Claude", &e)))?;
-    let id = state.next_id.fetch_add(1, Ordering::Relaxed);
-
-    // Relay host events -> webview until the host thread ends (sender dropped
-    // -> recv errors -> loop exits; no leak). `Disconnected` is the last event
-    // sent before the sender drops. Timeline events are also persisted (S3b).
-    // On exit we drop the now-dead handle from state so later commands on `id`
-    // fail loudly instead of silently no-op'ing.
-    let app = app.clone();
-    thread::spawn(move || {
-        while let Ok(event) = ev_rx.recv() {
-            persist_event(&app, &project, &event);
-            let _ = app.emit("acp-event", AcpEventPayload { id, event });
-        }
-        if let Some(state) = app.try_state::<AcpState>() {
-            if let Ok(mut hosts) = state.hosts.lock() {
-                hosts.remove(&id);
-            }
-        }
-    });
-
-    acp_lock(&state)?.insert(id, host);
-    Ok(id)
-}
-
-/// Queue a prompt to a Claude session.
-#[tauri::command]
-pub fn acp_prompt(state: State<'_, AcpState>, id: u64, text: String) -> Result<(), AppError> {
-    let hosts = acp_lock(&state)?;
-    let host = hosts
-        .get(&id)
-        .ok_or_else(|| AppError::new("unknown Claude session"))?;
-    host.prompt(text);
-    Ok(())
-}
-
-/// Whether a Claude session id is still live. Sessions survive tab/project
-/// switches (the host lives in `AcpState`) but **not** an app restart, which
-/// empties the process-local map — a re-attaching panel uses this to tell a
-/// live session from a stale persisted id.
-#[tauri::command]
-pub fn acp_alive(state: State<'_, AcpState>, id: u64) -> bool {
-    acp_lock(&state)
-        .map(|hosts| hosts.contains_key(&id))
-        .unwrap_or(false)
-}
-
-/// Answer a pending tool approval (S2b-2). `option_id` is the chosen permission
-/// option; an empty string declines (Cancelled).
-#[tauri::command]
-pub fn acp_respond(
-    state: State<'_, AcpState>,
-    id: u64,
-    request_id: u64,
-    option_id: String,
-) -> Result<(), AppError> {
-    let hosts = acp_lock(&state)?;
-    let host = hosts
-        .get(&id)
-        .ok_or_else(|| AppError::new("unknown Claude session"))?;
-    host.respond_permission(request_id, option_id);
-    Ok(())
-}
-
-/// Cancel the in-flight turn for a session (best effort).
-#[tauri::command]
-pub fn acp_cancel(state: State<'_, AcpState>, id: u64) -> Result<(), AppError> {
-    let hosts = acp_lock(&state)?;
-    let host = hosts
-        .get(&id)
-        .ok_or_else(|| AppError::new("unknown Claude session"))?;
-    host.cancel();
-    Ok(())
-}
-
-/// Close a session: drop the host (its `Drop` asks the thread to shut down and
-/// kill the adapter). The persisted timeline is **kept** (the `닫기` action).
-#[tauri::command]
-pub fn acp_close(state: State<'_, AcpState>, id: u64) -> Result<(), AppError> {
-    let host = acp_lock(&state)?.remove(&id);
-    drop(host);
-    Ok(())
 }
 
 // ---- Claude (architecture A: real terminal + session-JSONL tail) ----
@@ -953,146 +818,10 @@ pub fn claude_close(
     mgr.remove(id).map_err(AppError::new)
 }
 
-// ---- Timeline persistence + session management (S3b/S3c) ----
 
-/// Persist a timeline event (`TurnStarted` / `TimelineItem`) to the project's
-/// app-data history as one JSON line, tagged with today's date. Other events
-/// are not persisted. Best effort — never blocks the relay.
-fn persist_event(app: &AppHandle, project: &str, event: &AcpEvent) {
-    // Serialize the event (tagged) and only keep the timeline kinds.
-    let mut val = match serde_json::to_value(event) {
-        Ok(v) => v,
-        Err(_) => return,
-    };
-    let kind = val.get("type").and_then(|v| v.as_str()).unwrap_or("");
-    if kind != "timeline_item" && kind != "turn_started" && kind != "turn_answer" {
-        return;
-    }
-    let Some(session) = val
-        .get("session_id")
-        .and_then(|v| v.as_str())
-        .map(str::to_string)
-    else {
-        return;
-    };
-    let Ok(base) = app.path().app_data_dir() else {
-        return;
-    };
-    let date = chrono::Local::now().format("%Y-%m-%d").to_string();
-    if let Some(obj) = val.as_object_mut() {
-        obj.insert("date".into(), serde_json::Value::String(date.clone()));
-    }
-    if let Ok(line) = serde_json::to_string(&val) {
-        let _ = core_lib::history::append(&base, project, &date, &session, &line);
-    }
-}
 
-/// A saved session, summarized for the "open" picker (S3c/B3-5).
-#[derive(Serialize)]
-pub struct SessionSummary {
-    session_id: String,
-    date: String,
-    /// User-facing name ("Claude N" or a rename). Falls back to the title.
-    name: String,
-    /// The first prompt of the session (its first turn), shown as subtext.
-    title: String,
-    /// Number of timeline (tool-call) items recorded.
-    count: usize,
-}
 
-/// Persist a session's display name (B3-5). Appended as a `session_name` record;
-/// the latest one wins on load. Called on the first prompt (so empty sessions
-/// stay unsaved) and on rename.
-#[tauri::command]
-pub fn acp_rename_session(
-    app: AppHandle,
-    project: String,
-    session_id: String,
-    name: String,
-) -> Result<(), AppError> {
-    let base = app
-        .path()
-        .app_data_dir()
-        .map_err(|_| AppError::new("Cannot resolve app data directory"))?;
-    let date = chrono::Local::now().format("%Y-%m-%d").to_string();
-    let line = serde_json::json!({
-        "type": "session_name", "session_id": session_id, "name": name, "date": date,
-    })
-    .to_string();
-    core_lib::history::append(&base, &project, &date, &session_id, &line)
-        .map_err(|e| AppError::new(io_message("Cannot rename session", &e)))
-}
 
-/// List the saved Claude sessions for `project`, newest first.
-#[tauri::command]
-pub fn acp_sessions(app: AppHandle, project: String) -> Vec<SessionSummary> {
-    let Ok(base) = app.path().app_data_dir() else {
-        return vec![];
-    };
-    let mut out: Vec<SessionSummary> = Vec::new();
-    for file in core_lib::history::session_files(&base, &project) {
-        let Ok(content) = std::fs::read_to_string(&file) else {
-            continue;
-        };
-        let mut session_id = String::new();
-        let mut date = String::new();
-        let mut title = String::new();
-        let mut name = String::new();
-        let mut count = 0usize;
-        for line in content.lines() {
-            let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
-                continue;
-            };
-            if session_id.is_empty() {
-                session_id = v.get("session_id").and_then(|x| x.as_str()).unwrap_or("").to_string();
-                date = v.get("date").and_then(|x| x.as_str()).unwrap_or("").to_string();
-            }
-            match v.get("type").and_then(|x| x.as_str()) {
-                Some("turn_started") if title.is_empty() => {
-                    title = v.get("prompt").and_then(|x| x.as_str()).unwrap_or("").to_string();
-                }
-                // Latest session_name wins.
-                Some("session_name") => {
-                    name = v.get("name").and_then(|x| x.as_str()).unwrap_or("").to_string();
-                }
-                Some("timeline_item") => count += 1,
-                _ => {}
-            }
-        }
-        if !session_id.is_empty() {
-            if name.is_empty() {
-                name = title.clone();
-            }
-            out.push(SessionSummary {
-                session_id,
-                date,
-                name,
-                title,
-                count,
-            });
-        }
-    }
-    // Newest first (by date desc, then discovery order).
-    out.sort_by(|a, b| b.date.cmp(&a.date));
-    out
-}
-
-/// Return a saved session's timeline as JSON event lines (parsed), for the UI
-/// to replay into a read-only timeline view (S3c reopen).
-#[tauri::command]
-pub fn acp_session_timeline(
-    app: AppHandle,
-    project: String,
-    session_id: String,
-) -> Vec<serde_json::Value> {
-    let Ok(base) = app.path().app_data_dir() else {
-        return vec![];
-    };
-    core_lib::history::load_session(&base, &project, &session_id)
-        .into_iter()
-        .filter_map(|l| serde_json::from_str(&l).ok())
-        .collect()
-}
 
 /// Read a file's current text for the timeline detail viewer (B4) — e.g.
 /// clicking a `read` item shows the file itself. Capped to keep the viewer
@@ -1109,18 +838,3 @@ pub fn acp_read_file(path: String) -> Result<String, AppError> {
         .map_err(|e| AppError::new(io_message("Cannot read file", &e)))
 }
 
-/// Delete a saved session's persisted history (the `삭제` action). The live
-/// host, if any, should be closed separately via `acp_close`.
-#[tauri::command]
-pub fn acp_delete_session(
-    app: AppHandle,
-    project: String,
-    session_id: String,
-) -> Result<(), AppError> {
-    let base = app
-        .path()
-        .app_data_dir()
-        .map_err(|_| AppError::new("Cannot resolve app data directory"))?;
-    core_lib::history::delete_session(&base, &project, &session_id)
-        .map_err(|e| AppError::new(io_message("Cannot delete session", &e)))
-}

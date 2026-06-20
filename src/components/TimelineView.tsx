@@ -1,8 +1,8 @@
 /** One Claude session's change timeline (B3/B4) — the right column of a Claude
  * tab: one continuous list of every tool call grouped by turn. Clicking an item
- * calls `onSelect`; the owning ClaudePanel shows that item's content in a viewer
+ * calls `onSelect`; the owning ClaudeTermPanel shows that item's content in a viewer
  * that splits the chat area (left), keeping this list as a single column.
- * Presentational; ClaudePanel feeds it the items/turns for *its* session. */
+ * Presentational; ClaudeTermPanel feeds it the items/turns for *its* session. */
 
 import { Fragment, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";

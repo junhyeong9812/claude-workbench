@@ -7,8 +7,8 @@ import { create } from "zustand";
 export interface ClaudeCloseRequest {
   panelId: string;
   sessionId: string | null;
-  /** Which backend owns the session, so the modal calls the right delete. */
-  kind: "claude" | "claudeterm";
+  /** Panel kind (architecture-A claude terminal). */
+  kind: "claudeterm";
   /** claudeterm's live PTY id, so the modal can stop the poll thread before a
    * delete (otherwise it would recreate the snapshot). */
   ptyId?: number;

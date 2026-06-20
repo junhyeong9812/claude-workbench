@@ -12,13 +12,9 @@ import { useClaudeUi } from "../state/claudeUi";
  */
 export function ClaudeTab(props: IDockviewPanelHeaderProps) {
   const title = (props.params.title as string) ?? "Claude";
-  const kind = (props.params.kind as string) === "claudeterm" ? "claudeterm" : "claude";
-  // The session UUID to rename/delete. ACP panels key by `sessionId`; the
-  // architecture-A terminal keys by `sessionUuid` (its Claude session id).
+  // The architecture-A terminal keys by `sessionUuid` (its Claude session id).
   const sessionId =
-    kind === "claudeterm"
-      ? ((props.params.sessionUuid as string) ?? (props.params.loadSessionId as string) ?? null)
-      : ((props.params.sessionId as string) ?? (props.params.loadSessionId as string) ?? null);
+    (props.params.sessionUuid as string) ?? (props.params.loadSessionId as string) ?? null;
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState(title);
 
@@ -28,17 +24,11 @@ export function ClaudeTab(props: IDockviewPanelHeaderProps) {
     if (!next || next === title) return;
     props.api.setTitle(next);
     props.api.updateParameters({ ...props.params, title: next });
-    // The panel's own project (a workspace-wide reopen can run a task from a
-    // different project than the active tab) — fall back to the active project.
+    // The panel's own project — fall back to the active project.
     const project =
       (props.params.project as string | undefined) ?? useAppStore.getState().activeProject ?? null;
     if (sessionId && project) {
-      const cmd = kind === "claudeterm" ? "claude_rename" : "acp_rename_session";
-      const args =
-        kind === "claudeterm"
-          ? { project, uuid: sessionId, name: next }
-          : { project, sessionId, name: next };
-      invoke(cmd, args).catch(() => {});
+      invoke("claude_rename", { project, uuid: sessionId, name: next }).catch(() => {});
     }
   };
 
@@ -84,14 +74,16 @@ export function ClaudeTab(props: IDockviewPanelHeaderProps) {
         onClick={(e) => {
           e.stopPropagation();
           const ptyId =
-            kind === "claudeterm" && typeof props.params.sessionId === "number"
+            typeof props.params.sessionId === "number"
               ? (props.params.sessionId as number)
               : undefined;
           const project =
             (props.params.project as string | undefined) ??
             useAppStore.getState().activeProject ??
             null;
-          useClaudeUi.getState().requestClose({ panelId: props.api.id, sessionId, kind, ptyId, project });
+          useClaudeUi
+            .getState()
+            .requestClose({ panelId: props.api.id, sessionId, kind: "claudeterm", ptyId, project });
         }}
       >
         ×
