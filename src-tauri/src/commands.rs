@@ -350,6 +350,9 @@ struct ClaudeTimelinePayload {
     answers: Vec<(u64, String)>,
     dates: Vec<(u64, String)>,
     tokens: Vec<(u64, TokenUsage)>,
+    /// Per-subagent (`Task`) change lists, keyed by agent id — the work each
+    /// parallel agent did, tailed from `<uuid>/subagents/agent-<id>.jsonl` (B1).
+    subagents: Vec<(String, Vec<TimelineItem>)>,
 }
 
 /// Generate a fresh session UUID for `--session-id`. Linux-only (the app's
@@ -449,10 +452,13 @@ fn run_timeline_poll(
         return;
     };
     let mut tail: Option<core_lib::jsonl::SessionTail> = None;
-    // Cheap fingerprint of the last emitted state. A prompt- or answer-only
-    // record advances turns/answers without touching any tool item, so we can't
-    // key off `poll`'s touched indices alone — compare the whole shape.
-    let mut last_fp: (usize, u32, usize, usize, usize) = (0, 0, 0, 0, 0);
+    // `<uuid>/subagents/` dir + a tail per subagent transcript (Task agents).
+    let mut sub_dir: Option<PathBuf> = None;
+    let mut subagents: HashMap<String, core_lib::jsonl::SessionTail> = HashMap::new();
+    // Cheap fingerprint of the last emitted state (incl. subagent item count). A
+    // prompt- or answer-only record advances turns/answers without touching any
+    // tool item, so we can't key off `poll`'s touched indices alone.
+    let mut last_fp: (usize, u32, usize, usize, usize, usize) = (0, 0, 0, 0, 0, 0);
 
     while !stop.load(Ordering::Relaxed) {
         thread::sleep(Duration::from_millis(150));
@@ -466,6 +472,7 @@ fn run_timeline_poll(
         // Resolve the file once it appears, then keep tailing it.
         if tail.is_none() {
             if let Ok(Some(path)) = core_lib::jsonl::find_session_jsonl(&root, &uuid) {
+                sub_dir = Some(path.with_extension("").join("subagents"));
                 tail = Some(core_lib::jsonl::SessionTail::new(
                     cwd.clone(),
                     uuid.clone(),
@@ -480,13 +487,43 @@ fn run_timeline_poll(
             continue; // transient read error — retry next tick
         }
 
+        // Tail each subagent transcript (parallel Task agents write their own
+        // `<uuid>/subagents/agent-<id>.jsonl`). New files appear as agents spawn.
+        if let Some(sd) = &sub_dir {
+            if let Ok(entries) = std::fs::read_dir(sd) {
+                for entry in entries.flatten() {
+                    let f = entry.path();
+                    if f.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+                        continue;
+                    }
+                    let Some(aid) = f
+                        .file_stem()
+                        .and_then(|s| s.to_str())
+                        .map(|s| s.trim_start_matches("agent-").to_string())
+                    else {
+                        continue;
+                    };
+                    let st = subagents
+                        .entry(aid.clone())
+                        .or_insert_with(|| core_lib::jsonl::SessionTail::new(cwd.clone(), aid, f));
+                    let _ = st.poll();
+                }
+            }
+        }
+        let sub_rev: u32 = subagents
+            .values()
+            .flat_map(|st| st.timeline().items().iter().map(|i| i.revision))
+            .sum();
+        let sub_count: usize = subagents.values().map(|st| st.timeline().items().len()).sum();
+
         let items = t.timeline().items();
         let fp = (
             items.len(),
-            items.iter().map(|i| i.revision).sum(),
+            items.iter().map(|i| i.revision).sum::<u32>() + sub_rev,
             t.turns().len(),
             t.answers().values().map(|s| s.len()).sum(),
             t.dates().len(),
+            sub_count,
         );
         if fp == last_fp {
             continue; // nothing changed this tick
@@ -499,6 +536,11 @@ fn run_timeline_poll(
             t.answers().iter().map(|(k, v)| (*k, v.clone())).collect();
         let dates_v: Vec<(u64, String)> = t.dates().iter().map(|(k, v)| (*k, v.clone())).collect();
         let tokens_v: Vec<(u64, TokenUsage)> = t.tokens().iter().map(|(k, v)| (*k, *v)).collect();
+        let subagents_v: Vec<(String, Vec<TimelineItem>)> = subagents
+            .iter()
+            .filter(|(_, st)| !st.timeline().items().is_empty())
+            .map(|(aid, st)| (aid.clone(), st.timeline().items().to_vec()))
+            .collect();
 
         let _ = app.emit(
             "claude-timeline",
@@ -509,6 +551,7 @@ fn run_timeline_poll(
                 answers: answers_v.clone(),
                 dates: dates_v.clone(),
                 tokens: tokens_v.clone(),
+                subagents: subagents_v,
             },
         );
 

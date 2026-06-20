@@ -24,7 +24,7 @@ export interface TimelineItem {
   revision: number;
 }
 
-const KIND_ICON: Record<string, string> = {
+export const KIND_ICON: Record<string, string> = {
   read: "📖",
   edit: "✎",
   delete: "🗑",
@@ -36,7 +36,7 @@ const KIND_ICON: Record<string, string> = {
   other: "•",
 };
 
-const AGENT_BADGE: Record<string, string> = {
+export const AGENT_BADGE: Record<string, string> = {
   pending: "…",
   in_progress: "▶",
   completed: "✓",
