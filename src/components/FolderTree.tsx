@@ -124,11 +124,14 @@ export function FolderTree() {
     const cursor = useAppStore.getState().treeCursor;
     const idx = nodes.findIndex((n) => n.path === cursor);
     const cur = idx >= 0 ? nodes[idx] : null;
-    // Ctrl+E opens the cursor file in the editor.
+    // Ctrl+E opens the cursor file in the editor. Close the peek viewer too — the
+    // editor opens as a dock panel *under* the peek overlay, so leaving the peek
+    // open would hide it.
     if (e.ctrlKey && (e.key === "e" || e.key === "E")) {
       if (cur && !cur.is_dir) {
         e.preventDefault();
         requestEditorOpen(cur.path);
+        setPeekFile(null);
       }
       return;
     }
@@ -174,8 +177,17 @@ export function FolderTree() {
     return <div className="tree-empty">Loading…</div>;
   }
 
+  // When the tree gains focus (e.g. Ctrl+B) with no cursor yet, put it on the
+  // first node so there's a visible selection to navigate from.
+  const onFocus = () => {
+    if (useAppStore.getState().treeCursor == null) {
+      const nodes = visibleNodes();
+      if (nodes.length > 0) setTreeCursor(nodes[0].path);
+    }
+  };
+
   return (
-    <div className="tree" id="folder-tree" tabIndex={0} onKeyDown={onKeyDown}>
+    <div className="tree" id="folder-tree" tabIndex={0} onKeyDown={onKeyDown} onFocus={onFocus}>
       {rootChildren.map((entry) => (
         <TreeNode key={entry.path} entry={entry} depth={0} />
       ))}

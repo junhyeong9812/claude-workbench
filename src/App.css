@@ -1414,13 +1414,19 @@ body {
   white-space: nowrap;
 }
 
-/* Keyboard cursor + currently-peeked file in the tree. */
+/* Keyboard focus on the tree: a clear inset ring so Ctrl+B's effect is visible. */
 .tree:focus,
 .tree:focus-visible {
   outline: none;
+  box-shadow: inset 0 0 0 2px rgba(137, 180, 250, 0.55);
 }
+/* Keyboard cursor + currently-peeked file in the tree. The cursor reads stronger
+ * while the tree is focused. */
 .tree-row-cursor {
-  background: rgba(137, 180, 250, 0.25);
+  background: rgba(137, 180, 250, 0.18);
+}
+.tree:focus .tree-row-cursor {
+  background: rgba(137, 180, 250, 0.32);
 }
 .tree-row-peeked {
   box-shadow: inset 2px 0 0 #89b4fa;
