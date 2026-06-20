@@ -823,16 +823,18 @@ pub fn claude_close(
 
 
 
-/// Read a file's current text for the timeline detail viewer (B4) — e.g.
-/// clicking a `read` item shows the file itself. Capped to keep the viewer
-/// responsive; refuses binary/oversized files rather than flooding the UI.
+/// Read a file's text, capped at `max_bytes` (default 5MB for the viewer; the
+/// editor passes a smaller limit to decide editability). Refuses oversized files
+/// rather than flooding the UI. Used by the timeline detail viewer, the file peek
+/// viewer, and the editor.
 #[tauri::command]
-pub fn acp_read_file(path: String) -> Result<String, AppError> {
-    const MAX: u64 = 512 * 1024;
+pub fn acp_read_file(path: String, max_bytes: Option<u64>) -> Result<String, AppError> {
+    const VIEW_MAX: u64 = 5 * 1024 * 1024;
+    let max = max_bytes.unwrap_or(VIEW_MAX);
     let meta = std::fs::metadata(&path)
         .map_err(|e| AppError::new(io_message("Cannot read file", &e)))?;
-    if meta.len() > MAX {
-        return Err(AppError::new("파일이 너무 큽니다 (512KB 초과)"));
+    if meta.len() > max {
+        return Err(AppError::new(format!("파일이 너무 큽니다 ({}KB 초과)", max / 1024)));
     }
     std::fs::read_to_string(&path)
         .map_err(|e| AppError::new(io_message("Cannot read file", &e)))

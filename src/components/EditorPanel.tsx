@@ -67,7 +67,9 @@ export function EditorPanel(props: IDockviewPanelProps<EditorParams>) {
     }
     let cancelled = false;
     setErr(null);
-    invoke<string>("acp_read_file", { path })
+    // Editor cap: only files small enough to edit comfortably (512KB). Bigger
+    // files are view-only — the backend errors here and we point to the viewer.
+    invoke<string>("acp_read_file", { path, maxBytes: 512 * 1024 })
       .then((text) => {
         if (cancelled || !hostRef.current) return;
         viewRef.current = new EditorView({
@@ -92,7 +94,8 @@ export function EditorPanel(props: IDockviewPanelProps<EditorParams>) {
       })
       .catch((e) => {
         if (!cancelled) {
-          setErr(typeof e === "string" ? e : ((e as { message?: string })?.message ?? "읽기 실패"));
+          const msg = typeof e === "string" ? e : ((e as { message?: string })?.message ?? "읽기 실패");
+          setErr(`이 파일은 에디터로 열 수 없습니다 — ${msg} (트리에서 Enter로 뷰어로 보세요).`);
         }
       });
     return () => {
