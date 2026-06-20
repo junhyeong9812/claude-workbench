@@ -62,6 +62,10 @@ export function WorktreePanel() {
 
   return (
     <div className="git-panel">
+      <div className="tree-hint">
+        워크트리 = 같은 저장소의 <b>추가 작업 폴더</b>(각자 다른 브랜치를 동시 체크아웃). 병렬 작업
+        격리용 — 브랜치 자체가 아니라 그 브랜치가 놓인 폴더입니다. ‘열기’로 프로젝트 탭에 엽니다.
+      </div>
       <div className="git-head">
         <span className="git-track">워크트리 ({list.length})</span>
         <button
@@ -89,9 +93,15 @@ export function WorktreePanel() {
             <span className="git-path" title={`${w.path}\n${w.head}`}>
               {w.path}
             </span>
-            <button className="git-mini" disabled={busy} title="프로젝트 탭으로 열기" onClick={() => void addProject(w.path)}>
-              열기
-            </button>
+            {w.path === cwd ? (
+              <span className="git-cmeta" title="현재 활성 프로젝트">
+                현재
+              </span>
+            ) : (
+              <button className="git-mini" disabled={busy} title="프로젝트 탭으로 열기" onClick={() => void addProject(w.path)}>
+                열기
+              </button>
+            )}
             <button
               className="git-mini"
               disabled={busy}
