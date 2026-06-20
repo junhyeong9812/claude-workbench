@@ -57,12 +57,13 @@ pub struct TokenUsage {
 }
 
 impl TokenUsage {
-    /// Accumulate another usage reading into this one.
+    /// Accumulate another usage reading into this one (saturating, so corrupt or
+    /// adversarial `usage` values can't overflow — codex B1 F4).
     pub fn add(&mut self, o: &TokenUsage) {
-        self.input += o.input;
-        self.output += o.output;
-        self.cache_read += o.cache_read;
-        self.cache_creation += o.cache_creation;
+        self.input = self.input.saturating_add(o.input);
+        self.output = self.output.saturating_add(o.output);
+        self.cache_read = self.cache_read.saturating_add(o.cache_read);
+        self.cache_creation = self.cache_creation.saturating_add(o.cache_creation);
     }
 }
 

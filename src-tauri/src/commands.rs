@@ -561,15 +561,22 @@ fn run_timeline_poll(
         let subagents_v: Vec<(String, Option<String>, u64, Vec<TimelineItem>)> = sub_raw
             .iter()
             .map(|(aid, turn, its)| {
+                // Find the spawning item (its result mentions the agent id) in the
+                // main timeline or in *other* agents — never in this agent's own
+                // transcript, so a child echoing its id can't self-parent and
+                // vanish from the tree (codex B1 F1).
                 let parent = items_v
                     .iter()
-                    .chain(sub_raw.iter().flat_map(|(_, _, x)| x.iter()))
+                    .chain(
+                        sub_raw
+                            .iter()
+                            .filter(|(other, _, _)| other != aid)
+                            .flat_map(|(_, _, x)| x.iter()),
+                    )
                     .find(|it| {
-                        it.tool_call_id != *aid
-                            && it
-                                .content_text
-                                .as_deref()
-                                .is_some_and(|ct| ct.contains(aid.as_str()))
+                        it.content_text
+                            .as_deref()
+                            .is_some_and(|ct| ct.contains(aid.as_str()))
                     })
                     .map(|it| it.tool_call_id.clone());
                 (aid.clone(), parent, *turn, its.clone())

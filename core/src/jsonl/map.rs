@@ -225,9 +225,14 @@ fn apply_blocks(
             // Keyed by the record uuid + block index so a re-tail merges, not
             // duplicates.
             ContentBlock::Thinking { thinking } => {
-                if is_assistant && !thinking.trim().is_empty() {
-                    let id = format!("think:{}:{idx}", record_uuid.unwrap_or("?"));
-                    touched.push(open_thinking(timeline, session, turn, &id, &thinking));
+                // Need the record uuid for a stable, collision-free id (codex B1
+                // F2) — without it, `think:?:<idx>` from different records would
+                // merge and overwrite each other. Real records always carry one.
+                if let Some(uuid) = record_uuid {
+                    if is_assistant && !thinking.trim().is_empty() {
+                        let id = format!("think:{uuid}:{idx}");
+                        touched.push(open_thinking(timeline, session, turn, &id, &thinking));
+                    }
                 }
             }
             // unknown blocks are not timeline items.
@@ -710,11 +715,11 @@ mod tests {
         ];
         let tl = map_lines(&lines);
         // Malformed JSON, unknown record/block types, the text block, and the
-        // bare prompt all skip; the thinking block is now a Think item (B1) and
-        // the real tool_use is an item — 2 total.
-        assert_eq!(tl.items().len(), 2);
-        assert!(tl.items().iter().any(|i| i.tool_call_id == "t1"));
-        assert!(tl.items().iter().any(|i| i.kind == ItemKind::Think));
+        // bare prompt all skip. The thinking block here has no record uuid, so it
+        // is also skipped (B1 F2 — a Think item needs a stable uuid). Only the
+        // real tool_use is an item.
+        assert_eq!(tl.items().len(), 1);
+        assert_eq!(tl.items()[0].tool_call_id, "t1");
     }
 
     // Invariant ②, codex F1: a result seen before its tool_use marks the item
