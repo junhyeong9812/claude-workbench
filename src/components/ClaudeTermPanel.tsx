@@ -67,6 +67,45 @@ interface ClaudeTimelineEvent {
 /** Compact token count: 1234 → "1.2k". */
 const kfmt = (n: number): string => (n >= 1000 ? `${(n / 1000).toFixed(1)}k` : String(n));
 
+/** A short error string from an invoke rejection (AppError `{message}` or text). */
+const errText = (e: unknown): string =>
+  typeof e === "string" ? e : ((e as { message?: string })?.message ?? String(e));
+
+/**
+ * Review/edit step of a handoff: shows the generated summary in a textarea so the
+ * user can curate it before the new session is seeded with it. Confirm starts the
+ * restart; cancel aborts without touching the live session.
+ */
+function HandoffModal(props: {
+  initial: string;
+  busy: boolean;
+  onCancel: () => void;
+  onConfirm: (text: string) => void;
+}) {
+  const [text, setText] = useState(props.initial);
+  return (
+    <div className="claudeterm-modal-overlay" onMouseDown={props.onCancel}>
+      <div className="claudeterm-modal" onMouseDown={(e) => e.stopPropagation()}>
+        <div className="claudeterm-modal-head">핸드오프 요약 — 확인 후 이어가기</div>
+        <textarea
+          className="claudeterm-modal-body"
+          value={text}
+          onChange={(e) => setText(e.target.value)}
+          spellCheck={false}
+        />
+        <div className="claudeterm-modal-foot">
+          <button onClick={props.onCancel} disabled={props.busy}>
+            취소
+          </button>
+          <button onClick={() => props.onConfirm(text)} disabled={props.busy}>
+            {props.busy ? "진행 중…" : "이어가기 (새 task)"}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
   const hostRef = useRef<HTMLDivElement | null>(null);
   const containerRef = useRef<HTMLDivElement | null>(null);
@@ -94,6 +133,126 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
   // Width (px) of the detail viewer + timeline panes; drag splitters to resize.
   const [viewerWidth, setViewerWidth] = useState(480);
   const [timelineWidth, setTimelineWidth] = useState(360);
+
+  // --- Task handoff state ---
+  // Bumped to remount the terminal/timeline effect onto a new session (restart).
+  const [gen, setGen] = useState(0);
+  // Current live PTY session id, mirrored out of the effect so handoff (component
+  // scope) can read/close it. The effect remains the sole writer.
+  const sessionIdRef = useRef<number | null>(null);
+  // Seed to inject into a freshly-started session once it looks ready (handoff).
+  const pendingSeedRef = useRef<string | null>(null);
+  // On a handoff remount, the exact session to attach to — so the effect doesn't
+  // race dockview's param propagation (codex P3-impl 2). Consumed once by the effect.
+  const pendingAttachRef = useRef<{ id: number; uuid: string } | null>(null);
+  // The last handoff seed, so the user can re-inject it if the auto-attempt missed
+  // the prompt (codex P3 D3 — ready detection is best-effort).
+  const [lastSeed, setLastSeed] = useState<string | null>(null);
+  const [handoffBusy, setHandoffBusy] = useState(false);
+  // The generated summary awaiting review/edit (null = modal closed).
+  const [summaryDraft, setSummaryDraft] = useState<{ cwd: string; oldUuid: string; text: string } | null>(
+    null,
+  );
+
+  /** Write the seed (+Enter) to the current session — submits it as a prompt. */
+  const injectSeed = (text: string) => {
+    const id = sessionIdRef.current;
+    if (id == null) return;
+    invoke("terminal_write", {
+      id,
+      data: Array.from(new TextEncoder().encode(text + "\n")),
+    }).catch(() => {});
+  };
+
+  // Step 1 of "task 시작": summarize the current task and open it for review. Only
+  // generates — the restart happens on confirm, so a failure here never tears
+  // down the live session (codex P3 D1).
+  const startHandoff = async () => {
+    const cwd = useAppStore.getState().activeProject ?? null;
+    const oldUuid = props.params.sessionUuid ?? null;
+    if (!cwd || !oldUuid) {
+      alert("현재 세션 정보를 찾을 수 없습니다.");
+      return;
+    }
+    setHandoffBusy(true);
+    try {
+      const res = await invoke<{ path: string; text: string }>("generate_task_summary", {
+        cwd,
+        uuid: oldUuid,
+      });
+      setSummaryDraft({ cwd, oldUuid, text: res.text });
+    } catch (e) {
+      alert(`요약 생성 실패: ${errText(e)}`);
+    } finally {
+      setHandoffBusy(false);
+    }
+  };
+
+  // Step 2: persist the (edited) summary, start a fresh session, link the chain,
+  // remount onto it, and seed it. Order per codex P3: start(new) → set_task_meta →
+  // remount → close(old), so no step's failure orphans the live session.
+  const confirmHandoff = async (edited: string) => {
+    const draft = summaryDraft;
+    if (!draft) return;
+    setHandoffBusy(true);
+    let newId: number | null = null;
+    try {
+      const path = await invoke<string>("save_task_summary", {
+        cwd: draft.cwd,
+        uuid: draft.oldUuid,
+        text: edited,
+      });
+      const started = await invoke<ClaudeStarted>("claude_start", {
+        cwd: draft.cwd,
+        resume: null,
+        name: (props.params.title as string) ?? null,
+        cols: termRef.current?.cols ?? 80,
+        rows: termRef.current?.rows ?? 24,
+      });
+      newId = started.id;
+      // Record the chain link before any seed write, so a seed failure stays
+      // recoverable via summary_path (codex P3 D2).
+      await invoke("claude_set_task_meta", {
+        cwd: draft.cwd,
+        uuid: started.session_uuid,
+        prevUuid: draft.oldUuid,
+      });
+      const oldId = sessionIdRef.current;
+      // Hand the effect the exact session to attach to (codex P3-impl 2).
+      pendingAttachRef.current = { id: started.id, uuid: started.session_uuid };
+      props.api.updateParameters({
+        ...props.params,
+        sessionId: started.id,
+        sessionUuid: started.session_uuid,
+        loadSessionId: undefined,
+      });
+      const seed = `이전 작업(task)의 핸드오프 요약이 \`${path}\` 에 저장돼 있습니다. 먼저 이 파일을 읽고, 이어서 작업을 계속해 주세요.`;
+      pendingSeedRef.current = seed;
+      setLastSeed(seed);
+      // Reset the timeline for the fresh session, then remount the effect (it
+      // reattaches to the new sessionId now in params).
+      setItems([]);
+      setTurns(new Map());
+      setAnswers(new Map());
+      setDates(new Map());
+      setSubagents([]);
+      setTokenTotal({ input: 0, output: 0 });
+      setSelectedId(null);
+      setTextView(null);
+      setSummaryDraft(null);
+      setGen((g) => g + 1);
+      // Close the old session last (its snapshot/summary are kept).
+      if (oldId != null) invoke("claude_close", { id: oldId }).catch(() => {});
+    } catch (e) {
+      // A failure after the new session started would orphan it — close it
+      // (codex P3-impl 1). The old session is untouched, so the user can retry.
+      if (newId != null) invoke("claude_close", { id: newId }).catch(() => {});
+      pendingAttachRef.current = null;
+      alert(`핸드오프 실패: ${errText(e)}`);
+    } finally {
+      setHandoffBusy(false);
+    }
+  };
 
   // Ctrl+←/→ moves focus between the panes: terminal → (viewer) → timeline.
   // The current pane is derived from `document.activeElement` (not a counter) so
@@ -312,8 +471,12 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
       });
       if (disposed) return;
 
-      // Re-attach to a persisted PTY, else start a fresh Claude session.
-      const existing = props.params.sessionId;
+      // Re-attach to a persisted PTY, else start a fresh Claude session. A handoff
+      // hands us the exact new session via `pendingAttachRef` so the remount
+      // doesn't race dockview's param propagation (codex P3-impl 2).
+      const attach = pendingAttachRef.current;
+      pendingAttachRef.current = null;
+      const existing = attach?.id ?? props.params.sessionId;
       if (existing != null) {
         try {
           const snap = await invoke<SnapshotResult>("terminal_snapshot", { id: existing });
@@ -342,14 +505,29 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
         });
       }
 
+      sessionIdRef.current = sessionId;
       ready = true;
       for (const ev of pending) applyLive(ev);
       pending.length = 0;
 
+      // Handoff: seed the freshly-restarted session once it should be at a prompt.
+      // Ready detection is best-effort (codex P3 D3) — a fixed settle delay, with a
+      // manual "요약 주입" button if it missed. The seed is idempotent (it points at
+      // the summary file), so a re-send is harmless.
+      if (pendingSeedRef.current) {
+        const seed = pendingSeedRef.current;
+        setTimeout(() => {
+          if (!disposed && pendingSeedRef.current === seed) {
+            injectSeed(seed);
+            pendingSeedRef.current = null;
+          }
+        }, 1800);
+      }
+
       // Seed the timeline from the saved snapshot (reopen or tab-switch
       // re-attach) so it isn't empty until the next live change — unless a live
       // event already arrived (which is newer).
-      const seedUuid = props.params.sessionUuid ?? props.params.loadSessionId;
+      const seedUuid = attach?.uuid ?? props.params.sessionUuid ?? props.params.loadSessionId;
       const project = useAppStore.getState().activeProject ?? null;
       if (seedUuid && project) {
         invoke<{
@@ -407,7 +585,7 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
       term.dispose();
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  }, [gen]);
 
   const selectedItem = selectedId
     ? ([items, ...subagents.map(([, , , its]) => its)]
@@ -422,11 +600,30 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
           <span className="claudeterm-pane-head-title">
             Claude — {(props.params.title as string) ?? "터미널"}
           </span>
-          {(tokenTotal.input > 0 || tokenTotal.output > 0) && (
-            <span className="claudeterm-tokens" title="입력(컨텍스트) / 출력 토큰">
-              ↑{kfmt(tokenTotal.input)} ↓{kfmt(tokenTotal.output)}
-            </span>
-          )}
+          <span className="claudeterm-head-controls">
+            {(tokenTotal.input > 0 || tokenTotal.output > 0) && (
+              <span className="claudeterm-tokens" title="입력(컨텍스트) / 출력 토큰">
+                ↑{kfmt(tokenTotal.input)} ↓{kfmt(tokenTotal.output)}
+              </span>
+            )}
+            {lastSeed && (
+              <button
+                className="claudeterm-head-btn"
+                title="핸드오프 요약 안내를 현재 세션에 다시 보냅니다"
+                onClick={() => injectSeed(lastSeed)}
+              >
+                요약 주입
+              </button>
+            )}
+            <button
+              className="claudeterm-head-btn"
+              title="현재 작업을 요약해 새 task로 이어가기 (새 세션 재기동 + 요약 주입)"
+              disabled={handoffBusy || !props.params.sessionUuid}
+              onClick={startHandoff}
+            >
+              {handoffBusy ? "처리 중…" : "task 시작"}
+            </button>
+          </span>
         </div>
         <div className="claudeterm-term" ref={hostRef} />
       </div>
@@ -508,6 +705,15 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
           />
         </div>
       </div>
+
+      {summaryDraft && (
+        <HandoffModal
+          initial={summaryDraft.text}
+          busy={handoffBusy}
+          onCancel={() => setSummaryDraft(null)}
+          onConfirm={confirmHandoff}
+        />
+      )}
     </div>
   );
 }

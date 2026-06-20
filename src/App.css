@@ -414,6 +414,7 @@ body {
   display: flex;
   height: 100%;
   min-height: 0;
+  position: relative; /* anchor the handoff modal overlay */
 }
 .claudeterm-pane {
   display: flex;
@@ -470,6 +471,92 @@ body {
   font-variant-numeric: tabular-nums;
   opacity: 0.85;
   font-size: 0.95em;
+}
+/* Right-aligned cluster in the Claude pane head: tokens + handoff buttons. */
+.claudeterm-head-controls {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.claudeterm-head-btn {
+  flex: 0 0 auto;
+  padding: 1px 8px;
+  font-size: 0.95em;
+  color: var(--fg-dim);
+  background: rgba(137, 180, 250, 0.12);
+  border: 1px solid rgba(137, 180, 250, 0.35);
+  border-radius: 4px;
+  cursor: pointer;
+}
+.claudeterm-head-btn:hover:not(:disabled) {
+  background: rgba(137, 180, 250, 0.22);
+  color: var(--fg, #cdd6f4);
+}
+.claudeterm-head-btn:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+/* Handoff summary review/edit modal. */
+.claudeterm-modal-overlay {
+  position: absolute;
+  inset: 0;
+  z-index: 20;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(0, 0, 0, 0.5);
+}
+.claudeterm-modal {
+  display: flex;
+  flex-direction: column;
+  width: min(720px, 86%);
+  height: min(560px, 80%);
+  background: #1e1e2e;
+  border: 1px solid var(--border, #45475a);
+  border-radius: 8px;
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.5);
+}
+.claudeterm-modal-head {
+  flex: 0 0 auto;
+  padding: 8px 12px;
+  font-size: 0.85em;
+  color: var(--fg-dim);
+  border-bottom: 1px solid var(--border, #333);
+}
+.claudeterm-modal-body {
+  flex: 1 1 auto;
+  margin: 0;
+  padding: 10px 12px;
+  resize: none;
+  border: 0;
+  outline: none;
+  background: transparent;
+  color: var(--fg, #cdd6f4);
+  font-family: "JetBrains Mono", "DejaVu Sans Mono", "Noto Sans Mono CJK KR", monospace;
+  font-size: 0.85em;
+  line-height: 1.5;
+}
+.claudeterm-modal-foot {
+  flex: 0 0 auto;
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  padding: 8px 12px;
+  border-top: 1px solid var(--border, #333);
+}
+.claudeterm-modal-foot button {
+  padding: 4px 14px;
+  font-size: 0.9em;
+  color: var(--fg, #cdd6f4);
+  background: rgba(137, 180, 250, 0.15);
+  border: 1px solid rgba(137, 180, 250, 0.4);
+  border-radius: 4px;
+  cursor: pointer;
+}
+.claudeterm-modal-foot button:disabled {
+  opacity: 0.4;
+  cursor: default;
 }
 /* Subagent (Task) groups nested under their turn — collapsible (B1). Indented
  * to read as "during this question, this agent did …". */
