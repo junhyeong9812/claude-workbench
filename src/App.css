@@ -407,69 +407,88 @@ body {
   background: #1e1e1e;
 }
 
-/* Architecture A Claude panel: real terminal (left) | live change timeline
- * (right). The terminal flexes; the timeline is a fixed-width scroll column. */
+/* Architecture A Claude panel: terminal | (detail viewer) | timeline, each a
+ * pane with a header. The terminal flexes; the viewer is drag-resizable; the
+ * timeline is a fixed-width scroll column. */
 .claudeterm {
   display: flex;
   height: 100%;
   min-height: 0;
 }
-.claudeterm-term {
-  flex: 1 1 auto;
-  min-width: 0;
-  height: 100%;
-  padding: 2px 4px;
-  box-sizing: border-box;
-  background: #1e1e1e;
-}
-.claudeterm-timeline {
-  flex: 0 0 360px;
-  height: 100%;
-  min-height: 0;
-  border-left: 1px solid var(--border, #333);
-  overflow: hidden;
+.claudeterm-pane {
   display: flex;
   flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+  height: 100%;
 }
-/* B4 detail viewer: appears between terminal and timeline when an item is
- * selected (input / diff / content / file). */
-.claudeterm-viewer {
+.claudeterm-term-pane {
   flex: 1 1 0;
-  min-width: 0;
-  height: 100%;
-  min-height: 0;
+}
+.claudeterm-timeline-pane {
+  flex: 0 0 360px;
   border-left: 1px solid var(--border, #333);
-  display: flex;
-  flex-direction: column;
+}
+.claudeterm-viewer-pane {
+  /* flex (width) set inline via the splitter drag state */
+  border-left: 1px solid var(--border, #333);
   background: var(--bg, #1e1e1e);
 }
-.claudeterm-viewer-head {
+/* Each pane labels which pane it is. */
+.claudeterm-pane-head {
+  flex: 0 0 auto;
   display: flex;
   align-items: center;
   justify-content: space-between;
-  padding: 4px 8px;
-  border-bottom: 1px solid var(--border, #333);
-  font-size: 0.85em;
+  gap: 8px;
+  padding: 3px 8px;
+  font-size: 0.78em;
   color: var(--fg-dim);
+  background: rgba(255, 255, 255, 0.03);
+  border-bottom: 1px solid var(--border, #333);
 }
-.claudeterm-viewer-title {
+.claudeterm-pane-head-title {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
-.claudeterm-viewer-x {
-  cursor: pointer;
-  padding: 0 6px;
-  color: var(--fg-dim);
+.claudeterm-term {
+  flex: 1 1 0;
+  min-height: 0;
+  min-width: 0;
+  padding: 2px 4px;
+  box-sizing: border-box;
+  background: #1e1e2e;
 }
-.claudeterm-viewer-x:hover {
-  color: var(--fg);
+.claudeterm-timeline {
+  flex: 1 1 0;
+  min-height: 0;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
 }
 .claudeterm-viewer-body {
   flex: 1 1 0;
   min-height: 0;
   overflow: auto;
   padding: 6px 8px;
+}
+.claudeterm-viewer-x {
+  cursor: pointer;
+  padding: 0 4px;
+  color: var(--fg-dim);
+}
+.claudeterm-viewer-x:hover {
+  color: var(--fg);
+}
+/* Draggable divider between the terminal and the detail viewer. */
+.claudeterm-splitter {
+  flex: 0 0 5px;
+  cursor: col-resize;
+  background: var(--border, #333);
+}
+.claudeterm-splitter:hover {
+  background: var(--accent, #89b4fa);
 }
 
 .dock-placeholder {

@@ -56,11 +56,55 @@ interface ClaudeTimelineEvent {
 
 export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
   const hostRef = useRef<HTMLDivElement | null>(null);
+  const containerRef = useRef<HTMLDivElement | null>(null);
+  const termRef = useRef<Terminal | null>(null);
+  const viewerRef = useRef<HTMLDivElement | null>(null);
+  const timelineRef = useRef<HTMLDivElement | null>(null);
+  const focusIdxRef = useRef(0);
   const [items, setItems] = useState<TimelineItem[]>([]);
   const [turns, setTurns] = useState<Map<number, string>>(new Map());
   const [answers, setAnswers] = useState<Map<number, string>>(new Map());
   const [dates, setDates] = useState<Map<number, string>>(new Map());
   const [selectedId, setSelectedId] = useState<string | null>(null);
+  // Width (px) of the detail viewer pane; drag the splitter to resize.
+  const [viewerWidth, setViewerWidth] = useState(480);
+
+  // Ctrl+←/→ moves focus between the panes: terminal → (viewer) → timeline.
+  const navPane = (dir: number) => {
+    const hasViewer = viewerRef.current != null;
+    const focusers: (() => void)[] = [
+      () => termRef.current?.focus(),
+      ...(hasViewer ? [() => viewerRef.current?.focus()] : []),
+      () => (timelineRef.current?.querySelector(".timeline-list") as HTMLElement | null)?.focus(),
+    ];
+    const i = (focusIdxRef.current + dir + focusers.length) % focusers.length;
+    focusIdxRef.current = i;
+    focusers[i]?.();
+  };
+  const onContainerKey = (e: React.KeyboardEvent) => {
+    if (e.ctrlKey && (e.key === "ArrowLeft" || e.key === "ArrowRight")) {
+      e.preventDefault();
+      navPane(e.key === "ArrowRight" ? 1 : -1);
+    }
+  };
+  // Drag the terminal|viewer splitter to resize the viewer (timeline stays 360px).
+  const startDrag = (e: React.MouseEvent) => {
+    e.preventDefault();
+    const container = containerRef.current;
+    if (!container) return;
+    const rect = container.getBoundingClientRect();
+    const TIMELINE_W = 360;
+    const onMove = (ev: MouseEvent) => {
+      const w = rect.right - TIMELINE_W - ev.clientX;
+      setViewerWidth(Math.max(240, Math.min(rect.width - TIMELINE_W - 240, w)));
+    };
+    const onUp = () => {
+      window.removeEventListener("mousemove", onMove);
+      window.removeEventListener("mouseup", onUp);
+    };
+    window.addEventListener("mousemove", onMove);
+    window.addEventListener("mouseup", onUp);
+  };
 
   useEffect(() => {
     const host = hostRef.current;
@@ -104,11 +148,22 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
     const fit = new FitAddon();
     term.loadAddon(fit);
     term.open(host);
+    termRef.current = term;
     try {
       fit.fit();
     } catch {
       /* host not laid out yet — ResizeObserver fits shortly */
     }
+
+    // Intercept Ctrl+←/→ before xterm consumes them, so they move focus between
+    // panes instead of being sent to the PTY as word-motion.
+    term.attachCustomKeyEventHandler((e) => {
+      if (e.type === "keydown" && e.ctrlKey && (e.key === "ArrowLeft" || e.key === "ArrowRight")) {
+        navPane(e.key === "ArrowRight" ? 1 : -1);
+        return false;
+      }
+      return true;
+    });
 
     // Korean/CJK IME fix (attempt 2): in WebKitGTK, xterm's `onData` fires for
     // the in-progress composition (preedit), so each partial syllable is sent
@@ -286,6 +341,7 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
       onResize.dispose();
       if (unlistenTerm) unlistenTerm();
       if (unlistenTl) unlistenTl();
+      termRef.current = null;
       term.dispose();
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -296,36 +352,58 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
     : null;
 
   return (
-    <div className="claudeterm">
-      <div className="claudeterm-term" ref={hostRef} />
-      {selectedItem && (
-        <div className="claudeterm-viewer">
-          <div className="claudeterm-viewer-head">
-            <span className="claudeterm-viewer-title">
-              {selectedItem.title || selectedItem.kind}
-            </span>
-            <span
-              className="claudeterm-viewer-x"
-              title="닫기"
-              onClick={() => setSelectedId(null)}
-            >
-              ×
-            </span>
-          </div>
-          <div className="claudeterm-viewer-body">
-            <ItemDetail item={selectedItem} />
-          </div>
+    <div className="claudeterm" ref={containerRef} onKeyDown={onContainerKey}>
+      <div className="claudeterm-pane claudeterm-term-pane">
+        <div className="claudeterm-pane-head">
+          Claude — {(props.params.title as string) ?? "터미널"}
         </div>
+        <div className="claudeterm-term" ref={hostRef} />
+      </div>
+
+      {selectedItem && (
+        <>
+          <div
+            className="claudeterm-splitter"
+            title="드래그로 크기 조절"
+            onMouseDown={startDrag}
+          />
+          <div
+            className="claudeterm-pane claudeterm-viewer-pane"
+            ref={viewerRef}
+            tabIndex={0}
+            style={{ flex: `0 0 ${viewerWidth}px` }}
+          >
+            <div className="claudeterm-pane-head">
+              <span className="claudeterm-pane-head-title">
+                변경 상세 — {selectedItem.title || selectedItem.kind}
+              </span>
+              <span
+                className="claudeterm-viewer-x"
+                title="닫기"
+                onClick={() => setSelectedId(null)}
+              >
+                ×
+              </span>
+            </div>
+            <div className="claudeterm-viewer-body">
+              <ItemDetail item={selectedItem} />
+            </div>
+          </div>
+        </>
       )}
-      <div className="claudeterm-timeline">
-        <TimelineView
-          items={items}
-          turns={turns}
-          answers={answers}
-          dates={dates}
-          selectedId={selectedId}
-          onSelect={(it) => setSelectedId(it.tool_call_id)}
-        />
+
+      <div className="claudeterm-pane claudeterm-timeline-pane" ref={timelineRef}>
+        <div className="claudeterm-pane-head">타임라인</div>
+        <div className="claudeterm-timeline">
+          <TimelineView
+            items={items}
+            turns={turns}
+            answers={answers}
+            dates={dates}
+            selectedId={selectedId}
+            onSelect={(it) => setSelectedId(it.tool_call_id)}
+          />
+        </div>
       </div>
     </div>
   );
