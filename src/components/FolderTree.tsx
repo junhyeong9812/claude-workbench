@@ -9,8 +9,12 @@ function TreeNode({ entry, depth }: { entry: DirEntry; depth: number }) {
     return active?.tree_state.expanded.includes(entry.path) ?? false;
   });
   const children = useAppStore((s) => s.childrenCache[entry.path]);
+  const isCursor = useAppStore((s) => s.treeCursor === entry.path);
+  const isPeeked = useAppStore((s) => s.peekFile === entry.path);
   const toggleExpanded = useAppStore((s) => s.toggleExpanded);
   const loadChildren = useAppStore((s) => s.loadChildren);
+  const setTreeCursor = useAppStore((s) => s.setTreeCursor);
+  const setPeekFile = useAppStore((s) => s.setPeekFile);
 
   useEffect(() => {
     if (entry.is_dir && expanded && !children) {
@@ -19,7 +23,11 @@ function TreeNode({ entry, depth }: { entry: DirEntry; depth: number }) {
   }, [entry.is_dir, entry.path, expanded, children, loadChildren]);
 
   const onClick = () => {
+    setTreeCursor(entry.path);
     if (entry.is_dir) toggleExpanded(entry.path);
+    else setPeekFile(entry.path);
+    // Focus the tree so subsequent ↑/↓ navigate from here.
+    document.getElementById("folder-tree")?.focus();
   };
 
   const icon = entry.is_dir ? (expanded ? "▾" : "▸") : "·";
@@ -27,7 +35,8 @@ function TreeNode({ entry, depth }: { entry: DirEntry; depth: number }) {
   return (
     <div className="tree-node">
       <div
-        className="tree-row"
+        className={`tree-row${isCursor ? " tree-row-cursor" : ""}${isPeeked ? " tree-row-peeked" : ""}`}
+        data-tree-path={entry.path}
         style={{ paddingLeft: depth * 14 + 8 }}
         onClick={onClick}
       >
@@ -57,16 +66,97 @@ function TreeNode({ entry, depth }: { entry: DirEntry; depth: number }) {
   );
 }
 
+/** Flattened visible nodes (display order), respecting which dirs are expanded —
+ * the navigation model for ↑/↓. Read from the store directly (not a hook). */
+function visibleNodes(): DirEntry[] {
+  const s = useAppStore.getState();
+  const ap = s.activeProject;
+  if (!ap) return [];
+  const expanded = s.projects.find((p) => p.path === ap)?.tree_state.expanded ?? [];
+  const out: DirEntry[] = [];
+  const walk = (entries: DirEntry[] | undefined) => {
+    for (const e of entries ?? []) {
+      out.push(e);
+      if (e.is_dir && expanded.includes(e.path)) walk(s.childrenCache[e.path]);
+    }
+  };
+  walk(s.childrenCache[ap]);
+  return out;
+}
+
 export function FolderTree() {
   const activeProject = useAppStore((s) => s.activeProject);
   const rootChildren = useAppStore((s) =>
     s.activeProject ? s.childrenCache[s.activeProject] : undefined,
   );
   const loadChildren = useAppStore((s) => s.loadChildren);
+  const toggleExpanded = useAppStore((s) => s.toggleExpanded);
+  const setTreeCursor = useAppStore((s) => s.setTreeCursor);
+  const setPeekFile = useAppStore((s) => s.setPeekFile);
 
   useEffect(() => {
     if (activeProject) void loadChildren(activeProject);
   }, [activeProject, loadChildren]);
+
+  const isExpanded = (p: string): boolean => {
+    const s = useAppStore.getState();
+    return (
+      s.projects.find((pr) => pr.path === s.activeProject)?.tree_state.expanded.includes(p) ?? false
+    );
+  };
+
+  // Move the cursor to a node; when the peek viewer is open, follow it onto files
+  // (so ↑/↓ reads through the tree). Keep the moved row in view.
+  const moveTo = (node: DirEntry) => {
+    setTreeCursor(node.path);
+    if (useAppStore.getState().peekFile != null && !node.is_dir) setPeekFile(node.path);
+    requestAnimationFrame(() => {
+      document
+        .querySelector(`[data-tree-path="${CSS.escape(node.path)}"]`)
+        ?.scrollIntoView({ block: "nearest" });
+    });
+  };
+
+  const onKeyDown = (e: React.KeyboardEvent) => {
+    const nodes = visibleNodes();
+    if (nodes.length === 0) return;
+    const cursor = useAppStore.getState().treeCursor;
+    const idx = nodes.findIndex((n) => n.path === cursor);
+    const cur = idx >= 0 ? nodes[idx] : null;
+    switch (e.key) {
+      case "ArrowDown":
+        e.preventDefault();
+        moveTo(nodes[Math.min((idx < 0 ? -1 : idx) + 1, nodes.length - 1)]);
+        break;
+      case "ArrowUp":
+        e.preventDefault();
+        moveTo(nodes[Math.max((idx < 0 ? nodes.length : idx) - 1, 0)]);
+        break;
+      case "ArrowRight":
+        if (cur?.is_dir && !isExpanded(cur.path)) {
+          e.preventDefault();
+          toggleExpanded(cur.path);
+        }
+        break;
+      case "ArrowLeft":
+        if (cur?.is_dir && isExpanded(cur.path)) {
+          e.preventDefault();
+          toggleExpanded(cur.path);
+        }
+        break;
+      case "Enter":
+        if (cur) {
+          e.preventDefault();
+          if (cur.is_dir) toggleExpanded(cur.path);
+          else setPeekFile(cur.path);
+        }
+        break;
+      case "Escape":
+        e.preventDefault();
+        setPeekFile(null);
+        break;
+    }
+  };
 
   if (!activeProject) {
     return <div className="tree-empty">No project open</div>;
@@ -76,7 +166,7 @@ export function FolderTree() {
   }
 
   return (
-    <div className="tree">
+    <div className="tree" id="folder-tree" tabIndex={0} onKeyDown={onKeyDown}>
       {rootChildren.map((entry) => (
         <TreeNode key={entry.path} entry={entry} depth={0} />
       ))}

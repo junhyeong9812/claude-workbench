@@ -8,12 +8,15 @@ import {
 import { ProjectTabs } from "./components/ProjectTabs";
 import { FolderTree } from "./components/FolderTree";
 import { MainArea } from "./components/MainArea";
+import { FilePeekViewer } from "./components/FilePeekViewer";
 import { useAppStore } from "./state/store";
 import "./App.css";
 
 export default function App() {
   const init = useAppStore((s) => s.init);
   const activeProject = useAppStore((s) => s.activeProject);
+  const peekFile = useAppStore((s) => s.peekFile);
+  const setPeekFile = useAppStore((s) => s.setPeekFile);
 
   const treePanelRef = useRef<ImperativePanelHandle>(null);
   const [collapsed, setCollapsed] = useState(false);
@@ -21,6 +24,18 @@ export default function App() {
   useEffect(() => {
     void init();
   }, [init]);
+
+  // Ctrl+B focuses the folder tree (so keyboard nav can start without a click).
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.ctrlKey && (e.key === "b" || e.key === "B")) {
+        e.preventDefault();
+        document.getElementById("folder-tree")?.focus();
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, []);
 
   const toggleTree = () => {
     const panel = treePanelRef.current;
@@ -59,6 +74,9 @@ export default function App() {
         <PanelResizeHandle className="resize-handle" />
         <Panel defaultSize={80} minSize={30} className="pane-main">
           <MainArea />
+          {peekFile && (
+            <FilePeekViewer path={peekFile} onClose={() => setPeekFile(null)} />
+          )}
         </Panel>
       </PanelGroup>
     </div>

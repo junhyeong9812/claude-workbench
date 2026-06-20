@@ -148,6 +148,62 @@ body {
 .pane-main {
   /* dockview positions its own children; keep the pane a plain sized box. */
   overflow: hidden;
+  position: relative; /* anchor the file peek viewer overlay */
+}
+
+/* ---- File peek viewer (P1 — read-only CodeMirror overlay over the main area) ---- */
+.peek-viewer {
+  position: absolute;
+  inset: 0;
+  z-index: 30;
+  display: flex;
+  flex-direction: column;
+  background: #1e1e2e;
+}
+.peek-head {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 5px 10px;
+  font-size: 0.8em;
+  color: var(--fg-dim);
+  background: rgba(255, 255, 255, 0.03);
+  border-bottom: 1px solid var(--border, #333);
+}
+.peek-title {
+  flex: 0 0 auto;
+  font-weight: 600;
+  color: var(--fg, #cdd6f4);
+}
+.peek-path {
+  flex: 1 1 auto;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  opacity: 0.55;
+}
+.peek-hint {
+  flex: 0 0 auto;
+  opacity: 0.55;
+}
+.peek-x {
+  flex: 0 0 auto;
+  cursor: pointer;
+  font-size: 1.1em;
+  padding: 0 4px;
+}
+.peek-body {
+  flex: 1 1 0;
+  min-height: 0;
+  overflow: hidden;
+}
+.peek-body .cm-editor {
+  height: 100%;
+}
+.peek-err {
+  padding: 12px;
+  color: #f38ba8;
 }
 
 /* ---- Main area (dockview) ---- */
@@ -1296,6 +1352,17 @@ body {
   white-space: nowrap;
 }
 
+/* Keyboard cursor + currently-peeked file in the tree. */
+.tree:focus,
+.tree:focus-visible {
+  outline: none;
+}
+.tree-row-cursor {
+  background: rgba(137, 180, 250, 0.25);
+}
+.tree-row-peeked {
+  box-shadow: inset 2px 0 0 #89b4fa;
+}
 .tree-row:hover {
   background: var(--bg-hover);
 }

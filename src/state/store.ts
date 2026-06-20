@@ -20,6 +20,10 @@ interface AppState {
   childrenCache: Record<string, DirEntry[]>;
   /** dirPath -> in-flight read_dir guard. */
   loadingDirs: Record<string, boolean>;
+  /** Keyboard cursor in the folder tree (focused node path), or null. Transient. */
+  treeCursor: string | null;
+  /** File currently shown in the peek viewer overlay, or null (closed). Transient. */
+  peekFile: string | null;
 
   /** Load persisted state from the backend on startup. */
   init: () => Promise<void>;
@@ -41,6 +45,10 @@ interface AppState {
   loadChildren: (dirPath: string) => Promise<void>;
   /** Save a project's dockview main-area layout (opaque JSON) and persist. */
   setLayout: (path: string, layout: unknown) => void;
+  /** Move the folder-tree keyboard cursor. */
+  setTreeCursor: (path: string | null) => void;
+  /** Open/close the peek viewer on a file (null closes it). */
+  setPeekFile: (path: string | null) => void;
   /** Persist the current workspace to the backend. */
   persist: () => void;
 }
@@ -55,6 +63,8 @@ export const useAppStore = create<AppState>((set, get) => ({
   activeProject: null,
   childrenCache: {},
   loadingDirs: {},
+  treeCursor: null,
+  peekFile: null,
 
   init: async () => {
     try {
@@ -153,6 +163,9 @@ export const useAppStore = create<AppState>((set, get) => ({
     set({ activeProject: path });
     get().persist();
   },
+
+  setTreeCursor: (path) => set({ treeCursor: path }),
+  setPeekFile: (path) => set({ peekFile: path }),
 
   toggleExpanded: (dirPath) => {
     set((s) => ({
