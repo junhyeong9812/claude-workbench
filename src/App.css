@@ -390,6 +390,28 @@ body {
   font-size: 10px;
   color: var(--fg-dim);
 }
+/* Task-chain rows: a caret (expand previous tasks) beside the reopen button. */
+.claude-picker-row {
+  display: flex;
+  align-items: stretch;
+}
+.claude-picker-row .claude-picker-item {
+  flex: 1;
+  min-width: 0;
+}
+.claude-picker-caret {
+  display: flex;
+  align-items: center;
+  padding: 0 2px;
+  font-size: 10px;
+  color: var(--fg-dim);
+  cursor: pointer;
+  user-select: none;
+}
+.claude-picker-proj {
+  color: var(--accent);
+  font-size: 10px;
+}
 
 .main-dock {
   /* dockview needs a sized parent; take the rest of the column. */

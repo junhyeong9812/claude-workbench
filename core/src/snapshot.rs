@@ -82,6 +82,9 @@ pub struct SnapshotSummary {
     pub date: String,
     /// Number of tool-call items recorded.
     pub count: usize,
+    /// The task this session continues from (handoff chain link, from the `.task`
+    /// sidecar) — lets the picker group sessions into task chains.
+    pub prev_uuid: Option<String>,
 }
 
 fn dir(base: &Path, project: &str) -> PathBuf {
@@ -228,12 +231,14 @@ pub fn list(base: &Path, project: &str) -> Vec<SnapshotSummary> {
             .map(|(_, p)| p.clone())
             .unwrap_or_default();
         let name = read_name(base, project, &snap.uuid).unwrap_or(snap.name);
+        let prev_uuid = read_task_meta(base, project, &snap.uuid).and_then(|m| m.prev_uuid);
         out.push(SnapshotSummary {
             uuid: snap.uuid,
             name,
             title,
             date: snap.date,
             count: snap.items.len(),
+            prev_uuid,
         });
     }
     out.sort_by(|a, b| b.date.cmp(&a.date).then(a.name.cmp(&b.name)));
@@ -456,6 +461,18 @@ mod tests {
         assert_eq!(sessions[0].uuid, "u2", "newest date first");
         assert_eq!(sessions[0].title, "first prompt");
         assert_eq!(sessions[0].count, 4);
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn list_includes_prev_uuid_for_chain_grouping() {
+        let base = temp_base("listprev");
+        save(&base, "/p", &snap("u1", "n", "2026-06-19", 1)).unwrap();
+        save(&base, "/p", &snap("u2", "n", "2026-06-20", 1)).unwrap();
+        save_task_meta(&base, "/p", "u2", &TaskMeta { prev_uuid: Some("u1".into()), summary_path: None }).unwrap();
+        let list = list(&base, "/p");
+        assert_eq!(list.iter().find(|s| s.uuid == "u2").unwrap().prev_uuid, Some("u1".to_string()));
+        assert_eq!(list.iter().find(|s| s.uuid == "u1").unwrap().prev_uuid, None);
         let _ = fs::remove_dir_all(&base);
     }
 

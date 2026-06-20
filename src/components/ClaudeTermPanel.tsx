@@ -29,6 +29,10 @@ export interface ClaudeTermParams {
   sessionUuid?: string;
   /** Resume an existing Claude session by its UUID (same file, append). */
   loadSessionId?: string;
+  /** The project (cwd) this panel runs in. Lets a workspace-wide reopen open a
+   * task from a *different* project than the active tab. Falls back to the active
+   * project for freshly-created panels. */
+  project?: string;
 }
 
 interface TerminalOutputEvent {
@@ -197,7 +201,7 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
   // generates — the restart happens on confirm, so a failure here never tears
   // down the live session (codex P3 D1).
   const startHandoff = async () => {
-    const cwd = useAppStore.getState().activeProject ?? null;
+    const cwd = props.params.project ?? useAppStore.getState().activeProject ?? null;
     const oldUuid = props.params.sessionUuid ?? null;
     if (!cwd || !oldUuid) {
       alert("현재 세션 정보를 찾을 수 없습니다.");
@@ -525,7 +529,7 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
       }
       if (disposed) return;
       if (sessionId == null) {
-        const cwd = useAppStore.getState().activeProject ?? null;
+        const cwd = props.params.project ?? useAppStore.getState().activeProject ?? null;
         const started = await invoke<ClaudeStarted>("claude_start", {
           cwd,
           resume: props.params.loadSessionId ?? null,
@@ -564,7 +568,7 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
       // re-attach) so it isn't empty until the next live change — unless a live
       // event already arrived (which is newer).
       const seedUuid = attach?.uuid ?? props.params.sessionUuid ?? props.params.loadSessionId;
-      const project = useAppStore.getState().activeProject ?? null;
+      const project = props.params.project ?? useAppStore.getState().activeProject ?? null;
       if (seedUuid && project) {
         invoke<{
           items: TimelineItem[];

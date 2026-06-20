@@ -24,7 +24,14 @@ interface SessionSummary {
   name: string;
   title: string;
   count: number;
+  /** Handoff chain link (claudeterm only) — groups sessions into task chains. */
+  prev_uuid?: string | null;
+  /** The project (cwd) this session belongs to — for workspace-wide reopen. */
+  project: string;
 }
+
+/** Last path segment, for a compact project label in the picker. */
+const baseName = (p: string): string => p.split(/[\\/]/).filter(Boolean).pop() ?? p;
 
 /** Default tab for all panels. Both Claude panel kinds (ACP `claude` and the
  * architecture-A `claudeterm`) use the custom tab — its × raises a 닫기/삭제
@@ -67,6 +74,16 @@ export function MainArea() {
   // Which kind the open picker creates/reopens: ACP `claude` or A `claudeterm`.
   const [pickerKind, setPickerKind] = useState<"claude" | "claudeterm">("claudeterm");
   const [newName, setNewName] = useState("Claude 1");
+  // Expanded task chains in the picker (by head uuid) — collapsed shows only the
+  // latest task of each chain; expand reveals its previous tasks.
+  const [expandedChains, setExpandedChains] = useState<Set<string>>(new Set());
+  const toggleChain = (uuid: string) =>
+    setExpandedChains((prev) => {
+      const next = new Set(prev);
+      if (next.has(uuid)) next.delete(uuid);
+      else next.add(uuid);
+      return next;
+    });
   // Close request raised by a Claude tab's × (B3-1).
   const closeRequest = useClaudeUi((s) => s.closeRequest);
   const clearClose = useClaudeUi((s) => s.clearClose);
@@ -113,7 +130,10 @@ export function MainArea() {
     });
   };
 
-  const addPanel = (kind: PanelKind, opts?: { loadSessionId?: string; title?: string }) => {
+  const addPanel = (
+    kind: PanelKind,
+    opts?: { loadSessionId?: string; title?: string; project?: string },
+  ) => {
     const api = apiRef.current;
     if (!api) return;
     const n = ++counterRef.current;
@@ -132,7 +152,12 @@ export function MainArea() {
       id: `${kind}-${Date.now()}`,
       component,
       title,
-      params: { kind, title, ...(opts?.loadSessionId ? { loadSessionId: opts.loadSessionId } : {}) },
+      params: {
+        kind,
+        title,
+        ...(opts?.loadSessionId ? { loadSessionId: opts.loadSessionId } : {}),
+        ...(opts?.project ? { project: opts.project } : {}),
+      },
     });
   };
 
@@ -191,35 +216,82 @@ export function MainArea() {
   // saved (not-already-open) one. Normalizes both backends to `SessionSummary`.
   const openPicker = async (kind: "claude" | "claudeterm") => {
     setPickerKind(kind);
+    setExpandedChains(new Set());
     let sessions: SessionSummary[] = [];
-    if (activeProject) {
-      if (kind === "claudeterm") {
-        const raw = await invoke<
-          { uuid: string; name: string; title: string; date: string; count: number }[]
-        >("claude_sessions", { project: activeProject }).catch(() => []);
-        sessions = raw.map((s) => ({
-          id: s.uuid,
-          name: s.name,
-          title: s.title,
-          date: s.date,
-          count: s.count,
-        }));
-      } else {
-        const raw = await invoke<
-          { session_id: string; name: string; title: string; date: string; count: number }[]
-        >("acp_sessions", { project: activeProject }).catch(() => []);
-        sessions = raw.map((s) => ({
-          id: s.session_id,
-          name: s.name,
-          title: s.title,
-          date: s.date,
-          count: s.count,
-        }));
-      }
+    if (kind === "claudeterm") {
+      // Workspace-wide: aggregate saved task sessions across every open project
+      // tab (project_key is a non-reversible hash, so we drive the listing from
+      // the cwds the store knows). Each session keeps its project for reopen.
+      const lists = await Promise.all(
+        projects.map(async (p) => {
+          const raw = await invoke<
+            {
+              uuid: string;
+              name: string;
+              title: string;
+              date: string;
+              count: number;
+              prev_uuid?: string | null;
+            }[]
+          >("claude_sessions", { project: p.path }).catch(() => []);
+          return raw.map((s) => ({
+            id: s.uuid,
+            name: s.name,
+            title: s.title,
+            date: s.date,
+            count: s.count,
+            prev_uuid: s.prev_uuid ?? null,
+            project: p.path,
+          }));
+        }),
+      );
+      sessions = lists.flat();
+    } else if (activeProject) {
+      const raw = await invoke<
+        { session_id: string; name: string; title: string; date: string; count: number }[]
+      >("acp_sessions", { project: activeProject }).catch(() => []);
+      sessions = raw.map((s) => ({
+        id: s.session_id,
+        name: s.name,
+        title: s.title,
+        date: s.date,
+        count: s.count,
+        prev_uuid: null,
+        project: activeProject,
+      }));
     }
     setNewName(`Claude ${sessions.length + openKindCount(kind) + 1}`);
+    setPicker(sessions); // open-session filtering + chain grouping happen at render
+  };
+
+  // Picker rows: claudeterm groups into task chains (head + collapsed previous
+  // tasks); others are a flat list. Already-open sessions are excluded.
+  const pickerRows = (): { s: SessionSummary; depth: number; hasPrev: boolean }[] => {
+    if (picker == null) return [];
     const open = openSessionIds();
-    setPicker(sessions.filter((s) => !open.has(s.id)));
+    if (pickerKind !== "claudeterm") {
+      return picker.filter((s) => !open.has(s.id)).map((s) => ({ s, depth: 0, hasPrev: false }));
+    }
+    const byUuid = new Map(picker.map((s) => [s.id, s]));
+    const referenced = new Set(picker.map((s) => s.prev_uuid).filter(Boolean) as string[]);
+    // Heads = sessions no one continues from (the latest task of each chain).
+    const heads = picker
+      .filter((s) => !referenced.has(s.id) && !open.has(s.id))
+      .sort((a, b) => b.date.localeCompare(a.date));
+    const rows: { s: SessionSummary; depth: number; hasPrev: boolean }[] = [];
+    for (const head of heads) {
+      const prev: SessionSummary[] = [];
+      const seen = new Set([head.id]);
+      let cur = head.prev_uuid ? byUuid.get(head.prev_uuid) : undefined;
+      while (cur && !seen.has(cur.id)) {
+        seen.add(cur.id);
+        prev.push(cur);
+        cur = cur.prev_uuid ? byUuid.get(cur.prev_uuid) : undefined;
+      }
+      rows.push({ s: head, depth: 0, hasPrev: prev.length > 0 });
+      if (expandedChains.has(head.id)) for (const p of prev) rows.push({ s: p, depth: 1, hasPrev: false });
+    }
+    return rows;
   };
 
   const createNewSession = () => {
@@ -284,26 +356,60 @@ export function MainArea() {
                 + 만들기
               </button>
             </div>
-            {picker.length > 0 && <div className="claude-picker-sep">저장된 세션</div>}
-            {picker.map((s) => (
-              <button
-                key={s.id}
-                className="claude-picker-item"
-                onClick={() => {
-                  setPicker(null);
-                  addPanel(pickerKind, {
-                    loadSessionId: s.id,
-                    title: s.name || s.title?.slice(0, 24) || s.date,
-                  });
-                }}
-              >
-                <span className="claude-picker-title">{s.name || "(이름 없음)"}</span>
-                <span className="claude-picker-meta">
-                  {s.title ? `${s.title.slice(0, 40)} · ` : ""}
-                  {s.date} · 변경 {s.count}
-                </span>
-              </button>
-            ))}
+            {(() => {
+              const rows = pickerRows();
+              if (rows.length === 0) return null;
+              return (
+                <>
+                  <div className="claude-picker-sep">
+                    {pickerKind === "claudeterm" ? "저장된 task (워크스페이스)" : "저장된 세션"}
+                  </div>
+                  {rows.map(({ s, depth, hasPrev }) => (
+                    <div
+                      key={s.id}
+                      className="claude-picker-row"
+                      style={{ paddingLeft: 4 + depth * 16 }}
+                    >
+                      <span
+                        className="claude-picker-caret"
+                        onClick={(e) => {
+                          if (!hasPrev) return;
+                          e.stopPropagation();
+                          toggleChain(s.id);
+                        }}
+                        style={{ visibility: hasPrev ? "visible" : "hidden" }}
+                        title={expandedChains.has(s.id) ? "이전 task 접기" : "이전 task 펼치기"}
+                      >
+                        {expandedChains.has(s.id) ? "▾" : "▸"}
+                      </span>
+                      <button
+                        className="claude-picker-item"
+                        onClick={() => {
+                          setPicker(null);
+                          addPanel(pickerKind, {
+                            loadSessionId: s.id,
+                            project: s.project,
+                            title: s.name || s.title?.slice(0, 24) || s.date,
+                          });
+                        }}
+                      >
+                        <span className="claude-picker-title">
+                          {depth > 0 ? "↳ " : ""}
+                          {s.name || "(이름 없음)"}
+                          {s.project !== activeProject && (
+                            <span className="claude-picker-proj"> · {baseName(s.project)}</span>
+                          )}
+                        </span>
+                        <span className="claude-picker-meta">
+                          {s.title ? `${s.title.slice(0, 40)} · ` : ""}
+                          {s.date} · 변경 {s.count}
+                        </span>
+                      </button>
+                    </div>
+                  ))}
+                </>
+              );
+            })()}
             <button className="claude-picker-item claude-picker-cancel" onClick={() => setPicker(null)}>
               취소
             </button>
