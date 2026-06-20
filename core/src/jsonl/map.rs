@@ -19,7 +19,7 @@ use std::path::PathBuf;
 use serde_json::Value;
 
 use crate::jsonl::record::{Content, ContentBlock, RawRecord};
-use crate::timeline::{AgentStatus, FileDiff, ItemKind, Timeline};
+use crate::timeline::{AgentStatus, FileDiff, ItemKind, Timeline, TokenUsage};
 
 /// A [`Timeline`] fed line-by-line from one session's JSONL file. One file is
 /// one session; `session_id` is the file's UUID, used as a fallback when a
@@ -39,6 +39,7 @@ pub struct JsonlMapper {
     turns: BTreeMap<u64, String>,
     answers: BTreeMap<u64, String>,
     dates: BTreeMap<u64, String>,
+    tokens: BTreeMap<u64, TokenUsage>,
 }
 
 impl JsonlMapper {
@@ -50,6 +51,7 @@ impl JsonlMapper {
             turns: BTreeMap::new(),
             answers: BTreeMap::new(),
             dates: BTreeMap::new(),
+            tokens: BTreeMap::new(),
         }
     }
 
@@ -75,6 +77,16 @@ impl JsonlMapper {
             .or(rec.kind.as_deref());
         let is_user = role == Some("user");
         let is_assistant = role == Some("assistant");
+
+        // Accumulate this turn's token usage from assistant `usage` (B1).
+        if is_assistant {
+            if let Some(u) = rec.message.as_ref().and_then(|m| m.usage.as_ref()) {
+                self.tokens
+                    .entry(self.current_turn)
+                    .or_default()
+                    .add(&parse_usage(u));
+            }
+        }
 
         let content = rec.message.as_ref().and_then(|m| m.content.as_ref());
 
@@ -144,6 +156,11 @@ impl JsonlMapper {
     /// turn → YYYY-MM-DD (the record's UTC day).
     pub fn dates(&self) -> &BTreeMap<u64, String> {
         &self.dates
+    }
+
+    /// turn → accumulated token usage (B1).
+    pub fn tokens(&self) -> &BTreeMap<u64, TokenUsage> {
+        &self.tokens
     }
 
     pub fn current_turn(&self) -> u64 {
@@ -365,6 +382,17 @@ fn derive_title(name: &str, input: &Value) -> String {
         return format!("{name} {p}");
     }
     name.to_string()
+}
+
+/// Parse a Claude `usage` object into a [`TokenUsage`] (missing fields = 0).
+fn parse_usage(u: &Value) -> TokenUsage {
+    let n = |k: &str| u.get(k).and_then(Value::as_u64).unwrap_or(0);
+    TokenUsage {
+        input: n("input_tokens"),
+        output: n("output_tokens"),
+        cache_read: n("cache_read_input_tokens"),
+        cache_creation: n("cache_creation_input_tokens"),
+    }
 }
 
 /// Concatenate the `text` blocks of a content array (a user prompt or assistant
@@ -818,6 +846,33 @@ mod tests {
         m.apply_line(&line(tool_result));
         assert_eq!(m.current_turn(), 1, "a tool_result array is not a new prompt");
         assert_eq!(m.turns().len(), 1);
+    }
+
+    // B1: assistant `usage` accumulates into the current turn's token total.
+    #[test]
+    fn accumulates_token_usage_per_turn() {
+        let mut m = JsonlMapper::new(ROOT, SID);
+        m.apply_line(&line(json!({
+            "type": "user", "sessionId": SID,
+            "message": { "role": "user", "content": [{ "type": "text", "text": "go" }] }
+        })));
+        m.apply_line(&line(json!({
+            "type": "assistant", "sessionId": SID,
+            "message": { "role": "assistant",
+                "usage": { "input_tokens": 100, "output_tokens": 50,
+                           "cache_read_input_tokens": 2000, "cache_creation_input_tokens": 300 },
+                "content": [{ "type": "text", "text": "ok" }] }
+        })));
+        m.apply_line(&line(json!({
+            "type": "assistant", "sessionId": SID,
+            "message": { "role": "assistant",
+                "usage": { "input_tokens": 10, "output_tokens": 20 }, "content": [] }
+        })));
+        let t = m.tokens().get(&1).expect("turn 1 tokens");
+        assert_eq!(t.input, 110);
+        assert_eq!(t.output, 70);
+        assert_eq!(t.cache_read, 2000);
+        assert_eq!(t.cache_creation, 300);
     }
 
     // A record that omits sessionId falls back to the file's session uuid.

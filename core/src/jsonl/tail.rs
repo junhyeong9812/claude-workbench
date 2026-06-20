@@ -144,6 +144,11 @@ impl SessionTail {
     pub fn dates(&self) -> &BTreeMap<u64, String> {
         self.mapper.dates()
     }
+
+    /// turn → token usage (B1).
+    pub fn tokens(&self) -> &BTreeMap<u64, crate::timeline::TokenUsage> {
+        self.mapper.tokens()
+    }
 }
 
 #[cfg(test)]

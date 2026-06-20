@@ -14,7 +14,7 @@ use std::thread;
 use std::time::Duration;
 
 use core_acp::{AcpEvent, AcpHost};
-use core_lib::{DirEntry, ProjectType, SessionManager, TimelineItem, WorkspaceState};
+use core_lib::{DirEntry, ProjectType, SessionManager, TimelineItem, TokenUsage, WorkspaceState};
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager, State};
 
@@ -349,6 +349,7 @@ struct ClaudeTimelinePayload {
     turns: Vec<(u64, String)>,
     answers: Vec<(u64, String)>,
     dates: Vec<(u64, String)>,
+    tokens: Vec<(u64, TokenUsage)>,
 }
 
 /// Generate a fresh session UUID for `--session-id`. Linux-only (the app's
@@ -497,6 +498,7 @@ fn run_timeline_poll(
         let answers_v: Vec<(u64, String)> =
             t.answers().iter().map(|(k, v)| (*k, v.clone())).collect();
         let dates_v: Vec<(u64, String)> = t.dates().iter().map(|(k, v)| (*k, v.clone())).collect();
+        let tokens_v: Vec<(u64, TokenUsage)> = t.tokens().iter().map(|(k, v)| (*k, *v)).collect();
 
         let _ = app.emit(
             "claude-timeline",
@@ -506,6 +508,7 @@ fn run_timeline_poll(
                 turns: turns_v.clone(),
                 answers: answers_v.clone(),
                 dates: dates_v.clone(),
+                tokens: tokens_v.clone(),
             },
         );
 
@@ -530,6 +533,7 @@ fn run_timeline_poll(
                 turns: turns_v,
                 answers: answers_v,
                 dates: dates_v,
+                tokens: tokens_v,
             };
             let _ = core_lib::snapshot::save(&base, &cwd, &snap);
         }

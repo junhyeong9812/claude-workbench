@@ -44,6 +44,12 @@ interface ClaudeStarted {
   id: number;
   session_uuid: string;
 }
+interface TokenUsage {
+  input: number;
+  output: number;
+  cache_read: number;
+  cache_creation: number;
+}
 /** Full timeline snapshot for this session (the backend re-sends the whole
  * modest state on any change), so plain Q&A turns show too, not just tools. */
 interface ClaudeTimelineEvent {
@@ -52,7 +58,11 @@ interface ClaudeTimelineEvent {
   turns: [number, string][];
   answers: [number, string][];
   dates: [number, string][];
+  tokens: [number, TokenUsage][];
 }
+
+/** Compact token count: 1234 → "1.2k". */
+const kfmt = (n: number): string => (n >= 1000 ? `${(n / 1000).toFixed(1)}k` : String(n));
 
 export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
   const hostRef = useRef<HTMLDivElement | null>(null);
@@ -65,6 +75,12 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
   const [answers, setAnswers] = useState<Map<number, string>>(new Map());
   const [dates, setDates] = useState<Map<number, string>>(new Map());
   const [selectedId, setSelectedId] = useState<string | null>(null);
+  // Session token totals (B1): ↑ = new context processed (input + cache write),
+  // ↓ = generated output. Summed across turns.
+  const [tokenTotal, setTokenTotal] = useState<{ input: number; output: number }>({
+    input: 0,
+    output: 0,
+  });
   // Width (px) of the detail viewer pane; drag the splitter to resize.
   const [viewerWidth, setViewerWidth] = useState(480);
 
@@ -228,11 +244,20 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
       turns: [number, string][];
       answers: [number, string][];
       dates: [number, string][];
+      tokens?: [number, TokenUsage][];
     }) => {
       setItems([...s.items].sort((a, b) => a.seq - b.seq));
       setTurns(new Map(s.turns));
       setAnswers(new Map(s.answers));
       setDates(new Map(s.dates));
+      const total = (s.tokens ?? []).reduce(
+        (acc, [, u]) => ({
+          input: acc.input + u.input + u.cache_creation,
+          output: acc.output + u.output,
+        }),
+        { input: 0, output: 0 },
+      );
+      setTokenTotal(total);
     };
 
     const write = (bytes: number[]) => {
@@ -304,6 +329,7 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
           turns: [number, string][];
           answers: [number, string][];
           dates: [number, string][];
+          tokens?: [number, TokenUsage][];
         } | null>("claude_session_snapshot", { project, uuid: seedUuid })
           .then((snap) => {
             if (snap && !gotLive && !disposed) applySnapshot(snap);
@@ -363,7 +389,14 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
     <div className="claudeterm" ref={containerRef} onKeyDown={onContainerKey}>
       <div className="claudeterm-pane claudeterm-term-pane">
         <div className="claudeterm-pane-head">
-          Claude — {(props.params.title as string) ?? "터미널"}
+          <span className="claudeterm-pane-head-title">
+            Claude — {(props.params.title as string) ?? "터미널"}
+          </span>
+          {(tokenTotal.input > 0 || tokenTotal.output > 0) && (
+            <span className="claudeterm-tokens" title="입력(컨텍스트) / 출력 토큰">
+              ↑{kfmt(tokenTotal.input)} ↓{kfmt(tokenTotal.output)}
+            </span>
+          )}
         </div>
         <div className="claudeterm-term" ref={hostRef} />
       </div>

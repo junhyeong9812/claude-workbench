@@ -21,7 +21,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use serde::{Deserialize, Serialize};
 
 use crate::history::project_key;
-use crate::timeline::TimelineItem;
+use crate::timeline::{TimelineItem, TokenUsage};
 
 /// Process-unique suffix counter for temp files, so concurrent writers (even for
 /// the same uuid) never race on a shared temp path (codex session-UX F2).
@@ -58,6 +58,8 @@ pub struct SessionSnapshot {
     pub turns: Vec<(u64, String)>,
     pub answers: Vec<(u64, String)>,
     pub dates: Vec<(u64, String)>,
+    #[serde(default)]
+    pub tokens: Vec<(u64, TokenUsage)>,
 }
 
 /// A session summarized for the reopen picker.
@@ -222,6 +224,7 @@ mod tests {
             turns: vec![(1, "first prompt".into())],
             answers: vec![(1, "an answer".into())],
             dates: vec![(1, date.to_string())],
+            tokens: vec![],
         }
     }
 

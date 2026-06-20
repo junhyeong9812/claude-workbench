@@ -46,6 +46,26 @@ pub enum WriteStatus {
     WriteFailed,
 }
 
+/// Token accounting for a turn (summed from the turn's assistant `usage`), shown
+/// for the "lazy busy" token watch (P2b-4 B1).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TokenUsage {
+    pub input: u64,
+    pub output: u64,
+    pub cache_read: u64,
+    pub cache_creation: u64,
+}
+
+impl TokenUsage {
+    /// Accumulate another usage reading into this one.
+    pub fn add(&mut self, o: &TokenUsage) {
+        self.input += o.input;
+        self.output += o.output;
+        self.cache_read += o.cache_read;
+        self.cache_creation += o.cache_creation;
+    }
+}
+
 /// Category of a tool call (mirrors ACP `ToolKind`), for icons/grouping.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

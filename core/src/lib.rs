@@ -17,7 +17,9 @@ pub mod session;
 pub mod snapshot;
 pub mod timeline;
 
-pub use timeline::{AgentStatus, FileDiff, ItemKind, Timeline, TimelineItem, WriteStatus};
+pub use timeline::{
+    AgentStatus, FileDiff, ItemKind, Timeline, TimelineItem, TokenUsage, WriteStatus,
+};
 pub use fs::{list_dir, DirEntry};
 pub use label::nearest_project_marker;
 pub use persist::{load_state, save_state, Project, TreeState, WorkspaceState};
