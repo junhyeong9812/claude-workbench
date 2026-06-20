@@ -484,11 +484,11 @@ body {
   padding: 2px 8px;
   cursor: pointer;
   font-size: 0.82em;
-  color: var(--accent, #89b4fa);
-  background: rgba(137, 180, 250, 0.08);
+  color: var(--fg, #fff);
+  background: rgba(255, 255, 255, 0.04);
 }
 .timeline-agent-head:hover {
-  background: rgba(137, 180, 250, 0.16);
+  background: rgba(255, 255, 255, 0.09);
 }
 .timeline-agent-count {
   margin-left: auto;

@@ -202,7 +202,7 @@ export function TimelineView({
                     title={collapsed ? "펼치기" : "접기"}
                   >
                     <span className="timeline-date-caret">{collapsed ? "▸" : "▾"}</span>
-                    🔱 서브에이전트 {aid.slice(0, 8)}
+                    서브에이전트 {aid.slice(0, 8)}
                     <span className="timeline-agent-count">{its.length}</span>
                   </div>
                   {!collapsed &&
