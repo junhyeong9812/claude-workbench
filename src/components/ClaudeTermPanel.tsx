@@ -145,6 +145,11 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
   // On a handoff remount, the exact session to attach to — so the effect doesn't
   // race dockview's param propagation (codex P3-impl 2). Consumed once by the effect.
   const pendingAttachRef = useRef<{ id: number; uuid: string } | null>(null);
+  // While a handoff is generating/restarting (or its summary is under review),
+  // block keystrokes to the PTY so the user can't send a prompt into a session
+  // that's about to be replaced (which would error or land in the wrong session).
+  // A ref so the mount-time input handlers read the live value.
+  const inputLockedRef = useRef(false);
   // The last handoff seed, so the user can re-inject it if the auto-attempt missed
   // the prompt (codex P3 D3 — ready detection is best-effort).
   const [lastSeed, setLastSeed] = useState<string | null>(null);
@@ -316,6 +321,12 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
     window.addEventListener("mouseup", onUp);
   };
 
+  // Keep the input-lock ref in sync: locked while a handoff is busy or its summary
+  // is being reviewed.
+  useEffect(() => {
+    inputLockedRef.current = handoffBusy || summaryDraft != null;
+  }, [handoffBusy, summaryDraft]);
+
   useEffect(() => {
     const host = hostRef.current;
     if (!host) return;
@@ -405,7 +416,7 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
     if (ta) {
       ta.addEventListener("compositionend", (e) => {
         const text = (e as CompositionEvent).data;
-        if (text && sessionId != null) {
+        if (text && sessionId != null && !inputLockedRef.current) {
           invoke("terminal_write", {
             id: sessionId,
             data: Array.from(new TextEncoder().encode(text)),
@@ -545,7 +556,7 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
     })();
 
     const onData = term.onData((d) => {
-      if (sessionId == null) return;
+      if (sessionId == null || inputLockedRef.current) return;
       // Drop IME composition output (multi-byte / non-ASCII) — Hangul only
       // arrives legitimately via `compositionend` (handled above); any CJK here
       // is a duplicate. Keyboard input through onData is ASCII/control only.
@@ -626,6 +637,12 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
           </span>
         </div>
         <div className="claudeterm-term" ref={hostRef} />
+        {(handoffBusy || summaryDraft) && (
+          <div className="claudeterm-term-lock">
+            <span className="claudeterm-spinner" />
+            {handoffBusy ? "핸드오프 처리 중 — 입력 일시 잠금" : "요약 확인 중 — 입력 일시 잠금"}
+          </div>
+        )}
       </div>
 
       {(selectedItem || textView) && (

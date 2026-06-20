@@ -497,6 +497,40 @@ body {
   opacity: 0.4;
   cursor: default;
 }
+/* Non-blocking busy spinner in the Claude pane head (handoff in progress). */
+.claudeterm-spinner {
+  flex: 0 0 auto;
+  display: inline-block;
+  width: 11px;
+  height: 11px;
+  border: 2px solid rgba(137, 180, 250, 0.3);
+  border-top-color: #89b4fa;
+  border-radius: 50%;
+  animation: claudeterm-spin 0.7s linear infinite;
+}
+@keyframes claudeterm-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+/* Input-lock overlay over the terminal while a handoff is in progress, so the
+ * user can't type into a session that's about to be replaced. */
+.claudeterm-term-pane {
+  position: relative;
+}
+.claudeterm-term-lock {
+  position: absolute;
+  inset: 0;
+  z-index: 10;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  font-size: 0.85em;
+  color: var(--fg, #cdd6f4);
+  background: rgba(30, 30, 46, 0.6);
+  cursor: progress;
+}
 /* Handoff summary review/edit modal. */
 .claudeterm-modal-overlay {
   position: absolute;
