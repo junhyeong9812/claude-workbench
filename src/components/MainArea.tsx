@@ -167,21 +167,24 @@ export function MainArea() {
     const req = closeRequest;
     clearClose();
     if (!req) return;
+    // Delete must target the session's *own* project (a workspace-wide reopen can
+    // open a task from a project other than the active tab) — codex P2 F1.
+    const project = req.project ?? activeProject;
     if (req.kind === "claudeterm") {
       // Stop the live poll thread BEFORE deleting, so it can't recreate the
       // snapshot we're about to remove (codex session-UX F4).
       if (typeof req.ptyId === "number") {
         await invoke("claude_close", { id: req.ptyId }).catch(() => {});
       }
-      if (deleteHistory && req.sessionId && activeProject) {
+      if (deleteHistory && req.sessionId && project) {
         await invoke("claude_delete", {
-          project: activeProject,
+          project,
           uuid: req.sessionId,
         }).catch(() => {});
       }
-    } else if (deleteHistory && req.sessionId && activeProject) {
+    } else if (deleteHistory && req.sessionId && project) {
       await invoke("acp_delete_session", {
-        project: activeProject,
+        project,
         sessionId: req.sessionId,
       }).catch(() => {});
     }
@@ -265,7 +268,11 @@ export function MainArea() {
   };
 
   // Picker rows: claudeterm groups into task chains (head + collapsed previous
-  // tasks); others are a flat list. Already-open sessions are excluded.
+  // tasks); others are a flat list. Already-open sessions never appear as rows
+  // (their predecessors still surface via the fallback below). Note: chain
+  // indexing keys on uuid alone — handoff uuids are random v4 (globally unique),
+  // so a (project, uuid) compound key is unnecessary; the React row key is still
+  // compounded with project to be safe (codex P2 F2).
   const pickerRows = (): { s: SessionSummary; depth: number; hasPrev: boolean }[] => {
     if (picker == null) return [];
     const open = openSessionIds();
@@ -274,22 +281,39 @@ export function MainArea() {
     }
     const byUuid = new Map(picker.map((s) => [s.id, s]));
     const referenced = new Set(picker.map((s) => s.prev_uuid).filter(Boolean) as string[]);
-    // Heads = sessions no one continues from (the latest task of each chain).
-    const heads = picker
-      .filter((s) => !referenced.has(s.id) && !open.has(s.id))
-      .sort((a, b) => b.date.localeCompare(a.date));
     const rows: { s: SessionSummary; depth: number; hasPrev: boolean }[] = [];
-    for (const head of heads) {
+    const visited = new Set<string>();
+
+    // Emit a chain rooted at `head`: the head row + (when expanded) its previous
+    // tasks, both skipping already-open sessions.
+    const emit = (head: SessionSummary) => {
+      visited.add(head.id);
       const prev: SessionSummary[] = [];
       const seen = new Set([head.id]);
       let cur = head.prev_uuid ? byUuid.get(head.prev_uuid) : undefined;
       while (cur && !seen.has(cur.id)) {
         seen.add(cur.id);
+        visited.add(cur.id);
         prev.push(cur);
         cur = cur.prev_uuid ? byUuid.get(cur.prev_uuid) : undefined;
       }
-      rows.push({ s: head, depth: 0, hasPrev: prev.length > 0 });
-      if (expandedChains.has(head.id)) for (const p of prev) rows.push({ s: p, depth: 1, hasPrev: false });
+      const shownPrev = prev.filter((p) => !open.has(p.id));
+      rows.push({ s: head, depth: 0, hasPrev: shownPrev.length > 0 });
+      if (expandedChains.has(head.id)) {
+        for (const p of shownPrev) rows.push({ s: p, depth: 1, hasPrev: false });
+      }
+    };
+
+    // Heads = sessions no one continues from (the latest task of each chain).
+    const heads = picker
+      .filter((s) => !referenced.has(s.id) && !open.has(s.id))
+      .sort((a, b) => b.date.localeCompare(a.date));
+    for (const head of heads) emit(head);
+    // Fallback: any session not reached from a head (pure cycle / orphan, or a
+    // predecessor whose head is currently open) — emit so nothing is silently
+    // dropped (codex P2 F3).
+    for (const s of picker) {
+      if (!visited.has(s.id) && !open.has(s.id)) emit(s);
     }
     return rows;
   };
@@ -366,7 +390,7 @@ export function MainArea() {
                   </div>
                   {rows.map(({ s, depth, hasPrev }) => (
                     <div
-                      key={s.id}
+                      key={`${s.project}:${s.id}`}
                       className="claude-picker-row"
                       style={{ paddingLeft: 4 + depth * 16 }}
                     >

@@ -12,6 +12,10 @@ export interface ClaudeCloseRequest {
   /** claudeterm's live PTY id, so the modal can stop the poll thread before a
    * delete (otherwise it would recreate the snapshot). */
   ptyId?: number;
+  /** The project (cwd) the session is stored under — needed because a
+   * workspace-wide reopen can open a task from a project other than the active
+   * one, and delete must target that project's storage. */
+  project?: string | null;
 }
 
 interface ClaudeUiState {

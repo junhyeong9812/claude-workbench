@@ -28,7 +28,10 @@ export function ClaudeTab(props: IDockviewPanelHeaderProps) {
     if (!next || next === title) return;
     props.api.setTitle(next);
     props.api.updateParameters({ ...props.params, title: next });
-    const project = useAppStore.getState().activeProject ?? null;
+    // The panel's own project (a workspace-wide reopen can run a task from a
+    // different project than the active tab) — fall back to the active project.
+    const project =
+      (props.params.project as string | undefined) ?? useAppStore.getState().activeProject ?? null;
     if (sessionId && project) {
       const cmd = kind === "claudeterm" ? "claude_rename" : "acp_rename_session";
       const args =
@@ -84,7 +87,11 @@ export function ClaudeTab(props: IDockviewPanelHeaderProps) {
             kind === "claudeterm" && typeof props.params.sessionId === "number"
               ? (props.params.sessionId as number)
               : undefined;
-          useClaudeUi.getState().requestClose({ panelId: props.api.id, sessionId, kind, ptyId });
+          const project =
+            (props.params.project as string | undefined) ??
+            useAppStore.getState().activeProject ??
+            null;
+          useClaudeUi.getState().requestClose({ panelId: props.api.id, sessionId, kind, ptyId, project });
         }}
       >
         ×
