@@ -138,17 +138,27 @@ export function MainArea() {
 
   // Resolve a close request from a Claude tab's × (B3-1): 닫기 keeps the saved
   // history, 삭제 also removes it; both close the panel.
-  const resolveClose = (deleteHistory: boolean) => {
+  const resolveClose = async (deleteHistory: boolean) => {
     const req = closeRequest;
     clearClose();
     if (!req) return;
-    if (deleteHistory && req.sessionId && activeProject) {
-      const cmd = req.kind === "claudeterm" ? "claude_delete" : "acp_delete_session";
-      const args =
-        req.kind === "claudeterm"
-          ? { project: activeProject, uuid: req.sessionId }
-          : { project: activeProject, sessionId: req.sessionId };
-      invoke(cmd, args).catch(() => {});
+    if (req.kind === "claudeterm") {
+      // Stop the live poll thread BEFORE deleting, so it can't recreate the
+      // snapshot we're about to remove (codex session-UX F4).
+      if (typeof req.ptyId === "number") {
+        await invoke("claude_close", { id: req.ptyId }).catch(() => {});
+      }
+      if (deleteHistory && req.sessionId && activeProject) {
+        await invoke("claude_delete", {
+          project: activeProject,
+          uuid: req.sessionId,
+        }).catch(() => {});
+      }
+    } else if (deleteHistory && req.sessionId && activeProject) {
+      await invoke("acp_delete_session", {
+        project: activeProject,
+        sessionId: req.sessionId,
+      }).catch(() => {});
     }
     apiRef.current?.getPanel(req.panelId)?.api.close();
   };

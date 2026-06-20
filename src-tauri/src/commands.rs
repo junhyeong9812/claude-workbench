@@ -455,6 +455,12 @@ fn run_timeline_poll(
 
     while !stop.load(Ordering::Relaxed) {
         thread::sleep(Duration::from_millis(150));
+        // Re-check after the sleep so a `claude_close` during the sleep stops us
+        // before another poll/save (so a delete-after-close isn't recreated —
+        // codex session-UX F4).
+        if stop.load(Ordering::Relaxed) {
+            break;
+        }
 
         // Resolve the file once it appears, then keep tailing it.
         if tail.is_none() {
@@ -507,9 +513,13 @@ fn run_timeline_poll(
         // survives restart and can be listed/reopened, without the append
         // duplication. A rename (claude_rename writes the snapshot's name) is
         // preserved by reading the existing name back here.
+        if stop.load(Ordering::Relaxed) {
+            break; // closed during poll/emit — don't persist after close (F4)
+        }
         if let Ok(base) = app.path().app_data_dir() {
-            let name = core_lib::snapshot::load(&base, &cwd, &uuid)
-                .map(|s| s.name)
+            // Read the rename override (decoupled file) rather than the body's
+            // own name, so a concurrent rename isn't clobbered (codex F1).
+            let name = core_lib::snapshot::read_name(&base, &cwd, &uuid)
                 .unwrap_or_else(|| initial_name.clone());
             let date = chrono::Local::now().format("%Y-%m-%d").to_string();
             let snap = core_lib::snapshot::SessionSnapshot {
@@ -567,10 +577,9 @@ pub fn claude_rename(
         .path()
         .app_data_dir()
         .map_err(|_| AppError::new("Cannot resolve app data directory"))?;
-    let mut snap = core_lib::snapshot::load(&base, &project, &uuid)
-        .ok_or_else(|| AppError::new("unknown session"))?;
-    snap.name = name;
-    core_lib::snapshot::save(&base, &project, &snap)
+    // Write only the name override file — decoupled from the timeline body the
+    // poll thread writes, so neither clobbers the other (codex F1).
+    core_lib::snapshot::save_name(&base, &project, &uuid, &name)
         .map_err(|e| AppError::new(io_message("Cannot rename session", &e)))
 }
 

@@ -16,11 +16,35 @@
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde::{Deserialize, Serialize};
 
 use crate::history::project_key;
 use crate::timeline::TimelineItem;
+
+/// Process-unique suffix counter for temp files, so concurrent writers (even for
+/// the same uuid) never race on a shared temp path (codex session-UX F2).
+static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// Reject a uuid that isn't a plain identifier so a command-supplied value can't
+/// traverse out of the project's `claude` dir (`..`, `/`, …) — our generated
+/// session ids are `[0-9a-f-]` (codex session-UX F5).
+fn is_safe_uuid(uuid: &str) -> bool {
+    !uuid.is_empty()
+        && uuid.len() <= 128
+        && uuid
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+}
+
+fn unique_tmp(dir: &Path, stem: &str) -> PathBuf {
+    dir.join(format!(
+        "{stem}.{}-{}.tmp",
+        std::process::id(),
+        TMP_SEQ.fetch_add(1, Ordering::Relaxed)
+    ))
+}
 
 /// The full persisted state of one session's timeline.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -52,17 +76,46 @@ fn dir(base: &Path, project: &str) -> PathBuf {
     base.join("projects").join(project_key(project)).join("claude")
 }
 
-/// Write (overwrite) a session snapshot atomically (temp file + rename) so a
-/// crash mid-write never leaves a half-written snapshot.
+/// Write (overwrite) a session snapshot **body** atomically (unique temp +
+/// rename). The display name is kept in a separate `.name` file (see
+/// [`save_name`]) so a rename and the poll thread never clobber each other.
 pub fn save(base: &Path, project: &str, snap: &SessionSnapshot) -> io::Result<()> {
+    if !is_safe_uuid(&snap.uuid) {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "unsafe session id"));
+    }
     let dir = dir(base, project);
     fs::create_dir_all(&dir)?;
     let json = serde_json::to_string(snap)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-    let final_path = dir.join(format!("{}.json", snap.uuid));
-    let tmp_path = dir.join(format!("{}.json.tmp", snap.uuid));
+    let tmp_path = unique_tmp(&dir, &format!("{}.json", snap.uuid));
     fs::write(&tmp_path, json)?;
-    fs::rename(&tmp_path, &final_path)
+    fs::rename(&tmp_path, dir.join(format!("{}.json", snap.uuid)))
+}
+
+/// Override a session's display name without touching its timeline body
+/// (rename). Decoupled into its own file so the poll thread (sole writer of the
+/// `.json`) and a rename write **different** files and can't clobber each other
+/// (codex session-UX F1).
+pub fn save_name(base: &Path, project: &str, uuid: &str, name: &str) -> io::Result<()> {
+    if !is_safe_uuid(uuid) {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "unsafe session id"));
+    }
+    let dir = dir(base, project);
+    fs::create_dir_all(&dir)?;
+    let tmp_path = unique_tmp(&dir, &format!("{uuid}.name"));
+    fs::write(&tmp_path, name)?;
+    fs::rename(&tmp_path, dir.join(format!("{uuid}.name")))
+}
+
+/// The renamed display name override, if any (else the snapshot's own name).
+pub fn read_name(base: &Path, project: &str, uuid: &str) -> Option<String> {
+    if !is_safe_uuid(uuid) {
+        return None;
+    }
+    fs::read_to_string(dir(base, project).join(format!("{uuid}.name")))
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
 }
 
 /// List the saved sessions for a project, newest first (by date, then name).
@@ -89,9 +142,10 @@ pub fn list(base: &Path, project: &str) -> Vec<SnapshotSummary> {
             .min_by_key(|(t, _)| *t)
             .map(|(_, p)| p.clone())
             .unwrap_or_default();
+        let name = read_name(base, project, &snap.uuid).unwrap_or(snap.name);
         out.push(SnapshotSummary {
             uuid: snap.uuid,
-            name: snap.name,
+            name,
             title,
             date: snap.date,
             count: snap.items.len(),
@@ -101,21 +155,39 @@ pub fn list(base: &Path, project: &str) -> Vec<SnapshotSummary> {
     out
 }
 
-/// Load one session's full snapshot (for reopen). `None` if absent/corrupt.
+/// Load one session's full snapshot (for reopen), applying the name override.
+/// `None` if absent/corrupt/unsafe id.
 pub fn load(base: &Path, project: &str, uuid: &str) -> Option<SessionSnapshot> {
+    if !is_safe_uuid(uuid) {
+        return None;
+    }
     let path = dir(base, project).join(format!("{uuid}.json"));
     let text = fs::read_to_string(path).ok()?;
-    serde_json::from_str(&text).ok()
+    let mut snap: SessionSnapshot = serde_json::from_str(&text).ok()?;
+    if let Some(name) = read_name(base, project, uuid) {
+        snap.name = name;
+    }
+    Some(snap)
 }
 
-/// Delete a session's snapshot (the `삭제` action). Missing file is not an error.
+/// Delete a session's snapshot body + name override (the `삭제` action). Missing
+/// files / unsafe ids are not an error.
 pub fn delete(base: &Path, project: &str, uuid: &str) -> io::Result<()> {
-    let path = dir(base, project).join(format!("{uuid}.json"));
-    match fs::remove_file(path) {
-        Ok(()) => Ok(()),
-        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(e),
+    if !is_safe_uuid(uuid) {
+        return Ok(());
     }
+    let dir = dir(base, project);
+    for path in [
+        dir.join(format!("{uuid}.json")),
+        dir.join(format!("{uuid}.name")),
+    ] {
+        match fs::remove_file(path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -205,6 +277,32 @@ mod tests {
     fn list_missing_project_is_empty() {
         let base = temp_base("empty");
         assert!(list(&base, "/never").is_empty());
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    // codex F1: a rename (save_name) is decoupled from the body and survives a
+    // later body save (the poll thread re-writing the timeline).
+    #[test]
+    fn rename_via_name_file_survives_body_resave() {
+        let base = temp_base("rename");
+        save(&base, "/p", &snap("u1", "Claude 1", "2026-06-19", 1)).unwrap();
+        save_name(&base, "/p", "u1", "내 세션").unwrap();
+        assert_eq!(load(&base, "/p", "u1").unwrap().name, "내 세션");
+        // The poll thread re-saves the body with its own name; the override wins.
+        save(&base, "/p", &snap("u1", "Claude 1", "2026-06-20", 3)).unwrap();
+        assert_eq!(load(&base, "/p", "u1").unwrap().name, "내 세션");
+        assert_eq!(list(&base, "/p")[0].name, "내 세션");
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    // codex F5: a path-traversal uuid is rejected, not used as a path component.
+    #[test]
+    fn unsafe_uuid_is_rejected() {
+        let base = temp_base("unsafe");
+        assert!(save(&base, "/p", &snap("../evil", "n", "d", 1)).is_err());
+        assert!(load(&base, "/p", "../evil").is_none());
+        assert!(save_name(&base, "/p", "a/b", "x").is_err());
+        delete(&base, "/p", "../evil").unwrap(); // no-op, not an error
         let _ = fs::remove_dir_all(&base);
     }
 }

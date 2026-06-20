@@ -80,7 +80,11 @@ export function ClaudeTab(props: IDockviewPanelHeaderProps) {
         onMouseDown={(e) => e.stopPropagation()}
         onClick={(e) => {
           e.stopPropagation();
-          useClaudeUi.getState().requestClose({ panelId: props.api.id, sessionId, kind });
+          const ptyId =
+            kind === "claudeterm" && typeof props.params.sessionId === "number"
+              ? (props.params.sessionId as number)
+              : undefined;
+          useClaudeUi.getState().requestClose({ panelId: props.api.id, sessionId, kind, ptyId });
         }}
       >
         ×
