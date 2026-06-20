@@ -406,9 +406,14 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
     }
 
     // Intercept Ctrl+←/→ before xterm consumes them, so they move focus between
-    // panes instead of being sent to the PTY as word-motion.
+    // panes instead of being sent to the PTY as word-motion. Stop propagation so
+    // the event does NOT also bubble to the container's `onContainerKey`, which
+    // would call `navPane` a second time (moving two panes — with the viewer
+    // closed that wraps right back to the terminal).
     term.attachCustomKeyEventHandler((e) => {
       if (e.type === "keydown" && e.ctrlKey && (e.key === "ArrowLeft" || e.key === "ArrowRight")) {
+        e.preventDefault();
+        e.stopPropagation();
         navPane(e.key === "ArrowRight" ? 1 : -1);
         return false;
       }
