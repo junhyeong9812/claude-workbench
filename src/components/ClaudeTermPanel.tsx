@@ -173,6 +173,15 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
   // Previous tasks in this session's handoff chain (read-only, newest-first),
   // rendered below the live timeline so the chain reads continuously (Phase 2).
   const [chainPrev, setChainPrev] = useState<ChainTask[]>([]);
+  // Collapsed previous-task sections (by uuid) — click a task header to fold it.
+  const [collapsedTasks, setCollapsedTasks] = useState<Set<string>>(new Set());
+  const toggleTask = (uuid: string) =>
+    setCollapsedTasks((prev) => {
+      const next = new Set(prev);
+      if (next.has(uuid)) next.delete(uuid);
+      else next.add(uuid);
+      return next;
+    });
 
   /** Write the seed (+Enter) to the current session — submits it as a prompt. */
   const injectSeed = (text: string) => {
@@ -745,30 +754,40 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
               setSelectedId(null);
             }}
           />
-          {chainPrev.map((task) => (
-            <div key={task.uuid} className="claudeterm-prevtask">
-              <div className="claudeterm-prevtask-head" title={`이전 task · ${task.uuid}`}>
-                ◀ 이전 task — {task.name} · {task.date}
+          {chainPrev.map((task) => {
+            const collapsed = collapsedTasks.has(task.uuid);
+            return (
+              <div key={task.uuid} className="claudeterm-prevtask">
+                <div
+                  className="claudeterm-prevtask-head"
+                  title={collapsed ? "펼치기" : "접기"}
+                  onClick={() => toggleTask(task.uuid)}
+                >
+                  <span className="timeline-date-caret">{collapsed ? "▸" : "▾"}</span> ◀ 이전 task —{" "}
+                  {task.name} · {task.date}
+                </div>
+                {!collapsed && (
+                  <TimelineView
+                    items={task.items}
+                    turns={new Map(task.turns)}
+                    answers={new Map(task.answers)}
+                    dates={new Map(task.dates)}
+                    subagents={[]}
+                    selectedId={selectedId}
+                    onSelect={(it) => {
+                      setSelectedId(it.tool_call_id);
+                      setTextView(null);
+                    }}
+                    onSelectAnswer={(turn) => {
+                      const a = new Map(task.answers).get(turn) ?? "";
+                      setTextView({ title: `답변 (${task.name} Q${turn})`, text: a });
+                      setSelectedId(null);
+                    }}
+                  />
+                )}
               </div>
-              <TimelineView
-                items={task.items}
-                turns={new Map(task.turns)}
-                answers={new Map(task.answers)}
-                dates={new Map(task.dates)}
-                subagents={[]}
-                selectedId={selectedId}
-                onSelect={(it) => {
-                  setSelectedId(it.tool_call_id);
-                  setTextView(null);
-                }}
-                onSelectAnswer={(turn) => {
-                  const a = new Map(task.answers).get(turn) ?? "";
-                  setTextView({ title: `답변 (${task.name} Q${turn})`, text: a });
-                  setSelectedId(null);
-                }}
-              />
-            </div>
-          ))}
+            );
+          })}
         </div>
       </div>
 
