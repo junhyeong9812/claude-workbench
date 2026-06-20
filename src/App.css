@@ -630,9 +630,31 @@ body {
 .claudeterm-timeline {
   flex: 1 1 0;
   min-height: 0;
-  overflow: hidden;
+  /* Single scroll container so the live timeline + previous-task timelines stack
+   * and scroll as one continuous history (Phase 2). */
+  overflow-y: auto;
   display: flex;
   flex-direction: column;
+}
+/* Inside the stacked view, each list is content-sized; the container scrolls. */
+.claudeterm-timeline .timeline-list {
+  flex: 0 0 auto;
+  overflow-y: visible;
+}
+/* A previous task in the handoff chain — a task-layer header above its dates. */
+.claudeterm-prevtask {
+  border-top: 2px solid rgba(137, 180, 250, 0.45);
+}
+.claudeterm-prevtask-head {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  padding: 4px 8px;
+  font-size: 0.8em;
+  font-weight: 600;
+  color: var(--fg, #cdd6f4);
+  background: rgba(137, 180, 250, 0.16);
+  border-bottom: 1px solid var(--border, #333);
 }
 .claudeterm-viewer-body {
   flex: 1 1 0;

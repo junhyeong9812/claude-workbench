@@ -44,6 +44,18 @@ interface ClaudeStarted {
   id: number;
   session_uuid: string;
 }
+/** A previous task in the handoff chain (a saved session snapshot), rendered
+ * read-only below the live timeline so the chain reads as one continuous task
+ * history across restarts. */
+interface ChainTask {
+  uuid: string;
+  name: string;
+  date: string;
+  items: TimelineItem[];
+  turns: [number, string][];
+  answers: [number, string][];
+  dates: [number, string][];
+}
 interface TokenUsage {
   input: number;
   output: number;
@@ -158,6 +170,9 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
   const [summaryDraft, setSummaryDraft] = useState<{ cwd: string; oldUuid: string; text: string } | null>(
     null,
   );
+  // Previous tasks in this session's handoff chain (read-only, newest-first),
+  // rendered below the live timeline so the chain reads continuously (Phase 2).
+  const [chainPrev, setChainPrev] = useState<ChainTask[]>([]);
 
   /** Write the seed (+Enter) to the current session — submits it as a prompt. */
   const injectSeed = (text: string) => {
@@ -241,6 +256,7 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
       setAnswers(new Map());
       setDates(new Map());
       setSubagents([]);
+      setChainPrev([]);
       setTokenTotal({ input: 0, output: 0 });
       setSelectedId(null);
       setTextView(null);
@@ -552,6 +568,15 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
             if (snap && !gotLive && !disposed) applySnapshot(snap);
           })
           .catch(() => {});
+
+        // Load the handoff chain (previous tasks) so they render below the live
+        // timeline — one continuous history across restarts (Phase 2). Excludes
+        // the head (the live session); newest prev task first.
+        invoke<ChainTask[]>("claude_session_chain", { project, headUuid: seedUuid })
+          .then((chain) => {
+            if (!disposed) setChainPrev(chain.filter((t) => t.uuid !== seedUuid).reverse());
+          })
+          .catch(() => {});
       }
     })();
 
@@ -599,7 +624,7 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
   }, [gen]);
 
   const selectedItem = selectedId
-    ? ([items, ...subagents.map(([, , , its]) => its)]
+    ? ([items, ...subagents.map(([, , , its]) => its), ...chainPrev.map((t) => t.items)]
         .flat()
         .find((it) => it.tool_call_id === selectedId) ?? null)
     : null;
@@ -720,6 +745,30 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
               setSelectedId(null);
             }}
           />
+          {chainPrev.map((task) => (
+            <div key={task.uuid} className="claudeterm-prevtask">
+              <div className="claudeterm-prevtask-head" title={`이전 task · ${task.uuid}`}>
+                ◀ 이전 task — {task.name} · {task.date}
+              </div>
+              <TimelineView
+                items={task.items}
+                turns={new Map(task.turns)}
+                answers={new Map(task.answers)}
+                dates={new Map(task.dates)}
+                subagents={[]}
+                selectedId={selectedId}
+                onSelect={(it) => {
+                  setSelectedId(it.tool_call_id);
+                  setTextView(null);
+                }}
+                onSelectAnswer={(turn) => {
+                  const a = new Map(task.answers).get(turn) ?? "";
+                  setTextView({ title: `답변 (${task.name} Q${turn})`, text: a });
+                  setSelectedId(null);
+                }}
+              />
+            </div>
+          ))}
         </div>
       </div>
 

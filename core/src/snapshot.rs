@@ -266,9 +266,12 @@ pub fn load(base: &Path, project: &str, uuid: &str) -> Option<SessionSnapshot> {
 
 /// Reconstruct a handoff chain: walk `prev_uuid` from `head` back to the root and
 /// return the sessions **oldest-first**, so the UI can render one continuous
-/// timeline across `/clear`-style restarts (each task is a separate session). A
-/// missing/corrupt link ends the walk; a cycle (corrupt `prev_uuid`) is bounded
-/// by a visited set so it can't loop forever.
+/// timeline across restarts (each task is a separate session). The link is
+/// followed via the `.task` sidecar — which exists even before a just-restarted
+/// head has saved a snapshot body — so the chain still reaches the previous tasks
+/// that *do* have snapshots (a head with no snapshot is simply absent from the
+/// result, not a dead end). A cycle (corrupt `prev_uuid`) is bounded by a visited
+/// set so it can't loop forever.
 pub fn load_chain(base: &Path, project: &str, head: &str) -> Vec<SessionSnapshot> {
     let mut chain = Vec::new();
     let mut seen = std::collections::HashSet::new();
@@ -277,11 +280,11 @@ pub fn load_chain(base: &Path, project: &str, head: &str) -> Vec<SessionSnapshot
         if !seen.insert(uuid.clone()) {
             break; // cycle guard
         }
-        let Some(snap) = load(base, project, &uuid) else {
-            break; // missing/corrupt link ends the chain
-        };
-        cur = snap.prev_uuid.clone();
-        chain.push(snap);
+        let next = read_task_meta(base, project, &uuid).and_then(|m| m.prev_uuid);
+        if let Some(snap) = load(base, project, &uuid) {
+            chain.push(snap);
+        }
+        cur = next;
     }
     chain.reverse(); // oldest-first
     chain
@@ -589,6 +592,19 @@ mod tests {
         save_task_meta(&base, "/p", "b", &TaskMeta { prev_uuid: Some("a".into()), summary_path: None }).unwrap();
         let chain = load_chain(&base, "/p", "a");
         assert_eq!(chain.len(), 2, "each node visited once under the cycle guard");
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    // A just-restarted head has a `.task` sidecar but no snapshot body yet; the
+    // chain must still reach the previous task (which does have a snapshot).
+    #[test]
+    fn load_chain_follows_link_without_head_snapshot() {
+        let base = temp_base("nohead");
+        save(&base, "/p", &snap("old", "n", "d", 1)).unwrap();
+        save_task_meta(&base, "/p", "new", &TaskMeta { prev_uuid: Some("old".into()), summary_path: None }).unwrap();
+        // "new" has only a sidecar (no .json) — load_chain still returns [old].
+        let chain = load_chain(&base, "/p", "new");
+        assert_eq!(chain.iter().map(|s| s.uuid.as_str()).collect::<Vec<_>>(), vec!["old"]);
         let _ = fs::remove_dir_all(&base);
     }
 
