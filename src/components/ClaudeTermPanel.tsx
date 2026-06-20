@@ -59,9 +59,9 @@ interface ClaudeTimelineEvent {
   answers: [number, string][];
   dates: [number, string][];
   tokens: [number, TokenUsage][];
-  /** [agentId, turn, items] for each parallel subagent (Task) — nested under
-   * the turn it was spawned in. */
-  subagents: [string, number, TimelineItem[]][];
+  /** [agentId, parentToolCallId|null, turn, items] per subagent — nested under
+   * its spawning Agent item (parent), or its turn when there's no known parent. */
+  subagents: [string, string | null, number, TimelineItem[]][];
 }
 
 /** Compact token count: 1234 → "1.2k". */
@@ -78,8 +78,10 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
   const [answers, setAnswers] = useState<Map<number, string>>(new Map());
   const [dates, setDates] = useState<Map<number, string>>(new Map());
   const [selectedId, setSelectedId] = useState<string | null>(null);
-  // Per-subagent change lists [agentId, turn, items] (B1), nested under turns.
-  const [subagents, setSubagents] = useState<[string, number, TimelineItem[]][]>([]);
+  // Per-subagent change lists [agentId, parentToolCallId|null, turn, items] (B1).
+  const [subagents, setSubagents] = useState<[string, string | null, number, TimelineItem[]][]>(
+    [],
+  );
   // Session token totals (B1): ↑ = new context processed (input + cache write),
   // ↓ = generated output. Summed across turns.
   const [tokenTotal, setTokenTotal] = useState<{ input: number; output: number }>({
@@ -388,18 +390,10 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
   }, []);
 
   const selectedItem = selectedId
-    ? ([items, ...subagents.map(([, , its]) => its)]
+    ? ([items, ...subagents.map(([, , , its]) => its)]
         .flat()
         .find((it) => it.tool_call_id === selectedId) ?? null)
     : null;
-  // Group subagents by the turn they were spawned in, for nesting in the
-  // timeline under that turn.
-  const subagentsByTurn = new Map<number, [string, TimelineItem[]][]>();
-  for (const [aid, turn, its] of subagents) {
-    const arr = subagentsByTurn.get(turn) ?? [];
-    arr.push([aid, its]);
-    subagentsByTurn.set(turn, arr);
-  }
 
   return (
     <div className="claudeterm" ref={containerRef} onKeyDown={onContainerKey}>
@@ -469,7 +463,7 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
             turns={turns}
             answers={answers}
             dates={dates}
-            subagents={subagentsByTurn}
+            subagents={subagents}
             selectedId={selectedId}
             onSelect={(it) => setSelectedId(it.tool_call_id)}
           />

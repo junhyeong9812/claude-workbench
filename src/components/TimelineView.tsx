@@ -57,12 +57,13 @@ export function TimelineView({
   turns: Map<number, string>;
   answers: Map<number, string>;
   dates: Map<number, string>;
-  /** turn → [agentId, items][]: subagents spawned in that turn, nested under it. */
-  subagents?: Map<number, [string, TimelineItem[]][]>;
+  /** [agentId, parentToolCallId|null, turn, items] per subagent (B1). Nested
+   * under its parent Agent item (recursive tree); orphans nest under their turn. */
+  subagents?: [string, string | null, number, TimelineItem[]][];
   selectedId: string | null;
   onSelect: (item: TimelineItem) => void;
 }) {
-  // Collapsed subagent groups (B1), keyed "turn:agentId".
+  // Collapsed subagent groups (B1), keyed by agentId.
   const [collapsedAgents, setCollapsedAgents] = useState<Set<string>>(new Set());
   const toggleAgent = (key: string) =>
     setCollapsedAgents((prev) => {
@@ -71,6 +72,68 @@ export function TimelineView({
       else next.add(key);
       return next;
     });
+
+  // Subagents indexed by parent tool-call id (for nesting) and, for those with
+  // no known parent, by turn (fallback).
+  const agentsByParent = new Map<string, [string, TimelineItem[]][]>();
+  const orphanAgentsByTurn = new Map<number, [string, TimelineItem[]][]>();
+  for (const [aid, parent, turn, its] of subagents ?? []) {
+    if (parent) {
+      const arr = agentsByParent.get(parent) ?? [];
+      arr.push([aid, its]);
+      agentsByParent.set(parent, arr);
+    } else {
+      const arr = orphanAgentsByTurn.get(turn) ?? [];
+      arr.push([aid, its]);
+      orphanAgentsByTurn.set(turn, arr);
+    }
+  }
+
+  // One tool item + (recursively) any subagent groups spawned by it.
+  const renderItem = (it: TimelineItem, sub: boolean): React.ReactNode => (
+    <Fragment key={it.tool_call_id}>
+      <div
+        data-tcid={it.tool_call_id}
+        className={`timeline-item ${sub ? "timeline-item-sub" : ""} ts-${it.agent_status} ${
+          selectedId === it.tool_call_id ? "timeline-item-sel" : ""
+        }`}
+        title={it.locations.join("\n")}
+        onClick={() => {
+          onSelect(it);
+          listRef.current?.focus();
+        }}
+      >
+        <span className="timeline-icon">{KIND_ICON[it.kind] ?? "•"}</span>
+        <span className="timeline-title">{it.title || it.kind}</span>
+        {it.project_label && <span className="timeline-label">{it.project_label}</span>}
+        {it.diffs.length > 0 && <span className="timeline-diff">±{it.diffs.length}</span>}
+        {it.write_status === "written" && <span className="timeline-write">💾</span>}
+        <span className={`timeline-status ts-${it.agent_status}`}>
+          {AGENT_BADGE[it.agent_status] ?? ""}
+        </span>
+      </div>
+      {(agentsByParent.get(it.tool_call_id) ?? []).map(([aid, its]) => renderAgent(aid, its))}
+    </Fragment>
+  );
+
+  // A collapsible subagent group; its items render recursively (agent-in-agent).
+  const renderAgent = (aid: string, its: TimelineItem[]): React.ReactNode => {
+    const collapsed = collapsedAgents.has(aid);
+    return (
+      <div key={aid} className="timeline-agent">
+        <div
+          className="timeline-agent-head"
+          onClick={() => toggleAgent(aid)}
+          title={collapsed ? "펼치기" : "접기"}
+        >
+          <span className="timeline-date-caret">{collapsed ? "▸" : "▾"}</span>
+          서브에이전트 {aid.slice(0, 8)}
+          <span className="timeline-agent-count">{its.length}</span>
+        </div>
+        {!collapsed && its.map((it) => renderItem(it, true))}
+      </div>
+    );
+  };
   // Every turn shows, even one with no tool calls (a plain Q&A): derive the
   // turn list from the union of prompts, answers, and items (B3). Newest turn
   // first — the current question sits at the top, older history below (B5).
@@ -165,70 +228,8 @@ export function TimelineView({
                 {answer.length > 140 ? `${answer.slice(0, 140)}…` : answer}
               </div>
             )}
-            {turnItems.map((it) => (
-              <div
-                key={it.tool_call_id}
-                data-tcid={it.tool_call_id}
-                className={`timeline-item ts-${it.agent_status} ${
-                  selectedId === it.tool_call_id ? "timeline-item-sel" : ""
-                }`}
-                title={it.locations.join("\n")}
-                onClick={() => {
-                  onSelect(it);
-                  listRef.current?.focus();
-                }}
-              >
-                <span className="timeline-icon">{KIND_ICON[it.kind] ?? "•"}</span>
-                <span className="timeline-title">{it.title || it.kind}</span>
-                {it.project_label && <span className="timeline-label">{it.project_label}</span>}
-                {it.diffs.length > 0 && <span className="timeline-diff">±{it.diffs.length}</span>}
-                {it.write_status === "written" && <span className="timeline-write">💾</span>}
-                {it.write_status === "write_failed" && (
-                  <span className="timeline-write timeline-write-fail">⚠</span>
-                )}
-                <span className={`timeline-status ts-${it.agent_status}`}>
-                  {AGENT_BADGE[it.agent_status] ?? ""}
-                </span>
-              </div>
-            ))}
-            {(subagents?.get(turn) ?? []).map(([aid, its]) => {
-              const key = `${turn}:${aid}`;
-              const collapsed = collapsedAgents.has(key);
-              return (
-                <div key={key} className="timeline-agent">
-                  <div
-                    className="timeline-agent-head"
-                    onClick={() => toggleAgent(key)}
-                    title={collapsed ? "펼치기" : "접기"}
-                  >
-                    <span className="timeline-date-caret">{collapsed ? "▸" : "▾"}</span>
-                    서브에이전트 {aid.slice(0, 8)}
-                    <span className="timeline-agent-count">{its.length}</span>
-                  </div>
-                  {!collapsed &&
-                    its.map((it) => (
-                      <div
-                        key={it.tool_call_id}
-                        data-tcid={it.tool_call_id}
-                        className={`timeline-item timeline-item-sub ts-${it.agent_status} ${
-                          selectedId === it.tool_call_id ? "timeline-item-sel" : ""
-                        }`}
-                        title={it.locations.join("\n")}
-                        onClick={() => onSelect(it)}
-                      >
-                        <span className="timeline-icon">{KIND_ICON[it.kind] ?? "•"}</span>
-                        <span className="timeline-title">{it.title || it.kind}</span>
-                        {it.diffs.length > 0 && (
-                          <span className="timeline-diff">±{it.diffs.length}</span>
-                        )}
-                        <span className={`timeline-status ts-${it.agent_status}`}>
-                          {AGENT_BADGE[it.agent_status] ?? ""}
-                        </span>
-                      </div>
-                    ))}
-                </div>
-              );
-            })}
+            {turnItems.map((it) => renderItem(it, false))}
+            {(orphanAgentsByTurn.get(turn) ?? []).map(([aid, its]) => renderAgent(aid, its))}
           </div>
             )}
           </Fragment>

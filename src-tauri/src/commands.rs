@@ -350,10 +350,12 @@ struct ClaudeTimelinePayload {
     answers: Vec<(u64, String)>,
     dates: Vec<(u64, String)>,
     tokens: Vec<(u64, TokenUsage)>,
-    /// Per-subagent (`Task`) change lists: `(agent_id, turn, items)` — the work
-    /// each parallel agent did, attributed to the turn it was spawned in, tailed
-    /// from `<uuid>/subagents/agent-<id>.jsonl` (B1).
-    subagents: Vec<(String, u64, Vec<TimelineItem>)>,
+    /// Per-subagent (`Agent`/`Task`) change lists:
+    /// `(agent_id, parent_tool_call_id, turn, items)`. `parent_tool_call_id` is
+    /// the timeline item (the spawning `Agent` tool call) the agent nests under —
+    /// found by matching the agent id inside that call's result. `None` ⇒ no
+    /// known parent (nest under its `turn`). Enables the recursive agent tree.
+    subagents: Vec<(String, Option<String>, u64, Vec<TimelineItem>)>,
 }
 
 /// Generate a fresh session UUID for `--session-id`. Linux-only (the app's
@@ -542,7 +544,7 @@ fn run_timeline_poll(
             t.answers().iter().map(|(k, v)| (*k, v.clone())).collect();
         let dates_v: Vec<(u64, String)> = t.dates().iter().map(|(k, v)| (*k, v.clone())).collect();
         let tokens_v: Vec<(u64, TokenUsage)> = t.tokens().iter().map(|(k, v)| (*k, *v)).collect();
-        let subagents_v: Vec<(String, u64, Vec<TimelineItem>)> = subagents
+        let sub_raw: Vec<(String, u64, Vec<TimelineItem>)> = subagents
             .iter()
             .filter(|(_, st)| !st.timeline().items().is_empty())
             .map(|(aid, st)| {
@@ -551,6 +553,26 @@ fn run_timeline_poll(
                     *subagent_turn.get(aid).unwrap_or(&0),
                     st.timeline().items().to_vec(),
                 )
+            })
+            .collect();
+        // Link each agent to the timeline item (the spawning `Agent`/`Task` call)
+        // whose result mentions the agent id — that item, in main or in a parent
+        // agent, is its parent (recursive tree). `None` ⇒ nest under its turn.
+        let subagents_v: Vec<(String, Option<String>, u64, Vec<TimelineItem>)> = sub_raw
+            .iter()
+            .map(|(aid, turn, its)| {
+                let parent = items_v
+                    .iter()
+                    .chain(sub_raw.iter().flat_map(|(_, _, x)| x.iter()))
+                    .find(|it| {
+                        it.tool_call_id != *aid
+                            && it
+                                .content_text
+                                .as_deref()
+                                .is_some_and(|ct| ct.contains(aid.as_str()))
+                    })
+                    .map(|it| it.tool_call_id.clone());
+                (aid.clone(), parent, *turn, its.clone())
             })
             .collect();
 
