@@ -618,6 +618,11 @@ fn run_timeline_poll(
                 answers: answers_v,
                 dates: dates_v,
                 tokens: tokens_v,
+                // Task-chain meta lives in the decoupled `.task` sidecar (set at
+                // handoff), not the body — the body is overwritten every tick, so
+                // these stay `None` here and `load` sources them from the sidecar.
+                prev_uuid: None,
+                summary_path: None,
             };
             let _ = core_lib::snapshot::save(&base, &cwd, &snap);
         }
@@ -650,6 +655,22 @@ pub fn claude_session_snapshot(
 ) -> Option<core_lib::snapshot::SessionSnapshot> {
     let base = app.path().app_data_dir().ok()?;
     core_lib::snapshot::load(&base, &project, &uuid)
+}
+
+/// Load a whole handoff chain (the `head` task and every task it continues from),
+/// oldest-first, so the panel can render one continuous timeline across the
+/// `/clear`-style restarts that split a task into separate sessions. Empty if the
+/// head is absent. (Task-chain links live in each session's `.task` sidecar.)
+#[tauri::command]
+pub fn claude_session_chain(
+    app: AppHandle,
+    project: String,
+    head_uuid: String,
+) -> Vec<core_lib::snapshot::SessionSnapshot> {
+    let Ok(base) = app.path().app_data_dir() else {
+        return vec![];
+    };
+    core_lib::snapshot::load_chain(&base, &project, &head_uuid)
 }
 
 /// Rename a saved session (persists in its snapshot; the poll thread reads the

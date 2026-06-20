@@ -60,6 +60,16 @@ pub struct SessionSnapshot {
     pub dates: Vec<(u64, String)>,
     #[serde(default)]
     pub tokens: Vec<(u64, TokenUsage)>,
+    /// The session this task continues from (handoff chain). `None` = chain root.
+    /// Sourced from the decoupled `<uuid>.task` sidecar on [`load`] (see
+    /// [`read_task_meta`]) so the poll thread's body overwrite never clobbers it —
+    /// the same decoupling the rename uses (`.name`, codex session-UX F1).
+    #[serde(default)]
+    pub prev_uuid: Option<String>,
+    /// Filesystem path of the handoff summary this task was seeded with, if any.
+    /// Also sidecar-sourced.
+    #[serde(default)]
+    pub summary_path: Option<String>,
 }
 
 /// A session summarized for the reopen picker.
@@ -120,6 +130,53 @@ pub fn read_name(base: &Path, project: &str, uuid: &str) -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
+/// Task-identity metadata kept in a decoupled `<uuid>.task` sidecar so the poll
+/// thread's whole-body overwrite of the `.json` never clobbers it (the same
+/// reason a rename lives in `.name` — codex session-UX F1). Holds the handoff
+/// chain link (`prev_uuid`) and the seed summary this task started from.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct TaskMeta {
+    #[serde(default)]
+    pub prev_uuid: Option<String>,
+    #[serde(default)]
+    pub summary_path: Option<String>,
+}
+
+/// Persist a session's task metadata to its `<uuid>.task` sidecar (atomic
+/// temp+rename). Decoupled from the body so the poll thread and a handoff write
+/// **different** files and can't clobber each other.
+pub fn save_task_meta(base: &Path, project: &str, uuid: &str, meta: &TaskMeta) -> io::Result<()> {
+    if !is_safe_uuid(uuid) {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "unsafe session id"));
+    }
+    // Reject an unsafe chain link at write time too, so a caller bug surfaces here
+    // rather than silently truncating the chain later when `load` skips it.
+    if let Some(prev) = &meta.prev_uuid {
+        if !is_safe_uuid(prev) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "unsafe prev session id",
+            ));
+        }
+    }
+    let dir = dir(base, project);
+    fs::create_dir_all(&dir)?;
+    let json =
+        serde_json::to_string(meta).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    let tmp_path = unique_tmp(&dir, &format!("{uuid}.task"));
+    fs::write(&tmp_path, json)?;
+    fs::rename(&tmp_path, dir.join(format!("{uuid}.task")))
+}
+
+/// Read a session's task metadata sidecar, if present and valid (else `None`).
+pub fn read_task_meta(base: &Path, project: &str, uuid: &str) -> Option<TaskMeta> {
+    if !is_safe_uuid(uuid) {
+        return None;
+    }
+    let text = fs::read_to_string(dir(base, project).join(format!("{uuid}.task"))).ok()?;
+    serde_json::from_str(&text).ok()
+}
+
 /// List the saved sessions for a project, newest first (by date, then name).
 pub fn list(base: &Path, project: &str) -> Vec<SnapshotSummary> {
     let mut out = Vec::new();
@@ -166,10 +223,42 @@ pub fn load(base: &Path, project: &str, uuid: &str) -> Option<SessionSnapshot> {
     let path = dir(base, project).join(format!("{uuid}.json"));
     let text = fs::read_to_string(path).ok()?;
     let mut snap: SessionSnapshot = serde_json::from_str(&text).ok()?;
+    // The requested (filename-derived, already validated) uuid is authoritative —
+    // a corrupt body claiming a different uuid must not mislead chain rendering.
+    snap.uuid = uuid.to_string();
     if let Some(name) = read_name(base, project, uuid) {
         snap.name = name;
     }
+    // Task meta is sidecar-authoritative (the body is overwritten by the poll
+    // thread with `None`), so override from the `.task` file when present.
+    if let Some(meta) = read_task_meta(base, project, uuid) {
+        snap.prev_uuid = meta.prev_uuid;
+        snap.summary_path = meta.summary_path;
+    }
     Some(snap)
+}
+
+/// Reconstruct a handoff chain: walk `prev_uuid` from `head` back to the root and
+/// return the sessions **oldest-first**, so the UI can render one continuous
+/// timeline across `/clear`-style restarts (each task is a separate session). A
+/// missing/corrupt link ends the walk; a cycle (corrupt `prev_uuid`) is bounded
+/// by a visited set so it can't loop forever.
+pub fn load_chain(base: &Path, project: &str, head: &str) -> Vec<SessionSnapshot> {
+    let mut chain = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    let mut cur = Some(head.to_string());
+    while let Some(uuid) = cur {
+        if !seen.insert(uuid.clone()) {
+            break; // cycle guard
+        }
+        let Some(snap) = load(base, project, &uuid) else {
+            break; // missing/corrupt link ends the chain
+        };
+        cur = snap.prev_uuid.clone();
+        chain.push(snap);
+    }
+    chain.reverse(); // oldest-first
+    chain
 }
 
 /// Delete a session's snapshot body + name override (the `삭제` action). Missing
@@ -182,6 +271,7 @@ pub fn delete(base: &Path, project: &str, uuid: &str) -> io::Result<()> {
     for path in [
         dir.join(format!("{uuid}.json")),
         dir.join(format!("{uuid}.name")),
+        dir.join(format!("{uuid}.task")),
     ] {
         match fs::remove_file(path) {
             Ok(()) => {}
@@ -225,6 +315,8 @@ mod tests {
             answers: vec![(1, "an answer".into())],
             dates: vec![(1, date.to_string())],
             tokens: vec![],
+            prev_uuid: None,
+            summary_path: None,
         }
     }
 
@@ -305,7 +397,121 @@ mod tests {
         assert!(save(&base, "/p", &snap("../evil", "n", "d", 1)).is_err());
         assert!(load(&base, "/p", "../evil").is_none());
         assert!(save_name(&base, "/p", "a/b", "x").is_err());
+        assert!(save_task_meta(&base, "/p", "../evil", &TaskMeta::default()).is_err());
+        assert!(read_task_meta(&base, "/p", "../evil").is_none());
+        // An unsafe chain link is rejected at write time (not silently stored).
+        assert!(save_task_meta(
+            &base,
+            "/p",
+            "u1",
+            &TaskMeta { prev_uuid: Some("../evil".into()), summary_path: None },
+        )
+        .is_err());
         delete(&base, "/p", "../evil").unwrap(); // no-op, not an error
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    // A body claiming a different uuid than its filename is normalized to the
+    // requested (validated) uuid, so chain rendering can't be misled.
+    #[test]
+    fn load_normalizes_uuid_to_request() {
+        let base = temp_base("norm");
+        let d = dir(&base, "/p");
+        fs::create_dir_all(&d).unwrap();
+        fs::write(
+            d.join("u2.json"),
+            r#"{"uuid":"u1","name":"n","date":"d","items":[],"turns":[],"answers":[],"dates":[]}"#,
+        )
+        .unwrap();
+        assert_eq!(load(&base, "/p", "u2").unwrap().uuid, "u2");
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    // A snapshot JSON written before task-meta existed (no prev_uuid/summary_path)
+    // still loads — the new fields default to None (serde default, backward compat).
+    #[test]
+    fn loads_legacy_snapshot_without_task_meta() {
+        let base = temp_base("legacy");
+        let d = dir(&base, "/p");
+        fs::create_dir_all(&d).unwrap();
+        let legacy = r#"{"uuid":"u1","name":"n","date":"2026-06-19","items":[],"turns":[],"answers":[],"dates":[]}"#;
+        fs::write(d.join("u1.json"), legacy).unwrap();
+        let got = load(&base, "/p", "u1").unwrap();
+        assert_eq!(got.prev_uuid, None);
+        assert_eq!(got.summary_path, None);
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    // The `.task` sidecar survives a later body re-save (the poll thread rewriting
+    // the timeline with prev_uuid: None on the body) — same decoupling as `.name`.
+    #[test]
+    fn task_meta_sidecar_survives_body_resave() {
+        let base = temp_base("taskmeta");
+        save(&base, "/p", &snap("u2", "n", "2026-06-19", 1)).unwrap();
+        save_task_meta(
+            &base,
+            "/p",
+            "u2",
+            &TaskMeta {
+                prev_uuid: Some("u1".into()),
+                summary_path: Some("/x/summary.md".into()),
+            },
+        )
+        .unwrap();
+        // Poll re-saves the body (struct carries prev_uuid: None) — sidecar wins.
+        save(&base, "/p", &snap("u2", "n", "2026-06-20", 3)).unwrap();
+        let got = load(&base, "/p", "u2").unwrap();
+        assert_eq!(got.prev_uuid, Some("u1".to_string()));
+        assert_eq!(got.summary_path, Some("/x/summary.md".to_string()));
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn load_chain_walks_prev_uuid_oldest_first() {
+        let base = temp_base("chain");
+        for u in ["u1", "u2", "u3"] {
+            save(&base, "/p", &snap(u, "n", "2026-06-19", 1)).unwrap();
+        }
+        // u1 <- u2 <- u3 (u3 is the head/newest task).
+        save_task_meta(&base, "/p", "u2", &TaskMeta { prev_uuid: Some("u1".into()), summary_path: None }).unwrap();
+        save_task_meta(&base, "/p", "u3", &TaskMeta { prev_uuid: Some("u2".into()), summary_path: None }).unwrap();
+        let chain = load_chain(&base, "/p", "u3");
+        let uuids: Vec<_> = chain.iter().map(|s| s.uuid.as_str()).collect();
+        assert_eq!(uuids, vec!["u1", "u2", "u3"], "oldest-first");
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn load_chain_is_bounded_on_cycle() {
+        let base = temp_base("cycle");
+        save(&base, "/p", &snap("a", "n", "d", 1)).unwrap();
+        save(&base, "/p", &snap("b", "n", "d", 1)).unwrap();
+        // a <-> b (corrupt cycle): the walk must terminate, not loop forever.
+        save_task_meta(&base, "/p", "a", &TaskMeta { prev_uuid: Some("b".into()), summary_path: None }).unwrap();
+        save_task_meta(&base, "/p", "b", &TaskMeta { prev_uuid: Some("a".into()), summary_path: None }).unwrap();
+        let chain = load_chain(&base, "/p", "a");
+        assert_eq!(chain.len(), 2, "each node visited once under the cycle guard");
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn load_chain_stops_at_missing_link() {
+        let base = temp_base("missing");
+        save(&base, "/p", &snap("u2", "n", "d", 1)).unwrap();
+        // u2.prev = u1 but u1 was never saved — the chain is just [u2].
+        save_task_meta(&base, "/p", "u2", &TaskMeta { prev_uuid: Some("u1".into()), summary_path: None }).unwrap();
+        let chain = load_chain(&base, "/p", "u2");
+        assert_eq!(chain.iter().map(|s| s.uuid.as_str()).collect::<Vec<_>>(), vec!["u2"]);
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn delete_removes_task_sidecar() {
+        let base = temp_base("deltask");
+        save(&base, "/p", &snap("u1", "n", "d", 1)).unwrap();
+        save_task_meta(&base, "/p", "u1", &TaskMeta { prev_uuid: Some("p".into()), summary_path: None }).unwrap();
+        delete(&base, "/p", "u1").unwrap();
+        assert!(read_task_meta(&base, "/p", "u1").is_none());
         let _ = fs::remove_dir_all(&base);
     }
 }

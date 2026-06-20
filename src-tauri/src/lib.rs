@@ -103,6 +103,7 @@ pub fn run() {
             commands::claude_close,
             commands::claude_sessions,
             commands::claude_session_snapshot,
+            commands::claude_session_chain,
             commands::claude_rename,
             commands::claude_delete,
             commands::acp_start,
