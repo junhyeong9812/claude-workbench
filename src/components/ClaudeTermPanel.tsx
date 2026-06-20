@@ -60,7 +60,6 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
   const termRef = useRef<Terminal | null>(null);
   const viewerRef = useRef<HTMLDivElement | null>(null);
   const timelineRef = useRef<HTMLDivElement | null>(null);
-  const focusIdxRef = useRef(0);
   const [items, setItems] = useState<TimelineItem[]>([]);
   const [turns, setTurns] = useState<Map<number, string>>(new Map());
   const [answers, setAnswers] = useState<Map<number, string>>(new Map());
@@ -70,16 +69,25 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
   const [viewerWidth, setViewerWidth] = useState(480);
 
   // Ctrl+←/→ moves focus between the panes: terminal → (viewer) → timeline.
+  // The current pane is derived from `document.activeElement` (not a counter) so
+  // it stays correct after the user clicks into a pane directly.
   const navPane = (dir: number) => {
-    const hasViewer = viewerRef.current != null;
-    const focusers: (() => void)[] = [
-      () => termRef.current?.focus(),
-      ...(hasViewer ? [() => viewerRef.current?.focus()] : []),
-      () => (timelineRef.current?.querySelector(".timeline-list") as HTMLElement | null)?.focus(),
+    const panes: { el: HTMLElement | null; focus: () => void }[] = [
+      { el: hostRef.current, focus: () => termRef.current?.focus() },
+      ...(viewerRef.current
+        ? [{ el: viewerRef.current, focus: () => viewerRef.current?.focus() }]
+        : []),
+      {
+        el: timelineRef.current,
+        focus: () =>
+          (timelineRef.current?.querySelector(".timeline-list") as HTMLElement | null)?.focus(),
+      },
     ];
-    const i = (focusIdxRef.current + dir + focusers.length) % focusers.length;
-    focusIdxRef.current = i;
-    focusers[i]?.();
+    const active = document.activeElement;
+    let cur = panes.findIndex((p) => p.el && active && p.el.contains(active));
+    if (cur === -1) cur = 0;
+    const next = (cur + dir + panes.length) % panes.length;
+    panes[next].focus();
   };
   const onContainerKey = (e: React.KeyboardEvent) => {
     if (e.ctrlKey && (e.key === "ArrowLeft" || e.key === "ArrowRight")) {
@@ -372,6 +380,18 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
             ref={viewerRef}
             tabIndex={0}
             style={{ flex: `0 0 ${viewerWidth}px` }}
+            onKeyDown={(e) => {
+              if (["ArrowDown", "ArrowUp", "PageDown", "PageUp"].includes(e.key)) {
+                const body = viewerRef.current?.querySelector(
+                  ".claudeterm-viewer-body",
+                ) as HTMLElement | null;
+                if (body) {
+                  e.preventDefault();
+                  const step = e.key.startsWith("Page") ? body.clientHeight * 0.9 : 48;
+                  body.scrollTop += e.key === "ArrowDown" || e.key === "PageDown" ? step : -step;
+                }
+              }
+            }}
           >
             <div className="claudeterm-pane-head">
               <span className="claudeterm-pane-head-title">

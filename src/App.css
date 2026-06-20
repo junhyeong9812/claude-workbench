@@ -422,6 +422,19 @@ body {
   min-height: 0;
   height: 100%;
 }
+/* Highlight the focused pane (Ctrl+←/→ navigation feedback). */
+.claudeterm-pane:focus-within {
+  outline: 2px solid var(--accent, #89b4fa);
+  outline-offset: -2px;
+}
+.claudeterm-pane:focus-within > .claudeterm-pane-head {
+  background: rgba(137, 180, 250, 0.18);
+  color: var(--fg);
+}
+.claudeterm-viewer-pane:focus {
+  outline: 2px solid var(--accent, #89b4fa);
+  outline-offset: -2px;
+}
 .claudeterm-term-pane {
   flex: 1 1 0;
 }
