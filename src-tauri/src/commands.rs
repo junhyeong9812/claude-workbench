@@ -793,7 +793,20 @@ fn run_claude_p(cwd: &str, prompt: &str, timeout: Duration) -> Result<String, Ap
 /// current session is left untouched, so a failure here aborts the handoff
 /// without losing the live session.
 #[tauri::command]
-pub fn generate_task_summary(
+pub async fn generate_task_summary(
+    app: AppHandle,
+    cwd: String,
+    uuid: String,
+) -> Result<TaskSummary, AppError> {
+    // Tauri runs *synchronous* commands on the main thread, so the blocking
+    // `claude -p` wait would freeze the whole UI. Offload it to the blocking pool
+    // and await the result, keeping the webview responsive.
+    tauri::async_runtime::spawn_blocking(move || generate_task_summary_blocking(app, cwd, uuid))
+        .await
+        .map_err(|_| AppError::new("Summary task failed to run"))?
+}
+
+fn generate_task_summary_blocking(
     app: AppHandle,
     cwd: String,
     uuid: String,
