@@ -69,6 +69,7 @@ export default function App() {
           onExpand={() => setCollapsed(false)}
           className="pane-left"
         >
+          <div className="tree-hint">Ctrl+B 포커스 · ↑↓ 이동 · Enter 열기 · Ctrl+E 에디터 · Esc 닫기</div>
           <FolderTree />
         </Panel>
         <PanelResizeHandle className="resize-handle" />
