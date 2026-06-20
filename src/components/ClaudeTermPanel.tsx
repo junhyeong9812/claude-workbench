@@ -29,9 +29,9 @@ export interface ClaudeTermParams {
   sessionUuid?: string;
   /** Resume an existing Claude session by its UUID (same file, append). */
   loadSessionId?: string;
-  /** The project (cwd) this panel runs in. Lets a workspace-wide reopen open a
-   * task from a *different* project than the active tab. Falls back to the active
-   * project for freshly-created panels. */
+  /** The project (cwd) this panel runs in. Set when reopening a saved task so the
+   * panel uses that task's project; falls back to the active project for
+   * freshly-created panels. */
   project?: string;
 }
 

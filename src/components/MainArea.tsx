@@ -26,12 +26,10 @@ interface SessionSummary {
   count: number;
   /** Handoff chain link (claudeterm only) — groups sessions into task chains. */
   prev_uuid?: string | null;
-  /** The project (cwd) this session belongs to — for workspace-wide reopen. */
+  /** The project (cwd) this session belongs to — passed through on reopen. */
   project: string;
 }
 
-/** Last path segment, for a compact project label in the picker. */
-const baseName = (p: string): string => p.split(/[\\/]/).filter(Boolean).pop() ?? p;
 
 /** Default tab for all panels. Both Claude panel kinds (ACP `claude` and the
  * architecture-A `claudeterm`) use the custom tab — its × raises a 닫기/삭제
@@ -222,33 +220,29 @@ export function MainArea() {
     setExpandedChains(new Set());
     let sessions: SessionSummary[] = [];
     if (kind === "claudeterm") {
-      // Workspace-wide: aggregate saved task sessions across every open project
-      // tab (project_key is a non-reversible hash, so we drive the listing from
-      // the cwds the store knows). Each session keeps its project for reopen.
-      const lists = await Promise.all(
-        projects.map(async (p) => {
-          const raw = await invoke<
-            {
-              uuid: string;
-              name: string;
-              title: string;
-              date: string;
-              count: number;
-              prev_uuid?: string | null;
-            }[]
-          >("claude_sessions", { project: p.path }).catch(() => []);
-          return raw.map((s) => ({
-            id: s.uuid,
-            name: s.name,
-            title: s.title,
-            date: s.date,
-            count: s.count,
-            prev_uuid: s.prev_uuid ?? null,
-            project: p.path,
-          }));
-        }),
-      );
-      sessions = lists.flat();
+      // Per-project: list only the active project's saved task sessions (tasks are
+      // managed per project — mixing other projects' tasks here is confusing).
+      if (activeProject) {
+        const raw = await invoke<
+          {
+            uuid: string;
+            name: string;
+            title: string;
+            date: string;
+            count: number;
+            prev_uuid?: string | null;
+          }[]
+        >("claude_sessions", { project: activeProject }).catch(() => []);
+        sessions = raw.map((s) => ({
+          id: s.uuid,
+          name: s.name,
+          title: s.title,
+          date: s.date,
+          count: s.count,
+          prev_uuid: s.prev_uuid ?? null,
+          project: activeProject,
+        }));
+      }
     } else if (activeProject) {
       const raw = await invoke<
         { session_id: string; name: string; title: string; date: string; count: number }[]
@@ -386,7 +380,7 @@ export function MainArea() {
               return (
                 <>
                   <div className="claude-picker-sep">
-                    {pickerKind === "claudeterm" ? "저장된 task (워크스페이스)" : "저장된 세션"}
+                    {pickerKind === "claudeterm" ? "저장된 task" : "저장된 세션"}
                   </div>
                   {rows.map(({ s, depth, hasPrev }) => (
                     <div
@@ -420,9 +414,6 @@ export function MainArea() {
                         <span className="claude-picker-title">
                           {depth > 0 ? "↳ " : ""}
                           {s.name || "(이름 없음)"}
-                          {s.project !== activeProject && (
-                            <span className="claude-picker-proj"> · {baseName(s.project)}</span>
-                          )}
                         </span>
                         <span className="claude-picker-meta">
                           {s.title ? `${s.title.slice(0, 40)} · ` : ""}
