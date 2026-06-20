@@ -14,7 +14,6 @@ import { PlaceholderPanel } from "./PlaceholderPanel";
 import { TerminalPanel } from "./TerminalPanel";
 import { ClaudeTermPanel } from "./ClaudeTermPanel";
 import { EditorPanel } from "./EditorPanel";
-import { GitPanel } from "./GitPanel";
 import { fileName } from "./cmLang";
 import { ClaudeTab } from "./ClaudeTab";
 
@@ -48,10 +47,9 @@ const components = {
   terminal: TerminalPanel,
   claudeterm: ClaudeTermPanel,
   editor: EditorPanel,
-  git: GitPanel,
 };
 
-type PanelKind = "terminal" | "editor" | "claudeterm" | "git";
+type PanelKind = "terminal" | "editor" | "claudeterm";
 
 /**
  * The 80% main area, backed by dockview.
@@ -144,9 +142,7 @@ export function MainArea() {
           ? "claudeterm"
           : kind === "editor"
             ? "editor"
-            : kind === "git"
-              ? "git"
-              : "placeholder";
+            : "placeholder";
     api.addPanel({
       id: `${kind}-${Date.now()}`,
       component,
@@ -344,9 +340,6 @@ export function MainArea() {
         </button>
         <button className="toolbar-btn" onClick={() => openPicker()}>
           + Claude
-        </button>
-        <button className="toolbar-btn" onClick={() => addPanel("git")}>
-          + Git
         </button>
         {picker !== null && (
           <div className="claude-picker">

@@ -7,6 +7,7 @@ import {
 } from "react-resizable-panels";
 import { ProjectTabs } from "./components/ProjectTabs";
 import { FolderTree } from "./components/FolderTree";
+import { GitPanel } from "./components/GitPanel";
 import { MainArea } from "./components/MainArea";
 import { FilePeekViewer } from "./components/FilePeekViewer";
 import { useAppStore } from "./state/store";
@@ -20,6 +21,7 @@ export default function App() {
 
   const treePanelRef = useRef<ImperativePanelHandle>(null);
   const [collapsed, setCollapsed] = useState(false);
+  const [sideTab, setSideTab] = useState<"files" | "git">("files");
 
   useEffect(() => {
     void init();
@@ -69,8 +71,32 @@ export default function App() {
           onExpand={() => setCollapsed(false)}
           className="pane-left"
         >
-          <div className="tree-hint">Ctrl+B 포커스 · ↑↓ 이동 · Enter 열기 · Ctrl+E 에디터 · Esc 닫기</div>
-          <FolderTree />
+          <div className="sidebar-tabs">
+            <button
+              className={`sidebar-tab${sideTab === "files" ? " active" : ""}`}
+              onClick={() => setSideTab("files")}
+            >
+              파일
+            </button>
+            <button
+              className={`sidebar-tab${sideTab === "git" ? " active" : ""}`}
+              onClick={() => setSideTab("git")}
+            >
+              Git
+            </button>
+          </div>
+          <div className="sidebar-content">
+            {sideTab === "files" ? (
+              <>
+                <div className="tree-hint">
+                  Ctrl+B 포커스 · ↑↓ 이동 · Enter 열기 · Ctrl+E 에디터 · Esc 닫기
+                </div>
+                <FolderTree />
+              </>
+            ) : (
+              <GitPanel />
+            )}
+          </div>
         </Panel>
         <PanelResizeHandle className="resize-handle" />
         <Panel defaultSize={80} minSize={30} className="pane-main">
