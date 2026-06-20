@@ -109,6 +109,7 @@ pub fn run() {
             commands::claude_rename,
             commands::claude_delete,
             commands::acp_read_file,
+            commands::write_file,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

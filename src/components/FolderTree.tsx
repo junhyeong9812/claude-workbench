@@ -93,6 +93,7 @@ export function FolderTree() {
   const toggleExpanded = useAppStore((s) => s.toggleExpanded);
   const setTreeCursor = useAppStore((s) => s.setTreeCursor);
   const setPeekFile = useAppStore((s) => s.setPeekFile);
+  const requestEditorOpen = useAppStore((s) => s.requestEditorOpen);
 
   useEffect(() => {
     if (activeProject) void loadChildren(activeProject);
@@ -123,6 +124,14 @@ export function FolderTree() {
     const cursor = useAppStore.getState().treeCursor;
     const idx = nodes.findIndex((n) => n.path === cursor);
     const cur = idx >= 0 ? nodes[idx] : null;
+    // Ctrl+E opens the cursor file in the editor.
+    if (e.ctrlKey && (e.key === "e" || e.key === "E")) {
+      if (cur && !cur.is_dir) {
+        e.preventDefault();
+        requestEditorOpen(cur.path);
+      }
+      return;
+    }
     switch (e.key) {
       case "ArrowDown":
         e.preventDefault();

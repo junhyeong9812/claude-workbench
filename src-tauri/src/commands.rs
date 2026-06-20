@@ -8,7 +8,7 @@
 use std::collections::HashMap;
 use std::io;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -832,9 +832,46 @@ pub fn acp_read_file(path: String) -> Result<String, AppError> {
     let meta = std::fs::metadata(&path)
         .map_err(|e| AppError::new(io_message("Cannot read file", &e)))?;
     if meta.len() > MAX {
-        return Err(AppError::new("파일이 너무 커서 미리보기를 생략합니다 (512KB 초과)"));
+        return Err(AppError::new("파일이 너무 큽니다 (512KB 초과)"));
     }
     std::fs::read_to_string(&path)
         .map_err(|e| AppError::new(io_message("Cannot read file", &e)))
+}
+
+/// Process-unique suffix so two saves never race on a shared temp path.
+static SAVE_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// Write `content` to `path` (editor save), **atomically**: write a temp file in
+/// the same directory then `rename` over the target, so a crash / ENOSPC / I/O
+/// error never leaves the original truncated or partial (codex P2 E1). Symlinks
+/// are resolved first so we edit the link's *target* (like most editors), not
+/// replace the link.
+#[tauri::command]
+pub fn write_file(path: String, content: String) -> Result<(), AppError> {
+    let p = std::path::Path::new(&path);
+    if p.is_dir() {
+        return Err(AppError::new("Cannot write: path is a directory"));
+    }
+    // Resolve to the real file (follow symlinks); fall back to the given path if
+    // it doesn't exist yet (new file).
+    let target = std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    let dir = target
+        .parent()
+        .ok_or_else(|| AppError::new("Cannot save file: no parent directory"))?;
+    let stem = target
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("file");
+    let tmp = dir.join(format!(
+        ".{stem}.mt-save-{}-{}.tmp",
+        std::process::id(),
+        SAVE_SEQ.fetch_add(1, Ordering::Relaxed)
+    ));
+    std::fs::write(&tmp, content.as_bytes())
+        .map_err(|e| AppError::new(io_message("Cannot save file", &e)))?;
+    std::fs::rename(&tmp, &target).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp); // best-effort cleanup on rename failure
+        AppError::new(io_message("Cannot save file", &e))
+    })
 }
 

@@ -206,6 +206,68 @@ body {
   color: #f38ba8;
 }
 
+/* ---- Editor panel (P2 — editable CodeMirror in a dockview panel) ---- */
+.editor-panel {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-height: 0;
+  background: #1e1e2e;
+}
+.editor-head {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 4px 10px;
+  font-size: 0.78em;
+  color: var(--fg-dim);
+  background: rgba(255, 255, 255, 0.03);
+  border-bottom: 1px solid var(--border, #333);
+}
+.editor-title {
+  flex: 0 0 auto;
+  font-weight: 600;
+  color: var(--fg, #cdd6f4);
+}
+.editor-path {
+  flex: 1 1 auto;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  opacity: 0.5;
+}
+.editor-status {
+  flex: 0 0 auto;
+  opacity: 0.75;
+}
+.editor-save {
+  flex: 0 0 auto;
+  padding: 1px 8px;
+  font-size: 0.95em;
+  color: var(--fg, #cdd6f4);
+  background: rgba(137, 180, 250, 0.15);
+  border: 1px solid rgba(137, 180, 250, 0.4);
+  border-radius: 4px;
+  cursor: pointer;
+}
+.editor-save:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+.editor-body {
+  flex: 1 1 0;
+  min-height: 0;
+  overflow: hidden;
+}
+.editor-body .cm-editor {
+  height: 100%;
+}
+.editor-err {
+  padding: 12px;
+  color: #f38ba8;
+}
+
 /* ---- Main area (dockview) ---- */
 .main-area {
   display: flex;

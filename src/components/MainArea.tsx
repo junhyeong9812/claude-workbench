@@ -13,6 +13,8 @@ import { useClaudeUi } from "../state/claudeUi";
 import { PlaceholderPanel } from "./PlaceholderPanel";
 import { TerminalPanel } from "./TerminalPanel";
 import { ClaudeTermPanel } from "./ClaudeTermPanel";
+import { EditorPanel } from "./EditorPanel";
+import { fileName } from "./cmLang";
 import { ClaudeTab } from "./ClaudeTab";
 
 /** A saved session normalized for the reopen picker (ACP `claude` or A
@@ -44,6 +46,7 @@ const components = {
   placeholder: PlaceholderPanel,
   terminal: TerminalPanel,
   claudeterm: ClaudeTermPanel,
+  editor: EditorPanel,
 };
 
 type PanelKind = "terminal" | "editor" | "claudeterm";
@@ -59,6 +62,8 @@ type PanelKind = "terminal" | "editor" | "claudeterm";
 export function MainArea() {
   const activeProject = useAppStore((s) => s.activeProject);
   const projects = useAppStore((s) => s.projects);
+  const editorOpenRequest = useAppStore((s) => s.editorOpenRequest);
+  const requestEditorOpen = useAppStore((s) => s.requestEditorOpen);
   const setLayout = useAppStore((s) => s.setLayout);
 
   const apiRef = useRef<DockviewApi | null>(null);
@@ -122,16 +127,22 @@ export function MainArea() {
 
   const addPanel = (
     kind: PanelKind,
-    opts?: { loadSessionId?: string; title?: string; project?: string },
+    opts?: { loadSessionId?: string; title?: string; project?: string; path?: string },
   ) => {
     const api = apiRef.current;
     if (!api) return;
     const n = ++counterRef.current;
     const title = opts?.title ?? `${kind[0].toUpperCase()}${kind.slice(1)} ${n}`;
-    // Terminals get the real PTY panel, claudeterm the real claude CLI + timeline;
-    // editor stays a stub until the editor phase.
+    // Terminals get the real PTY panel, claudeterm the real claude CLI + timeline,
+    // editor a CodeMirror editor; anything else is a stub.
     const component =
-      kind === "terminal" ? "terminal" : kind === "claudeterm" ? "claudeterm" : "placeholder";
+      kind === "terminal"
+        ? "terminal"
+        : kind === "claudeterm"
+          ? "claudeterm"
+          : kind === "editor"
+            ? "editor"
+            : "placeholder";
     api.addPanel({
       id: `${kind}-${Date.now()}`,
       component,
@@ -141,9 +152,30 @@ export function MainArea() {
         title,
         ...(opts?.loadSessionId ? { loadSessionId: opts.loadSessionId } : {}),
         ...(opts?.project ? { project: opts.project } : {}),
+        ...(opts?.path ? { path: opts.path } : {}),
       },
     });
   };
+
+  // Open a file in the editor when requested (from the peek viewer or tree). Focus
+  // an already-open editor for the same file instead of opening a duplicate.
+  useEffect(() => {
+    if (!editorOpenRequest) return;
+    const api = apiRef.current;
+    if (!api) return; // dock not ready (mount/project switch) — keep the request
+    const path = editorOpenRequest;
+    requestEditorOpen(null); // consume only once we can actually act (codex P2 E4)
+    const existing = api.panels.find((p) => {
+      const prm = p.params as { kind?: string; path?: string } | undefined;
+      return prm?.kind === "editor" && prm.path === path;
+    });
+    if (existing) {
+      existing.api.setActive();
+      return;
+    }
+    addPanel("editor", { path, title: fileName(path) });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [editorOpenRequest, activeProject]);
 
   // Resolve a close request from a Claude tab's × (B3-1): 닫기 keeps the saved
   // history, 삭제 also removes it; both close the panel.
@@ -308,9 +340,6 @@ export function MainArea() {
         </button>
         <button className="toolbar-btn" onClick={() => openPicker()}>
           + Claude
-        </button>
-        <button className="toolbar-btn" onClick={() => addPanel("editor")}>
-          + Editor
         </button>
         {picker !== null && (
           <div className="claude-picker">

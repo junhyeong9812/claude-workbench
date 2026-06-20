@@ -24,6 +24,9 @@ interface AppState {
   treeCursor: string | null;
   /** File currently shown in the peek viewer overlay, or null (closed). Transient. */
   peekFile: string | null;
+  /** A request to open a file in the editor (consumed by MainArea, which owns the
+   * dockview api), or null. Transient. */
+  editorOpenRequest: string | null;
 
   /** Load persisted state from the backend on startup. */
   init: () => Promise<void>;
@@ -49,6 +52,8 @@ interface AppState {
   setTreeCursor: (path: string | null) => void;
   /** Open/close the peek viewer on a file (null closes it). */
   setPeekFile: (path: string | null) => void;
+  /** Request opening a file in the editor (MainArea consumes + clears with null). */
+  requestEditorOpen: (path: string | null) => void;
   /** Persist the current workspace to the backend. */
   persist: () => void;
 }
@@ -65,6 +70,7 @@ export const useAppStore = create<AppState>((set, get) => ({
   loadingDirs: {},
   treeCursor: null,
   peekFile: null,
+  editorOpenRequest: null,
 
   init: async () => {
     try {
@@ -166,6 +172,7 @@ export const useAppStore = create<AppState>((set, get) => ({
 
   setTreeCursor: (path) => set({ treeCursor: path }),
   setPeekFile: (path) => set({ peekFile: path }),
+  requestEditorOpen: (path) => set({ editorOpenRequest: path }),
 
   toggleExpanded: (dirPath) => {
     set((s) => ({
