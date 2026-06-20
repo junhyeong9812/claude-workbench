@@ -1,0 +1,113 @@
+import { useCallback, useEffect, useRef, useState } from "react";
+import { invoke } from "@tauri-apps/api/core";
+import { useAppStore } from "../state/store";
+
+interface Worktree {
+  path: string;
+  head: string;
+  branch: string;
+}
+
+const errText = (e: unknown): string =>
+  typeof e === "string" ? e : ((e as { message?: string })?.message ?? String(e));
+
+/**
+ * Worktree panel (GP4) — sidebar tab. Lists `git worktree`s for the active
+ * project, adds (path + branch), removes, and opens one as a project tab.
+ */
+export function WorktreePanel() {
+  const cwd = useAppStore((s) => s.activeProject);
+  const addProject = useAppStore((s) => s.addProject);
+  const [list, setList] = useState<Worktree[]>([]);
+  const [busy, setBusy] = useState(false);
+  const [note, setNote] = useState("");
+  const reqRef = useRef(0);
+
+  const reload = useCallback(async () => {
+    if (!cwd) {
+      setList([]);
+      return;
+    }
+    const myReq = ++reqRef.current;
+    const target = cwd;
+    try {
+      const wts = await invoke<Worktree[]>("git_worktrees", { cwd: target });
+      if (reqRef.current === myReq) setList(wts); // ignore superseded (project switch)
+    } catch (e) {
+      if (reqRef.current === myReq) {
+        setNote(errText(e));
+        setList([]);
+      }
+    }
+  }, [cwd]);
+
+  useEffect(() => {
+    void reload();
+  }, [reload]);
+
+  const act = async (fn: () => Promise<unknown>) => {
+    setBusy(true);
+    setNote("");
+    try {
+      await fn();
+    } catch (e) {
+      setNote(errText(e));
+    } finally {
+      setBusy(false);
+      await reload();
+    }
+  };
+
+  if (!cwd) return <div className="git-empty">프로젝트를 먼저 여세요.</div>;
+
+  return (
+    <div className="git-panel">
+      <div className="git-head">
+        <span className="git-track">워크트리 ({list.length})</span>
+        <button
+          className="git-btn"
+          disabled={busy}
+          title="새 워크트리 추가"
+          onClick={() => {
+            const path = window.prompt("새 워크트리 경로 (예: ../proj-feature)");
+            if (!path || !path.trim()) return;
+            const branch = window.prompt("체크아웃할 브랜치");
+            if (!branch || !branch.trim()) return;
+            act(() => invoke("git_worktree_add", { cwd, path: path.trim(), branch: branch.trim() }));
+          }}
+        >
+          + 추가
+        </button>
+        <button className="git-btn" disabled={busy} title="새로고침" onClick={() => void reload()}>
+          ↻
+        </button>
+      </div>
+      <div className="git-body">
+        {list.map((w) => (
+          <div key={w.path} className="git-file">
+            <span className="git-ref git-ref-local">{w.branch}</span>
+            <span className="git-path" title={`${w.path}\n${w.head}`}>
+              {w.path}
+            </span>
+            <button className="git-mini" disabled={busy} title="프로젝트 탭으로 열기" onClick={() => void addProject(w.path)}>
+              열기
+            </button>
+            <button
+              className="git-mini"
+              disabled={busy}
+              title="워크트리 제거"
+              onClick={() => {
+                if (window.confirm(`${w.path} 워크트리를 제거할까요?`))
+                  act(() => invoke("git_worktree_remove", { cwd, path: w.path }));
+              }}
+            >
+              ×
+            </button>
+          </div>
+        ))}
+        {list.length === 0 && <div className="git-clean">워크트리 없음</div>}
+        {note && <div className="git-clean">{note}</div>}
+      </div>
+    </div>
+  );
+}

@@ -8,6 +8,7 @@ import {
 import { ProjectTabs } from "./components/ProjectTabs";
 import { FolderTree } from "./components/FolderTree";
 import { GitPanel } from "./components/GitPanel";
+import { WorktreePanel } from "./components/WorktreePanel";
 import { MainArea } from "./components/MainArea";
 import { FilePeekViewer } from "./components/FilePeekViewer";
 import { useAppStore } from "./state/store";
@@ -21,7 +22,7 @@ export default function App() {
 
   const treePanelRef = useRef<ImperativePanelHandle>(null);
   const [collapsed, setCollapsed] = useState(false);
-  const [sideTab, setSideTab] = useState<"files" | "git">("files");
+  const [sideTab, setSideTab] = useState<"files" | "git" | "worktree">("files");
 
   useEffect(() => {
     void init();
@@ -84,6 +85,12 @@ export default function App() {
             >
               Git
             </button>
+            <button
+              className={`sidebar-tab${sideTab === "worktree" ? " active" : ""}`}
+              onClick={() => setSideTab("worktree")}
+            >
+              워크트리
+            </button>
           </div>
           <div className="sidebar-content">
             {sideTab === "files" ? (
@@ -93,8 +100,10 @@ export default function App() {
                 </div>
                 <FolderTree />
               </>
-            ) : (
+            ) : sideTab === "git" ? (
               <GitPanel />
+            ) : (
+              <WorktreePanel />
             )}
           </div>
         </Panel>

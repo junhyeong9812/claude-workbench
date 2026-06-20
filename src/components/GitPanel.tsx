@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { useAppStore } from "../state/store";
+import { computeGraph, GitGraphRow } from "./GitGraph";
 
 /** Mirrors core_lib::git serialized types. */
 interface FileChange {
@@ -160,6 +161,19 @@ export function GitPanel() {
       <span className="git-path" title={c.path}>
         {label}
       </span>
+      {kind === "unstaged" && (
+        <button
+          className="git-mini"
+          disabled={busy}
+          title="변경 취소(restore)"
+          onClick={() => {
+            if (window.confirm(`${c.path}의 변경을 취소할까요?`))
+              act(() => invoke("git_discard", { cwd, path: c.path }));
+          }}
+        >
+          ↩
+        </button>
+      )}
       <button
         className="git-mini"
         disabled={busy}
@@ -244,6 +258,31 @@ export function GitPanel() {
           >
             + 브랜치
           </button>
+          <button
+            className="git-btn"
+            disabled={busy}
+            title="브랜치 삭제"
+            onClick={() => {
+              const name = window.prompt("삭제할 브랜치 이름");
+              if (!name || !name.trim()) return;
+              if (!window.confirm(`'${name.trim()}' 브랜치를 삭제할까요?`)) return; // cancel = abort
+              const force = window.confirm("머지 안 됐어도 강제 삭제(-D)? (확인=강제 / 취소=안전 삭제 -d)");
+              act(() => invoke("git_delete_branch", { cwd, name: name.trim(), force }));
+            }}
+          >
+            − 브랜치
+          </button>
+          <button
+            className="git-btn"
+            disabled={busy}
+            title="브랜치 머지(현재 브랜치로)"
+            onClick={() => {
+              const b = window.prompt("현재 브랜치에 머지할 브랜치");
+              if (b && b.trim()) act(() => invoke("git_merge", { cwd, branch: b.trim() }), "머지 완료");
+            }}
+          >
+            merge
+          </button>
           <span className="git-track">
             {status ? `↑${status.ahead} ↓${status.behind}` : ""}
             {status && !status.has_remote ? " (원격없음)" : ""}
@@ -251,10 +290,48 @@ export function GitPanel() {
           <button
             className="git-btn"
             disabled={busy || !status?.has_remote}
+            title="fetch --all --prune"
+            onClick={() => act(() => invoke("git_fetch", { cwd }), "fetch 완료")}
+          >
+            fetch
+          </button>
+          <button
+            className="git-btn"
+            disabled={busy || !status?.has_remote}
+            title="pull"
+            onClick={() => act(() => invoke("git_pull", { cwd }), "pull 완료")}
+          >
+            pull
+          </button>
+          <button
+            className="git-btn"
+            disabled={busy || !status?.has_remote}
             title="현재 브랜치 push"
             onClick={() => act(() => invoke("git_push", { cwd }), "push 완료")}
           >
             push
+          </button>
+          <button
+            className="git-btn"
+            disabled={busy}
+            title="변경을 stash에 저장"
+            onClick={() => {
+              const m = window.prompt("stash 메시지(선택)") ?? "";
+              act(() => invoke("git_stash_save", { cwd, message: m }), "stash 저장");
+            }}
+          >
+            stash
+          </button>
+          <button
+            className="git-btn"
+            disabled={busy}
+            title="최근 stash 적용(pop)"
+            onClick={() => {
+              if (window.confirm("최근 stash를 적용(pop)할까요? (적용 후 stash에서 제거됩니다)"))
+                act(() => invoke("git_stash_pop", { cwd }), "stash pop");
+            }}
+          >
+            pop
           </button>
           <button
             className="git-btn"
@@ -326,25 +403,29 @@ export function GitPanel() {
       <div className="git-graph-pane">
         <div className="git-section-head">히스토리</div>
         <div className="git-graph">
-          {commits.map((c) => {
-            const refs = parseRefs(c.refs);
-            const merge = c.parents.length > 1;
-            return (
-              <div key={c.hash} className="git-commit-row-g" title={`${c.short} · ${c.author} · ${c.date}`}>
-                <span className={`git-node${merge ? " git-node-merge" : ""}`}>{merge ? "◆" : "●"}</span>
-                <span className="git-chash">{c.short}</span>
-                {refs.map((r, i) => (
-                  <span key={i} className={`git-ref git-ref-${r.kind}`}>
-                    {r.label}
+          {(() => {
+            const rows = computeGraph(commits);
+            const maxLanes = rows.reduce((m, r) => Math.max(m, r.before.length, r.after.length), 1);
+            return rows.map((row) => {
+              const c = row.commit;
+              const refs = parseRefs(c.refs);
+              return (
+                <div key={c.hash} className="git-commit-row-g" title={`${c.short} · ${c.author} · ${c.date}`}>
+                  <GitGraphRow row={row} maxLanes={maxLanes} />
+                  <span className="git-chash">{c.short}</span>
+                  {refs.map((r, i) => (
+                    <span key={i} className={`git-ref git-ref-${r.kind}`}>
+                      {r.label}
+                    </span>
+                  ))}
+                  <span className="git-subject" title={c.subject}>
+                    {c.subject}
                   </span>
-                ))}
-                <span className="git-subject" title={c.subject}>
-                  {c.subject}
-                </span>
-                <span className="git-cmeta">{c.date}</span>
-              </div>
-            );
-          })}
+                  <span className="git-cmeta">{c.date}</span>
+                </div>
+              );
+            });
+          })()}
           {commits.length === 0 && <div className="git-clean">커밋 없음</div>}
         </div>
       </div>

@@ -940,3 +940,60 @@ pub fn git_push(cwd: String) -> Result<String, AppError> {
 pub fn git_log(cwd: String, limit: Option<u32>) -> Result<Vec<core_lib::git::Commit>, AppError> {
     core_lib::git::log(&cwd, limit.unwrap_or(200)).map_err(AppError::new)
 }
+
+// ---- Git GP3 (actions) + GP4 (worktrees) ----
+
+#[tauri::command]
+pub fn git_merge(cwd: String, branch: String) -> Result<String, AppError> {
+    core_lib::git::merge(&cwd, &branch).map_err(AppError::new)
+}
+
+#[tauri::command]
+pub fn git_fetch(cwd: String) -> Result<String, AppError> {
+    core_lib::git::fetch(&cwd).map_err(AppError::new)
+}
+
+#[tauri::command]
+pub fn git_pull(cwd: String) -> Result<String, AppError> {
+    core_lib::git::pull(&cwd).map_err(AppError::new)
+}
+
+#[tauri::command]
+pub fn git_discard(cwd: String, path: String) -> Result<(), AppError> {
+    core_lib::git::discard(&cwd, &path).map(|_| ()).map_err(AppError::new)
+}
+
+#[tauri::command]
+pub fn git_delete_branch(cwd: String, name: String, force: bool) -> Result<String, AppError> {
+    core_lib::git::delete_branch(&cwd, &name, force).map_err(AppError::new)
+}
+
+#[tauri::command]
+pub fn git_stash_list(cwd: String) -> Result<Vec<String>, AppError> {
+    core_lib::git::stash_list(&cwd).map_err(AppError::new)
+}
+
+#[tauri::command]
+pub fn git_stash_save(cwd: String, message: String) -> Result<String, AppError> {
+    core_lib::git::stash_save(&cwd, &message).map_err(AppError::new)
+}
+
+#[tauri::command]
+pub fn git_stash_pop(cwd: String) -> Result<String, AppError> {
+    core_lib::git::stash_pop(&cwd).map_err(AppError::new)
+}
+
+#[tauri::command]
+pub fn git_worktrees(cwd: String) -> Result<Vec<core_lib::git::Worktree>, AppError> {
+    core_lib::git::worktrees(&cwd).map_err(AppError::new)
+}
+
+#[tauri::command]
+pub fn git_worktree_add(cwd: String, path: String, branch: String) -> Result<String, AppError> {
+    core_lib::git::worktree_add(&cwd, &path, &branch).map_err(AppError::new)
+}
+
+#[tauri::command]
+pub fn git_worktree_remove(cwd: String, path: String) -> Result<String, AppError> {
+    core_lib::git::worktree_remove(&cwd, &path).map_err(AppError::new)
+}

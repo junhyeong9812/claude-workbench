@@ -280,6 +280,117 @@ pub fn push(cwd: &str) -> Result<String, String> {
     }
 }
 
+// ---- GP3: more actions ----
+
+/// Merge `branch` into the current branch.
+pub fn merge(cwd: &str, branch: &str) -> Result<String, String> {
+    safe_ref(branch)?;
+    run_git(cwd, &["merge", branch])
+}
+
+/// Fetch all remotes (pruning deleted remote branches).
+pub fn fetch(cwd: &str) -> Result<String, String> {
+    run_git(cwd, &["fetch", "--all", "--prune"])
+}
+
+/// Pull the current branch.
+pub fn pull(cwd: &str) -> Result<String, String> {
+    run_git(cwd, &["pull"])
+}
+
+/// Discard unstaged changes to a tracked file (`git restore`).
+pub fn discard(cwd: &str, path: &str) -> Result<String, String> {
+    run_git(cwd, &["restore", "--", path])
+}
+
+/// Delete a local branch (`-d`; `-D` to force-delete unmerged).
+pub fn delete_branch(cwd: &str, name: &str, force: bool) -> Result<String, String> {
+    safe_ref(name)?;
+    run_git(cwd, &["branch", if force { "-D" } else { "-d" }, name])
+}
+
+/// Stash entries (`stash list`), one per line.
+pub fn stash_list(cwd: &str) -> Result<Vec<String>, String> {
+    Ok(run_git(cwd, &["stash", "list"])?
+        .lines()
+        .map(|l| l.to_string())
+        .filter(|l| !l.is_empty())
+        .collect())
+}
+
+/// Stash the working tree (optionally with a message).
+pub fn stash_save(cwd: &str, message: &str) -> Result<String, String> {
+    if message.is_empty() {
+        run_git(cwd, &["stash", "push"])
+    } else {
+        run_git(cwd, &["stash", "push", "-m", message])
+    }
+}
+
+/// Pop the most recent stash.
+pub fn stash_pop(cwd: &str) -> Result<String, String> {
+    run_git(cwd, &["stash", "pop"])
+}
+
+// ---- GP4: worktrees ----
+
+/// One git worktree.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct Worktree {
+    pub path: String,
+    pub head: String,
+    pub branch: String,
+}
+
+/// Parse `git worktree list --porcelain`. Pure — tested.
+fn parse_worktrees(out: &str) -> Vec<Worktree> {
+    let mut res = Vec::new();
+    let mut path = String::new();
+    let mut head = String::new();
+    let mut branch = String::new();
+    let flush = |res: &mut Vec<Worktree>, path: &str, head: &str, branch: &str| {
+        if !path.is_empty() {
+            res.push(Worktree {
+                path: path.to_string(),
+                head: head.to_string(),
+                branch: branch.to_string(),
+            });
+        }
+    };
+    for line in out.lines() {
+        if let Some(p) = line.strip_prefix("worktree ") {
+            flush(&mut res, &path, &head, &branch);
+            path = p.to_string();
+            head = String::new();
+            branch = "(detached)".to_string();
+        } else if let Some(h) = line.strip_prefix("HEAD ") {
+            head = h.to_string();
+        } else if let Some(b) = line.strip_prefix("branch ") {
+            branch = b.strip_prefix("refs/heads/").unwrap_or(b).to_string();
+        } else if line == "detached" {
+            branch = "(detached)".to_string();
+        }
+    }
+    flush(&mut res, &path, &head, &branch);
+    res
+}
+
+pub fn worktrees(cwd: &str) -> Result<Vec<Worktree>, String> {
+    Ok(parse_worktrees(&run_git(cwd, &["worktree", "list", "--porcelain"])?))
+}
+
+/// Add a worktree at `path` checking out `branch` (must exist). `--` so a `path`
+/// starting with `-` can't be parsed as a git option (codex GP-2).
+pub fn worktree_add(cwd: &str, path: &str, branch: &str) -> Result<String, String> {
+    safe_ref(branch)?;
+    run_git(cwd, &["worktree", "add", "--", path, branch])
+}
+
+/// Remove the worktree at `path`.
+pub fn worktree_remove(cwd: &str, path: &str) -> Result<String, String> {
+    run_git(cwd, &["worktree", "remove", "--", path])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -348,6 +459,17 @@ mod tests {
         assert_eq!(commits[0].parents, vec!["p1", "p2"]); // merge
         assert_eq!(commits[0].refs, "HEAD -> main");
         assert_eq!(commits[1].subject, "init");
+    }
+
+    #[test]
+    fn parse_worktrees_main_and_detached() {
+        let out = "worktree /repo\nHEAD aaa\nbranch refs/heads/main\n\nworktree /repo/wt\nHEAD bbb\ndetached\n";
+        let wts = parse_worktrees(out);
+        assert_eq!(wts.len(), 2);
+        assert_eq!(wts[0].path, "/repo");
+        assert_eq!(wts[0].branch, "main");
+        assert_eq!(wts[1].path, "/repo/wt");
+        assert_eq!(wts[1].branch, "(detached)");
     }
 
     #[test]
