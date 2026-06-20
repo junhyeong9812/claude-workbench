@@ -471,22 +471,13 @@ body {
   opacity: 0.85;
   font-size: 0.95em;
 }
-/* Subagent (Task) groups under the timeline — collapsible per agent (B1). */
-.claudeterm-subagents {
-  flex: 0 0 auto;
-  border-top: 1px solid var(--border, #333);
-  overflow: auto;
-  max-height: 45%;
+/* Subagent (Task) groups nested under their turn — collapsible (B1). Indented
+ * to read as "during this question, this agent did …". */
+.timeline-agent {
+  margin-left: 14px;
+  border-left: 2px solid rgba(137, 180, 250, 0.4);
 }
-.claudeterm-subagents-head {
-  padding: 3px 8px;
-  font-size: 0.78em;
-  color: var(--fg-dim);
-  background: rgba(255, 255, 255, 0.03);
-  position: sticky;
-  top: 0;
-}
-.claudeterm-agent-head {
+.timeline-agent-head {
   display: flex;
   align-items: center;
   gap: 5px;
@@ -496,13 +487,16 @@ body {
   color: var(--accent, #89b4fa);
   background: rgba(137, 180, 250, 0.08);
 }
-.claudeterm-agent-head:hover {
+.timeline-agent-head:hover {
   background: rgba(137, 180, 250, 0.16);
 }
-.claudeterm-agent-count {
+.timeline-agent-count {
   margin-left: auto;
   opacity: 0.7;
   font-variant-numeric: tabular-nums;
+}
+.timeline-item-sub {
+  padding-left: 14px;
 }
 .claudeterm-term {
   flex: 1 1 0;

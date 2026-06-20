@@ -149,6 +149,12 @@ impl SessionTail {
     pub fn tokens(&self) -> &BTreeMap<u64, crate::timeline::TokenUsage> {
         self.mapper.tokens()
     }
+
+    /// The current conversation turn (for attributing a subagent to the turn it
+    /// was spawned in — B1).
+    pub fn current_turn(&self) -> u64 {
+        self.mapper.current_turn()
+    }
 }
 
 #[cfg(test)]

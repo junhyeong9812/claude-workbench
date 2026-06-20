@@ -6,13 +6,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import "@xterm/xterm/css/xterm.css";
 import { useAppStore } from "../state/store";
-import {
-  TimelineView,
-  ItemDetail,
-  KIND_ICON,
-  AGENT_BADGE,
-  type TimelineItem,
-} from "./TimelineView";
+import { TimelineView, ItemDetail, type TimelineItem } from "./TimelineView";
 
 /**
  * Architecture A Claude panel: the **real** `claude` CLI in an xterm PTY (left)
@@ -65,8 +59,9 @@ interface ClaudeTimelineEvent {
   answers: [number, string][];
   dates: [number, string][];
   tokens: [number, TokenUsage][];
-  /** [agentId, items] for each parallel subagent (Task) — what each did. */
-  subagents: [string, TimelineItem[]][];
+  /** [agentId, turn, items] for each parallel subagent (Task) — nested under
+   * the turn it was spawned in. */
+  subagents: [string, number, TimelineItem[]][];
 }
 
 /** Compact token count: 1234 → "1.2k". */
@@ -83,9 +78,8 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
   const [answers, setAnswers] = useState<Map<number, string>>(new Map());
   const [dates, setDates] = useState<Map<number, string>>(new Map());
   const [selectedId, setSelectedId] = useState<string | null>(null);
-  // Per-subagent change lists [agentId, items] + which are collapsed (B1).
-  const [subagents, setSubagents] = useState<[string, TimelineItem[]][]>([]);
-  const [collapsedAgents, setCollapsedAgents] = useState<Set<string>>(new Set());
+  // Per-subagent change lists [agentId, turn, items] (B1), nested under turns.
+  const [subagents, setSubagents] = useState<[string, number, TimelineItem[]][]>([]);
   // Session token totals (B1): ↑ = new context processed (input + cache write),
   // ↓ = generated output. Summed across turns.
   const [tokenTotal, setTokenTotal] = useState<{ input: number; output: number }>({
@@ -394,17 +388,18 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
   }, []);
 
   const selectedItem = selectedId
-    ? ([items, ...subagents.map(([, its]) => its)]
+    ? ([items, ...subagents.map(([, , its]) => its)]
         .flat()
         .find((it) => it.tool_call_id === selectedId) ?? null)
     : null;
-  const toggleAgent = (aid: string) =>
-    setCollapsedAgents((prev) => {
-      const next = new Set(prev);
-      if (next.has(aid)) next.delete(aid);
-      else next.add(aid);
-      return next;
-    });
+  // Group subagents by the turn they were spawned in, for nesting in the
+  // timeline under that turn.
+  const subagentsByTurn = new Map<number, [string, TimelineItem[]][]>();
+  for (const [aid, turn, its] of subagents) {
+    const arr = subagentsByTurn.get(turn) ?? [];
+    arr.push([aid, its]);
+    subagentsByTurn.set(turn, arr);
+  }
 
   return (
     <div className="claudeterm" ref={containerRef} onKeyDown={onContainerKey}>
@@ -474,50 +469,10 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
             turns={turns}
             answers={answers}
             dates={dates}
+            subagents={subagentsByTurn}
             selectedId={selectedId}
             onSelect={(it) => setSelectedId(it.tool_call_id)}
           />
-          {subagents.length > 0 && (
-            <div className="claudeterm-subagents">
-              <div className="claudeterm-subagents-head">서브에이전트 {subagents.length}</div>
-              {subagents.map(([aid, its]) => {
-                const collapsed = collapsedAgents.has(aid);
-                return (
-                  <div key={aid} className="claudeterm-agent">
-                    <div
-                      className="claudeterm-agent-head"
-                      onClick={() => toggleAgent(aid)}
-                      title={collapsed ? "펼치기" : "접기"}
-                    >
-                      <span className="timeline-date-caret">{collapsed ? "▸" : "▾"}</span>
-                      🔱 {aid.slice(0, 8)}
-                      <span className="claudeterm-agent-count">{its.length}</span>
-                    </div>
-                    {!collapsed &&
-                      its.map((it) => (
-                        <div
-                          key={it.tool_call_id}
-                          className={`timeline-item ts-${it.agent_status} ${
-                            selectedId === it.tool_call_id ? "timeline-item-sel" : ""
-                          }`}
-                          title={it.locations.join("\n")}
-                          onClick={() => setSelectedId(it.tool_call_id)}
-                        >
-                          <span className="timeline-icon">{KIND_ICON[it.kind] ?? "•"}</span>
-                          <span className="timeline-title">{it.title || it.kind}</span>
-                          {it.diffs.length > 0 && (
-                            <span className="timeline-diff">±{it.diffs.length}</span>
-                          )}
-                          <span className={`timeline-status ts-${it.agent_status}`}>
-                            {AGENT_BADGE[it.agent_status] ?? ""}
-                          </span>
-                        </div>
-                      ))}
-                  </div>
-                );
-              })}
-            </div>
-          )}
         </div>
       </div>
     </div>

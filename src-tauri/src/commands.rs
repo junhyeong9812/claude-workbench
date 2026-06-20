@@ -350,9 +350,10 @@ struct ClaudeTimelinePayload {
     answers: Vec<(u64, String)>,
     dates: Vec<(u64, String)>,
     tokens: Vec<(u64, TokenUsage)>,
-    /// Per-subagent (`Task`) change lists, keyed by agent id — the work each
-    /// parallel agent did, tailed from `<uuid>/subagents/agent-<id>.jsonl` (B1).
-    subagents: Vec<(String, Vec<TimelineItem>)>,
+    /// Per-subagent (`Task`) change lists: `(agent_id, turn, items)` — the work
+    /// each parallel agent did, attributed to the turn it was spawned in, tailed
+    /// from `<uuid>/subagents/agent-<id>.jsonl` (B1).
+    subagents: Vec<(String, u64, Vec<TimelineItem>)>,
 }
 
 /// Generate a fresh session UUID for `--session-id`. Linux-only (the app's
@@ -452,9 +453,11 @@ fn run_timeline_poll(
         return;
     };
     let mut tail: Option<core_lib::jsonl::SessionTail> = None;
-    // `<uuid>/subagents/` dir + a tail per subagent transcript (Task agents).
+    // `<uuid>/subagents/` dir + a tail per subagent transcript (Task agents), and
+    // the main turn each agent was first seen in (so it nests under that turn).
     let mut sub_dir: Option<PathBuf> = None;
     let mut subagents: HashMap<String, core_lib::jsonl::SessionTail> = HashMap::new();
+    let mut subagent_turn: HashMap<String, u64> = HashMap::new();
     // Cheap fingerprint of the last emitted state (incl. subagent item count). A
     // prompt- or answer-only record advances turns/answers without touching any
     // tool item, so we can't key off `poll`'s touched indices alone.
@@ -503,9 +506,12 @@ fn run_timeline_poll(
                     else {
                         continue;
                     };
-                    let st = subagents
-                        .entry(aid.clone())
-                        .or_insert_with(|| core_lib::jsonl::SessionTail::new(cwd.clone(), aid, f));
+                    if !subagents.contains_key(&aid) {
+                        subagent_turn.insert(aid.clone(), t.current_turn());
+                    }
+                    let st = subagents.entry(aid.clone()).or_insert_with(|| {
+                        core_lib::jsonl::SessionTail::new(cwd.clone(), aid.clone(), f)
+                    });
                     let _ = st.poll();
                 }
             }
@@ -536,10 +542,16 @@ fn run_timeline_poll(
             t.answers().iter().map(|(k, v)| (*k, v.clone())).collect();
         let dates_v: Vec<(u64, String)> = t.dates().iter().map(|(k, v)| (*k, v.clone())).collect();
         let tokens_v: Vec<(u64, TokenUsage)> = t.tokens().iter().map(|(k, v)| (*k, *v)).collect();
-        let subagents_v: Vec<(String, Vec<TimelineItem>)> = subagents
+        let subagents_v: Vec<(String, u64, Vec<TimelineItem>)> = subagents
             .iter()
             .filter(|(_, st)| !st.timeline().items().is_empty())
-            .map(|(aid, st)| (aid.clone(), st.timeline().items().to_vec()))
+            .map(|(aid, st)| {
+                (
+                    aid.clone(),
+                    *subagent_turn.get(aid).unwrap_or(&0),
+                    st.timeline().items().to_vec(),
+                )
+            })
             .collect();
 
         let _ = app.emit(
