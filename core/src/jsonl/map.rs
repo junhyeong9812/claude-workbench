@@ -115,8 +115,14 @@ impl JsonlMapper {
         // Otherwise: assistant tool_use + text(answer), or user tool_result blocks.
         match content {
             Some(Content::Blocks(blocks)) => {
-                let (touched, answer) =
-                    apply_blocks(&mut self.timeline, &session, self.current_turn, is_assistant, blocks);
+                let (touched, answer) = apply_blocks(
+                    &mut self.timeline,
+                    &session,
+                    self.current_turn,
+                    is_assistant,
+                    rec.uuid.as_deref(),
+                    blocks,
+                );
                 if let Some(a) = answer {
                     let entry = self.answers.entry(self.current_turn).or_default();
                     if !entry.is_empty() {
@@ -177,11 +183,12 @@ fn apply_blocks(
     session: &str,
     turn: u64,
     is_assistant: bool,
+    record_uuid: Option<&str>,
     blocks: &[Value],
 ) -> (Vec<usize>, Option<String>) {
     let mut touched = Vec::new();
     let mut answer = String::new();
-    for value in blocks {
+    for (idx, value) in blocks.iter().enumerate() {
         let Ok(block) = serde_json::from_value::<ContentBlock>(value.clone()) else {
             continue;
         };
@@ -213,11 +220,45 @@ fn apply_blocks(
                     answer.push_str(&text);
                 }
             }
-            // thinking / unknown blocks are not timeline items.
+            // Extended-thinking reasoning becomes a Think item in seq order, so
+            // the user can follow the reasoning → action flow (B1, user intent).
+            // Keyed by the record uuid + block index so a re-tail merges, not
+            // duplicates.
+            ContentBlock::Thinking { thinking } => {
+                if is_assistant && !thinking.trim().is_empty() {
+                    let id = format!("think:{}:{idx}", record_uuid.unwrap_or("?"));
+                    touched.push(open_thinking(timeline, session, turn, &id, &thinking));
+                }
+            }
+            // unknown blocks are not timeline items.
             _ => {}
         }
     }
     (touched, (!answer.is_empty()).then_some(answer))
+}
+
+/// Record an extended-thinking block as a completed `Think` timeline item. Its
+/// title is the first line; the full reasoning is in `content_text` (detail view).
+fn open_thinking(timeline: &mut Timeline, session: &str, turn: u64, id: &str, thinking: &str) -> usize {
+    let (idx, is_new) = timeline.entry(session, id);
+    let item = timeline.item_mut(idx);
+    if is_new {
+        item.turn = turn;
+    }
+    item.kind = ItemKind::Think;
+    item.title = thinking
+        .lines()
+        .find(|l| !l.trim().is_empty())
+        .unwrap_or(thinking)
+        .chars()
+        .take(80)
+        .collect();
+    item.content_text = Some(thinking.to_string());
+    item.agent_status = AgentStatus::Completed;
+    if !is_new {
+        item.revision += 1;
+    }
+    idx
 }
 
 /// Open (or, for a re-sent id, refresh) the timeline item for a `tool_use`.
@@ -668,8 +709,12 @@ mod tests {
             ]))),
         ];
         let tl = map_lines(&lines);
-        assert_eq!(tl.items().len(), 1, "only the real tool_use is an item");
-        assert_eq!(tl.items()[0].tool_call_id, "t1");
+        // Malformed JSON, unknown record/block types, the text block, and the
+        // bare prompt all skip; the thinking block is now a Think item (B1) and
+        // the real tool_use is an item — 2 total.
+        assert_eq!(tl.items().len(), 2);
+        assert!(tl.items().iter().any(|i| i.tool_call_id == "t1"));
+        assert!(tl.items().iter().any(|i| i.kind == ItemKind::Think));
     }
 
     // Invariant ②, codex F1: a result seen before its tool_use marks the item
@@ -873,6 +918,30 @@ mod tests {
         assert_eq!(t.output, 70);
         assert_eq!(t.cache_read, 2000);
         assert_eq!(t.cache_creation, 300);
+    }
+
+    // B1: an extended-thinking block becomes a Think item (reasoning flow).
+    #[test]
+    fn thinking_becomes_a_think_item() {
+        let lines = [line(json!({
+            "type": "assistant", "sessionId": SID, "uuid": "msg-1",
+            "message": { "role": "assistant", "content": [
+                { "type": "thinking", "thinking": "Let me reason about this.\nStep two." },
+                { "type": "tool_use", "id": "t1", "name": "Read", "input": { "file_path": "/x" } }
+            ] }
+        }))];
+        let tl = map_lines(&lines);
+        assert_eq!(tl.items().len(), 2, "a think item + the tool item");
+        let think = tl.items().iter().find(|i| i.kind == ItemKind::Think).unwrap();
+        assert_eq!(think.tool_call_id, "think:msg-1:0", "deterministic id for re-tail merge");
+        assert_eq!(think.title, "Let me reason about this.");
+        assert_eq!(
+            think.content_text.as_deref(),
+            Some("Let me reason about this.\nStep two.")
+        );
+        assert_eq!(think.agent_status, AgentStatus::Completed);
+        // The think item precedes the tool item (seq order = flow).
+        assert!(think.seq < tl.items().iter().find(|i| i.kind == ItemKind::Read).unwrap().seq);
     }
 
     // A record that omits sessionId falls back to the file's session uuid.
