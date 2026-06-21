@@ -6,21 +6,49 @@ import type { DirEntry, Project, ProjectType, WorkspaceState } from "../types";
 /** Clamp a font size to the allowed range (also normalizes NaN). */
 export const clampFontSize = (n: number): number => Math.max(9, Math.min(28, Math.round(n) || 13));
 
-/** Safe-parse the persisted study root folders. */
-function loadStudyFolders(): { left: string | null; right: string | null } {
+/** Persisted study slice (folders + tabs + active + per-side mode). */
+interface StudyPersist {
+  folders: { left: string | null; right: string | null };
+  tabs: { left: string[]; right: string[] };
+  active: { left: string | null; right: string | null };
+  mode: { left: "viewer" | "editor"; right: "viewer" | "editor" };
+}
+
+const STUDY_DEFAULT: StudyPersist = {
+  folders: { left: null, right: null },
+  tabs: { left: [], right: [] },
+  active: { left: null, right: null },
+  mode: { left: "viewer", right: "viewer" },
+};
+
+/** Safe-parse the persisted study view slice (P4). Falls back to defaults. */
+function loadStudyView(): StudyPersist {
   try {
-    const v = JSON.parse(localStorage.getItem("studyFolders") || "null");
-    if (v && typeof v === "object") {
-      return {
-        left: typeof v.left === "string" ? v.left : null,
-        right: typeof v.right === "string" ? v.right : null,
-      };
-    }
+    const v = JSON.parse(localStorage.getItem("studyView") || "null");
+    if (v && typeof v === "object") return { ...STUDY_DEFAULT, ...v };
   } catch {
     /* fall through */
   }
-  return { left: null, right: null };
+  return STUDY_DEFAULT;
 }
+
+/** Persist the study view slice to localStorage (survives restart). */
+function saveStudyView(s: {
+  studyFolders: StudyPersist["folders"];
+  studyTabs: StudyPersist["tabs"];
+  studyActive: StudyPersist["active"];
+  studyMode: StudyPersist["mode"];
+}) {
+  const slice: StudyPersist = {
+    folders: s.studyFolders,
+    tabs: s.studyTabs,
+    active: s.studyActive,
+    mode: s.studyMode,
+  };
+  localStorage.setItem("studyView", JSON.stringify(slice));
+}
+
+const STUDY0 = loadStudyView();
 
 const TERM_COLOR_KEYS = new Set([
   "background",
@@ -201,11 +229,11 @@ export const useAppStore = create<AppState>((set, get) => ({
   fontSize: clampFontSize(Number(localStorage.getItem("fontSize")) || 13),
   termColors: loadTermColors(),
   mode: (localStorage.getItem("mode") as "workspace" | "study") || "workspace",
-  studyFolders: loadStudyFolders(),
-  studyTabs: { left: [], right: [] },
-  studyActive: { left: null, right: null },
+  studyFolders: STUDY0.folders,
+  studyTabs: STUDY0.tabs,
+  studyActive: STUDY0.active,
+  studyMode: STUDY0.mode,
   studySessionLayout: null,
-  studyMode: { left: "viewer", right: "viewer" },
 
   init: async () => {
     try {
@@ -320,27 +348,29 @@ export const useAppStore = create<AppState>((set, get) => ({
     localStorage.setItem("mode", mode);
     set({ mode });
   },
-  setStudyFolder: (side, path) =>
-    set((s) => {
-      const studyFolders = { ...s.studyFolders, [side]: path };
-      localStorage.setItem("studyFolders", JSON.stringify(studyFolders));
-      return {
-        studyFolders,
-        studyTabs: { ...s.studyTabs, [side]: [] },
-        studyActive: { ...s.studyActive, [side]: null },
-      };
-    }),
-  openStudyTab: (side, path) =>
+  setStudyFolder: (side, path) => {
+    set((s) => ({
+      studyFolders: { ...s.studyFolders, [side]: path },
+      studyTabs: { ...s.studyTabs, [side]: [] },
+      studyActive: { ...s.studyActive, [side]: null },
+    }));
+    saveStudyView(get());
+  },
+  openStudyTab: (side, path) => {
     set((s) => ({
       studyTabs: { ...s.studyTabs, [side]: [path, ...s.studyTabs[side].filter((p) => p !== path)] },
       studyActive: { ...s.studyActive, [side]: path },
-    })),
-  setStudyActive: (side, path) =>
+    }));
+    saveStudyView(get());
+  },
+  setStudyActive: (side, path) => {
     set((s) => ({
       studyTabs: { ...s.studyTabs, [side]: [path, ...s.studyTabs[side].filter((p) => p !== path)] },
       studyActive: { ...s.studyActive, [side]: path },
-    })),
-  closeStudyTab: (side, path) =>
+    }));
+    saveStudyView(get());
+  },
+  closeStudyTab: (side, path) => {
     set((s) => {
       const next = s.studyTabs[side].filter((p) => p !== path);
       const active = s.studyActive[side] === path ? (next[0] ?? null) : s.studyActive[side];
@@ -348,22 +378,31 @@ export const useAppStore = create<AppState>((set, get) => ({
         studyTabs: { ...s.studyTabs, [side]: next },
         studyActive: { ...s.studyActive, [side]: active },
       };
-    }),
+    });
+    saveStudyView(get());
+  },
   setStudySessionLayout: (layout) => set({ studySessionLayout: layout }),
-  setStudyMode: (side, mode) => set((s) => ({ studyMode: { ...s.studyMode, [side]: mode } })),
-  openStudyPreview: (side, path) =>
+  setStudyMode: (side, mode) => {
+    set((s) => ({ studyMode: { ...s.studyMode, [side]: mode } }));
+    saveStudyView(get());
+  },
+  openStudyPreview: (side, path) => {
     set((s) => ({
       studyTabs: { ...s.studyTabs, [side]: [path] },
       studyActive: { ...s.studyActive, [side]: path },
-    })),
-  cycleStudyTab: (side, dir) =>
+    }));
+    saveStudyView(get());
+  },
+  cycleStudyTab: (side, dir) => {
     set((s) => {
       const tabs = s.studyTabs[side];
       if (tabs.length === 0) return {};
       const i = tabs.indexOf(s.studyActive[side] ?? "");
       const ni = ((i === -1 ? 0 : i) + dir + tabs.length) % tabs.length;
       return { studyActive: { ...s.studyActive, [side]: tabs[ni] } };
-    }),
+    });
+    saveStudyView(get());
+  },
 
   toggleExpanded: (dirPath) => {
     set((s) => ({

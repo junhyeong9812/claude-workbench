@@ -35,9 +35,9 @@ export function StudyView() {
 
   return (
     <div className="study-view-root" onKeyDown={onKeyDown}>
-      <PanelGroup direction="vertical" className="study-view">
+      <PanelGroup direction="vertical" className="study-view" autoSaveId="study-vert">
         <Panel defaultSize={70} minSize={30}>
-          <PanelGroup direction="horizontal" className="study-cols">
+          <PanelGroup direction="horizontal" className="study-cols" autoSaveId="study-cols">
             <Panel defaultSize={18} minSize={8} className="study-col">
               <StudySidebar side="left" focusId={FOCUS_IDS[0]} />
             </Panel>
