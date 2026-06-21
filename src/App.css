@@ -6,6 +6,15 @@
   --fg: #cccccc;
   --fg-dim: #888888;
   --accent: #0e639c;
+  /* git status + ref colors (bright variants for the dark bg) */
+  --git-add: #3fb950;
+  --git-mod: #d29922;
+  --git-del: #f85149;
+  --git-ren: #4493f8;
+  --git-ref-head: #3fb950;
+  --git-ref-local: #4493f8;
+  --git-ref-remote: #c678dd;
+  --git-ref-tag: #d29922;
 }
 
 /* Light theme — toggled via document.documentElement[data-theme="light"]. */
@@ -17,6 +26,15 @@
   --fg: #1f1f1f;
   --fg-dim: #6a6a6a;
   --accent: #0066b8;
+  /* darker, saturated git colors so they read on white */
+  --git-add: #1a7f37;
+  --git-mod: #9a6700;
+  --git-del: #cf222e;
+  --git-ren: #0969da;
+  --git-ref-head: #1a7f37;
+  --git-ref-local: #0969da;
+  --git-ref-remote: #8250df;
+  --git-ref-tag: #9a6700;
 }
 
 * {
@@ -425,11 +443,22 @@ body {
   flex: 0 0 auto;
   width: 18px;
   text-align: center;
+  font-weight: 600;
   font-variant-numeric: tabular-nums;
-  color: #f9e2af;
+  color: var(--git-mod);
 }
-.git-code.git-staged {
-  color: #a6e3a1;
+.git-c-add,
+.git-c-new {
+  color: var(--git-add);
+}
+.git-c-mod {
+  color: var(--git-mod);
+}
+.git-c-del {
+  color: var(--git-del);
+}
+.git-c-ren {
+  color: var(--git-ren);
 }
 .git-path {
   flex: 1 1 auto;
@@ -546,21 +575,25 @@ body {
   line-height: 1.4;
 }
 .git-ref-head {
-  background: rgba(166, 227, 161, 0.25);
-  color: #a6e3a1;
+  background: rgba(127, 127, 127, 0.14);
+  color: var(--git-ref-head);
   font-weight: 600;
 }
 .git-ref-local {
-  background: rgba(137, 180, 250, 0.22);
-  color: #89b4fa;
+  background: rgba(127, 127, 127, 0.14);
+  color: var(--git-ref-local);
 }
 .git-ref-remote {
-  background: rgba(245, 194, 231, 0.2);
-  color: #f5c2e7;
+  background: rgba(127, 127, 127, 0.14);
+  color: var(--git-ref-remote);
 }
 .git-ref-tag {
-  background: rgba(249, 226, 175, 0.2);
-  color: #f9e2af;
+  background: rgba(127, 127, 127, 0.14);
+  color: var(--git-ref-tag);
+}
+/* Commit-graph node ring = panel bg so the dot separates from lanes (both themes). */
+.git-graph-node {
+  stroke: var(--bg);
 }
 .git-subject {
   flex: 1 1 auto;

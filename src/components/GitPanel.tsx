@@ -40,6 +40,27 @@ const errText = (e: unknown): string =>
 
 const localOf = (remote: string): string => remote.split("/").slice(1).join("/") || remote;
 
+/** Map a porcelain status code (e.g. "??", " M", "A ") to a readable single
+ * letter + a color class + a tooltip. "??" = untracked (a new, unstaged file). */
+function statusInfo(code: string): { ch: string; cls: string; title: string } {
+  if (code.includes("?")) return { ch: "U", cls: "git-c-new", title: "untracked — git에 없는 새 파일" };
+  const c = code.replace(/\s/g, "")[0] ?? "M";
+  switch (c) {
+    case "A":
+      return { ch: "A", cls: "git-c-add", title: "added — 새로 추가됨" };
+    case "M":
+      return { ch: "M", cls: "git-c-mod", title: "modified — 수정됨" };
+    case "D":
+      return { ch: "D", cls: "git-c-del", title: "deleted — 삭제됨" };
+    case "R":
+      return { ch: "R", cls: "git-c-ren", title: "renamed — 이름 변경" };
+    case "C":
+      return { ch: "C", cls: "git-c-ren", title: "copied — 복사됨" };
+    default:
+      return { ch: c, cls: "git-c-mod", title: code };
+  }
+}
+
 type Ref = { kind: "head" | "local" | "remote" | "tag"; label: string };
 function parseRefs(refs: string): Ref[] {
   if (!refs.trim()) return [];
@@ -90,6 +111,7 @@ export function GitPanel() {
   const cwd = useAppStore((s) => s.activeProject);
   const requestDiff = useAppStore((s) => s.requestDiff);
   const requestEditorOpen = useAppStore((s) => s.requestEditorOpen);
+  const theme = useAppStore((s) => s.theme);
   const [status, setStatus] = useState<GitStatus | null>(null);
   const [branches, setBranches] = useState<Branches | null>(null);
   const [commits, setCommits] = useState<Commit[]>([]);
@@ -166,9 +188,14 @@ export function GitPanel() {
 
   const fileRow = (c: FileChange, label: string, depth: number, kind: "staged" | "unstaged"): ReactNode => (
     <div key={c.path} className="git-file" style={{ paddingLeft: 8 + depth * 12 }}>
-      <span className={`git-code${kind === "staged" ? " git-staged" : ""}`}>
-        {c.code || (kind === "staged" ? "·" : "??")}
-      </span>
+      {(() => {
+        const si = statusInfo(c.code);
+        return (
+          <span className={`git-code ${si.cls}`} title={si.title}>
+            {si.ch}
+          </span>
+        );
+      })()}
       <span
         className="git-path git-clickable"
         title={`${c.path}\n(클릭: diff 보기)`}
@@ -562,7 +589,7 @@ export function GitPanel() {
                   title={`${c.short} · ${c.author} · ${c.date}\n(클릭: 커밋 변경 보기)`}
                   onClick={() => requestDiff({ title: `${c.short} ${c.subject}`, cwd: cwd as string, hash: c.hash })}
                 >
-                  <GitGraphRow row={row} maxLanes={maxLanes} />
+                  <GitGraphRow row={row} maxLanes={maxLanes} theme={theme} />
                   <span className="git-chash">{c.short}</span>
                   {refs.map((r, i) => (
                     <span key={i} className={`git-ref git-ref-${r.kind}`}>

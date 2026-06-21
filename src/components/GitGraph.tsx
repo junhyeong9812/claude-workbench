@@ -61,8 +61,10 @@ export function computeGraph(commits: GraphCommit[]): GraphRow[] {
 const CELL = 14;
 const ROW = 24;
 const RADIUS = 4;
-const LANE_COLORS = ["#89b4fa", "#a6e3a1", "#f9e2af", "#f5c2e7", "#94e2d5", "#fab387", "#f38ba8"];
-const laneColor = (col: number): string => LANE_COLORS[col % LANE_COLORS.length];
+// Dark: bright catppuccin lanes on a dark bg. Light: darker, saturated lanes so
+// they stay legible on white. The graph follows the app theme.
+const LANE_COLORS_DARK = ["#89b4fa", "#a6e3a1", "#f9e2af", "#f5c2e7", "#94e2d5", "#fab387", "#f38ba8"];
+const LANE_COLORS_LIGHT = ["#0969da", "#1a7f37", "#9a6700", "#8250df", "#1b7c83", "#bc4c00", "#cf222e"];
 const cx = (col: number): number => col * CELL + CELL / 2;
 
 /** A path from (x1,y1)→(x2,y2): straight if same column, else a smooth S-curve
@@ -73,8 +75,19 @@ function edge(x1: number, y1: number, x2: number, y2: number): string {
   return `M${x1} ${y1} C${x1} ${ym}, ${x2} ${ym}, ${x2} ${y2}`;
 }
 
-/** SVG gutter for one commit row (curved multi-lane). */
-export function GitGraphRow({ row, maxLanes }: { row: GraphRow; maxLanes: number }) {
+/** SVG gutter for one commit row (curved multi-lane). `theme` picks the palette
+ * so lanes stay legible in both light and dark. */
+export function GitGraphRow({
+  row,
+  maxLanes,
+  theme,
+}: {
+  row: GraphRow;
+  maxLanes: number;
+  theme: "dark" | "light";
+}) {
+  const palette = theme === "light" ? LANE_COLORS_LIGHT : LANE_COLORS_DARK;
+  const laneColor = (col: number): string => palette[col % palette.length];
   const width = Math.max(1, maxLanes) * CELL;
   const node = cx(row.col);
   return (
@@ -101,7 +114,8 @@ export function GitGraphRow({ row, maxLanes }: { row: GraphRow; maxLanes: number
           <path key={`p${pi}`} d={edge(node, ROW / 2, cx(pc), ROW)} stroke={laneColor(pc)} fill="none" strokeWidth={1.6} />
         ) : null;
       })}
-      <circle cx={node} cy={ROW / 2} r={RADIUS} fill={laneColor(row.col)} stroke="#1e1e2e" strokeWidth={1} />
+      {/* The ring uses the panel bg so the node separates from the lines in both themes. */}
+      <circle className="git-graph-node" cx={node} cy={ROW / 2} r={RADIUS} fill={laneColor(row.col)} strokeWidth={1} />
     </svg>
   );
 }
