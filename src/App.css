@@ -603,14 +603,15 @@ body {
   min-height: 0;
   overflow: auto;
   margin: 0;
-  padding: 4px 0;
-  font-family: "JetBrains Mono", "DejaVu Sans Mono", "Noto Sans Mono CJK KR", monospace;
-  font-size: 0.82em;
-  line-height: 1.4;
 }
-.diff-body > div {
+/* Fixed metrics so virtualization math (LINE_H) is exact. */
+.diff-line {
+  height: 18px;
+  line-height: 18px;
   padding: 0 10px;
   white-space: pre;
+  font-family: "JetBrains Mono", "DejaVu Sans Mono", "Noto Sans Mono CJK KR", monospace;
+  font-size: 12px;
 }
 .diff-add {
   background: rgba(166, 227, 161, 0.12);

@@ -1,6 +1,10 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { IDockviewPanelProps } from "dockview-react";
 import { invoke } from "@tauri-apps/api/core";
+
+/** Fixed line metrics for diff virtualization (must match .diff-line CSS). */
+const LINE_H = 18;
+const OVERSCAN = 24;
 
 export interface DiffParams {
   kind?: "diff";
@@ -46,6 +50,20 @@ export function DiffPanel(props: IDockviewPanelProps<DiffParams>) {
   const { cwd, path, staged, hash } = props.params;
   const [text, setText] = useState<string | null>(null);
   const [err, setErr] = useState<string | null>(null);
+  const bodyRef = useRef<HTMLDivElement>(null);
+  const [scrollTop, setScrollTop] = useState(0);
+  const [viewH, setViewH] = useState(800);
+  const lines = useMemo(() => (text ? text.split("\n") : []), [text]);
+
+  // Measure the scroll viewport so only visible lines render (large-diff virtualization).
+  useEffect(() => {
+    const el = bodyRef.current;
+    if (!el) return;
+    setViewH(el.clientHeight);
+    const ro = new ResizeObserver(() => setViewH(el.clientHeight));
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, [text]);
 
   const load = useCallback(() => {
     setText(null);
@@ -66,6 +84,9 @@ export function DiffPanel(props: IDockviewPanelProps<DiffParams>) {
 
   useEffect(() => load(), [load]);
 
+  const start = Math.max(0, Math.floor(scrollTop / LINE_H) - OVERSCAN);
+  const end = Math.min(lines.length, Math.ceil((scrollTop + viewH) / LINE_H) + OVERSCAN);
+
   return (
     <div className="diff-panel">
       <div className="diff-head">
@@ -81,13 +102,22 @@ export function DiffPanel(props: IDockviewPanelProps<DiffParams>) {
       ) : text.trim() === "" ? (
         <div className="diff-empty">변경 내용이 없습니다.</div>
       ) : (
-        <pre className="diff-body">
-          {text.split("\n").map((l, i) => (
-            <div key={i} className={lineClass(l)}>
-              {l || " "}
+        <div
+          className="diff-body"
+          ref={bodyRef}
+          onScroll={(e) => setScrollTop(e.currentTarget.scrollTop)}
+        >
+          {/* spacer = total height; only the visible window is rendered */}
+          <div style={{ height: lines.length * LINE_H, position: "relative" }}>
+            <div style={{ position: "absolute", top: start * LINE_H, left: 0, right: 0 }}>
+              {lines.slice(start, end).map((l, i) => (
+                <div key={start + i} className={`diff-line ${lineClass(l)}`}>
+                  {l || " "}
+                </div>
+              ))}
             </div>
-          ))}
-        </pre>
+          </div>
+        </div>
       )}
     </div>
   );
