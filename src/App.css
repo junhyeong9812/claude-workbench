@@ -2382,3 +2382,20 @@ body {
   background: var(--bg-hover);
   color: var(--fg);
 }
+
+/* ---- PDF (pdf.js canvas pages) ---- */
+.study-pdf {
+  flex: 1 1 0;
+  min-height: 0;
+  overflow: auto;
+  padding: 12px;
+  background: var(--bg-alt);
+  text-align: center;
+}
+.study-pdf-page {
+  display: block;
+  margin: 0 auto 12px;
+  max-width: 100%;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.35);
+  background: #fff;
+}

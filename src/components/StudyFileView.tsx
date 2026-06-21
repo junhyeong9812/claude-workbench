@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { invoke, convertFileSrc } from "@tauri-apps/api/core";
 import { marked } from "marked";
 import DOMPurify from "dompurify";
+import { PdfView } from "./PdfView";
 import { EditorView, basicSetup } from "codemirror";
 import { EditorState } from "@codemirror/state";
 import { keymap } from "@codemirror/view";
@@ -107,7 +108,7 @@ export function StudyFileView({ path, editable = false }: { path: string; editab
         <img src={convertFileSrc(path)} alt={path} />
       </div>
     );
-  if (isPdf(path)) return <iframe className="study-media-pdf" title={path} src={convertFileSrc(path)} />;
+  if (isPdf(path)) return <PdfView path={path} />;
   if (isBinary(path))
     return <div className="study-view-note">바이너리 파일이라 미리볼 수 없습니다.<br />{path.split("/").pop()}</div>;
   if (renderMarkdown) return <MarkdownView path={path} />;
