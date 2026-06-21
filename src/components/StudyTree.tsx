@@ -39,6 +39,7 @@ export function StudyTree({
   const childrenCache = useAppStore((s) => s.childrenCache);
   const loadChildren = useAppStore((s) => s.loadChildren);
   const reloadDir = useAppStore((s) => s.reloadDir);
+  const closeStudyTabsUnder = useAppStore((s) => s.closeStudyTabsUnder);
   const [expanded, setExpanded] = useState<Set<string>>(() => new Set());
   const [cursor, setCursor] = useState<string | null>(null);
   const [menu, setMenu] = useState<{ x: number; y: number; entry: DirEntry } | null>(null);
@@ -176,6 +177,7 @@ export function StudyTree({
           if (!window.confirm(`${entry.path}\n삭제할까요?${entry.is_dir ? " (폴더 전체)" : ""}`)) return;
           try {
             await invoke("delete_path", { path: entry.path });
+            closeStudyTabsUnder(entry.path); // prune now-dead tabs
             await reloadDir(dirname(entry.path));
           } catch (err) {
             alert(`삭제 실패: ${errText(err)}`);

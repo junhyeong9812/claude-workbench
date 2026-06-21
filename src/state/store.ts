@@ -227,6 +227,8 @@ interface AppState {
   openStudyPreview: (side: "left" | "right", path: string) => void;
   /** Cycle the active tab by `dir` (+1/-1) in stable order (Alt+←/→ tab nav). */
   cycleStudyTab: (side: "left" | "right", dir: 1 | -1) => void;
+  /** Close any study tabs at `path` or under it (after a delete) — both sides. */
+  closeStudyTabsUnder: (path: string) => void;
   /** Persist the current workspace to the backend. */
   persist: () => void;
 }
@@ -430,6 +432,23 @@ export const useAppStore = create<AppState>((set, get) => ({
       const i = tabs.indexOf(s.studyActive[side] ?? "");
       const ni = ((i === -1 ? 0 : i) + dir + tabs.length) % tabs.length;
       return { studyActive: { ...s.studyActive, [side]: tabs[ni] } };
+    });
+    saveStudyView(get());
+  },
+  closeStudyTabsUnder: (path) => {
+    const match = (p: string) => p === path || p.startsWith(`${path}/`);
+    set((s) => {
+      const prune = (side: "left" | "right") => {
+        const tabs = s.studyTabs[side].filter((p) => !match(p));
+        const active = match(s.studyActive[side] ?? "\0") ? (tabs[0] ?? null) : s.studyActive[side];
+        return { tabs, active };
+      };
+      const L = prune("left");
+      const R = prune("right");
+      return {
+        studyTabs: { left: L.tabs, right: R.tabs },
+        studyActive: { left: L.active, right: R.active },
+      };
     });
     saveStudyView(get());
   },
