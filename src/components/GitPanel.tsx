@@ -156,7 +156,9 @@ export function GitPanel() {
   const staged = status?.changes.filter((c) => c.staged && !c.conflicted) ?? [];
   const unstaged = status?.changes.filter((c) => !c.staged && !c.conflicted) ?? [];
   const merging = status?.merging ?? false;
-  const canCommit = staged.length > 0 && message.trim().length > 0 && !busy;
+  // During a merge, conclude via the banner's '계속'(merge --continue) instead of
+  // a normal commit, so the prepared merge message is used (codex TF-2).
+  const canCommit = staged.length > 0 && message.trim().length > 0 && !busy && !merging;
 
   const fileRow = (c: FileChange, label: string, depth: number, kind: "staged" | "unstaged"): ReactNode => (
     <div key={c.path} className="git-file" style={{ paddingLeft: 8 + depth * 12 }}>

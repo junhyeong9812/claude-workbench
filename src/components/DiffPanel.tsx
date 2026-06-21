@@ -55,10 +55,13 @@ export function DiffPanel(props: IDockviewPanelProps<DiffParams>) {
   const [viewH, setViewH] = useState(800);
   const lines = useMemo(() => (text ? text.split("\n") : []), [text]);
 
-  // Measure the scroll viewport so only visible lines render (large-diff virtualization).
+  // Measure the scroll viewport + reset scroll on new content (so a deep scroll
+  // into a previous diff can't leave a shorter diff blank — codex TF-1).
   useEffect(() => {
+    setScrollTop(0);
     const el = bodyRef.current;
     if (!el) return;
+    el.scrollTop = 0;
     setViewH(el.clientHeight);
     const ro = new ResizeObserver(() => setViewH(el.clientHeight));
     ro.observe(el);
@@ -84,8 +87,8 @@ export function DiffPanel(props: IDockviewPanelProps<DiffParams>) {
 
   useEffect(() => load(), [load]);
 
-  const start = Math.max(0, Math.floor(scrollTop / LINE_H) - OVERSCAN);
   const end = Math.min(lines.length, Math.ceil((scrollTop + viewH) / LINE_H) + OVERSCAN);
+  const start = Math.max(0, Math.min(Math.floor(scrollTop / LINE_H) - OVERSCAN, end));
 
   return (
     <div className="diff-panel">
