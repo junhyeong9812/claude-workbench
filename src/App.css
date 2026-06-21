@@ -8,6 +8,17 @@
   --accent: #0e639c;
 }
 
+/* Light theme — toggled via document.documentElement[data-theme="light"]. */
+:root[data-theme="light"] {
+  --bg: #ffffff;
+  --bg-alt: #f3f3f3;
+  --bg-hover: #e8e8e8;
+  --border: #d4d4d4;
+  --fg: #1f1f1f;
+  --fg-dim: #6a6a6a;
+  --accent: #0066b8;
+}
+
 * {
   box-sizing: border-box;
 }
@@ -197,7 +208,7 @@ body {
   z-index: 30;
   display: flex;
   flex-direction: column;
-  background: #1e1e2e;
+  background: var(--bg);
 }
 .peek-head {
   flex: 0 0 auto;
@@ -251,7 +262,7 @@ body {
   flex-direction: column;
   height: 100%;
   min-height: 0;
-  background: #1e1e2e;
+  background: var(--bg);
 }
 .editor-head {
   flex: 0 0 auto;
@@ -313,7 +324,7 @@ body {
   flex-direction: column;
   height: 100%;
   min-height: 0;
-  background: #1e1e2e;
+  background: var(--bg);
   color: var(--fg, #cdd6f4);
   font-size: 0.82em;
 }
@@ -354,7 +365,7 @@ body {
   text-overflow: ellipsis;
 }
 .git-branch select {
-  background: #181825;
+  background: var(--bg-alt);
   color: var(--fg, #cdd6f4);
   border: 1px solid var(--border, #45475a);
   border-radius: 4px;
@@ -471,7 +482,7 @@ body {
   box-sizing: border-box;
   height: 48px;
   resize: vertical;
-  background: #181825;
+  background: var(--bg-alt);
   color: var(--fg, #cdd6f4);
   border: 1px solid var(--border, #45475a);
   border-radius: 4px;
@@ -574,7 +585,7 @@ body {
   flex-direction: column;
   height: 100%;
   min-height: 0;
-  background: #1e1e2e;
+  background: var(--bg);
   color: var(--fg, #cdd6f4);
 }
 .diff-head {
@@ -1051,7 +1062,7 @@ body {
   flex-direction: column;
   width: min(720px, 86%);
   height: min(560px, 80%);
-  background: #1e1e2e;
+  background: var(--bg);
   border: 1px solid var(--border, #45475a);
   border-radius: 8px;
   box-shadow: 0 8px 32px rgba(0, 0, 0, 0.5);
@@ -1130,7 +1141,7 @@ body {
   min-width: 0;
   padding: 2px 4px;
   box-sizing: border-box;
-  background: #1e1e2e;
+  background: var(--bg);
 }
 .claudeterm-timeline {
   flex: 1 1 0;

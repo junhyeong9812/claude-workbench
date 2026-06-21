@@ -23,10 +23,19 @@ export default function App() {
   const treePanelRef = useRef<ImperativePanelHandle>(null);
   const [collapsed, setCollapsed] = useState(false);
   const [sideTab, setSideTab] = useState<"files" | "git" | "worktree">("files");
+  const [theme, setTheme] = useState<"dark" | "light">(
+    () => (localStorage.getItem("theme") as "dark" | "light") || "dark",
+  );
 
   useEffect(() => {
     void init();
   }, [init]);
+
+  // Apply + persist the color theme (dark default / light).
+  useEffect(() => {
+    document.documentElement.setAttribute("data-theme", theme);
+    localStorage.setItem("theme", theme);
+  }, [theme]);
 
   // Ctrl+B focuses the folder tree (so keyboard nav can start without a click).
   useEffect(() => {
@@ -56,6 +65,13 @@ export default function App() {
       <div className="toolbar">
         <button className="toolbar-btn" onClick={toggleTree}>
           {collapsed ? "Show tree" : "Hide tree"}
+        </button>
+        <button
+          className="toolbar-btn"
+          title="라이트/다크 테마 전환"
+          onClick={() => setTheme((t) => (t === "dark" ? "light" : "dark"))}
+        >
+          {theme === "dark" ? "☀ 라이트" : "🌙 다크"}
         </button>
         <span className="toolbar-title">
           {activeProject ?? "multi-terminal"}
