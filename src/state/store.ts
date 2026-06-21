@@ -118,6 +118,9 @@ interface AppState {
   /** Study view: dockview layout of the single pinned Claude study session
    * (keeps the session attached across mode switches within a run). */
   studySessionLayout: unknown | null;
+  /** Study view: per-side open behavior. "viewer" = tree cursor follows and
+   * replaces a single preview (read); "editor" = files accumulate as tabs. */
+  studyMode: { left: "viewer" | "editor"; right: "viewer" | "editor" };
   /** Custom terminal color overrides (merged over the theme base), or null to
    * follow the theme. Persisted. */
   termColors: Partial<ITheme> | null;
@@ -168,6 +171,10 @@ interface AppState {
   setStudyActive: (side: "left" | "right", path: string) => void;
   /** Save the study session's dockview layout. */
   setStudySessionLayout: (layout: unknown | null) => void;
+  /** Set a study side's open mode (viewer / editor). */
+  setStudyMode: (side: "left" | "right", mode: "viewer" | "editor") => void;
+  /** Viewer-mode open: replace the side's single preview tab (no accumulation). */
+  openStudyPreview: (side: "left" | "right", path: string) => void;
   /** Persist the current workspace to the backend. */
   persist: () => void;
 }
@@ -194,6 +201,7 @@ export const useAppStore = create<AppState>((set, get) => ({
   studyTabs: { left: [], right: [] },
   studyActive: { left: null, right: null },
   studySessionLayout: null,
+  studyMode: { left: "viewer", right: "viewer" },
 
   init: async () => {
     try {
@@ -338,6 +346,12 @@ export const useAppStore = create<AppState>((set, get) => ({
       };
     }),
   setStudySessionLayout: (layout) => set({ studySessionLayout: layout }),
+  setStudyMode: (side, mode) => set((s) => ({ studyMode: { ...s.studyMode, [side]: mode } })),
+  openStudyPreview: (side, path) =>
+    set((s) => ({
+      studyTabs: { ...s.studyTabs, [side]: [path] },
+      studyActive: { ...s.studyActive, [side]: path },
+    })),
 
   toggleExpanded: (dirPath) => {
     set((s) => ({

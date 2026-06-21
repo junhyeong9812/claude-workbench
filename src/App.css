@@ -2059,6 +2059,17 @@ body {
 .study-tree-row:hover {
   background: var(--bg-hover);
 }
+.study-tree:focus {
+  outline: none;
+}
+.study-tree-row.cursor {
+  background: var(--bg-hover);
+  box-shadow: inset 2px 0 0 var(--accent);
+}
+.study-tree:focus .study-tree-row.cursor {
+  outline: 1px solid var(--accent);
+  outline-offset: -1px;
+}
 .study-tree-caret {
   flex: 0 0 auto;
   width: 10px;
