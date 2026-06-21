@@ -236,8 +236,15 @@ fn parse_log(out: &str) -> Vec<Commit> {
     commits
 }
 
-/// Recent commits across all refs (newest first), for the history graph.
-pub fn log(cwd: &str, limit: u32) -> Result<Vec<Commit>, String> {
+/// Recent commits across all refs for the history graph. `order`: "topo"
+/// (topological — keeps branches contiguous), "author" (author-date), else
+/// "date" (commit-date, default).
+pub fn log(cwd: &str, limit: u32, order: &str) -> Result<Vec<Commit>, String> {
+    let order_flag = match order {
+        "topo" => "--topo-order",
+        "author" => "--author-date-order",
+        _ => "--date-order",
+    };
     let fmt = "--pretty=format:%H%x1f%h%x1f%P%x1f%an%x1f%ad%x1f%D%x1f%s%x1e";
     let out = run_git(
         cwd,
@@ -245,6 +252,7 @@ pub fn log(cwd: &str, limit: u32) -> Result<Vec<Commit>, String> {
             "log",
             &format!("-{limit}"),
             "--all",
+            order_flag,
             "--date=format:%Y-%m-%d %H:%M",
             fmt,
         ],

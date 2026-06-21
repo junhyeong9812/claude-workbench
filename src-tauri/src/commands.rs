@@ -937,8 +937,13 @@ pub fn git_push(cwd: String) -> Result<String, AppError> {
 
 /// Recent commits across all refs (newest first) for the history graph.
 #[tauri::command]
-pub fn git_log(cwd: String, limit: Option<u32>) -> Result<Vec<core_lib::git::Commit>, AppError> {
-    core_lib::git::log(&cwd, limit.unwrap_or(200)).map_err(AppError::new)
+pub fn git_log(
+    cwd: String,
+    limit: Option<u32>,
+    order: Option<String>,
+) -> Result<Vec<core_lib::git::Commit>, AppError> {
+    core_lib::git::log(&cwd, limit.unwrap_or(200), order.as_deref().unwrap_or("date"))
+        .map_err(AppError::new)
 }
 
 // ---- Git GP3 (actions) + GP4 (worktrees) ----

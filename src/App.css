@@ -1844,3 +1844,11 @@ body {
 .placeholder-sub {
   font-size: 12px;
 }
+.git-sort {
+  background: var(--bg-alt);
+  color: var(--fg);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  font-size: 0.9em;
+  padding: 0 2px;
+}

@@ -96,6 +96,7 @@ export function GitPanel() {
   const [busy, setBusy] = useState(false);
   const [note, setNote] = useState("");
   const [view, setView] = useState<"tree" | "flat">("tree");
+  const [sort, setSort] = useState<"date" | "topo" | "author">("date");
   const reqRef = useRef(0);
 
   const reload = useCallback(async () => {
@@ -114,7 +115,9 @@ export function GitPanel() {
       if (st.is_repo) {
         const [br, lg] = await Promise.all([
           invoke<Branches>("git_branches", { cwd: target }).catch(() => null),
-          invoke<Commit[]>("git_log", { cwd: target, limit: 200 }).catch(() => [] as Commit[]),
+          invoke<Commit[]>("git_log", { cwd: target, limit: 200, order: sort }).catch(
+            () => [] as Commit[],
+          ),
         ]);
         if (reqRef.current !== myReq) return;
         setBranches(br);
@@ -126,7 +129,7 @@ export function GitPanel() {
     } catch (e) {
       if (reqRef.current === myReq) setNote(errText(e));
     }
-  }, [cwd]);
+  }, [cwd, sort]);
 
   useEffect(() => {
     void reload();
@@ -500,7 +503,20 @@ export function GitPanel() {
 
       {/* Bottom half: commit history graph */}
       <div className="git-graph-pane">
-        <div className="git-section-head">히스토리</div>
+        <div className="git-section-head">
+          히스토리
+          <select
+            className="git-sort"
+            value={sort}
+            disabled={busy}
+            title="그래프 정렬"
+            onChange={(e) => setSort(e.target.value as "date" | "topo" | "author")}
+          >
+            <option value="date">커밋 날짜순</option>
+            <option value="topo">토폴로지순</option>
+            <option value="author">작성 날짜순</option>
+          </select>
+        </div>
         <div className="git-graph">
           {(() => {
             const rows = computeGraph(commits);
