@@ -1,11 +1,36 @@
 import { useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { marked } from "marked";
 import { EditorView, basicSetup } from "codemirror";
 import { EditorState } from "@codemirror/state";
 import { keymap } from "@codemirror/view";
 import { useAppStore } from "../state/store";
 import { langFor } from "./cmLang";
 import { cmThemeExt } from "./cmTheme";
+
+const isMarkdown = (p: string): boolean => /\.(md|markdown|mdx)$/i.test(p);
+
+/** Rendered-markdown viewer (viewer mode only). */
+function MarkdownView({ path }: { path: string }) {
+  const [html, setHtml] = useState<string | null>(null);
+  const [err, setErr] = useState<string | null>(null);
+  useEffect(() => {
+    let cancelled = false;
+    invoke<string>("acp_read_file", { path })
+      .then((text) => {
+        if (!cancelled) setHtml(marked.parse(text, { async: false }) as string);
+      })
+      .catch((e) => {
+        if (!cancelled) setErr(typeof e === "string" ? e : ((e as { message?: string })?.message ?? "읽기 실패"));
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [path]);
+  if (err) return <div className="study-view-err">{err}</div>;
+  if (html == null) return <div className="study-md study-md-loading">불러오는 중…</div>;
+  return <div className="study-md" dangerouslySetInnerHTML={{ __html: html }} />;
+}
 
 /**
  * CodeMirror view of one file for a study viewer tab. Read-only in viewer mode;
@@ -17,7 +42,12 @@ export function StudyFileView({ path, editable = false }: { path: string; editab
   const [err, setErr] = useState<string | null>(null);
   const [status, setStatus] = useState("");
 
+  // Viewer mode renders markdown as formatted HTML; editor mode edits the source.
+  const renderMarkdown = !editable && isMarkdown(path);
+
   useEffect(() => {
+    if (renderMarkdown) return; // CodeMirror not used for the rendered view
+
     let cancelled = false;
     let view: EditorView | null = null;
     setErr(null);
@@ -60,6 +90,7 @@ export function StudyFileView({ path, editable = false }: { path: string; editab
     };
   }, [path, theme, editable]);
 
+  if (renderMarkdown) return <MarkdownView path={path} />;
   if (err) return <div className="study-view-err">{err}</div>;
   return (
     <>
