@@ -58,37 +58,50 @@ export function computeGraph(commits: GraphCommit[]): GraphRow[] {
   return rows;
 }
 
-const CELL = 12;
-const ROW = 22;
-const RADIUS = 3.5;
+const CELL = 14;
+const ROW = 24;
+const RADIUS = 4;
 const LANE_COLORS = ["#89b4fa", "#a6e3a1", "#f9e2af", "#f5c2e7", "#94e2d5", "#fab387", "#f38ba8"];
 const laneColor = (col: number): string => LANE_COLORS[col % LANE_COLORS.length];
 const cx = (col: number): number => col * CELL + CELL / 2;
 
-/** SVG gutter for one commit row. */
+/** A path from (x1,y1)→(x2,y2): straight if same column, else a smooth S-curve
+ * (vertical-tangent cubic bezier) so lane shifts/merges read as curves. */
+function edge(x1: number, y1: number, x2: number, y2: number): string {
+  if (x1 === x2) return `M${x1} ${y1} L${x2} ${y2}`;
+  const ym = (y1 + y2) / 2;
+  return `M${x1} ${y1} C${x1} ${ym}, ${x2} ${ym}, ${x2} ${y2}`;
+}
+
+/** SVG gutter for one commit row (curved multi-lane). */
 export function GitGraphRow({ row, maxLanes }: { row: GraphRow; maxLanes: number }) {
   const width = Math.max(1, maxLanes) * CELL;
+  const node = cx(row.col);
   return (
     <svg width={width} height={ROW} className="git-graph-svg" style={{ flex: `0 0 ${width}px` }}>
-      {row.before.map((h, i) =>
-        h != null ? (
-          <line key={`b${i}`} x1={cx(i)} y1={0} x2={cx(i)} y2={ROW / 2} stroke={laneColor(i)} strokeWidth={1.5} />
-        ) : null,
-      )}
-      {row.after.map((h, i) =>
-        h != null ? (
-          <line key={`a${i}`} x1={cx(i)} y1={ROW / 2} x2={cx(i)} y2={ROW} stroke={laneColor(i)} strokeWidth={1.5} />
-        ) : null,
-      )}
+      {/* Incoming lanes from the top: the commit's own lane(s) curve into the node;
+          other lanes pass straight through to their column in `after`. */}
+      {row.before.map((h, i) => {
+        if (h == null) return null;
+        if (h === row.commit.hash) {
+          return (
+            <path key={`in${i}`} d={edge(cx(i), 0, node, ROW / 2)} stroke={laneColor(i)} fill="none" strokeWidth={1.6} />
+          );
+        }
+        const af = row.after.indexOf(h);
+        if (af < 0) return null;
+        return (
+          <path key={`th${i}`} d={edge(cx(i), 0, cx(af), ROW)} stroke={laneColor(i)} fill="none" strokeWidth={1.6} />
+        );
+      })}
+      {/* Outgoing edges: node → each parent's lane in `after` (merges fan out). */}
       {row.commit.parents.map((p, pi) => {
         const pc = row.after.indexOf(p);
-        // Connect the node to a parent that sits in a *different* lane (merge/branch
-        // diagonal); same-lane parents are already covered by the after-line.
-        return pc >= 0 && pc !== row.col ? (
-          <line key={`p${pi}`} x1={cx(row.col)} y1={ROW / 2} x2={cx(pc)} y2={ROW} stroke={laneColor(pc)} strokeWidth={1.5} />
+        return pc >= 0 ? (
+          <path key={`p${pi}`} d={edge(node, ROW / 2, cx(pc), ROW)} stroke={laneColor(pc)} fill="none" strokeWidth={1.6} />
         ) : null;
       })}
-      <circle cx={cx(row.col)} cy={ROW / 2} r={RADIUS} fill={laneColor(row.col)} />
+      <circle cx={node} cy={ROW / 2} r={RADIUS} fill={laneColor(row.col)} stroke="#1e1e2e" strokeWidth={1} />
     </svg>
   );
 }
