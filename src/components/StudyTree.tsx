@@ -133,7 +133,13 @@ export function StudyTree({
         onClick: async () => {
           const name = window.prompt(`새 파일 이름 (${targetDir})`);
           if (!name || !name.trim()) return;
-          const np = `${targetDir}/${name.trim()}`;
+          const clean = name.trim();
+          // Keep new files inside the folder — no separators / parent escapes (codex SF-1).
+          if (/[\\/]/.test(clean) || clean.split("/").includes("..") || clean.includes("..")) {
+            alert("파일 이름에 경로 구분자(/ \\)나 ..는 쓸 수 없습니다.");
+            return;
+          }
+          const np = `${targetDir}/${clean}`;
           try {
             await invoke("write_file", { path: np, content: "" });
             if (entry.is_dir) expand(entry.path);

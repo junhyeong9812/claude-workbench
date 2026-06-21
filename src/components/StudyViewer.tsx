@@ -20,7 +20,6 @@ export function StudyViewer({ side, focusId }: { side: "left" | "right"; focusId
   const mode = useAppStore((s) => s.studyMode[side]);
   const setStudyActive = useAppStore((s) => s.setStudyActive);
   const closeStudyTab = useAppStore((s) => s.closeStudyTab);
-  const cycleStudyTab = useAppStore((s) => s.cycleStudyTab);
   const [menuOpen, setMenuOpen] = useState(false);
   const [menuIdx, setMenuIdx] = useState(0);
   const [ctx, setCtx] = useState<{ x: number; y: number; path: string } | null>(null);
@@ -41,15 +40,10 @@ export function StudyViewer({ side, focusId }: { side: "left" | "right"; focusId
     rootRef.current?.focus();
   };
 
+  // Alt+←/→ (tab cycle) is handled at the StudyView level so it works from the
+  // sidebar too; here we only open the overflow dropdown (Alt+↓).
   const onRootKey = (e: React.KeyboardEvent) => {
-    if (!e.altKey) return; // Ctrl/plain handled elsewhere (column nav / textarea)
-    if (e.key === "ArrowRight") {
-      e.preventDefault();
-      cycleStudyTab(side, 1);
-    } else if (e.key === "ArrowLeft") {
-      e.preventDefault();
-      cycleStudyTab(side, -1);
-    } else if (e.key === "ArrowDown" && tabs.length > 0) {
+    if (e.altKey && e.key === "ArrowDown" && tabs.length > 0) {
       e.preventDefault();
       openMenu();
     }

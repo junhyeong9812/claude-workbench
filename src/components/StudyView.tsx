@@ -2,6 +2,7 @@ import { Panel, PanelGroup, PanelResizeHandle } from "react-resizable-panels";
 import { StudySidebar } from "./StudySidebar";
 import { StudyViewer } from "./StudyViewer";
 import { StudySession } from "./StudySession";
+import { useAppStore } from "../state/store";
 
 /** Focusable element ids for the four study columns, left→right. Ctrl+←/→ moves
  * focus across them (mouse-free). */
@@ -18,10 +19,12 @@ const FOCUS_IDS = ["study-focus-0", "study-focus-1", "study-focus-2", "study-foc
  * its own keys (tree ↑↓/Enter, viewer Alt+←/→ tabs).
  */
 export function StudyView() {
-  // Ctrl+←/→ : move focus to the adjacent column. No-op if focus is elsewhere
-  // (e.g. inside the study session, which keeps its own pane navigation).
+  // Ctrl+←/→ moves focus across the four columns; Alt+←/→ cycles the focused
+  // side's viewer tabs (works from the sidebar too — codex SF-5). No-op if focus
+  // is elsewhere (e.g. the study session, which keeps its own pane navigation).
   const onKeyDown = (e: React.KeyboardEvent) => {
-    if (!e.ctrlKey || (e.key !== "ArrowLeft" && e.key !== "ArrowRight")) return;
+    const isArrow = e.key === "ArrowLeft" || e.key === "ArrowRight";
+    if (!isArrow || (!e.ctrlKey && !e.altKey)) return;
     const ae = document.activeElement;
     const cur = FOCUS_IDS.findIndex((id) => {
       const el = document.getElementById(id);
@@ -29,8 +32,13 @@ export function StudyView() {
     });
     if (cur === -1) return;
     e.preventDefault();
-    const ni = e.key === "ArrowRight" ? Math.min(cur + 1, 3) : Math.max(cur - 1, 0);
-    document.getElementById(FOCUS_IDS[ni])?.focus();
+    if (e.ctrlKey) {
+      const ni = e.key === "ArrowRight" ? Math.min(cur + 1, 3) : Math.max(cur - 1, 0);
+      document.getElementById(FOCUS_IDS[ni])?.focus();
+    } else {
+      const side = cur < 2 ? "left" : "right";
+      useAppStore.getState().cycleStudyTab(side, e.key === "ArrowRight" ? 1 : -1);
+    }
   };
 
   return (

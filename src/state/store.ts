@@ -21,15 +21,29 @@ const STUDY_DEFAULT: StudyPersist = {
   mode: { left: "viewer", right: "viewer" },
 };
 
-/** Safe-parse the persisted study view slice (P4). Falls back to defaults. */
+/** Safe-parse + validate the persisted study view slice (P4). Validates nested
+ * fields so corrupt/old JSON can't break consumers (codex SF-4). */
 function loadStudyView(): StudyPersist {
   try {
     const v = JSON.parse(localStorage.getItem("studyView") || "null");
-    if (v && typeof v === "object") return { ...STUDY_DEFAULT, ...v };
+    if (!v || typeof v !== "object") return STUDY_DEFAULT;
+    const str = (x: unknown): string | null => (typeof x === "string" ? x : null);
+    const strArr = (x: unknown): string[] =>
+      Array.isArray(x) ? x.filter((p): p is string => typeof p === "string") : [];
+    const md = (x: unknown): "viewer" | "editor" => (x === "editor" ? "editor" : "viewer");
+    const F = (v.folders ?? {}) as Record<string, unknown>;
+    const T = (v.tabs ?? {}) as Record<string, unknown>;
+    const A = (v.active ?? {}) as Record<string, unknown>;
+    const M = (v.mode ?? {}) as Record<string, unknown>;
+    return {
+      folders: { left: str(F.left), right: str(F.right) },
+      tabs: { left: strArr(T.left), right: strArr(T.right) },
+      active: { left: str(A.left), right: str(A.right) },
+      mode: { left: md(M.left), right: md(M.right) },
+    };
   } catch {
-    /* fall through */
+    return STUDY_DEFAULT;
   }
-  return STUDY_DEFAULT;
 }
 
 /** Persist the study view slice to localStorage (survives restart). */

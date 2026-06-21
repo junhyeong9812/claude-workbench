@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { marked } from "marked";
+import DOMPurify from "dompurify";
 import { EditorView, basicSetup } from "codemirror";
 import { EditorState } from "@codemirror/state";
 import { keymap } from "@codemirror/view";
@@ -18,7 +19,8 @@ function MarkdownView({ path }: { path: string }) {
     let cancelled = false;
     invoke<string>("acp_read_file", { path })
       .then((text) => {
-        if (!cancelled) setHtml(marked.parse(text, { async: false }) as string);
+        // marked is not a sanitizer — purify before injecting (codex SF-2).
+        if (!cancelled) setHtml(DOMPurify.sanitize(marked.parse(text, { async: false }) as string));
       })
       .catch((e) => {
         if (!cancelled) setErr(typeof e === "string" ? e : ((e as { message?: string })?.message ?? "읽기 실패"));
