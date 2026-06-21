@@ -333,7 +333,10 @@ export function MainArea() {
   const createNewSession = () => {
     const name = newName.trim() || "Claude";
     setPicker(null);
-    addPanel("claudeterm", { title: name });
+    // Give the new session a stable UUID up front so it's saved in the layout
+    // immediately → resumes the same session after restart (create-or-resume in
+    // claude_start handles the not-yet-chatted case). #6
+    addPanel("claudeterm", { title: name, loadSessionId: crypto.randomUUID() });
   };
 
   // Alt+←/→/↑/↓ cycles the active session tab (dockview panel). Left/Up = prev,
