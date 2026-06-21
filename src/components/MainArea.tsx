@@ -14,6 +14,7 @@ import { PlaceholderPanel } from "./PlaceholderPanel";
 import { TerminalPanel } from "./TerminalPanel";
 import { ClaudeTermPanel } from "./ClaudeTermPanel";
 import { EditorPanel } from "./EditorPanel";
+import { DiffPanel } from "./DiffPanel";
 import { fileName } from "./cmLang";
 import { ClaudeTab } from "./ClaudeTab";
 
@@ -47,6 +48,7 @@ const components = {
   terminal: TerminalPanel,
   claudeterm: ClaudeTermPanel,
   editor: EditorPanel,
+  diff: DiffPanel,
 };
 
 type PanelKind = "terminal" | "editor" | "claudeterm";
@@ -64,6 +66,8 @@ export function MainArea() {
   const projects = useAppStore((s) => s.projects);
   const editorOpenRequest = useAppStore((s) => s.editorOpenRequest);
   const requestEditorOpen = useAppStore((s) => s.requestEditorOpen);
+  const diffRequest = useAppStore((s) => s.diffRequest);
+  const requestDiff = useAppStore((s) => s.requestDiff);
   const setLayout = useAppStore((s) => s.setLayout);
 
   const apiRef = useRef<DockviewApi | null>(null);
@@ -176,6 +180,28 @@ export function MainArea() {
     addPanel("editor", { path, title: fileName(path) });
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [editorOpenRequest, activeProject]);
+
+  // Open a diff panel (changed file or commit) when requested from the Git panel.
+  useEffect(() => {
+    if (!diffRequest) return;
+    const api = apiRef.current;
+    if (!api) return;
+    const spec = diffRequest;
+    requestDiff(null);
+    const key = spec.hash ? `diff:${spec.hash}` : `diff:${spec.path}:${spec.staged ? 1 : 0}`;
+    const existing = api.panels.find((p) => p.id === key);
+    if (existing) {
+      existing.api.setActive();
+      return;
+    }
+    api.addPanel({
+      id: key,
+      component: "diff",
+      title: spec.title,
+      params: { kind: "diff", ...spec },
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [diffRequest, activeProject]);
 
   // Resolve a close request from a Claude tab's × (B3-1): 닫기 keeps the saved
   // history, 삭제 also removes it; both close the panel.

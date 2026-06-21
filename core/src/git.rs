@@ -391,6 +391,26 @@ pub fn worktree_remove(cwd: &str, path: &str) -> Result<String, String> {
     run_git(cwd, &["worktree", "remove", "--", path])
 }
 
+// ---- diff viewer ----
+
+/// Unified diff for one path — staged (`--cached`) or working-tree.
+pub fn diff(cwd: &str, path: &str, staged: bool) -> Result<String, String> {
+    if staged {
+        run_git(cwd, &["diff", "--cached", "--", path])
+    } else {
+        run_git(cwd, &["diff", "--", path])
+    }
+}
+
+/// A commit's full diff (`git show`). `hash` comes from our log; guard a leading
+/// `-` defensively so it can't be parsed as an option.
+pub fn show(cwd: &str, hash: &str) -> Result<String, String> {
+    if hash.starts_with('-') || hash.is_empty() {
+        return Err("잘못된 커밋 해시입니다".to_string());
+    }
+    run_git(cwd, &["show", hash])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

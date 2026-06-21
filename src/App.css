@@ -535,6 +535,80 @@ body {
   opacity: 0.5;
   font-size: 0.9em;
 }
+.git-clickable {
+  cursor: pointer;
+}
+.git-clickable:hover {
+  text-decoration: underline;
+}
+.git-commit-row-g.git-clickable:hover {
+  background: var(--bg-hover, rgba(255, 255, 255, 0.06));
+  text-decoration: none;
+}
+
+/* ---- Diff viewer panel ---- */
+.diff-panel {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-height: 0;
+  background: #1e1e2e;
+  color: var(--fg, #cdd6f4);
+}
+.diff-head {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 4px 10px;
+  font-size: 0.8em;
+  color: var(--fg-dim);
+  background: rgba(255, 255, 255, 0.03);
+  border-bottom: 1px solid var(--border, #333);
+}
+.diff-title {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.diff-empty {
+  padding: 12px;
+  color: var(--fg-dim);
+}
+.diff-body {
+  flex: 1 1 0;
+  min-height: 0;
+  overflow: auto;
+  margin: 0;
+  padding: 4px 0;
+  font-family: "JetBrains Mono", "DejaVu Sans Mono", "Noto Sans Mono CJK KR", monospace;
+  font-size: 0.82em;
+  line-height: 1.4;
+}
+.diff-body > div {
+  padding: 0 10px;
+  white-space: pre;
+}
+.diff-add {
+  background: rgba(166, 227, 161, 0.12);
+  color: #a6e3a1;
+}
+.diff-del {
+  background: rgba(243, 139, 168, 0.12);
+  color: #f38ba8;
+}
+.diff-hunk {
+  color: #94e2d5;
+}
+.diff-meta {
+  color: var(--fg-dim);
+  opacity: 0.7;
+}
+.diff-ctx {
+  color: var(--fg, #cdd6f4);
+  opacity: 0.85;
+}
 
 /* ---- Main area (dockview) ---- */
 .main-area {

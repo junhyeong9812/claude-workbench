@@ -997,3 +997,13 @@ pub fn git_worktree_add(cwd: String, path: String, branch: String) -> Result<Str
 pub fn git_worktree_remove(cwd: String, path: String) -> Result<String, AppError> {
     core_lib::git::worktree_remove(&cwd, &path).map_err(AppError::new)
 }
+
+#[tauri::command]
+pub fn git_diff(cwd: String, path: String, staged: bool) -> Result<String, AppError> {
+    core_lib::git::diff(&cwd, &path, staged).map_err(AppError::new)
+}
+
+#[tauri::command]
+pub fn git_show(cwd: String, hash: String) -> Result<String, AppError> {
+    core_lib::git::show(&cwd, &hash).map_err(AppError::new)
+}

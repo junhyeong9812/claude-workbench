@@ -2,6 +2,17 @@ import { create } from "zustand";
 import { invoke } from "@tauri-apps/api/core";
 import type { DirEntry, Project, ProjectType, WorkspaceState } from "../types";
 
+/** A request to open a diff in the main area (file change or a commit). */
+export interface DiffSpec {
+  title: string;
+  cwd: string;
+  /** File diff: the path (+ `staged`). */
+  path?: string;
+  staged?: boolean;
+  /** Commit diff: the commit hash. */
+  hash?: string;
+}
+
 /**
  * Global shell state.
  *
@@ -27,6 +38,8 @@ interface AppState {
   /** A request to open a file in the editor (consumed by MainArea, which owns the
    * dockview api), or null. Transient. */
   editorOpenRequest: string | null;
+  /** A request to open a diff panel (consumed by MainArea), or null. Transient. */
+  diffRequest: DiffSpec | null;
 
   /** Load persisted state from the backend on startup. */
   init: () => Promise<void>;
@@ -54,6 +67,8 @@ interface AppState {
   setPeekFile: (path: string | null) => void;
   /** Request opening a file in the editor (MainArea consumes + clears with null). */
   requestEditorOpen: (path: string | null) => void;
+  /** Request opening a diff panel (MainArea consumes + clears with null). */
+  requestDiff: (spec: DiffSpec | null) => void;
   /** Persist the current workspace to the backend. */
   persist: () => void;
 }
@@ -71,6 +86,7 @@ export const useAppStore = create<AppState>((set, get) => ({
   treeCursor: null,
   peekFile: null,
   editorOpenRequest: null,
+  diffRequest: null,
 
   init: async () => {
     try {
@@ -173,6 +189,7 @@ export const useAppStore = create<AppState>((set, get) => ({
   setTreeCursor: (path) => set({ treeCursor: path }),
   setPeekFile: (path) => set({ peekFile: path }),
   requestEditorOpen: (path) => set({ editorOpenRequest: path }),
+  requestDiff: (spec) => set({ diffRequest: spec }),
 
   toggleExpanded: (dirPath) => {
     set((s) => ({

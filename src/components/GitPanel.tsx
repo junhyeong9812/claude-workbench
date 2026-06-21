@@ -86,6 +86,7 @@ function buildTree(changes: FileChange[]): TreeNode {
  */
 export function GitPanel() {
   const cwd = useAppStore((s) => s.activeProject);
+  const requestDiff = useAppStore((s) => s.requestDiff);
   const [status, setStatus] = useState<GitStatus | null>(null);
   const [branches, setBranches] = useState<Branches | null>(null);
   const [commits, setCommits] = useState<Commit[]>([]);
@@ -158,7 +159,18 @@ export function GitPanel() {
       <span className={`git-code${kind === "staged" ? " git-staged" : ""}`}>
         {c.code || (kind === "staged" ? "·" : "??")}
       </span>
-      <span className="git-path" title={c.path}>
+      <span
+        className="git-path git-clickable"
+        title={`${c.path}\n(클릭: diff 보기)`}
+        onClick={() =>
+          requestDiff({
+            title: c.path.split("/").pop() ?? c.path,
+            cwd: cwd as string,
+            path: c.path,
+            staged: kind === "staged",
+          })
+        }
+      >
         {label}
       </span>
       {kind === "unstaged" && (
@@ -410,7 +422,12 @@ export function GitPanel() {
               const c = row.commit;
               const refs = parseRefs(c.refs);
               return (
-                <div key={c.hash} className="git-commit-row-g" title={`${c.short} · ${c.author} · ${c.date}`}>
+                <div
+                  key={c.hash}
+                  className="git-commit-row-g git-clickable"
+                  title={`${c.short} · ${c.author} · ${c.date}\n(클릭: 커밋 변경 보기)`}
+                  onClick={() => requestDiff({ title: `${c.short} ${c.subject}`, cwd: cwd as string, hash: c.hash })}
+                >
                   <GitGraphRow row={row} maxLanes={maxLanes} />
                   <span className="git-chash">{c.short}</span>
                   {refs.map((r, i) => (
