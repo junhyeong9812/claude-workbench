@@ -411,6 +411,33 @@ pub fn show(cwd: &str, hash: &str) -> Result<String, String> {
     run_git(cwd, &["show", hash])
 }
 
+// ---- T1: tags ----
+
+/// Tags, newest first.
+pub fn tags(cwd: &str) -> Result<Vec<String>, String> {
+    Ok(run_git(cwd, &["tag", "--sort=-creatordate"])?
+        .lines()
+        .map(|l| l.trim().to_string())
+        .filter(|l| !l.is_empty())
+        .collect())
+}
+
+/// Create a tag at HEAD — lightweight, or annotated when `message` is given.
+pub fn create_tag(cwd: &str, name: &str, message: &str) -> Result<String, String> {
+    safe_ref(name)?;
+    if message.is_empty() {
+        run_git(cwd, &["tag", name])
+    } else {
+        run_git(cwd, &["tag", "-a", name, "-m", message])
+    }
+}
+
+/// Delete a tag.
+pub fn delete_tag(cwd: &str, name: &str) -> Result<String, String> {
+    safe_ref(name)?;
+    run_git(cwd, &["tag", "-d", name])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

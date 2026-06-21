@@ -348,6 +348,32 @@ export function GitPanel() {
           <button
             className="git-btn"
             disabled={busy}
+            title="HEAD에 태그 생성"
+            onClick={() => {
+              const name = window.prompt("태그 이름");
+              if (!name || !name.trim()) return;
+              const message = window.prompt("주석 메시지 (비우면 lightweight)") ?? "";
+              act(() => invoke("git_create_tag", { cwd, name: name.trim(), message }), "태그 생성");
+            }}
+          >
+            tag
+          </button>
+          <button
+            className="git-btn"
+            disabled={busy}
+            title="태그 삭제"
+            onClick={() => {
+              const name = window.prompt("삭제할 태그 이름");
+              if (!name || !name.trim()) return;
+              if (!window.confirm(`태그 '${name.trim()}'를 삭제할까요?`)) return;
+              act(() => invoke("git_delete_tag", { cwd, name: name.trim() }), "태그 삭제");
+            }}
+          >
+            tag−
+          </button>
+          <button
+            className="git-btn"
+            disabled={busy}
             title={view === "tree" ? "목록형으로" : "폴더형으로"}
             onClick={() => setView((v) => (v === "tree" ? "flat" : "tree"))}
           >

@@ -1007,3 +1007,18 @@ pub fn git_diff(cwd: String, path: String, staged: bool) -> Result<String, AppEr
 pub fn git_show(cwd: String, hash: String) -> Result<String, AppError> {
     core_lib::git::show(&cwd, &hash).map_err(AppError::new)
 }
+
+#[tauri::command]
+pub fn git_tags(cwd: String) -> Result<Vec<String>, AppError> {
+    core_lib::git::tags(&cwd).map_err(AppError::new)
+}
+
+#[tauri::command]
+pub fn git_create_tag(cwd: String, name: String, message: String) -> Result<String, AppError> {
+    core_lib::git::create_tag(&cwd, &name, &message).map_err(AppError::new)
+}
+
+#[tauri::command]
+pub fn git_delete_tag(cwd: String, name: String) -> Result<String, AppError> {
+    core_lib::git::delete_tag(&cwd, &name).map_err(AppError::new)
+}
