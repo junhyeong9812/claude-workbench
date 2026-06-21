@@ -91,6 +91,8 @@ interface AppState {
   theme: "dark" | "light";
   /** Code font size in px (terminals + editor/viewer), persisted. */
   fontSize: number;
+  /** Workspace view mode: normal workspace or the two-folder study view. Persisted. */
+  mode: "workspace" | "study";
   /** Custom terminal color overrides (merged over the theme base), or null to
    * follow the theme. Persisted. */
   termColors: Partial<ITheme> | null;
@@ -129,6 +131,8 @@ interface AppState {
   setFontSize: (n: number) => void;
   /** Set (or clear with null) the custom terminal color overrides. */
   setTermColors: (c: Partial<ITheme> | null) => void;
+  /** Switch the workspace view mode (workspace / study). */
+  setMode: (mode: "workspace" | "study") => void;
   /** Persist the current workspace to the backend. */
   persist: () => void;
 }
@@ -150,6 +154,7 @@ export const useAppStore = create<AppState>((set, get) => ({
   theme: (localStorage.getItem("theme") as "dark" | "light") || "dark",
   fontSize: clampFontSize(Number(localStorage.getItem("fontSize")) || 13),
   termColors: loadTermColors(),
+  mode: (localStorage.getItem("mode") as "workspace" | "study") || "workspace",
 
   init: async () => {
     try {
@@ -259,6 +264,10 @@ export const useAppStore = create<AppState>((set, get) => ({
     if (c) localStorage.setItem("termColors", JSON.stringify(c));
     else localStorage.removeItem("termColors");
     set({ termColors: c });
+  },
+  setMode: (mode) => {
+    localStorage.setItem("mode", mode);
+    set({ mode });
   },
 
   toggleExpanded: (dirPath) => {

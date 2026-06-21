@@ -1,0 +1,43 @@
+import { Panel, PanelGroup, PanelResizeHandle } from "react-resizable-panels";
+
+/**
+ * Study-view workspace mode (P1 — layout skeleton).
+ *
+ * Two folders side by side for comparison, each with its own sidebar + a
+ * multi-tab viewer, over a single pinned Claude study session:
+ *
+ *   [좌 사이드바][좌 뷰어][우 뷰어][우 사이드바]   ← all resizable
+ *   [        스터디 Claude 세션 + 타임라인        ]
+ *
+ * P1 lays out the resizable structure with placeholders; sidebars/viewers (P2)
+ * and the study session (P3) fill in next.
+ */
+export function StudyView() {
+  return (
+    <PanelGroup direction="vertical" className="study-view">
+      <Panel defaultSize={70} minSize={30}>
+        <PanelGroup direction="horizontal" className="study-cols">
+          <Panel defaultSize={18} minSize={8} className="study-col">
+            <div className="study-ph study-ph-sidebar">좌 사이드바 (폴더 A) · P2</div>
+          </Panel>
+          <PanelResizeHandle className="resize-handle" />
+          <Panel defaultSize={32} minSize={15} className="study-col">
+            <div className="study-ph">좌 뷰어 (멀티탭) · P2</div>
+          </Panel>
+          <PanelResizeHandle className="resize-handle" />
+          <Panel defaultSize={32} minSize={15} className="study-col">
+            <div className="study-ph">우 뷰어 (멀티탭) · P2</div>
+          </Panel>
+          <PanelResizeHandle className="resize-handle" />
+          <Panel defaultSize={18} minSize={8} className="study-col">
+            <div className="study-ph study-ph-sidebar">우 사이드바 (폴더 B) · P2</div>
+          </Panel>
+        </PanelGroup>
+      </Panel>
+      <PanelResizeHandle className="resize-handle resize-handle-v" />
+      <Panel defaultSize={30} minSize={10} className="study-col">
+        <div className="study-ph study-ph-term">스터디 Claude 세션 1개 + 타임라인 · P3</div>
+      </Panel>
+    </PanelGroup>
+  );
+}

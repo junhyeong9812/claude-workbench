@@ -12,6 +12,7 @@ import { WorktreePanel } from "./components/WorktreePanel";
 import { MainArea } from "./components/MainArea";
 import { FilePeekViewer } from "./components/FilePeekViewer";
 import { TerminalSettings } from "./components/TerminalSettings";
+import { StudyView } from "./components/StudyView";
 import { useAppStore } from "./state/store";
 import "./App.css";
 
@@ -29,6 +30,8 @@ export default function App() {
   const setTheme = useAppStore((s) => s.setTheme);
   const fontSize = useAppStore((s) => s.fontSize);
   const setFontSize = useAppStore((s) => s.setFontSize);
+  const mode = useAppStore((s) => s.mode);
+  const setMode = useAppStore((s) => s.setMode);
 
   useEffect(() => {
     void init();
@@ -99,11 +102,21 @@ export default function App() {
         >
           터미널색
         </button>
+        <button
+          className="toolbar-btn"
+          title="워크스페이스 ↔ 스터디 모드 전환"
+          onClick={() => setMode(mode === "study" ? "workspace" : "study")}
+        >
+          {mode === "study" ? "워크스페이스" : "스터디"}
+        </button>
         <span className="toolbar-title">
           {activeProject ?? "multi-terminal"}
         </span>
       </div>
-      <PanelGroup direction="horizontal" className="panes">
+      {mode === "study" ? (
+        <StudyView />
+      ) : (
+        <PanelGroup direction="horizontal" className="panes">
         <Panel
           ref={treePanelRef}
           defaultSize={20}
@@ -156,7 +169,8 @@ export default function App() {
             <FilePeekViewer path={peekFile} onClose={() => setPeekFile(null)} />
           )}
         </Panel>
-      </PanelGroup>
+        </PanelGroup>
+      )}
       {termSettingsOpen && <TerminalSettings onClose={() => setTermSettingsOpen(false)} />}
     </div>
   );
