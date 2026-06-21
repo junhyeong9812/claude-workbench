@@ -6,6 +6,22 @@ import type { DirEntry, Project, ProjectType, WorkspaceState } from "../types";
 /** Clamp a font size to the allowed range (also normalizes NaN). */
 export const clampFontSize = (n: number): number => Math.max(9, Math.min(28, Math.round(n) || 13));
 
+/** Safe-parse the persisted study root folders. */
+function loadStudyFolders(): { left: string | null; right: string | null } {
+  try {
+    const v = JSON.parse(localStorage.getItem("studyFolders") || "null");
+    if (v && typeof v === "object") {
+      return {
+        left: typeof v.left === "string" ? v.left : null,
+        right: typeof v.right === "string" ? v.right : null,
+      };
+    }
+  } catch {
+    /* fall through */
+  }
+  return { left: null, right: null };
+}
+
 const TERM_COLOR_KEYS = new Set([
   "background",
   "foreground",
@@ -93,6 +109,12 @@ interface AppState {
   fontSize: number;
   /** Workspace view mode: normal workspace or the two-folder study view. Persisted. */
   mode: "workspace" | "study";
+  /** Study view: root folder per side (persisted). */
+  studyFolders: { left: string | null; right: string | null };
+  /** Study view: open file tabs per side, MRU order (most recent first). */
+  studyTabs: { left: string[]; right: string[] };
+  /** Study view: active tab path per side. */
+  studyActive: { left: string | null; right: string | null };
   /** Custom terminal color overrides (merged over the theme base), or null to
    * follow the theme. Persisted. */
   termColors: Partial<ITheme> | null;
@@ -133,6 +155,14 @@ interface AppState {
   setTermColors: (c: Partial<ITheme> | null) => void;
   /** Switch the workspace view mode (workspace / study). */
   setMode: (mode: "workspace" | "study") => void;
+  /** Set (or clear) a study side's root folder (resets that side's tabs). */
+  setStudyFolder: (side: "left" | "right", path: string | null) => void;
+  /** Open a file in a study side's viewer (front of MRU + active). */
+  openStudyTab: (side: "left" | "right", path: string) => void;
+  /** Close a study tab (fixes the active tab if it was the one closed). */
+  closeStudyTab: (side: "left" | "right", path: string) => void;
+  /** Activate a study tab (moves it to front of MRU). */
+  setStudyActive: (side: "left" | "right", path: string) => void;
   /** Persist the current workspace to the backend. */
   persist: () => void;
 }
@@ -155,6 +185,9 @@ export const useAppStore = create<AppState>((set, get) => ({
   fontSize: clampFontSize(Number(localStorage.getItem("fontSize")) || 13),
   termColors: loadTermColors(),
   mode: (localStorage.getItem("mode") as "workspace" | "study") || "workspace",
+  studyFolders: loadStudyFolders(),
+  studyTabs: { left: [], right: [] },
+  studyActive: { left: null, right: null },
 
   init: async () => {
     try {
@@ -269,6 +302,35 @@ export const useAppStore = create<AppState>((set, get) => ({
     localStorage.setItem("mode", mode);
     set({ mode });
   },
+  setStudyFolder: (side, path) =>
+    set((s) => {
+      const studyFolders = { ...s.studyFolders, [side]: path };
+      localStorage.setItem("studyFolders", JSON.stringify(studyFolders));
+      return {
+        studyFolders,
+        studyTabs: { ...s.studyTabs, [side]: [] },
+        studyActive: { ...s.studyActive, [side]: null },
+      };
+    }),
+  openStudyTab: (side, path) =>
+    set((s) => ({
+      studyTabs: { ...s.studyTabs, [side]: [path, ...s.studyTabs[side].filter((p) => p !== path)] },
+      studyActive: { ...s.studyActive, [side]: path },
+    })),
+  setStudyActive: (side, path) =>
+    set((s) => ({
+      studyTabs: { ...s.studyTabs, [side]: [path, ...s.studyTabs[side].filter((p) => p !== path)] },
+      studyActive: { ...s.studyActive, [side]: path },
+    })),
+  closeStudyTab: (side, path) =>
+    set((s) => {
+      const next = s.studyTabs[side].filter((p) => p !== path);
+      const active = s.studyActive[side] === path ? (next[0] ?? null) : s.studyActive[side];
+      return {
+        studyTabs: { ...s.studyTabs, [side]: next },
+        studyActive: { ...s.studyActive, [side]: active },
+      };
+    }),
 
   toggleExpanded: (dirPath) => {
     set((s) => ({

@@ -1,4 +1,6 @@
 import { Panel, PanelGroup, PanelResizeHandle } from "react-resizable-panels";
+import { StudySidebar } from "./StudySidebar";
+import { StudyViewer } from "./StudyViewer";
 
 /**
  * Study-view workspace mode (P1 — layout skeleton).
@@ -18,19 +20,19 @@ export function StudyView() {
       <Panel defaultSize={70} minSize={30}>
         <PanelGroup direction="horizontal" className="study-cols">
           <Panel defaultSize={18} minSize={8} className="study-col">
-            <div className="study-ph study-ph-sidebar">좌 사이드바 (폴더 A) · P2</div>
+            <StudySidebar side="left" />
           </Panel>
           <PanelResizeHandle className="resize-handle" />
           <Panel defaultSize={32} minSize={15} className="study-col">
-            <div className="study-ph">좌 뷰어 (멀티탭) · P2</div>
+            <StudyViewer side="left" />
           </Panel>
           <PanelResizeHandle className="resize-handle" />
           <Panel defaultSize={32} minSize={15} className="study-col">
-            <div className="study-ph">우 뷰어 (멀티탭) · P2</div>
+            <StudyViewer side="right" />
           </Panel>
           <PanelResizeHandle className="resize-handle" />
           <Panel defaultSize={18} minSize={8} className="study-col">
-            <div className="study-ph study-ph-sidebar">우 사이드바 (폴더 B) · P2</div>
+            <StudySidebar side="right" />
           </Panel>
         </PanelGroup>
       </Panel>

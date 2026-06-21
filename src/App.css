@@ -2005,3 +2005,177 @@ body {
 .study-ph-term {
   background: var(--bg-alt);
 }
+
+/* ---- Study sidebar + tree (P2) ---- */
+.study-sidebar {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-height: 0;
+  background: var(--bg-alt);
+  overflow: hidden;
+  font-size: 0.85em;
+}
+.study-sidebar-empty {
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  color: var(--fg-dim);
+}
+.study-sb-hint {
+  font-size: 0.9em;
+  opacity: 0.7;
+}
+.study-sb-head {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 8px;
+  border-bottom: 1px solid var(--border);
+  background: rgba(127, 127, 127, 0.08);
+}
+.study-sb-name {
+  flex: 1 1 auto;
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.study-tree {
+  flex: 1 1 0;
+  min-height: 0;
+  overflow: auto;
+  padding: 4px 0;
+}
+.study-tree-row {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 1px 6px;
+  white-space: nowrap;
+  cursor: pointer;
+}
+.study-tree-row:hover {
+  background: var(--bg-hover);
+}
+.study-tree-caret {
+  flex: 0 0 auto;
+  width: 10px;
+  font-size: 8px;
+  color: var(--fg-dim);
+}
+.study-tree-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.study-tree-file .study-tree-name {
+  color: var(--fg);
+}
+
+/* ---- Study viewer + tabs (P2) ---- */
+.study-viewer {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-height: 0;
+  background: var(--bg);
+  overflow: hidden;
+}
+.study-viewer-empty {
+  align-items: center;
+  justify-content: center;
+  color: var(--fg-dim);
+  font-size: 0.85em;
+  text-align: center;
+  padding: 12px;
+}
+.study-tabs {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: stretch;
+  border-bottom: 1px solid var(--border);
+  background: var(--bg-alt);
+  min-height: 26px;
+}
+.study-tabs-list {
+  flex: 1 1 0;
+  min-width: 0;
+  display: flex;
+  overflow: hidden;
+}
+.study-tab {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  max-width: 160px;
+  padding: 2px 8px;
+  border-right: 1px solid var(--border);
+  cursor: pointer;
+  font-size: 0.82em;
+  color: var(--fg-dim);
+}
+.study-tab.active {
+  color: var(--fg);
+  background: var(--bg);
+  border-bottom: 2px solid var(--accent);
+}
+.study-tab-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.study-tab-x {
+  flex: 0 0 auto;
+  opacity: 0.6;
+}
+.study-tab-x:hover {
+  opacity: 1;
+}
+.study-tabs-more {
+  position: relative;
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  padding: 0 4px;
+}
+.study-tabs-menu {
+  position: absolute;
+  top: 100%;
+  right: 0;
+  z-index: 40;
+  min-width: 180px;
+  max-height: 320px;
+  overflow: auto;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.35);
+}
+.study-tabs-menu-item {
+  padding: 4px 10px;
+  font-size: 0.82em;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  cursor: pointer;
+}
+.study-tabs-menu-item:hover {
+  background: var(--bg-hover);
+}
+.study-tabs-menu-item.active {
+  color: var(--accent);
+}
+.study-view-body {
+  flex: 1 1 0;
+  min-height: 0;
+  overflow: hidden;
+}
+.study-view-body .cm-editor {
+  height: 100%;
+}
+.study-view-err {
+  padding: 12px;
+  color: #f38ba8;
+}
