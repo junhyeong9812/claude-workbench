@@ -251,6 +251,10 @@ body {
 .peek-body .cm-editor {
   height: 100%;
 }
+/* Code font size (editor + peek viewer) — driven by the --code-font-size var. */
+.cm-editor {
+  font-size: var(--code-font-size, 13px);
+}
 .peek-err {
   padding: 12px;
   color: #f38ba8;

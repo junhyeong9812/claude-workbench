@@ -363,6 +363,20 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
     if (termRef.current) termRef.current.options.theme = xtermTheme(theme);
   }, [theme]);
 
+  // Live-update terminal font size (+ refit dimensions) on change.
+  const fitRef = useRef<FitAddon | null>(null);
+  const fontSize = useAppStore((s) => s.fontSize);
+  useEffect(() => {
+    if (termRef.current) {
+      termRef.current.options.fontSize = fontSize;
+      try {
+        fitRef.current?.fit();
+      } catch {
+        /* not laid out yet */
+      }
+    }
+  }, [fontSize]);
+
   useEffect(() => {
     const host = hostRef.current;
     if (!host) return;
@@ -372,7 +386,7 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
       // falling back through common Linux fonts.
       fontFamily:
         "'JetBrains Mono', 'DejaVu Sans Mono', 'Noto Sans Mono CJK KR', 'Noto Sans Mono', monospace",
-      fontSize: 13,
+      fontSize: useAppStore.getState().fontSize,
       lineHeight: 1.15,
       cursorBlink: true,
       cursorStyle: "block",
@@ -381,6 +395,7 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
       theme: xtermTheme(useAppStore.getState().theme),
     });
     const fit = new FitAddon();
+    fitRef.current = fit;
     term.loadAddon(fit);
     term.open(host);
     termRef.current = term;

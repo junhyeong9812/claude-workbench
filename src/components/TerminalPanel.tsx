@@ -41,6 +41,7 @@ interface SnapshotResult {
 export function TerminalPanel(props: IDockviewPanelProps<TerminalParams>) {
   const hostRef = useRef<HTMLDivElement | null>(null);
   const termRef = useRef<Terminal | null>(null);
+  const fitRef = useRef<FitAddon | null>(null);
 
   // Live-update the xterm palette when the app theme changes.
   const theme = useAppStore((s) => s.theme);
@@ -48,17 +49,31 @@ export function TerminalPanel(props: IDockviewPanelProps<TerminalParams>) {
     if (termRef.current) termRef.current.options.theme = xtermTheme(theme);
   }, [theme]);
 
+  // Live-update terminal font size (+ refit).
+  const fontSize = useAppStore((s) => s.fontSize);
+  useEffect(() => {
+    if (termRef.current) {
+      termRef.current.options.fontSize = fontSize;
+      try {
+        fitRef.current?.fit();
+      } catch {
+        /* not laid out yet */
+      }
+    }
+  }, [fontSize]);
+
   useEffect(() => {
     const host = hostRef.current;
     if (!host) return;
 
     const term = new Terminal({
       fontFamily: "monospace",
-      fontSize: 13,
+      fontSize: useAppStore.getState().fontSize,
       theme: xtermTheme(useAppStore.getState().theme),
     });
     termRef.current = term;
     const fit = new FitAddon();
+    fitRef.current = fit;
     term.loadAddon(fit);
     term.open(host);
     try {

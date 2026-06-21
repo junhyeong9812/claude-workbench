@@ -25,6 +25,8 @@ export default function App() {
   const [sideTab, setSideTab] = useState<"files" | "git" | "worktree">("files");
   const theme = useAppStore((s) => s.theme);
   const setTheme = useAppStore((s) => s.setTheme);
+  const fontSize = useAppStore((s) => s.fontSize);
+  const setFontSize = useAppStore((s) => s.setFontSize);
 
   useEffect(() => {
     void init();
@@ -35,6 +37,13 @@ export default function App() {
     document.documentElement.setAttribute("data-theme", theme);
     localStorage.setItem("theme", theme);
   }, [theme]);
+
+  // Apply + persist the code font size (CSS var drives CodeMirror; xterm reads it
+  // from the store directly).
+  useEffect(() => {
+    document.documentElement.style.setProperty("--code-font-size", `${fontSize}px`);
+    localStorage.setItem("fontSize", String(fontSize));
+  }, [fontSize]);
 
   // Ctrl+B focuses the folder tree (so keyboard nav can start without a click).
   useEffect(() => {
@@ -71,6 +80,15 @@ export default function App() {
           onClick={() => setTheme(theme === "dark" ? "light" : "dark")}
         >
           {theme === "dark" ? "☀ 라이트" : "🌙 다크"}
+        </button>
+        <button className="toolbar-btn" title="폰트 작게" onClick={() => setFontSize(fontSize - 1)}>
+          A−
+        </button>
+        <span className="toolbar-title" title="코드 폰트 크기">
+          {fontSize}px
+        </span>
+        <button className="toolbar-btn" title="폰트 크게" onClick={() => setFontSize(fontSize + 1)}>
+          A+
         </button>
         <span className="toolbar-title">
           {activeProject ?? "multi-terminal"}

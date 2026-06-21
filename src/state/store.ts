@@ -42,6 +42,8 @@ interface AppState {
   diffRequest: DiffSpec | null;
   /** Color theme (persisted to localStorage). Drives CSS vars + xterm palette. */
   theme: "dark" | "light";
+  /** Code font size in px (terminals + editor/viewer), persisted. */
+  fontSize: number;
 
   /** Load persisted state from the backend on startup. */
   init: () => Promise<void>;
@@ -73,6 +75,8 @@ interface AppState {
   requestDiff: (spec: DiffSpec | null) => void;
   /** Switch the color theme. */
   setTheme: (theme: "dark" | "light") => void;
+  /** Set the code font size (clamped 9–28). */
+  setFontSize: (n: number) => void;
   /** Persist the current workspace to the backend. */
   persist: () => void;
 }
@@ -92,6 +96,7 @@ export const useAppStore = create<AppState>((set, get) => ({
   editorOpenRequest: null,
   diffRequest: null,
   theme: (localStorage.getItem("theme") as "dark" | "light") || "dark",
+  fontSize: Number(localStorage.getItem("fontSize")) || 13,
 
   init: async () => {
     try {
@@ -196,6 +201,7 @@ export const useAppStore = create<AppState>((set, get) => ({
   requestEditorOpen: (path) => set({ editorOpenRequest: path }),
   requestDiff: (spec) => set({ diffRequest: spec }),
   setTheme: (theme) => set({ theme }),
+  setFontSize: (n) => set({ fontSize: Math.max(9, Math.min(28, Math.round(n))) }),
 
   toggleExpanded: (dirPath) => {
     set((s) => ({
