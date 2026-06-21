@@ -39,6 +39,15 @@ export function EditorPanel(props: IDockviewPanelProps<EditorParams>) {
     viewRef.current?.dispatch({ effects: themeComp.current.reconfigure(cmThemeExt(theme)) });
   }, [theme]);
 
+  // Focus the editor whenever this panel becomes active (covers reopening an
+  // already-open file via Ctrl+E — the panel is re-activated, not recreated).
+  useEffect(() => {
+    const d = props.api.onDidActiveChange(() => {
+      if (props.api.isActive) viewRef.current?.focus();
+    });
+    return () => d.dispose();
+  }, [props.api]);
+
   const baseTitle = (props.params.title as string) ?? (path ? fileName(path) : "Editor");
 
   // Reflect dirty state in the dockview tab title.
@@ -99,6 +108,8 @@ export function EditorPanel(props: IDockviewPanelProps<EditorParams>) {
             ],
           }),
         });
+        // Ctrl+E should land the cursor in the editor, not just open the tab.
+        viewRef.current.focus();
       })
       .catch((e) => {
         if (!cancelled) {
