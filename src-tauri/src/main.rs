@@ -2,5 +2,5 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 fn main() {
-    multi_terminal_lib::run();
+    claude_workbench_lib::run();
 }

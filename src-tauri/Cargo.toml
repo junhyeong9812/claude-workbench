@@ -1,13 +1,13 @@
 [package]
-name = "multi-terminal"
+name = "claude-workbench"
 version = "0.1.0"
-description = "Multi-terminal IDE shell"
+description = "Claude Workbench — Claude-centric IDE shell (terminals + Git + study)"
 edition = "2021"
 
 # The Tauri app's reusable logic lives in a lib so both desktop `main.rs` and
 # (future) mobile entry points can share it.
 [lib]
-name = "multi_terminal_lib"
+name = "claude_workbench_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
 [build-dependencies]
