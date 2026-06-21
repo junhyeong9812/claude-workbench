@@ -17,6 +17,7 @@ const basename = (p: string): string => p.split(/[\\/]/).filter(Boolean).pop() ?
 export function StudyViewer({ side, focusId }: { side: "left" | "right"; focusId?: string }) {
   const tabs = useAppStore((s) => s.studyTabs[side]);
   const active = useAppStore((s) => s.studyActive[side]);
+  const mode = useAppStore((s) => s.studyMode[side]);
   const setStudyActive = useAppStore((s) => s.setStudyActive);
   const closeStudyTab = useAppStore((s) => s.closeStudyTab);
   const cycleStudyTab = useAppStore((s) => s.cycleStudyTab);
@@ -135,7 +136,7 @@ export function StudyViewer({ side, focusId }: { side: "left" | "right"; focusId
           </div>
         )}
       </div>
-      {active && <StudyFileView key={active} path={active} />}
+      {active && <StudyFileView key={`${active}:${mode}`} path={active} editable={mode === "editor"} />}
       {ctx && (
         <ContextMenu
           x={ctx.x}

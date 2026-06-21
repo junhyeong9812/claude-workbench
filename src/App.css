@@ -269,9 +269,22 @@ body {
 .peek-body .cm-editor {
   height: 100%;
 }
-/* Code font size (editor + peek viewer) — driven by the --code-font-size var. */
+/* Code font (editor + peek + study viewers) — clean monospace + sized via var. */
 .cm-editor {
   font-size: var(--code-font-size, 13px);
+  font-family: "JetBrains Mono", "DejaVu Sans Mono", "Noto Sans Mono CJK KR", "Noto Sans Mono",
+    ui-monospace, monospace;
+}
+.cm-editor .cm-content {
+  font-variant-ligatures: none;
+}
+.study-edit-status {
+  flex: 0 0 auto;
+  padding: 2px 8px;
+  font-size: 0.72em;
+  color: var(--fg-dim);
+  border-top: 1px solid var(--border);
+  background: var(--bg-alt);
 }
 .peek-err {
   padding: 12px;
