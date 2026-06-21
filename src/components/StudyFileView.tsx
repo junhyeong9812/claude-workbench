@@ -12,6 +12,11 @@ import { cmThemeExt } from "./cmTheme";
 const isMarkdown = (p: string): boolean => /\.(md|markdown|mdx)$/i.test(p);
 const isImage = (p: string): boolean => /\.(png|jpe?g|gif|webp|bmp|svg|ico|avif)$/i.test(p);
 const isPdf = (p: string): boolean => /\.pdf$/i.test(p);
+/** Known binary/compiled file types — not previewable as text. */
+const isBinary = (p: string): boolean =>
+  /\.(class|jar|war|ear|zip|gz|tgz|tar|rar|7z|exe|dll|so|o|a|lib|bin|dat|pyc|pyo|wasm|node|woff2?|ttf|otf|eot|mp[34]|m4a|mov|avi|mkv|wav|flac|ogg|webm|db|sqlite3?|jks|keystore|p12|pfx|kotlin_module|kotlin_builtins)$/i.test(
+    p,
+  );
 
 /** Rendered-markdown viewer (viewer mode only). */
 function MarkdownView({ path }: { path: string }) {
@@ -48,8 +53,8 @@ export function StudyFileView({ path, editable = false }: { path: string; editab
 
   // Viewer mode renders markdown as formatted HTML; editor mode edits the source.
   const renderMarkdown = !editable && isMarkdown(path);
-  // Images/PDF are always shown as media (not editable as text).
-  const renderMedia = isImage(path) || isPdf(path);
+  // Images/PDF/binary are shown as media/placeholder, never read as text.
+  const renderMedia = isImage(path) || isPdf(path) || isBinary(path);
 
   useEffect(() => {
     if (renderMarkdown || renderMedia) return; // CodeMirror not used for rendered/media views
@@ -103,8 +108,10 @@ export function StudyFileView({ path, editable = false }: { path: string; editab
       </div>
     );
   if (isPdf(path)) return <iframe className="study-media-pdf" title={path} src={convertFileSrc(path)} />;
+  if (isBinary(path))
+    return <div className="study-view-note">바이너리 파일이라 미리볼 수 없습니다.<br />{path.split("/").pop()}</div>;
   if (renderMarkdown) return <MarkdownView path={path} />;
-  if (err) return <div className="study-view-err">{err}</div>;
+  if (err) return <div className="study-view-note">미리볼 수 없는 파일입니다 (바이너리이거나 읽기 실패).</div>;
   return (
     <>
       <div className="study-view-body" ref={hostRef} />
