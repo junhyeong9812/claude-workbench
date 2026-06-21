@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { invoke } from "@tauri-apps/api/core";
+import { invoke, convertFileSrc } from "@tauri-apps/api/core";
 import { marked } from "marked";
 import DOMPurify from "dompurify";
 import { EditorView, basicSetup } from "codemirror";
@@ -10,6 +10,8 @@ import { langFor } from "./cmLang";
 import { cmThemeExt } from "./cmTheme";
 
 const isMarkdown = (p: string): boolean => /\.(md|markdown|mdx)$/i.test(p);
+const isImage = (p: string): boolean => /\.(png|jpe?g|gif|webp|bmp|svg|ico|avif)$/i.test(p);
+const isPdf = (p: string): boolean => /\.pdf$/i.test(p);
 
 /** Rendered-markdown viewer (viewer mode only). */
 function MarkdownView({ path }: { path: string }) {
@@ -46,9 +48,11 @@ export function StudyFileView({ path, editable = false }: { path: string; editab
 
   // Viewer mode renders markdown as formatted HTML; editor mode edits the source.
   const renderMarkdown = !editable && isMarkdown(path);
+  // Images/PDF are always shown as media (not editable as text).
+  const renderMedia = isImage(path) || isPdf(path);
 
   useEffect(() => {
-    if (renderMarkdown) return; // CodeMirror not used for the rendered view
+    if (renderMarkdown || renderMedia) return; // CodeMirror not used for rendered/media views
 
     let cancelled = false;
     let view: EditorView | null = null;
@@ -92,6 +96,13 @@ export function StudyFileView({ path, editable = false }: { path: string; editab
     };
   }, [path, theme, editable]);
 
+  if (isImage(path))
+    return (
+      <div className="study-media">
+        <img src={convertFileSrc(path)} alt={path} />
+      </div>
+    );
+  if (isPdf(path)) return <iframe className="study-media-pdf" title={path} src={convertFileSrc(path)} />;
   if (renderMarkdown) return <MarkdownView path={path} />;
   if (err) return <div className="study-view-err">{err}</div>;
   return (

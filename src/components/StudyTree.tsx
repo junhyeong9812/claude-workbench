@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { useAppStore } from "../state/store";
 import type { DirEntry } from "../types";
@@ -27,11 +27,14 @@ export function StudyTree({
   onActivate,
   onPreview,
   id,
+  reloadSignal,
 }: {
   root: string;
   onActivate: (path: string) => void;
   onPreview?: (path: string) => void;
   id?: string;
+  /** Bump to force an immediate disk re-read (manual refresh button). */
+  reloadSignal?: number;
 }) {
   const childrenCache = useAppStore((s) => s.childrenCache);
   const loadChildren = useAppStore((s) => s.loadChildren);
@@ -39,6 +42,22 @@ export function StudyTree({
   const [expanded, setExpanded] = useState<Set<string>>(() => new Set());
   const [cursor, setCursor] = useState<string | null>(null);
   const [menu, setMenu] = useState<{ x: number; y: number; entry: DirEntry } | null>(null);
+  // Re-read the root + every expanded dir from disk (reflects external add/delete).
+  const expandedRef = useRef(expanded);
+  expandedRef.current = expanded;
+  const refreshFromDisk = useCallback(() => {
+    void reloadDir(root);
+    expandedRef.current.forEach((d) => void reloadDir(d));
+  }, [root, reloadDir]);
+  // Periodic polling (every 4s) so external file changes show up on their own.
+  useEffect(() => {
+    const t = setInterval(refreshFromDisk, 4000);
+    return () => clearInterval(t);
+  }, [refreshFromDisk]);
+  // Manual force-refresh (sidebar ↻ button bumps reloadSignal).
+  useEffect(() => {
+    if (reloadSignal) refreshFromDisk();
+  }, [reloadSignal, refreshFromDisk]);
   const onPreviewRef = useRef(onPreview);
   onPreviewRef.current = onPreview;
 

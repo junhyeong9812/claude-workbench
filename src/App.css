@@ -273,8 +273,8 @@ body {
  * antialiased smoothing avoids the blurry subpixel rendering on Linux/WebKitGTK. */
 .cm-editor {
   font-size: var(--code-font-size, 13px);
-  font-family: "DejaVu Sans Mono", "JetBrains Mono", "Noto Sans Mono CJK KR", "Ubuntu Mono",
-    ui-monospace, monospace;
+  font-family: "JetBrains Mono", "Cascadia Code", "Noto Sans Mono", "DejaVu Sans Mono",
+    "Noto Sans Mono CJK KR", ui-monospace, monospace;
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
 }
@@ -2284,7 +2284,7 @@ body {
   color: var(--accent);
 }
 .study-md code {
-  font-family: "DejaVu Sans Mono", "JetBrains Mono", monospace;
+  font-family: "JetBrains Mono", "Cascadia Code", "Noto Sans Mono", "DejaVu Sans Mono", monospace;
   font-size: 0.85em;
   background: var(--bg-hover);
   padding: 1px 4px;
@@ -2323,4 +2323,27 @@ body {
   border: none;
   border-top: 1px solid var(--border);
   margin: 1em 0;
+}
+
+/* ---- Study media (image / PDF) ---- */
+.study-media {
+  flex: 1 1 0;
+  min-height: 0;
+  overflow: auto;
+  display: flex;
+  align-items: flex-start;
+  justify-content: center;
+  padding: 12px;
+  background: var(--bg);
+}
+.study-media img {
+  max-width: 100%;
+  height: auto;
+}
+.study-media-pdf {
+  flex: 1 1 0;
+  min-height: 0;
+  width: 100%;
+  border: none;
+  background: var(--bg);
 }

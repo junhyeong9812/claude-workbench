@@ -1,3 +1,4 @@
+import { useState } from "react";
 import { open } from "@tauri-apps/plugin-dialog";
 import { useAppStore } from "../state/store";
 import { StudyTree } from "./StudyTree";
@@ -14,6 +15,7 @@ export function StudySidebar({ side, focusId }: { side: "left" | "right"; focusI
   const setStudyMode = useAppStore((s) => s.setStudyMode);
   const openStudyTab = useAppStore((s) => s.openStudyTab);
   const openStudyPreview = useAppStore((s) => s.openStudyPreview);
+  const [reloadSignal, setReloadSignal] = useState(0);
 
   const pick = async () => {
     const sel = await open({ directory: true, multiple: false });
@@ -48,11 +50,20 @@ export function StudySidebar({ side, focusId }: { side: "left" | "right"; focusI
         >
           {mode === "viewer" ? "뷰어" : "에디터"}
         </button>
+        <button className="git-mini" title="디스크에서 새로고침" onClick={() => setReloadSignal((n) => n + 1)}>
+          ↻
+        </button>
         <button className="git-mini" title="폴더 변경" onClick={() => void pick()}>
           ⋯
         </button>
       </div>
-      <StudyTree root={folder} onActivate={onActivate} onPreview={onPreview} id={focusId} />
+      <StudyTree
+        root={folder}
+        onActivate={onActivate}
+        onPreview={onPreview}
+        id={focusId}
+        reloadSignal={reloadSignal}
+      />
     </div>
   );
 }
