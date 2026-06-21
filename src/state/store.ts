@@ -3,13 +3,50 @@ import { invoke } from "@tauri-apps/api/core";
 import type { ITheme } from "@xterm/xterm";
 import type { DirEntry, Project, ProjectType, WorkspaceState } from "../types";
 
-/** Safe-parse the persisted terminal color overrides. */
+/** Clamp a font size to the allowed range (also normalizes NaN). */
+export const clampFontSize = (n: number): number => Math.max(9, Math.min(28, Math.round(n) || 13));
+
+const TERM_COLOR_KEYS = new Set([
+  "background",
+  "foreground",
+  "cursor",
+  "cursorAccent",
+  "selectionBackground",
+  "black",
+  "red",
+  "green",
+  "yellow",
+  "blue",
+  "magenta",
+  "cyan",
+  "white",
+  "brightBlack",
+  "brightRed",
+  "brightGreen",
+  "brightYellow",
+  "brightBlue",
+  "brightMagenta",
+  "brightCyan",
+  "brightWhite",
+]);
+const isHex = (v: unknown): v is string =>
+  typeof v === "string" && /^#([0-9a-fA-F]{3}|[0-9a-fA-F]{6})$/.test(v);
+
+/** Safe-parse + validate the persisted terminal color overrides — drop unknown
+ * keys / non-hex values, and reject non-objects (codex CF-3). */
 function loadTermColors(): Partial<ITheme> | null {
+  let raw: unknown;
   try {
-    return JSON.parse(localStorage.getItem("termColors") || "null");
+    raw = JSON.parse(localStorage.getItem("termColors") || "null");
   } catch {
     return null;
   }
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
+  const out: Record<string, string> = {};
+  for (const [k, v] of Object.entries(raw as Record<string, unknown>)) {
+    if (TERM_COLOR_KEYS.has(k) && isHex(v)) out[k] = v;
+  }
+  return Object.keys(out).length > 0 ? (out as Partial<ITheme>) : null;
 }
 
 /** A request to open a diff in the main area (file change or a commit). */
@@ -111,7 +148,7 @@ export const useAppStore = create<AppState>((set, get) => ({
   editorOpenRequest: null,
   diffRequest: null,
   theme: (localStorage.getItem("theme") as "dark" | "light") || "dark",
-  fontSize: Number(localStorage.getItem("fontSize")) || 13,
+  fontSize: clampFontSize(Number(localStorage.getItem("fontSize")) || 13),
   termColors: loadTermColors(),
 
   init: async () => {
@@ -217,7 +254,7 @@ export const useAppStore = create<AppState>((set, get) => ({
   requestEditorOpen: (path) => set({ editorOpenRequest: path }),
   requestDiff: (spec) => set({ diffRequest: spec }),
   setTheme: (theme) => set({ theme }),
-  setFontSize: (n) => set({ fontSize: Math.max(9, Math.min(28, Math.round(n))) }),
+  setFontSize: (n) => set({ fontSize: clampFontSize(n) }),
   setTermColors: (c) => {
     if (c) localStorage.setItem("termColors", JSON.stringify(c));
     else localStorage.removeItem("termColors");

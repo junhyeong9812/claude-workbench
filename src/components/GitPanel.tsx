@@ -449,16 +449,22 @@ export function GitPanel() {
                   <button
                     className="git-mini"
                     disabled={busy}
-                    title="내 쪽(현재 브랜치)으로 해결"
-                    onClick={() => act(() => invoke("git_resolve_ours", { cwd, path: c.path }))}
+                    title="내 쪽(현재 브랜치)으로 해결 — 이 파일을 덮어쓰고 stage"
+                    onClick={() => {
+                      if (window.confirm(`${c.path}을(를) 내 쪽으로 덮어쓰고 해결할까요? (수동 편집 사라짐)`))
+                        act(() => invoke("git_resolve_ours", { cwd, path: c.path }));
+                    }}
                   >
                     내것
                   </button>
                   <button
                     className="git-mini"
                     disabled={busy}
-                    title="상대 쪽(머지 대상)으로 해결"
-                    onClick={() => act(() => invoke("git_resolve_theirs", { cwd, path: c.path }))}
+                    title="상대 쪽(머지 대상)으로 해결 — 이 파일을 덮어쓰고 stage"
+                    onClick={() => {
+                      if (window.confirm(`${c.path}을(를) 상대 쪽으로 덮어쓰고 해결할까요? (수동 편집 사라짐)`))
+                        act(() => invoke("git_resolve_theirs", { cwd, path: c.path }));
+                    }}
                   >
                     상대
                   </button>
