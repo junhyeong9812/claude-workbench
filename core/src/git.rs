@@ -173,6 +173,18 @@ pub fn merge_continue(cwd: &str) -> Result<String, String> {
     run_git(cwd, &["commit", "--no-edit"])
 }
 
+/// Resolve a conflict by taking our side (current branch) + stage it.
+pub fn resolve_ours(cwd: &str, path: &str) -> Result<String, String> {
+    run_git(cwd, &["checkout", "--ours", "--", path])?;
+    run_git(cwd, &["add", "--", path])
+}
+
+/// Resolve a conflict by taking their side (merged-in branch) + stage it.
+pub fn resolve_theirs(cwd: &str, path: &str) -> Result<String, String> {
+    run_git(cwd, &["checkout", "--theirs", "--", path])?;
+    run_git(cwd, &["add", "--", path])
+}
+
 /// Local + remote branches, with the current local branch.
 #[derive(Debug, Clone, Serialize)]
 pub struct Branches {

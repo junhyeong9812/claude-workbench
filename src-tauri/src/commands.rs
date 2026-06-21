@@ -1037,3 +1037,13 @@ pub fn git_merge_abort(cwd: String) -> Result<String, AppError> {
 pub fn git_merge_continue(cwd: String) -> Result<String, AppError> {
     core_lib::git::merge_continue(&cwd).map_err(AppError::new)
 }
+
+#[tauri::command]
+pub fn git_resolve_ours(cwd: String, path: String) -> Result<String, AppError> {
+    core_lib::git::resolve_ours(&cwd, &path).map_err(AppError::new)
+}
+
+#[tauri::command]
+pub fn git_resolve_theirs(cwd: String, path: String) -> Result<String, AppError> {
+    core_lib::git::resolve_theirs(&cwd, &path).map_err(AppError::new)
+}

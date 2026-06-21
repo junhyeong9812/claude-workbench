@@ -89,6 +89,7 @@ function buildTree(changes: FileChange[]): TreeNode {
 export function GitPanel() {
   const cwd = useAppStore((s) => s.activeProject);
   const requestDiff = useAppStore((s) => s.requestDiff);
+  const requestEditorOpen = useAppStore((s) => s.requestEditorOpen);
   const [status, setStatus] = useState<GitStatus | null>(null);
   const [branches, setBranches] = useState<Branches | null>(null);
   const [commits, setCommits] = useState<Commit[]>([]);
@@ -440,7 +441,31 @@ export function GitPanel() {
                   <button
                     className="git-mini"
                     disabled={busy}
-                    title="해결됨으로 표시(stage)"
+                    title="에디터로 충돌 마커 직접 편집"
+                    onClick={() => requestEditorOpen(`${cwd}/${c.path}`)}
+                  >
+                    편집
+                  </button>
+                  <button
+                    className="git-mini"
+                    disabled={busy}
+                    title="내 쪽(현재 브랜치)으로 해결"
+                    onClick={() => act(() => invoke("git_resolve_ours", { cwd, path: c.path }))}
+                  >
+                    내것
+                  </button>
+                  <button
+                    className="git-mini"
+                    disabled={busy}
+                    title="상대 쪽(머지 대상)으로 해결"
+                    onClick={() => act(() => invoke("git_resolve_theirs", { cwd, path: c.path }))}
+                  >
+                    상대
+                  </button>
+                  <button
+                    className="git-mini"
+                    disabled={busy}
+                    title="편집 후 해결됨으로 표시(stage)"
                     onClick={() => act(() => invoke("git_stage", { cwd, path: c.path }))}
                   >
                     해결
