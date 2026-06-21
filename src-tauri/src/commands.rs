@@ -851,13 +851,24 @@ pub fn acp_read_file(path: String, max_bytes: Option<u64>) -> Result<String, App
 /// Process-unique suffix so two saves never race on a shared temp path.
 static SAVE_SEQ: AtomicU64 = AtomicU64::new(0);
 
-/// Write `content` to `path` (editor save), **atomically**: write a temp file in
-/// the same directory then `rename` over the target, so a crash / ENOSPC / I/O
-/// error never leaves the original truncated or partial (codex P2 E1). Symlinks
-/// are resolved first so we edit the link's *target* (like most editors), not
-/// replace the link.
+/// Reject empty paths or any `..` parent-dir traversal (defense-in-depth on top
+/// of the UI gates — a buggy/compromised renderer must not escape via `..`).
+fn reject_unsafe_path(path: &str) -> Result<(), AppError> {
+    if path.trim().is_empty() {
+        return Err(AppError::new("빈 경로입니다"));
+    }
+    if std::path::Path::new(path)
+        .components()
+        .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        return Err(AppError::new("'..' 가 포함된 경로는 허용되지 않습니다"));
+    }
+    Ok(())
+}
+
 #[tauri::command]
 pub fn delete_path(path: String) -> Result<(), AppError> {
+    reject_unsafe_path(&path)?;
     let p = std::path::Path::new(&path);
     let md = std::fs::symlink_metadata(p).map_err(|e| AppError::new(io_message("Cannot delete", &e)))?;
     if md.is_dir() {
@@ -867,8 +878,14 @@ pub fn delete_path(path: String) -> Result<(), AppError> {
     }
 }
 
+/// Write `content` to `path` (editor save), **atomically**: write a temp file in
+/// the same directory then `rename` over the target, so a crash / ENOSPC / I/O
+/// error never leaves the original truncated or partial (codex P2 E1). Symlinks
+/// are resolved first so we edit the link's *target* (like most editors), not
+/// replace the link.
 #[tauri::command]
 pub fn write_file(path: String, content: String) -> Result<(), AppError> {
+    reject_unsafe_path(&path)?;
     let p = std::path::Path::new(&path);
     if p.is_dir() {
         return Err(AppError::new("Cannot write: path is a directory"));
