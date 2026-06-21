@@ -924,7 +924,7 @@ body {
   /* xterm needs a sized box; small padding gives the content breathing room. */
   padding: 2px 4px;
   box-sizing: border-box;
-  background: #1e1e1e;
+  background: var(--bg);
 }
 
 /* Architecture A Claude panel: terminal | (detail viewer) | timeline, each a

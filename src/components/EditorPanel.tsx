@@ -2,10 +2,11 @@ import { useEffect, useRef, useState } from "react";
 import type { IDockviewPanelProps } from "dockview-react";
 import { invoke } from "@tauri-apps/api/core";
 import { EditorView, basicSetup } from "codemirror";
-import { EditorState } from "@codemirror/state";
+import { EditorState, Compartment } from "@codemirror/state";
 import { keymap } from "@codemirror/view";
-import { oneDark } from "@codemirror/theme-one-dark";
 import { langFor, fileName } from "./cmLang";
+import { cmThemeExt } from "./cmTheme";
+import { useAppStore } from "../state/store";
 
 export interface EditorParams {
   kind?: "editor";
@@ -30,6 +31,13 @@ export function EditorPanel(props: IDockviewPanelProps<EditorParams>) {
   // Bumped on every doc change — captured at save start so a late-resolving save
   // only marks the tab clean if no further edits happened meanwhile (codex P2 E2).
   const versionRef = useRef(0);
+  const themeComp = useRef(new Compartment());
+
+  // Switch the CodeMirror theme live when the app theme changes.
+  const theme = useAppStore((s) => s.theme);
+  useEffect(() => {
+    viewRef.current?.dispatch({ effects: themeComp.current.reconfigure(cmThemeExt(theme)) });
+  }, [theme]);
 
   const baseTitle = (props.params.title as string) ?? (path ? fileName(path) : "Editor");
 
@@ -78,7 +86,7 @@ export function EditorPanel(props: IDockviewPanelProps<EditorParams>) {
             doc: text,
             extensions: [
               basicSetup, // bracket close, indent-on-input, bracket matching, etc.
-              oneDark,
+              themeComp.current.of(cmThemeExt(useAppStore.getState().theme)),
               ...langFor(path),
               keymap.of([{ key: "Mod-s", preventDefault: true, run: () => saveRef.current() }]),
               EditorView.updateListener.of((u) => {

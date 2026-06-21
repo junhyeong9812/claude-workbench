@@ -63,6 +63,7 @@ type PanelKind = "terminal" | "editor" | "claudeterm";
  */
 export function MainArea() {
   const activeProject = useAppStore((s) => s.activeProject);
+  const theme = useAppStore((s) => s.theme);
   const projects = useAppStore((s) => s.projects);
   const editorOpenRequest = useAppStore((s) => s.editorOpenRequest);
   const requestEditorOpen = useAppStore((s) => s.requestEditorOpen);
@@ -442,7 +443,7 @@ export function MainArea() {
       </div>
       <DockviewReact
         key={activeProject ?? "none"}
-        className="dockview-theme-dark main-dock"
+        className={`dockview-theme-${theme === "light" ? "light" : "dark"} main-dock`}
         components={components}
         defaultTabComponent={AppTab}
         onReady={onReady}

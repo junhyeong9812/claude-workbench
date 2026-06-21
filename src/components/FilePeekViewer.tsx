@@ -2,9 +2,9 @@ import { useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { EditorView, basicSetup } from "codemirror";
 import { EditorState } from "@codemirror/state";
-import { oneDark } from "@codemirror/theme-one-dark";
 import { useAppStore } from "../state/store";
 import { langFor, fileName } from "./cmLang";
+import { cmThemeExt } from "./cmTheme";
 
 /**
  * Read-only file peek viewer (P1): a CodeMirror 6 editor in read-only mode that
@@ -14,6 +14,7 @@ import { langFor, fileName } from "./cmLang";
  */
 export function FilePeekViewer({ path, onClose }: { path: string; onClose: () => void }) {
   const requestEditorOpen = useAppStore((s) => s.requestEditorOpen);
+  const theme = useAppStore((s) => s.theme);
   const hostRef = useRef<HTMLDivElement | null>(null);
   const [err, setErr] = useState<string | null>(null);
 
@@ -34,7 +35,7 @@ export function FilePeekViewer({ path, onClose }: { path: string; onClose: () =>
               basicSetup,
               EditorState.readOnly.of(true),
               EditorView.editable.of(false),
-              oneDark,
+              cmThemeExt(theme),
               ...langFor(path),
             ],
           }),
@@ -49,7 +50,7 @@ export function FilePeekViewer({ path, onClose }: { path: string; onClose: () =>
       cancelled = true;
       view?.destroy();
     };
-  }, [path]);
+  }, [path, theme]);
 
   return (
     <div
