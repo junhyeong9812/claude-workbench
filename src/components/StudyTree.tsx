@@ -20,10 +20,12 @@ export function StudyTree({
   root,
   onActivate,
   onPreview,
+  id,
 }: {
   root: string;
   onActivate: (path: string) => void;
   onPreview?: (path: string) => void;
+  id?: string;
 }) {
   const childrenCache = useAppStore((s) => s.childrenCache);
   const loadChildren = useAppStore((s) => s.loadChildren);
@@ -78,6 +80,7 @@ export function StudyTree({
   };
 
   const onKeyDown = (e: React.KeyboardEvent) => {
+    if (e.ctrlKey || e.altKey) return; // Ctrl/Alt arrows = column/tab nav (bubble up)
     const cur = visible.find((v) => v.entry.path === cursor);
     switch (e.key) {
       case "ArrowDown":
@@ -114,7 +117,7 @@ export function StudyTree({
   };
 
   return (
-    <div className="study-tree" tabIndex={0} onKeyDown={onKeyDown}>
+    <div className="study-tree" id={id} tabIndex={0} onKeyDown={onKeyDown}>
       {visible.map(({ entry, depth }): ReactNode => (
         <div
           key={entry.path}

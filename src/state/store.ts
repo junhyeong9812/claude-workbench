@@ -175,6 +175,8 @@ interface AppState {
   setStudyMode: (side: "left" | "right", mode: "viewer" | "editor") => void;
   /** Viewer-mode open: replace the side's single preview tab (no accumulation). */
   openStudyPreview: (side: "left" | "right", path: string) => void;
+  /** Cycle the active tab by `dir` (+1/-1) in stable order (Alt+←/→ tab nav). */
+  cycleStudyTab: (side: "left" | "right", dir: 1 | -1) => void;
   /** Persist the current workspace to the backend. */
   persist: () => void;
 }
@@ -352,6 +354,14 @@ export const useAppStore = create<AppState>((set, get) => ({
       studyTabs: { ...s.studyTabs, [side]: [path] },
       studyActive: { ...s.studyActive, [side]: path },
     })),
+  cycleStudyTab: (side, dir) =>
+    set((s) => {
+      const tabs = s.studyTabs[side];
+      if (tabs.length === 0) return {};
+      const i = tabs.indexOf(s.studyActive[side] ?? "");
+      const ni = ((i === -1 ? 0 : i) + dir + tabs.length) % tabs.length;
+      return { studyActive: { ...s.studyActive, [side]: tabs[ni] } };
+    }),
 
   toggleExpanded: (dirPath) => {
     set((s) => ({

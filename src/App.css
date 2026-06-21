@@ -2192,3 +2192,8 @@ body {
 }
 
 .study-session-dock { height: 100%; }
+
+.study-view-root { flex: 1; min-height: 0; display: flex; }
+.study-view-root .study-view { flex: 1; }
+.study-viewer:focus, .study-viewer-empty:focus { outline: 1px solid var(--accent); outline-offset: -1px; }
+.study-tabs-menu-item.hl { background: var(--bg-hover); }

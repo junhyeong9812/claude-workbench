@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useAppStore } from "../state/store";
 import { StudyFileView } from "./StudyFileView";
 
@@ -6,22 +6,80 @@ const basename = (p: string): string => p.split(/[\\/]/).filter(Boolean).pop() ?
 
 /**
  * A study viewer: multi-tab read-only file view for one side. Tabs are MRU
- * ordered (active first), so the recent ones stay visible; the rest overflow
- * (clipped) and are reachable via the ▾ dropdown that lists every open tab.
+ * ordered (active first) so recent ones stay visible; the rest overflow and are
+ * reachable via the ▾ dropdown.
+ *
+ * Keyboard (mouse-free): the viewer root is focusable (Ctrl+←/→ lands here).
+ * Alt+←/→ cycles tabs in stable order; Alt+↓ opens the overflow dropdown where
+ * ↑/↓ highlight and Enter opens (Esc closes).
  */
-export function StudyViewer({ side }: { side: "left" | "right" }) {
+export function StudyViewer({ side, focusId }: { side: "left" | "right"; focusId?: string }) {
   const tabs = useAppStore((s) => s.studyTabs[side]);
   const active = useAppStore((s) => s.studyActive[side]);
   const setStudyActive = useAppStore((s) => s.setStudyActive);
   const closeStudyTab = useAppStore((s) => s.closeStudyTab);
+  const cycleStudyTab = useAppStore((s) => s.cycleStudyTab);
   const [menuOpen, setMenuOpen] = useState(false);
+  const [menuIdx, setMenuIdx] = useState(0);
+  const rootRef = useRef<HTMLDivElement | null>(null);
+  const menuRef = useRef<HTMLDivElement | null>(null);
+
+  // Focus the menu when it opens (so ↑/↓/Enter work without the mouse).
+  useEffect(() => {
+    if (menuOpen) menuRef.current?.focus();
+  }, [menuOpen]);
+
+  const openMenu = () => {
+    setMenuIdx(Math.max(0, tabs.indexOf(active ?? "")));
+    setMenuOpen(true);
+  };
+  const closeMenu = () => {
+    setMenuOpen(false);
+    rootRef.current?.focus();
+  };
+
+  const onRootKey = (e: React.KeyboardEvent) => {
+    if (!e.altKey) return; // Ctrl/plain handled elsewhere (column nav / textarea)
+    if (e.key === "ArrowRight") {
+      e.preventDefault();
+      cycleStudyTab(side, 1);
+    } else if (e.key === "ArrowLeft") {
+      e.preventDefault();
+      cycleStudyTab(side, -1);
+    } else if (e.key === "ArrowDown" && tabs.length > 0) {
+      e.preventDefault();
+      openMenu();
+    }
+  };
+
+  const onMenuKey = (e: React.KeyboardEvent) => {
+    if (e.key === "ArrowDown") {
+      e.preventDefault();
+      setMenuIdx((i) => Math.min(tabs.length - 1, i + 1));
+    } else if (e.key === "ArrowUp") {
+      e.preventDefault();
+      setMenuIdx((i) => Math.max(0, i - 1));
+    } else if (e.key === "Enter") {
+      e.preventDefault();
+      const p = tabs[menuIdx];
+      if (p) setStudyActive(side, p);
+      closeMenu();
+    } else if (e.key === "Escape") {
+      e.preventDefault();
+      closeMenu();
+    }
+  };
 
   if (tabs.length === 0) {
-    return <div className="study-viewer study-viewer-empty">사이드바에서 파일을 열면 탭으로 표시됩니다.</div>;
+    return (
+      <div className="study-viewer study-viewer-empty" id={focusId} tabIndex={0}>
+        사이드바에서 파일을 열면 탭으로 표시됩니다.
+      </div>
+    );
   }
 
   return (
-    <div className="study-viewer">
+    <div className="study-viewer" id={focusId} tabIndex={0} ref={rootRef} onKeyDown={onRootKey}>
       <div className="study-tabs">
         <div className="study-tabs-list">
           {tabs.map((p) => (
@@ -47,19 +105,20 @@ export function StudyViewer({ side }: { side: "left" | "right" }) {
         </div>
         {tabs.length > 1 && (
           <div className="study-tabs-more">
-            <button className="git-mini" title="모든 탭" onClick={() => setMenuOpen((o) => !o)}>
+            <button className="git-mini" title="모든 탭 (Alt+↓)" onClick={() => (menuOpen ? closeMenu() : openMenu())}>
               ▾ {tabs.length}
             </button>
             {menuOpen && (
-              <div className="study-tabs-menu" onMouseLeave={() => setMenuOpen(false)}>
-                {tabs.map((p) => (
+              <div className="study-tabs-menu" ref={menuRef} tabIndex={-1} onKeyDown={onMenuKey} onBlur={() => setMenuOpen(false)}>
+                {tabs.map((p, i) => (
                   <div
                     key={p}
-                    className={`study-tabs-menu-item${p === active ? " active" : ""}`}
+                    className={`study-tabs-menu-item${p === active ? " active" : ""}${i === menuIdx ? " hl" : ""}`}
                     title={p}
+                    onMouseEnter={() => setMenuIdx(i)}
                     onClick={() => {
                       setStudyActive(side, p);
-                      setMenuOpen(false);
+                      closeMenu();
                     }}
                   >
                     {basename(p)}

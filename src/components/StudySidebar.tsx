@@ -7,7 +7,7 @@ const basename = (p: string): string => p.split(/[\\/]/).filter(Boolean).pop() ?
 /** A study sidebar: pick a root folder, then browse it (mouse or keyboard). The
  * 뷰어/에디터 toggle controls how files open — viewer follows the tree cursor
  * (single preview), editor accumulates tabs. */
-export function StudySidebar({ side }: { side: "left" | "right" }) {
+export function StudySidebar({ side, focusId }: { side: "left" | "right"; focusId?: string }) {
   const folder = useAppStore((s) => s.studyFolders[side]);
   const mode = useAppStore((s) => s.studyMode[side]);
   const setStudyFolder = useAppStore((s) => s.setStudyFolder);
@@ -22,7 +22,7 @@ export function StudySidebar({ side }: { side: "left" | "right" }) {
 
   if (!folder) {
     return (
-      <div className="study-sidebar study-sidebar-empty">
+      <div className="study-sidebar study-sidebar-empty" id={focusId} tabIndex={-1}>
         <button className="toolbar-btn" onClick={() => void pick()}>
           폴더 선택
         </button>
@@ -52,7 +52,7 @@ export function StudySidebar({ side }: { side: "left" | "right" }) {
           ⋯
         </button>
       </div>
-      <StudyTree root={folder} onActivate={onActivate} onPreview={onPreview} />
+      <StudyTree root={folder} onActivate={onActivate} onPreview={onPreview} id={focusId} />
     </div>
   );
 }
