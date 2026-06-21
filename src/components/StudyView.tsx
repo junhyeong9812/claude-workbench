@@ -1,6 +1,7 @@
 import { Panel, PanelGroup, PanelResizeHandle } from "react-resizable-panels";
 import { StudySidebar } from "./StudySidebar";
 import { StudyViewer } from "./StudyViewer";
+import { StudySession } from "./StudySession";
 
 /**
  * Study-view workspace mode (P1 — layout skeleton).
@@ -38,7 +39,7 @@ export function StudyView() {
       </Panel>
       <PanelResizeHandle className="resize-handle resize-handle-v" />
       <Panel defaultSize={30} minSize={10} className="study-col">
-        <div className="study-ph study-ph-term">스터디 Claude 세션 1개 + 타임라인 · P3</div>
+        <StudySession />
       </Panel>
     </PanelGroup>
   );

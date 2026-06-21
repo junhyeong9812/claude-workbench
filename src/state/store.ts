@@ -115,6 +115,9 @@ interface AppState {
   studyTabs: { left: string[]; right: string[] };
   /** Study view: active tab path per side. */
   studyActive: { left: string | null; right: string | null };
+  /** Study view: dockview layout of the single pinned Claude study session
+   * (keeps the session attached across mode switches within a run). */
+  studySessionLayout: unknown | null;
   /** Custom terminal color overrides (merged over the theme base), or null to
    * follow the theme. Persisted. */
   termColors: Partial<ITheme> | null;
@@ -163,6 +166,8 @@ interface AppState {
   closeStudyTab: (side: "left" | "right", path: string) => void;
   /** Activate a study tab (moves it to front of MRU). */
   setStudyActive: (side: "left" | "right", path: string) => void;
+  /** Save the study session's dockview layout. */
+  setStudySessionLayout: (layout: unknown | null) => void;
   /** Persist the current workspace to the backend. */
   persist: () => void;
 }
@@ -188,6 +193,7 @@ export const useAppStore = create<AppState>((set, get) => ({
   studyFolders: loadStudyFolders(),
   studyTabs: { left: [], right: [] },
   studyActive: { left: null, right: null },
+  studySessionLayout: null,
 
   init: async () => {
     try {
@@ -331,6 +337,7 @@ export const useAppStore = create<AppState>((set, get) => ({
         studyActive: { ...s.studyActive, [side]: active },
       };
     }),
+  setStudySessionLayout: (layout) => set({ studySessionLayout: layout }),
 
   toggleExpanded: (dirPath) => {
     set((s) => ({
