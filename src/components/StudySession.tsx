@@ -38,11 +38,14 @@ export function StudySession() {
       }
     }
     if (api.panels.length === 0 && cwd) {
+      // Seed with the stable study session UUID so it resumes the same session
+      // across restarts (create-or-resume in claude_start) even before any chat.
+      const uuid = useAppStore.getState().ensureStudySessionUuid();
       api.addPanel({
         id: "study-claude",
         component: "claudeterm",
         title: "스터디 세션",
-        params: { kind: "claudeterm", title: "스터디 세션", project: cwd },
+        params: { kind: "claudeterm", title: "스터디 세션", project: cwd, loadSessionId: uuid },
       });
     }
 

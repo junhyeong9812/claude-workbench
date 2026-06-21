@@ -64,15 +64,6 @@ function saveStudyView(s: {
 
 const STUDY0 = loadStudyView();
 
-/** Safe-parse the persisted study session dockview layout (P5 — restart resume). */
-function loadStudySessionLayout(): unknown | null {
-  try {
-    return JSON.parse(localStorage.getItem("studySessionLayout") || "null");
-  } catch {
-    return null;
-  }
-}
-
 const TERM_COLOR_KEYS = new Set([
   "background",
   "foreground",
@@ -167,8 +158,12 @@ interface AppState {
   /** Study view: active tab path per side. */
   studyActive: { left: string | null; right: string | null };
   /** Study view: dockview layout of the single pinned Claude study session
-   * (keeps the session attached across mode switches within a run). */
+   * (in-memory — keeps the session attached across mode switches within a run). */
   studySessionLayout: unknown | null;
+  /** Study view: stable Claude session UUID (persisted). The study session is
+   * always created/resumed under this id so it survives restart even before any
+   * chat (claude writes the JSONL only on interaction). */
+  studySessionUuid: string | null;
   /** Study view: per-side open behavior. "viewer" = tree cursor follows and
    * replaces a single preview (read); "editor" = files accumulate as tabs. */
   studyMode: { left: "viewer" | "editor"; right: "viewer" | "editor" };
@@ -222,8 +217,10 @@ interface AppState {
   closeStudyTab: (side: "left" | "right", path: string) => void;
   /** Activate a study tab (moves it to front of MRU). */
   setStudyActive: (side: "left" | "right", path: string) => void;
-  /** Save the study session's dockview layout. */
+  /** Save the study session's dockview layout (in-memory). */
   setStudySessionLayout: (layout: unknown | null) => void;
+  /** Return the stable study session UUID, generating + persisting if absent. */
+  ensureStudySessionUuid: () => string;
   /** Set a study side's open mode (viewer / editor). */
   setStudyMode: (side: "left" | "right", mode: "viewer" | "editor") => void;
   /** Viewer-mode open: replace the side's single preview tab (no accumulation). */
@@ -256,7 +253,8 @@ export const useAppStore = create<AppState>((set, get) => ({
   studyTabs: STUDY0.tabs,
   studyActive: STUDY0.active,
   studyMode: STUDY0.mode,
-  studySessionLayout: loadStudySessionLayout(),
+  studySessionLayout: null,
+  studySessionUuid: localStorage.getItem("studySessionUuid"),
 
   init: async () => {
     try {
@@ -404,10 +402,15 @@ export const useAppStore = create<AppState>((set, get) => ({
     });
     saveStudyView(get());
   },
-  setStudySessionLayout: (layout) => {
-    if (layout) localStorage.setItem("studySessionLayout", JSON.stringify(layout));
-    else localStorage.removeItem("studySessionLayout");
-    set({ studySessionLayout: layout });
+  setStudySessionLayout: (layout) => set({ studySessionLayout: layout }),
+  ensureStudySessionUuid: () => {
+    let u = get().studySessionUuid;
+    if (!u) {
+      u = crypto.randomUUID();
+      localStorage.setItem("studySessionUuid", u);
+      set({ studySessionUuid: u });
+    }
+    return u;
   },
   setStudyMode: (side, mode) => {
     set((s) => ({ studyMode: { ...s.studyMode, [side]: mode } }));

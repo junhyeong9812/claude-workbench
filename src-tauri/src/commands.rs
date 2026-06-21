@@ -255,7 +255,15 @@ pub fn claude_start(
         Some(u) => u.clone(),
         None => new_session_uuid()?,
     };
-    let flag = if resume.is_some() { "--resume" } else { "--session-id" };
+    // Resume only if the session's transcript already exists. An empty/never-used
+    // session has no JSONL yet, so `--resume` would fail and spawn a *different*
+    // new session — in that case create with this exact id via `--session-id` so
+    // the id stays stable across restarts (e.g. the study session before any chat).
+    let resuming = resume.is_some()
+        && core_lib::jsonl::claude_projects_root()
+            .and_then(|root| core_lib::jsonl::find_session_jsonl(&root, &session_uuid).ok().flatten())
+            .is_some();
+    let flag = if resuming { "--resume" } else { "--session-id" };
     let cmd = vec!["claude".to_string(), flag.to_string(), session_uuid.clone()];
 
     let id = mgr
