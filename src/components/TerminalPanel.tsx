@@ -6,6 +6,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import "@xterm/xterm/css/xterm.css";
 import { useAppStore } from "../state/store";
+import { xtermTheme } from "./xtermTheme";
 
 /** Params attached to a terminal panel. `sessionId` is persisted into the
  * dockview layout so a remount (tab/project switch) re-attaches the same PTY. */
@@ -39,6 +40,13 @@ interface SnapshotResult {
  */
 export function TerminalPanel(props: IDockviewPanelProps<TerminalParams>) {
   const hostRef = useRef<HTMLDivElement | null>(null);
+  const termRef = useRef<Terminal | null>(null);
+
+  // Live-update the xterm palette when the app theme changes.
+  const theme = useAppStore((s) => s.theme);
+  useEffect(() => {
+    if (termRef.current) termRef.current.options.theme = xtermTheme(theme);
+  }, [theme]);
 
   useEffect(() => {
     const host = hostRef.current;
@@ -47,8 +55,9 @@ export function TerminalPanel(props: IDockviewPanelProps<TerminalParams>) {
     const term = new Terminal({
       fontFamily: "monospace",
       fontSize: 13,
-      theme: { background: "#1e1e1e" },
+      theme: xtermTheme(useAppStore.getState().theme),
     });
+    termRef.current = term;
     const fit = new FitAddon();
     term.loadAddon(fit);
     term.open(host);
@@ -144,6 +153,7 @@ export function TerminalPanel(props: IDockviewPanelProps<TerminalParams>) {
       onResize.dispose();
       if (unlisten) unlisten();
       term.dispose();
+      termRef.current = null;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);

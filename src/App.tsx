@@ -23,9 +23,8 @@ export default function App() {
   const treePanelRef = useRef<ImperativePanelHandle>(null);
   const [collapsed, setCollapsed] = useState(false);
   const [sideTab, setSideTab] = useState<"files" | "git" | "worktree">("files");
-  const [theme, setTheme] = useState<"dark" | "light">(
-    () => (localStorage.getItem("theme") as "dark" | "light") || "dark",
-  );
+  const theme = useAppStore((s) => s.theme);
+  const setTheme = useAppStore((s) => s.setTheme);
 
   useEffect(() => {
     void init();
@@ -69,7 +68,7 @@ export default function App() {
         <button
           className="toolbar-btn"
           title="라이트/다크 테마 전환"
-          onClick={() => setTheme((t) => (t === "dark" ? "light" : "dark"))}
+          onClick={() => setTheme(theme === "dark" ? "light" : "dark")}
         >
           {theme === "dark" ? "☀ 라이트" : "🌙 다크"}
         </button>

@@ -6,6 +6,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import "@xterm/xterm/css/xterm.css";
 import { useAppStore } from "../state/store";
+import { xtermTheme } from "./xtermTheme";
 import { TimelineView, ItemDetail, type TimelineItem } from "./TimelineView";
 
 /**
@@ -356,6 +357,12 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
     inputLockedRef.current = handoffBusy || summaryDraft != null;
   }, [handoffBusy, summaryDraft]);
 
+  // Live-update the xterm palette when the app theme changes (no terminal rebuild).
+  const theme = useAppStore((s) => s.theme);
+  useEffect(() => {
+    if (termRef.current) termRef.current.options.theme = xtermTheme(theme);
+  }, [theme]);
+
   useEffect(() => {
     const host = hostRef.current;
     if (!host) return;
@@ -370,30 +377,8 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
       cursorBlink: true,
       cursorStyle: "block",
       scrollback: 10000,
-      // Catppuccin Mocha — a clean dark palette (Terminus-grade).
-      theme: {
-        background: "#1e1e2e",
-        foreground: "#cdd6f4",
-        cursor: "#f5e0dc",
-        cursorAccent: "#1e1e2e",
-        selectionBackground: "#585b70",
-        black: "#45475a",
-        red: "#f38ba8",
-        green: "#a6e3a1",
-        yellow: "#f9e2af",
-        blue: "#89b4fa",
-        magenta: "#f5c2e7",
-        cyan: "#94e2d5",
-        white: "#bac2de",
-        brightBlack: "#585b70",
-        brightRed: "#f38ba8",
-        brightGreen: "#a6e3a1",
-        brightYellow: "#f9e2af",
-        brightBlue: "#89b4fa",
-        brightMagenta: "#f5c2e7",
-        brightCyan: "#94e2d5",
-        brightWhite: "#a6adc8",
-      },
+      // Follows the app theme (Catppuccin Mocha/Latte); updated live below.
+      theme: xtermTheme(useAppStore.getState().theme),
     });
     const fit = new FitAddon();
     term.loadAddon(fit);

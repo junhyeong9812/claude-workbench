@@ -40,6 +40,8 @@ interface AppState {
   editorOpenRequest: string | null;
   /** A request to open a diff panel (consumed by MainArea), or null. Transient. */
   diffRequest: DiffSpec | null;
+  /** Color theme (persisted to localStorage). Drives CSS vars + xterm palette. */
+  theme: "dark" | "light";
 
   /** Load persisted state from the backend on startup. */
   init: () => Promise<void>;
@@ -69,6 +71,8 @@ interface AppState {
   requestEditorOpen: (path: string | null) => void;
   /** Request opening a diff panel (MainArea consumes + clears with null). */
   requestDiff: (spec: DiffSpec | null) => void;
+  /** Switch the color theme. */
+  setTheme: (theme: "dark" | "light") => void;
   /** Persist the current workspace to the backend. */
   persist: () => void;
 }
@@ -87,6 +91,7 @@ export const useAppStore = create<AppState>((set, get) => ({
   peekFile: null,
   editorOpenRequest: null,
   diffRequest: null,
+  theme: (localStorage.getItem("theme") as "dark" | "light") || "dark",
 
   init: async () => {
     try {
@@ -190,6 +195,7 @@ export const useAppStore = create<AppState>((set, get) => ({
   setPeekFile: (path) => set({ peekFile: path }),
   requestEditorOpen: (path) => set({ editorOpenRequest: path }),
   requestDiff: (spec) => set({ diffRequest: spec }),
+  setTheme: (theme) => set({ theme }),
 
   toggleExpanded: (dirPath) => {
     set((s) => ({
