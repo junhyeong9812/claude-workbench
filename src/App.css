@@ -563,9 +563,10 @@ body {
 }
 .git-chash {
   flex: 0 0 auto;
+  font-family: "JetBrains Mono", "DejaVu Sans Mono", monospace;
   font-variant-numeric: tabular-nums;
-  color: #f9e2af;
-  opacity: 0.85;
+  color: var(--git-ref-local);
+  opacity: 0.95;
 }
 .git-ref {
   flex: 0 0 auto;
