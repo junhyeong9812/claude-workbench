@@ -11,6 +11,7 @@ import { GitPanel } from "./components/GitPanel";
 import { WorktreePanel } from "./components/WorktreePanel";
 import { MainArea } from "./components/MainArea";
 import { FilePeekViewer } from "./components/FilePeekViewer";
+import { TerminalSettings } from "./components/TerminalSettings";
 import { useAppStore } from "./state/store";
 import "./App.css";
 
@@ -23,6 +24,7 @@ export default function App() {
   const treePanelRef = useRef<ImperativePanelHandle>(null);
   const [collapsed, setCollapsed] = useState(false);
   const [sideTab, setSideTab] = useState<"files" | "git" | "worktree">("files");
+  const [termSettingsOpen, setTermSettingsOpen] = useState(false);
   const theme = useAppStore((s) => s.theme);
   const setTheme = useAppStore((s) => s.setTheme);
   const fontSize = useAppStore((s) => s.fontSize);
@@ -90,6 +92,13 @@ export default function App() {
         <button className="toolbar-btn" title="폰트 크게" onClick={() => setFontSize(fontSize + 1)}>
           A+
         </button>
+        <button
+          className="toolbar-btn"
+          title="터미널 색상 커스텀"
+          onClick={() => setTermSettingsOpen(true)}
+        >
+          터미널색
+        </button>
         <span className="toolbar-title">
           {activeProject ?? "multi-terminal"}
         </span>
@@ -148,6 +157,7 @@ export default function App() {
           )}
         </Panel>
       </PanelGroup>
+      {termSettingsOpen && <TerminalSettings onClose={() => setTermSettingsOpen(false)} />}
     </div>
   );
 }

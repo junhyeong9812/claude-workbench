@@ -50,6 +50,101 @@ const light: ITheme = {
   brightWhite: "#bcc0cc",
 };
 
-/** The xterm palette for the app color theme — used by every PTY panel so the
- * terminal follows light/dark. Set `term.options.theme` live on theme change. */
-export const xtermTheme = (theme: "dark" | "light"): ITheme => (theme === "light" ? light : dark);
+/** Dracula. */
+const dracula: ITheme = {
+  background: "#282a36",
+  foreground: "#f8f8f2",
+  cursor: "#f8f8f2",
+  cursorAccent: "#282a36",
+  selectionBackground: "#44475a",
+  black: "#21222c",
+  red: "#ff5555",
+  green: "#50fa7b",
+  yellow: "#f1fa8c",
+  blue: "#bd93f9",
+  magenta: "#ff79c6",
+  cyan: "#8be9fd",
+  white: "#f8f8f2",
+  brightBlack: "#6272a4",
+  brightRed: "#ff6e6e",
+  brightGreen: "#69ff94",
+  brightYellow: "#ffffa5",
+  brightBlue: "#d6acff",
+  brightMagenta: "#ff92df",
+  brightCyan: "#a4ffff",
+  brightWhite: "#ffffff",
+};
+
+/** Solarized Dark. */
+const solarized: ITheme = {
+  background: "#002b36",
+  foreground: "#839496",
+  cursor: "#93a1a1",
+  cursorAccent: "#002b36",
+  selectionBackground: "#073642",
+  black: "#073642",
+  red: "#dc322f",
+  green: "#859900",
+  yellow: "#b58900",
+  blue: "#268bd2",
+  magenta: "#d33682",
+  cyan: "#2aa198",
+  white: "#eee8d5",
+  brightBlack: "#586e75",
+  brightRed: "#cb4b16",
+  brightGreen: "#586e75",
+  brightYellow: "#657b83",
+  brightBlue: "#839496",
+  brightMagenta: "#6c71c4",
+  brightCyan: "#93a1a1",
+  brightWhite: "#fdf6e3",
+};
+
+/** Gruvbox Dark. */
+const gruvbox: ITheme = {
+  background: "#282828",
+  foreground: "#ebdbb2",
+  cursor: "#ebdbb2",
+  cursorAccent: "#282828",
+  selectionBackground: "#504945",
+  black: "#282828",
+  red: "#cc241d",
+  green: "#98971a",
+  yellow: "#d79921",
+  blue: "#458588",
+  magenta: "#b16286",
+  cyan: "#689d6a",
+  white: "#a89984",
+  brightBlack: "#928374",
+  brightRed: "#fb4934",
+  brightGreen: "#b8bb26",
+  brightYellow: "#fabd2f",
+  brightBlue: "#83a598",
+  brightMagenta: "#d3869b",
+  brightCyan: "#8ec07c",
+  brightWhite: "#ebdbb2",
+};
+
+/** Named presets selectable in the terminal-colors dialog. */
+export const TERM_PRESETS: Record<string, ITheme> = {
+  "Mocha (다크)": dark,
+  "Latte (라이트)": light,
+  Dracula: dracula,
+  "Solarized Dark": solarized,
+  "Gruvbox Dark": gruvbox,
+};
+
+/** Keys exposed as individual color pickers in the dialog. */
+export const TERM_EDITABLE: { key: keyof ITheme; label: string }[] = [
+  { key: "background", label: "배경" },
+  { key: "foreground", label: "전경(글자)" },
+  { key: "cursor", label: "커서" },
+  { key: "selectionBackground", label: "선택 영역" },
+];
+
+/** The xterm palette: the app theme base (Mocha/Latte), with any user color
+ * overrides merged on top. `custom` is null when following the theme. */
+export const xtermTheme = (theme: "dark" | "light", custom?: Partial<ITheme> | null): ITheme => {
+  const base = theme === "light" ? light : dark;
+  return custom ? { ...base, ...custom } : base;
+};

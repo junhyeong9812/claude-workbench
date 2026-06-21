@@ -43,11 +43,12 @@ export function TerminalPanel(props: IDockviewPanelProps<TerminalParams>) {
   const termRef = useRef<Terminal | null>(null);
   const fitRef = useRef<FitAddon | null>(null);
 
-  // Live-update the xterm palette when the app theme changes.
+  // Live-update the xterm palette when the app theme or custom colors change.
   const theme = useAppStore((s) => s.theme);
+  const termColors = useAppStore((s) => s.termColors);
   useEffect(() => {
-    if (termRef.current) termRef.current.options.theme = xtermTheme(theme);
-  }, [theme]);
+    if (termRef.current) termRef.current.options.theme = xtermTheme(theme, termColors);
+  }, [theme, termColors]);
 
   // Live-update terminal font size (+ refit).
   const fontSize = useAppStore((s) => s.fontSize);
@@ -69,7 +70,7 @@ export function TerminalPanel(props: IDockviewPanelProps<TerminalParams>) {
     const term = new Terminal({
       fontFamily: "monospace",
       fontSize: useAppStore.getState().fontSize,
-      theme: xtermTheme(useAppStore.getState().theme),
+      theme: xtermTheme(useAppStore.getState().theme, useAppStore.getState().termColors),
     });
     termRef.current = term;
     const fit = new FitAddon();

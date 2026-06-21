@@ -357,11 +357,12 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
     inputLockedRef.current = handoffBusy || summaryDraft != null;
   }, [handoffBusy, summaryDraft]);
 
-  // Live-update the xterm palette when the app theme changes (no terminal rebuild).
+  // Live-update the xterm palette when the app theme or custom colors change.
   const theme = useAppStore((s) => s.theme);
+  const termColors = useAppStore((s) => s.termColors);
   useEffect(() => {
-    if (termRef.current) termRef.current.options.theme = xtermTheme(theme);
-  }, [theme]);
+    if (termRef.current) termRef.current.options.theme = xtermTheme(theme, termColors);
+  }, [theme, termColors]);
 
   // Live-update terminal font size (+ refit dimensions) on change.
   const fitRef = useRef<FitAddon | null>(null);
@@ -392,7 +393,7 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
       cursorStyle: "block",
       scrollback: 10000,
       // Follows the app theme (Catppuccin Mocha/Latte); updated live below.
-      theme: xtermTheme(useAppStore.getState().theme),
+      theme: xtermTheme(useAppStore.getState().theme, useAppStore.getState().termColors),
     });
     const fit = new FitAddon();
     fitRef.current = fit;

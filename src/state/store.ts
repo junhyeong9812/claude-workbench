@@ -1,6 +1,16 @@
 import { create } from "zustand";
 import { invoke } from "@tauri-apps/api/core";
+import type { ITheme } from "@xterm/xterm";
 import type { DirEntry, Project, ProjectType, WorkspaceState } from "../types";
+
+/** Safe-parse the persisted terminal color overrides. */
+function loadTermColors(): Partial<ITheme> | null {
+  try {
+    return JSON.parse(localStorage.getItem("termColors") || "null");
+  } catch {
+    return null;
+  }
+}
 
 /** A request to open a diff in the main area (file change or a commit). */
 export interface DiffSpec {
@@ -44,6 +54,9 @@ interface AppState {
   theme: "dark" | "light";
   /** Code font size in px (terminals + editor/viewer), persisted. */
   fontSize: number;
+  /** Custom terminal color overrides (merged over the theme base), or null to
+   * follow the theme. Persisted. */
+  termColors: Partial<ITheme> | null;
 
   /** Load persisted state from the backend on startup. */
   init: () => Promise<void>;
@@ -77,6 +90,8 @@ interface AppState {
   setTheme: (theme: "dark" | "light") => void;
   /** Set the code font size (clamped 9–28). */
   setFontSize: (n: number) => void;
+  /** Set (or clear with null) the custom terminal color overrides. */
+  setTermColors: (c: Partial<ITheme> | null) => void;
   /** Persist the current workspace to the backend. */
   persist: () => void;
 }
@@ -97,6 +112,7 @@ export const useAppStore = create<AppState>((set, get) => ({
   diffRequest: null,
   theme: (localStorage.getItem("theme") as "dark" | "light") || "dark",
   fontSize: Number(localStorage.getItem("fontSize")) || 13,
+  termColors: loadTermColors(),
 
   init: async () => {
     try {
@@ -202,6 +218,11 @@ export const useAppStore = create<AppState>((set, get) => ({
   requestDiff: (spec) => set({ diffRequest: spec }),
   setTheme: (theme) => set({ theme }),
   setFontSize: (n) => set({ fontSize: Math.max(9, Math.min(28, Math.round(n))) }),
+  setTermColors: (c) => {
+    if (c) localStorage.setItem("termColors", JSON.stringify(c));
+    else localStorage.removeItem("termColors");
+    set({ termColors: c });
+  },
 
   toggleExpanded: (dirPath) => {
     set((s) => ({

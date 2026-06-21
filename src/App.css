@@ -1852,3 +1852,81 @@ body {
   font-size: 0.9em;
   padding: 0 2px;
 }
+
+/* ---- Terminal color settings modal ---- */
+.modal-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 100;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(0, 0, 0, 0.45);
+}
+.modal {
+  background: var(--bg);
+  color: var(--fg);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.4);
+  min-width: 360px;
+  max-width: 90vw;
+  max-height: 85vh;
+  overflow: auto;
+}
+.modal-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--border);
+  font-weight: 600;
+}
+.ts-section {
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--border);
+}
+.ts-label {
+  font-size: 0.85em;
+  color: var(--fg-dim);
+  margin-bottom: 6px;
+}
+.ts-presets {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+.ts-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 3px 0;
+}
+.ts-key {
+  flex: 0 0 90px;
+  font-size: 0.9em;
+}
+.ts-row input[type="color"] {
+  width: 32px;
+  height: 24px;
+  padding: 0;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: none;
+  cursor: pointer;
+}
+.ts-hex {
+  flex: 1 1 auto;
+  background: var(--bg-alt);
+  color: var(--fg);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 2px 6px;
+  font-family: "JetBrains Mono", monospace;
+  font-size: 0.9em;
+}
+.ts-foot {
+  padding: 10px 12px;
+  display: flex;
+  justify-content: flex-end;
+}
