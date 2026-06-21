@@ -143,6 +143,8 @@ interface AppState {
   toggleExpanded: (dirPath: string) => void;
   /** Lazily load a directory's children via the backend. */
   loadChildren: (dirPath: string) => Promise<void>;
+  /** Force re-read a directory (after create/delete) — bypasses the cache. */
+  reloadDir: (dirPath: string) => Promise<void>;
   /** Save a project's dockview main-area layout (opaque JSON) and persist. */
   setLayout: (path: string, layout: unknown) => void;
   /** Move the folder-tree keyboard cursor. */
@@ -395,6 +397,15 @@ export const useAppStore = create<AppState>((set, get) => ({
       }));
     } finally {
       set((s) => ({ loadingDirs: { ...s.loadingDirs, [dirPath]: false } }));
+    }
+  },
+
+  reloadDir: async (dirPath) => {
+    try {
+      const entries = await invoke<DirEntry[]>("read_dir", { path: dirPath });
+      set((s) => ({ childrenCache: { ...s.childrenCache, [dirPath]: entries } }));
+    } catch (err) {
+      console.error("reloadDir failed", err);
     }
   },
 

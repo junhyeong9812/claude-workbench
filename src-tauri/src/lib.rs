@@ -110,6 +110,7 @@ pub fn run() {
             commands::claude_delete,
             commands::acp_read_file,
             commands::write_file,
+            commands::delete_path,
             commands::git_status,
             commands::git_branches,
             commands::git_checkout,

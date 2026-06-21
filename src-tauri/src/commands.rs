@@ -849,6 +849,17 @@ static SAVE_SEQ: AtomicU64 = AtomicU64::new(0);
 /// are resolved first so we edit the link's *target* (like most editors), not
 /// replace the link.
 #[tauri::command]
+pub fn delete_path(path: String) -> Result<(), AppError> {
+    let p = std::path::Path::new(&path);
+    let md = std::fs::symlink_metadata(p).map_err(|e| AppError::new(io_message("Cannot delete", &e)))?;
+    if md.is_dir() {
+        std::fs::remove_dir_all(p).map_err(|e| AppError::new(io_message("Cannot delete", &e)))
+    } else {
+        std::fs::remove_file(p).map_err(|e| AppError::new(io_message("Cannot delete", &e)))
+    }
+}
+
+#[tauri::command]
 pub fn write_file(path: String, content: String) -> Result<(), AppError> {
     let p = std::path::Path::new(&path);
     if p.is_dir() {

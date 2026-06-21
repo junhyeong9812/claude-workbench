@@ -1,6 +1,12 @@
 import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { invoke } from "@tauri-apps/api/core";
 import { useAppStore } from "../state/store";
 import type { DirEntry } from "../types";
+import { ContextMenu, copyText, type MenuItem } from "./ContextMenu";
+
+const dirname = (p: string): string => p.split(/[\\/]/).slice(0, -1).join("/") || "/";
+const errText = (e: unknown): string =>
+  typeof e === "string" ? e : ((e as { message?: string })?.message ?? String(e));
 
 interface VisNode {
   entry: DirEntry;
@@ -29,8 +35,10 @@ export function StudyTree({
 }) {
   const childrenCache = useAppStore((s) => s.childrenCache);
   const loadChildren = useAppStore((s) => s.loadChildren);
+  const reloadDir = useAppStore((s) => s.reloadDir);
   const [expanded, setExpanded] = useState<Set<string>>(() => new Set());
   const [cursor, setCursor] = useState<string | null>(null);
+  const [menu, setMenu] = useState<{ x: number; y: number; entry: DirEntry } | null>(null);
   const onPreviewRef = useRef(onPreview);
   onPreviewRef.current = onPreview;
 
@@ -116,22 +124,68 @@ export function StudyTree({
     else onActivate(entry.path);
   };
 
+  const menuItems = (entry: DirEntry): MenuItem[] => {
+    const targetDir = entry.is_dir ? entry.path : dirname(entry.path);
+    return [
+      { label: "경로 복사", onClick: () => void copyText(entry.path) },
+      {
+        label: "새 파일",
+        onClick: async () => {
+          const name = window.prompt(`새 파일 이름 (${targetDir})`);
+          if (!name || !name.trim()) return;
+          const np = `${targetDir}/${name.trim()}`;
+          try {
+            await invoke("write_file", { path: np, content: "" });
+            if (entry.is_dir) expand(entry.path);
+            await reloadDir(targetDir);
+            onActivate(np);
+          } catch (err) {
+            alert(`파일 생성 실패: ${errText(err)}`);
+          }
+        },
+      },
+      {
+        label: "삭제",
+        danger: true,
+        onClick: async () => {
+          if (!window.confirm(`${entry.path}\n삭제할까요?${entry.is_dir ? " (폴더 전체)" : ""}`)) return;
+          try {
+            await invoke("delete_path", { path: entry.path });
+            await reloadDir(dirname(entry.path));
+          } catch (err) {
+            alert(`삭제 실패: ${errText(err)}`);
+          }
+        },
+      },
+    ];
+  };
+
   return (
-    <div className="study-tree" id={id} tabIndex={0} onKeyDown={onKeyDown}>
-      {visible.map(({ entry, depth }): ReactNode => (
-        <div
-          key={entry.path}
-          className={`study-tree-row${entry.is_dir ? "" : " study-tree-file"}${
-            cursor === entry.path ? " cursor" : ""
-          }`}
-          style={{ paddingLeft: 6 + depth * 12 + (entry.is_dir ? 0 : 12) }}
-          title={entry.path}
-          onClick={() => onRowClick(entry)}
-        >
-          {entry.is_dir && <span className="study-tree-caret">{expanded.has(entry.path) ? "▾" : "▸"}</span>}
-          <span className="study-tree-name">{entry.name}</span>
-        </div>
-      ))}
-    </div>
+    <>
+      <div className="study-tree" id={id} tabIndex={0} onKeyDown={onKeyDown}>
+        {visible.map(({ entry, depth }): ReactNode => (
+          <div
+            key={entry.path}
+            className={`study-tree-row${entry.is_dir ? "" : " study-tree-file"}${
+              cursor === entry.path ? " cursor" : ""
+            }`}
+            style={{ paddingLeft: 6 + depth * 12 + (entry.is_dir ? 0 : 12) }}
+            title={entry.path}
+            onClick={() => onRowClick(entry)}
+            onContextMenu={(e) => {
+              e.preventDefault();
+              setCursor(entry.path);
+              setMenu({ x: e.clientX, y: e.clientY, entry });
+            }}
+          >
+            {entry.is_dir && <span className="study-tree-caret">{expanded.has(entry.path) ? "▾" : "▸"}</span>}
+            <span className="study-tree-name">{entry.name}</span>
+          </div>
+        ))}
+      </div>
+      {menu && (
+        <ContextMenu x={menu.x} y={menu.y} items={menuItems(menu.entry)} onClose={() => setMenu(null)} />
+      )}
+    </>
   );
 }

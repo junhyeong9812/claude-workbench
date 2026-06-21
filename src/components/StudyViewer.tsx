@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { useAppStore } from "../state/store";
 import { StudyFileView } from "./StudyFileView";
+import { ContextMenu, copyText } from "./ContextMenu";
 
 const basename = (p: string): string => p.split(/[\\/]/).filter(Boolean).pop() ?? p;
 
@@ -21,6 +22,7 @@ export function StudyViewer({ side, focusId }: { side: "left" | "right"; focusId
   const cycleStudyTab = useAppStore((s) => s.cycleStudyTab);
   const [menuOpen, setMenuOpen] = useState(false);
   const [menuIdx, setMenuIdx] = useState(0);
+  const [ctx, setCtx] = useState<{ x: number; y: number; path: string } | null>(null);
   const rootRef = useRef<HTMLDivElement | null>(null);
   const menuRef = useRef<HTMLDivElement | null>(null);
 
@@ -88,6 +90,10 @@ export function StudyViewer({ side, focusId }: { side: "left" | "right"; focusId
               className={`study-tab${p === active ? " active" : ""}`}
               title={p}
               onClick={() => setStudyActive(side, p)}
+              onContextMenu={(e) => {
+                e.preventDefault();
+                setCtx({ x: e.clientX, y: e.clientY, path: p });
+              }}
             >
               <span className="study-tab-name">{basename(p)}</span>
               <span
@@ -130,6 +136,14 @@ export function StudyViewer({ side, focusId }: { side: "left" | "right"; focusId
         )}
       </div>
       {active && <StudyFileView key={active} path={active} />}
+      {ctx && (
+        <ContextMenu
+          x={ctx.x}
+          y={ctx.y}
+          items={[{ label: "경로 복사", onClick: () => void copyText(ctx.path) }]}
+          onClose={() => setCtx(null)}
+        />
+      )}
     </div>
   );
 }
