@@ -136,6 +136,8 @@ pub fn run() {
             commands::git_tags,
             commands::git_create_tag,
             commands::git_delete_tag,
+            commands::git_merge_abort,
+            commands::git_merge_continue,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

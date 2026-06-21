@@ -8,6 +8,7 @@ interface FileChange {
   path: string;
   code: string;
   staged: boolean;
+  conflicted: boolean;
 }
 interface GitStatus {
   is_repo: boolean;
@@ -16,6 +17,7 @@ interface GitStatus {
   ahead: number;
   behind: number;
   has_remote: boolean;
+  merging: boolean;
   changes: FileChange[];
 }
 interface Branches {
@@ -150,8 +152,10 @@ export function GitPanel() {
   if (!cwd) return <div className="git-empty">프로젝트를 먼저 여세요.</div>;
   if (status && !status.is_repo) return <div className="git-empty">git 저장소가 아닙니다.</div>;
 
-  const staged = status?.changes.filter((c) => c.staged) ?? [];
-  const unstaged = status?.changes.filter((c) => !c.staged) ?? [];
+  const conflicted = status?.changes.filter((c) => c.conflicted) ?? [];
+  const staged = status?.changes.filter((c) => c.staged && !c.conflicted) ?? [];
+  const unstaged = status?.changes.filter((c) => !c.staged && !c.conflicted) ?? [];
+  const merging = status?.merging ?? false;
   const canCommit = staged.length > 0 && message.trim().length > 0 && !busy;
 
   const fileRow = (c: FileChange, label: string, depth: number, kind: "staged" | "unstaged"): ReactNode => (
@@ -385,6 +389,61 @@ export function GitPanel() {
         </div>
 
         <div className="git-body">
+          {merging && (
+            <div className="git-merge-banner">
+              <span>머지 진행 중 — 충돌 {conflicted.length}개</span>
+              <button
+                className="git-mini"
+                disabled={busy}
+                onClick={() => {
+                  if (window.confirm("머지를 중단(abort)할까요? 변경이 머지 전 상태로 돌아갑니다."))
+                    act(() => invoke("git_merge_abort", { cwd }), "머지 중단");
+                }}
+              >
+                중단
+              </button>
+              <button
+                className="git-mini"
+                disabled={busy || conflicted.length > 0}
+                title={conflicted.length > 0 ? "충돌을 모두 해결(stage)한 뒤 가능" : "머지 커밋"}
+                onClick={() => act(() => invoke("git_merge_continue", { cwd }), "머지 완료")}
+              >
+                계속
+              </button>
+            </div>
+          )}
+          {conflicted.length > 0 && (
+            <>
+              <div className="git-section-head git-conflict-head">충돌 ({conflicted.length})</div>
+              {conflicted.map((c) => (
+                <div key={c.path} className="git-file">
+                  <span className="git-code git-conflict">{c.code || "U"}</span>
+                  <span
+                    className="git-path git-clickable"
+                    title={`${c.path}\n(클릭: diff 보기)`}
+                    onClick={() =>
+                      requestDiff({
+                        title: c.path.split("/").pop() ?? c.path,
+                        cwd: cwd as string,
+                        path: c.path,
+                        staged: false,
+                      })
+                    }
+                  >
+                    {c.path}
+                  </span>
+                  <button
+                    className="git-mini"
+                    disabled={busy}
+                    title="해결됨으로 표시(stage)"
+                    onClick={() => act(() => invoke("git_stage", { cwd, path: c.path }))}
+                  >
+                    해결
+                  </button>
+                </div>
+              ))}
+            </>
+          )}
           <div className="git-section-head">
             스테이지됨 ({staged.length})
             {staged.length > 0 && (

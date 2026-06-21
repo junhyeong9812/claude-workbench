@@ -439,6 +439,28 @@ body {
   padding: 8px;
   color: var(--fg-dim);
 }
+.git-merge-banner {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 5px 8px;
+  margin: 4px;
+  border-radius: 4px;
+  background: rgba(243, 139, 168, 0.15);
+  border: 1px solid rgba(243, 139, 168, 0.4);
+  color: #f38ba8;
+  font-size: 0.95em;
+}
+.git-merge-banner span {
+  flex: 1 1 auto;
+}
+.git-conflict-head {
+  color: #f38ba8;
+}
+.git-code.git-conflict {
+  color: #f38ba8;
+  font-weight: 600;
+}
 .git-commit {
   flex: 0 0 auto;
   border-top: 1px solid var(--border, #333);

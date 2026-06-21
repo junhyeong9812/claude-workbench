@@ -1022,3 +1022,13 @@ pub fn git_create_tag(cwd: String, name: String, message: String) -> Result<Stri
 pub fn git_delete_tag(cwd: String, name: String) -> Result<String, AppError> {
     core_lib::git::delete_tag(&cwd, &name).map_err(AppError::new)
 }
+
+#[tauri::command]
+pub fn git_merge_abort(cwd: String) -> Result<String, AppError> {
+    core_lib::git::merge_abort(&cwd).map_err(AppError::new)
+}
+
+#[tauri::command]
+pub fn git_merge_continue(cwd: String) -> Result<String, AppError> {
+    core_lib::git::merge_continue(&cwd).map_err(AppError::new)
+}

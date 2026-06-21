@@ -41,6 +41,8 @@ pub struct FileChange {
     pub code: String,
     /// Whether the change is staged (index column is set and not untracked).
     pub staged: bool,
+    /// Whether the file is in a merge conflict (unmerged porcelain code).
+    pub conflicted: bool,
 }
 
 /// Working-tree status for the Git panel.
@@ -52,6 +54,8 @@ pub struct GitStatus {
     pub ahead: u32,
     pub behind: u32,
     pub has_remote: bool,
+    /// A merge is in progress (MERGE_HEAD exists) — conflicts may need resolving.
+    pub merging: bool,
     pub changes: Vec<FileChange>,
 }
 
@@ -64,6 +68,7 @@ impl GitStatus {
             ahead: 0,
             behind: 0,
             has_remote: false,
+            merging: false,
             changes: Vec::new(),
         }
     }
@@ -110,18 +115,23 @@ fn parse_status(out: &str) -> (String, Option<String>, u32, u32, Vec<FileChange>
         } else if rec.len() >= 4 {
             let code = &rec[..2];
             let path = rec[3..].to_string();
-            let index = code.chars().next().unwrap_or(' ');
-            let staged = index != ' ' && index != '?';
+            let b = code.as_bytes();
+            let x = b[0] as char;
+            let y = b[1] as char;
+            // Unmerged (conflict): a 'U' on either side, or both-added/both-deleted.
+            let conflicted = x == 'U' || y == 'U' || (x == 'A' && y == 'A') || (x == 'D' && y == 'D');
+            let staged = x != ' ' && x != '?';
             // Rename/copy entries carry a second NUL field (the source path) — the
             // shown `path` is the new path; consume the source so it isn't parsed
             // as its own change.
-            if index == 'R' || index == 'C' {
+            if x == 'R' || x == 'C' {
                 let _ = recs.next();
             }
             changes.push(FileChange {
                 path,
                 code: code.trim().to_string(),
                 staged,
+                conflicted,
             });
         }
     }
@@ -139,6 +149,7 @@ pub fn status(cwd: &str) -> GitStatus {
     let porcelain = run_git(cwd, &["status", "--porcelain=v1", "-z", "-b"]).unwrap_or_default();
     let (branch, upstream, ahead, behind, changes) = parse_status(&porcelain);
     let has_remote = !run_git(cwd, &["remote"]).unwrap_or_default().is_empty();
+    let merging = run_git(cwd, &["rev-parse", "-q", "--verify", "MERGE_HEAD"]).is_ok();
     GitStatus {
         is_repo: true,
         branch,
@@ -146,8 +157,20 @@ pub fn status(cwd: &str) -> GitStatus {
         ahead,
         behind,
         has_remote,
+        merging,
         changes,
     }
+}
+
+/// Abort an in-progress merge.
+pub fn merge_abort(cwd: &str) -> Result<String, String> {
+    run_git(cwd, &["merge", "--abort"])
+}
+
+/// Conclude a merge after conflicts are resolved + staged (commit the merge with
+/// its prepared message; no editor).
+pub fn merge_continue(cwd: &str) -> Result<String, String> {
+    run_git(cwd, &["commit", "--no-edit"])
 }
 
 /// Local + remote branches, with the current local branch.
@@ -483,6 +506,14 @@ mod tests {
         assert_eq!(changes[0].path, "src/new.rs");
         assert!(changes[0].staged);
         assert_eq!(changes[1].path, "other.rs"); // source not parsed as its own entry
+    }
+
+    #[test]
+    fn parse_conflict_unmerged() {
+        let (_, _, _, _, changes) = parse_status("## main\0UU src/a.rs\0AA b.rs\0 M c.rs\0");
+        assert!(changes[0].conflicted); // UU
+        assert!(changes[1].conflicted); // AA (both added)
+        assert!(!changes[2].conflicted); // " M" normal modify
     }
 
     #[test]
