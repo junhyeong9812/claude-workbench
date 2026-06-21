@@ -162,7 +162,15 @@ export function StudyTree({
 
   return (
     <>
-      <div className="study-tree" id={id} tabIndex={0} onKeyDown={onKeyDown}>
+      <div
+        className="study-tree"
+        id={id}
+        tabIndex={0}
+        onKeyDown={onKeyDown}
+        onFocus={() => {
+          if (!cursor && visible.length > 0) setCursor(visible[0].entry.path);
+        }}
+      >
         {visible.map(({ entry, depth }): ReactNode => (
           <div
             key={entry.path}

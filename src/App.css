@@ -2059,16 +2059,19 @@ body {
 .study-tree-row:hover {
   background: var(--bg-hover);
 }
+/* Focused tree gets a clear ring so keyboard nav is obviously active. */
 .study-tree:focus {
-  outline: none;
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
 }
 .study-tree-row.cursor {
   background: var(--bg-hover);
   box-shadow: inset 2px 0 0 var(--accent);
 }
+/* When focused, the cursor row is highlighted with the accent tint. */
 .study-tree:focus .study-tree-row.cursor {
-  outline: 1px solid var(--accent);
-  outline-offset: -1px;
+  background: color-mix(in srgb, var(--accent) 22%, transparent);
+  box-shadow: inset 3px 0 0 var(--accent);
 }
 .study-tree-caret {
   flex: 0 0 auto;
