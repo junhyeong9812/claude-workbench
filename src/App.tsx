@@ -151,7 +151,14 @@ export default function App() {
             {sideTab === "files" ? (
               <>
                 <div className="tree-hint">
-                  Ctrl+B 포커스 · ↑↓ 이동 · Enter 열기 · Ctrl+E 에디터 · Esc 닫기
+                  <span>Ctrl+B 포커스 · ↑↓ 이동 · Enter 열기 · Ctrl+E 에디터</span>
+                  <button
+                    className="tree-refresh"
+                    title="디스크에서 새로고침"
+                    onClick={() => void useAppStore.getState().reloadActiveTree()}
+                  >
+                    ↻
+                  </button>
                 </div>
                 <FolderTree />
               </>

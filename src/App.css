@@ -2361,3 +2361,24 @@ body {
   color: var(--fg-dim);
   font-size: 0.85em;
 }
+
+.tree-hint {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+}
+.tree-refresh {
+  flex: 0 0 auto;
+  background: none;
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  color: var(--fg-dim);
+  cursor: pointer;
+  padding: 0 5px;
+  font-size: 1em;
+}
+.tree-refresh:hover {
+  background: var(--bg-hover);
+  color: var(--fg);
+}

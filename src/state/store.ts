@@ -191,6 +191,8 @@ interface AppState {
   loadChildren: (dirPath: string) => Promise<void>;
   /** Force re-read a directory (after create/delete) — bypasses the cache. */
   reloadDir: (dirPath: string) => Promise<void>;
+  /** Re-read the active project's root + expanded dirs (disk reload). */
+  reloadActiveTree: () => Promise<void>;
   /** Save a project's dockview main-area layout (opaque JSON) and persist. */
   setLayout: (path: string, layout: unknown) => void;
   /** Move the folder-tree keyboard cursor. */
@@ -495,6 +497,14 @@ export const useAppStore = create<AppState>((set, get) => ({
     } catch (err) {
       console.error("reloadDir failed", err);
     }
+  },
+
+  reloadActiveTree: async () => {
+    const { activeProject, projects } = get();
+    if (!activeProject) return;
+    await get().reloadDir(activeProject);
+    const expanded = projects.find((p) => p.path === activeProject)?.tree_state.expanded ?? [];
+    for (const d of expanded) await get().reloadDir(d);
   },
 
   setLayout: (path, layout) => {

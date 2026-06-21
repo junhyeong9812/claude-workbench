@@ -94,10 +94,19 @@ export function FolderTree() {
   const setTreeCursor = useAppStore((s) => s.setTreeCursor);
   const setPeekFile = useAppStore((s) => s.setPeekFile);
   const requestEditorOpen = useAppStore((s) => s.requestEditorOpen);
+  const reloadActiveTree = useAppStore((s) => s.reloadActiveTree);
 
   useEffect(() => {
     if (activeProject) void loadChildren(activeProject);
   }, [activeProject, loadChildren]);
+
+  // Disk reload: poll the active tree (root + expanded) so external file
+  // add/delete shows up on its own (manual ↻ in the toolbar bumps it too).
+  useEffect(() => {
+    if (!activeProject) return;
+    const t = setInterval(() => void reloadActiveTree(), 4000);
+    return () => clearInterval(t);
+  }, [activeProject, reloadActiveTree]);
 
   const isExpanded = (p: string): boolean => {
     const s = useAppStore.getState();
