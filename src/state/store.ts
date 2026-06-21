@@ -64,6 +64,15 @@ function saveStudyView(s: {
 
 const STUDY0 = loadStudyView();
 
+/** Safe-parse the persisted study session dockview layout (P5 — restart resume). */
+function loadStudySessionLayout(): unknown | null {
+  try {
+    return JSON.parse(localStorage.getItem("studySessionLayout") || "null");
+  } catch {
+    return null;
+  }
+}
+
 const TERM_COLOR_KEYS = new Set([
   "background",
   "foreground",
@@ -247,7 +256,7 @@ export const useAppStore = create<AppState>((set, get) => ({
   studyTabs: STUDY0.tabs,
   studyActive: STUDY0.active,
   studyMode: STUDY0.mode,
-  studySessionLayout: null,
+  studySessionLayout: loadStudySessionLayout(),
 
   init: async () => {
     try {
@@ -395,7 +404,11 @@ export const useAppStore = create<AppState>((set, get) => ({
     });
     saveStudyView(get());
   },
-  setStudySessionLayout: (layout) => set({ studySessionLayout: layout }),
+  setStudySessionLayout: (layout) => {
+    if (layout) localStorage.setItem("studySessionLayout", JSON.stringify(layout));
+    else localStorage.removeItem("studySessionLayout");
+    set({ studySessionLayout: layout });
+  },
   setStudyMode: (side, mode) => {
     set((s) => ({ studyMode: { ...s.studyMode, [side]: mode } }));
     saveStudyView(get());

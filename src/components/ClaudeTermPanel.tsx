@@ -538,7 +538,11 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
         const cwd = props.params.project ?? useAppStore.getState().activeProject ?? null;
         const started = await invoke<ClaudeStarted>("claude_start", {
           cwd,
-          resume: props.params.loadSessionId ?? null,
+          // Resume the same session after a restart (PTY died) via its persisted
+          // UUID — append to the same JSONL so the timeline continues (P5). A
+          // picker-reopen uses loadSessionId; a normally-started panel uses the
+          // sessionUuid stamped into its params after the first start.
+          resume: props.params.loadSessionId ?? props.params.sessionUuid ?? null,
           name: (props.params.title as string) ?? null,
           cols: term.cols,
           rows: term.rows,
