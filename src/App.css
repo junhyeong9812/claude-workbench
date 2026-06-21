@@ -218,7 +218,7 @@ body {
   padding: 5px 10px;
   font-size: 0.8em;
   color: var(--fg-dim);
-  background: rgba(255, 255, 255, 0.03);
+  background: rgba(127, 127, 127, 0.08);
   border-bottom: 1px solid var(--border, #333);
 }
 .peek-title {
@@ -272,7 +272,7 @@ body {
   padding: 4px 10px;
   font-size: 0.78em;
   color: var(--fg-dim);
-  background: rgba(255, 255, 255, 0.03);
+  background: rgba(127, 127, 127, 0.08);
   border-bottom: 1px solid var(--border, #333);
 }
 .editor-title {
@@ -354,7 +354,7 @@ body {
   gap: 4px;
   padding: 5px 8px;
   border-bottom: 1px solid var(--border, #333);
-  background: rgba(255, 255, 255, 0.03);
+  background: rgba(127, 127, 127, 0.08);
 }
 .git-dir {
   padding: 1px 8px;
@@ -406,7 +406,7 @@ body {
   padding: 4px 8px 2px;
   font-size: 0.92em;
   color: var(--fg-dim);
-  border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+  border-bottom: 1px solid rgba(127, 127, 127, 0.12);
 }
 .git-file {
   display: flex;
@@ -597,7 +597,7 @@ body {
   padding: 4px 10px;
   font-size: 0.8em;
   color: var(--fg-dim);
-  background: rgba(255, 255, 255, 0.03);
+  background: rgba(127, 127, 127, 0.08);
   border-bottom: 1px solid var(--border, #333);
 }
 .diff-title {
@@ -974,7 +974,7 @@ body {
   padding: 3px 8px;
   font-size: 0.78em;
   color: var(--fg-dim);
-  background: rgba(255, 255, 255, 0.03);
+  background: rgba(127, 127, 127, 0.08);
   border-bottom: 1px solid var(--border, #333);
 }
 .claudeterm-pane-head-title {
@@ -1122,7 +1122,7 @@ body {
   cursor: pointer;
   font-size: 0.82em;
   color: var(--fg, #fff);
-  background: rgba(255, 255, 255, 0.04);
+  background: rgba(127, 127, 127, 0.1);
 }
 .timeline-agent-head:hover {
   background: rgba(255, 255, 255, 0.09);
