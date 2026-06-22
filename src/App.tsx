@@ -13,11 +13,34 @@ import { MainArea } from "./components/MainArea";
 import { FilePeekViewer } from "./components/FilePeekViewer";
 import { TerminalSettings } from "./components/TerminalSettings";
 import { StudyView } from "./components/StudyView";
+import { PopoutWorkbench } from "./components/PopoutWorkbench";
 import { useAppStore } from "./state/store";
+import { WebviewWindow } from "@tauri-apps/api/webviewWindow";
 import "./App.css";
 
 export default function App() {
+  // A popped-out panel window loads the same frontend with the `#popout` hash
+  // and renders only the minimal panel workbench (multiwindow).
+  if (window.location.hash.startsWith("#popout")) return <PopoutWorkbench />;
+  return <AppMain />;
+}
+
+/** Open an empty popout window. TEMPORARY P1 verification trigger — P3 replaces
+ * it with the tab drag-out gesture. */
+function openEmptyPopout() {
+  const label = `panel-${Date.now()}`;
+  const w = new WebviewWindow(label, {
+    url: `${window.location.pathname}#popout=${label}`,
+    title: "패널 창",
+    width: 900,
+    height: 640,
+  });
+  w.once("tauri://error", (e) => console.error("[popout] create failed", e));
+}
+
+function AppMain() {
   const init = useAppStore((s) => s.init);
+  const initProjectSync = useAppStore((s) => s.initProjectSync);
   const activeProject = useAppStore((s) => s.activeProject);
   const peekFile = useAppStore((s) => s.peekFile);
   const setPeekFile = useAppStore((s) => s.setPeekFile);
@@ -36,6 +59,17 @@ export default function App() {
   useEffect(() => {
     void init();
   }, [init]);
+
+  // Follow cross-window project switches (multiwindow, review R0-4).
+  useEffect(() => {
+    let un: (() => void) | undefined;
+    initProjectSync()
+      .then((f) => {
+        un = f;
+      })
+      .catch(() => {});
+    return () => un?.();
+  }, [initProjectSync]);
 
   // Apply + persist the color theme (dark default / light).
   useEffect(() => {
@@ -138,6 +172,13 @@ export default function App() {
         <span className="toolbar-title">
           {activeProject ?? "multi-terminal"}
         </span>
+        <button
+          className="toolbar-btn"
+          title="빈 패널 창 열기 (멀티윈도우 P1 검증 — P3에서 드래그 제스처로 대체)"
+          onClick={openEmptyPopout}
+        >
+          🪟 새 창
+        </button>
       </div>
       {mode === "study" ? (
         <StudyView />

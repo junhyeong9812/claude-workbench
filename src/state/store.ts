@@ -1,5 +1,7 @@
 import { create } from "zustand";
 import { invoke } from "@tauri-apps/api/core";
+import { emit, listen, type UnlistenFn } from "@tauri-apps/api/event";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import type { ITheme } from "@xterm/xterm";
 import type { DirEntry, Project, ProjectType, SshConnection, WorkspaceState } from "../types";
 
@@ -202,8 +204,15 @@ interface AppState {
     toPath: string,
     insertAfter: boolean,
   ) => void;
-  /** Make a project active (swaps the visible tree). */
+  /** Make a project active (swaps the visible tree) + broadcast to other
+   * windows so every window shares the same project (multiwindow). */
   setActive: (path: string) => void;
+  /** Apply a project switch broadcast from ANOTHER window — sets state only, no
+   * persist/re-emit (the originating window already did both; review R0-3). */
+  applyRemoteActive: (path: string | null) => void;
+  /** Subscribe to cross-window `project-sync` events; returns an unlisten fn.
+   * Both the main window and popout windows call this (review R0-4). */
+  initProjectSync: () => Promise<UnlistenFn>;
   /** Expand/collapse a directory for the active project. */
   toggleExpanded: (dirPath: string) => void;
   /** Lazily load a directory's children via the backend. */
@@ -391,6 +400,23 @@ export const useAppStore = create<AppState>((set, get) => ({
   setActive: (path) => {
     set({ activeProject: path });
     get().persist();
+    // Broadcast so other windows follow (origin-tagged to skip our own echo).
+    emit("project-sync", { activeProject: path, sourceWindow: getCurrentWindow().label }).catch(
+      () => {},
+    );
+  },
+  applyRemoteActive: (path) => set({ activeProject: path }),
+  initProjectSync: async () => {
+    const self = getCurrentWindow().label;
+    return await listen<{ activeProject: string | null; sourceWindow: string }>(
+      "project-sync",
+      (e) => {
+        const { activeProject, sourceWindow } = e.payload;
+        // Ignore our own echo + no-op if already on that project (review R0-3).
+        if (sourceWindow === self || activeProject === get().activeProject) return;
+        get().applyRemoteActive(activeProject);
+      },
+    );
   },
 
   setTreeCursor: (path) => set({ treeCursor: path }),

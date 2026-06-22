@@ -1,7 +1,7 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "Default capabilities for the main window: core APIs + folder picker dialog.",
+  "description": "Capabilities for the main window: core APIs + folder picker dialog + runtime window creation (multiwindow popouts). Popped-out panel windows use the narrower panel.json capability.",
   "windows": ["main"],
-  "permissions": ["core:default", "dialog:default"]
+  "permissions": ["core:default", "dialog:default", "core:webview:allow-create-webview-window"]
 }

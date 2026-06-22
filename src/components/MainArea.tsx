@@ -1,10 +1,8 @@
 import { useEffect, useRef, useState } from "react";
 import {
   DockviewReact,
-  DockviewDefaultTab,
   type DockviewApi,
   type DockviewReadyEvent,
-  type IDockviewPanelHeaderProps,
 } from "dockview-react";
 import "dockview-react/dist/styles/dockview.css";
 import { invoke } from "@tauri-apps/api/core";
@@ -12,14 +10,9 @@ import { listen } from "@tauri-apps/api/event";
 import { useAppStore } from "../state/store";
 import { useClaudeUi } from "../state/claudeUi";
 import { recallArea, forgetArea, type PanelArea } from "../state/panelFocus";
-import { PlaceholderPanel } from "./PlaceholderPanel";
-import { TerminalPanel } from "./TerminalPanel";
-import { ClaudeTermPanel } from "./ClaudeTermPanel";
-import { EditorPanel } from "./EditorPanel";
-import { DiffPanel } from "./DiffPanel";
+import { isTransferring } from "../state/panelTransfer";
+import { components, AppTab, type PanelKind } from "./panelRegistry";
 import { fileName } from "./cmLang";
-import { ClaudeTab } from "./ClaudeTab";
-import { SshTab } from "./SshTab";
 
 /** A saved session normalized for the reopen picker (ACP `claude` or A
  * `claudeterm`). `id` is the session UUID. */
@@ -35,29 +28,6 @@ interface SessionSummary {
   project: string;
 }
 
-
-/** Default tab for all panels. Both Claude panel kinds (ACP `claude` and the
- * architecture-A `claudeterm`) use the custom tab — its × raises a 닫기/삭제
- * modal and its title renames inline (B3-1/B3-5). */
-function AppTab(props: IDockviewPanelHeaderProps) {
-  const kind = props.params.kind;
-  if (kind === "claudeterm") return <ClaudeTab {...props} />;
-  if (kind === "ssh") return <SshTab {...props} />;
-  return <DockviewDefaultTab {...props} />;
-}
-
-/** dockview component registry — maps component name -> React panel. SSH reuses
- * the PTY-backed TerminalPanel (it branches on `kind` internally). */
-const components = {
-  placeholder: PlaceholderPanel,
-  terminal: TerminalPanel,
-  ssh: TerminalPanel,
-  claudeterm: ClaudeTermPanel,
-  editor: EditorPanel,
-  diff: DiffPanel,
-};
-
-type PanelKind = "terminal" | "editor" | "claudeterm";
 
 /** Transient new-connection dialog form state. The secret fields never enter
  * panel params or workspace.json — they go to `ssh_create` (this session) and,
@@ -208,6 +178,10 @@ export function MainArea() {
     api.onDidRemovePanel((panel) => {
       // Drop this panel's remembered focus area (closed for good — not a switch).
       forgetArea(panel.id);
+      // A *transfer* to another window removes the panel here but the backend
+      // session must survive (it re-attaches in the target window) — skip close
+      // (detach≠close, review R0-1). The actual move is wired in P2.
+      if (isTransferring(panel.id)) return;
       const params = panel.params as { kind?: string; sessionId?: number } | undefined;
       if (typeof params?.sessionId === "number") {
         // claudeterm sessions also need their poll thread stopped (claude_close);
