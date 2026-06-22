@@ -1553,8 +1553,8 @@ body {
   line-height: 1.45;
   white-space: pre-wrap;
   word-break: break-word;
-  max-height: 280px;
-  overflow-y: auto;
+  /* No inner vertical cap: content flows full-height so the focusable detail pane
+     (.claudeterm-viewer-body) scrolls it all with ↑↓/PageUp·Down (no trapped box). */
   padding: 4px 6px;
   border-radius: 3px;
   background: var(--bg-alt);
@@ -1567,10 +1567,9 @@ body {
   font-size: 11px;
   line-height: 1.45;
   white-space: pre;
+  /* horizontal scroll only; no vertical cap so the outer detail pane scrolls the
+     whole diff with the keyboard (extra bottom padding clears the h-scrollbar). */
   overflow-x: auto;
-  max-height: 240px;
-  overflow-y: auto;
-  /* extra bottom padding so the horizontal scrollbar doesn't cover the last line */
   padding: 4px 6px 14px;
   border-radius: 3px;
 }
