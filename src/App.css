@@ -1248,6 +1248,22 @@ body {
   flex: 0 0 auto;
   overflow-y: visible;
 }
+/* The previous-task history region (above the live timeline) + its show/hide bar. */
+.claudeterm-prevtasks-toggle {
+  position: sticky;
+  top: 0;
+  z-index: 2;
+  cursor: pointer;
+  user-select: none;
+  font-size: 11px;
+  color: var(--fg-dim);
+  padding: 3px 6px;
+  background: var(--bg-alt);
+  border-bottom: 1px solid var(--border);
+}
+.claudeterm-prevtasks-toggle:hover {
+  color: var(--fg);
+}
 /* A previous task in the handoff chain — a task-layer header above its dates. */
 .claudeterm-prevtask {
   border-top: 2px solid rgba(137, 180, 250, 0.45);

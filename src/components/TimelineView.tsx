@@ -13,7 +13,13 @@ import DOMPurify from "dompurify";
  * the study viewer — the content is local session text, sanitized before inject. */
 export function MarkdownText({ text }: { text: string }) {
   const html = useMemo(
-    () => DOMPurify.sanitize(marked.parse(text, { async: false }) as string),
+    () =>
+      DOMPurify.sanitize(marked.parse(text, { async: false }) as string, {
+        // Tool output / read results are rendered here — block media tags so a
+        // `![x](https://attacker/…)` can't make the webview fetch a remote URL
+        // just by opening the detail pane (codex).
+        FORBID_TAGS: ["img", "picture", "source", "video", "audio", "iframe", "object", "embed"],
+      }),
     [text],
   );
   return <div className="study-md tl-markdown" dangerouslySetInnerHTML={{ __html: html }} />;
@@ -68,6 +74,7 @@ export function TimelineView({
   selectedTurn,
   selectedScope,
   scope = "live",
+  followBottom = false,
   onSelect,
   onSelectTurn,
 }: {
@@ -89,6 +96,9 @@ export function TimelineView({
    * `selectedId` needs no scope.) */
   selectedScope?: string;
   scope?: string;
+  /** When true, scroll the shared container to the bottom as new content arrives
+   * (the live timeline). Previous-task lists leave this false. */
+  followBottom?: boolean;
   onSelect: (item: TimelineItem) => void;
   /** Select a turn (Q&A): view its prompt + full answer in the detail pane.
    * Used by ↑/↓ landing on a question head and by clicking the head/answer. */
@@ -166,11 +176,12 @@ export function TimelineView({
     );
   };
   // Every turn shows, even one with no tool calls (a plain Q&A): derive the
-  // turn list from the union of prompts, answers, and items (B3). Newest turn
-  // first — the current question sits at the top, older history below (B5).
+  // turn list from the union of prompts, answers, and items (B3). Chronological —
+  // oldest at top, newest at the bottom (chat-like); the view follows new content
+  // downward so the latest is always at the bottom.
   const turnNos = [
     ...new Set<number>([...turns.keys(), ...answers.keys(), ...items.map((it) => it.turn)]),
-  ].sort((a, b) => b - a);
+  ].sort((a, b) => a - b);
 
   // Collapsed date groups (B8): clicking a date header folds/unfolds its turns.
   const [collapsedDates, setCollapsedDates] = useState<Set<string>>(new Set());
@@ -225,11 +236,23 @@ export function TimelineView({
     if (sel) listRef.current.querySelector(sel)?.scrollIntoView({ block: "nearest" });
   }, [selectedId, selectedTurn, selectedScope, scope]);
 
-  // A new question arrives at the top — scroll there so the current Q is in view (B5).
-  const newestTurn = turnNos[0] ?? 0;
+  // New content arrives at the bottom — follow it down so the latest is in view.
+  // Only the live timeline follows (followBottom); the stacked previous-task lists
+  // share one scroll container, so we scroll that container, not the inner list
+  // (which is content-sized). The live list is the last child ⇒ container bottom.
+  const newestTurn = turnNos[turnNos.length - 1] ?? 0;
   useEffect(() => {
-    listRef.current?.scrollTo({ top: 0 });
-  }, [newestTurn]);
+    if (!followBottom) return;
+    let n = listRef.current?.parentElement ?? null;
+    while (n) {
+      const oy = getComputedStyle(n).overflowY;
+      if (oy === "auto" || oy === "scroll") {
+        n.scrollTop = n.scrollHeight;
+        return;
+      }
+      n = n.parentElement;
+    }
+  }, [newestTurn, followBottom]);
 
   const onKeyDown = (e: React.KeyboardEvent<HTMLDivElement>) => {
     if (e.key !== "ArrowDown" && e.key !== "ArrowUp") return;
@@ -248,7 +271,7 @@ export function TimelineView({
   };
 
   // Insert a date divider whenever the date changes between turns (B6). Turns
-  // are newest-first, so dates read newest→oldest down the list.
+  // are oldest-first, so dates read oldest→newest down the list.
   let prevDate: string | null = null;
   const turnRows = turnNos.map((turn) => {
     const date = dates.get(turn) ?? "";
