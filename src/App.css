@@ -1264,21 +1264,20 @@ body {
   flex: 0 0 auto;
   overflow-y: visible;
 }
-/* The previous-task history region (above the live timeline) + its show/hide bar. */
+/* Prev-task expand/collapse control inside the timeline pane header. */
 .claudeterm-prevtasks-toggle {
-  position: sticky;
-  top: 0;
-  z-index: 2;
+  flex: 0 0 auto;
   cursor: pointer;
   user-select: none;
-  font-size: 11px;
+  font-size: 10px;
   color: var(--fg-dim);
-  padding: 3px 6px;
-  background: var(--bg-alt);
-  border-bottom: 1px solid var(--border);
+  padding: 1px 6px;
+  border: 1px solid var(--border);
+  border-radius: 3px;
 }
 .claudeterm-prevtasks-toggle:hover {
   color: var(--fg);
+  background: var(--bg-hover);
 }
 /* A previous task in the handoff chain — a task-layer header above its dates. */
 .claudeterm-prevtask {

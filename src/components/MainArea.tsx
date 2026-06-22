@@ -364,11 +364,21 @@ export function MainArea() {
   }, []);
 
   // Ctrl+B from the already-focused tree asks to focus the open tab (App bumps
-  // focusMainRequest). dockview's focus() focuses the active panel if one exists.
-  // Skip the initial 0 so a fresh mount doesn't steal focus.
+  // focusMainRequest). dockview's focus() only focuses the active GROUP, so also
+  // drop focus into the active panel's content (xterm/CodeMirror/…) so keyboard
+  // input lands there. Skip the initial 0 so a fresh mount doesn't steal focus.
   useEffect(() => {
     if (focusMainRequest === 0) return;
-    apiRef.current?.focus();
+    const api = apiRef.current;
+    if (!api) return;
+    api.focus();
+    requestAnimationFrame(() => {
+      const group = document.querySelector(".main-dock .dv-active-group");
+      const el = group?.querySelector(
+        ".xterm-helper-textarea, .cm-content, textarea, input, [tabindex]",
+      ) as HTMLElement | null;
+      el?.focus();
+    });
   }, [focusMainRequest]);
 
   return (

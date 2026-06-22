@@ -792,23 +792,29 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
         ref={timelineRef}
         style={{ flex: `0 0 ${timelineWidth}px` }}
       >
-        <div className="claudeterm-pane-head">타임라인</div>
+        {/* Prev-task expand/collapse lives IN the header (outside the scroll
+            container) so the live timeline's auto-scroll-to-bottom can't hide it.
+            Only shown when a handoff chain exists. */}
+        <div className="claudeterm-pane-head">
+          <span className="claudeterm-pane-head-title">타임라인</span>
+          {chainPrev.length > 0 && (
+            <span
+              className="claudeterm-prevtasks-toggle"
+              title={hidePrev ? "이전 task 펼치기" : "이전 task 접기"}
+              onClick={() => setHidePrev((h) => !h)}
+            >
+              <span className="timeline-date-caret">{hidePrev ? "▸" : "▾"}</span> 이전 task{" "}
+              {chainPrev.length}개
+            </span>
+          )}
+        </div>
         <div className="claudeterm-timeline">
           {/* Previous tasks render ABOVE the live timeline (older = higher), each
-              collapsible; the whole region can be hidden. Reverse the (newest-first)
-              chain so the oldest task sits at the very top — chronological down. */}
-          {chainPrev.length > 0 && (
+              collapsible. Reverse the (newest-first) chain so the oldest task sits
+              at the very top — chronological down. */}
+          {chainPrev.length > 0 && !hidePrev && (
             <div className="claudeterm-prevtasks">
-              <div
-                className="claudeterm-prevtasks-toggle"
-                title={hidePrev ? "이전 task 보기" : "이전 task 숨기기"}
-                onClick={() => setHidePrev((h) => !h)}
-              >
-                <span className="timeline-date-caret">{hidePrev ? "▸" : "▾"}</span> 이전 task{" "}
-                {chainPrev.length}개 {hidePrev ? "보기" : "숨기기"}
-              </div>
-              {!hidePrev &&
-                [...chainPrev].reverse().map((task) => {
+              {[...chainPrev].reverse().map((task) => {
                   const collapsed = collapsedTasks.has(task.uuid);
                   return (
                     <div key={task.uuid} className="claudeterm-prevtask">
