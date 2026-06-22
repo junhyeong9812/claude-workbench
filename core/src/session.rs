@@ -42,6 +42,41 @@ pub struct OutputChunk {
     pub bytes: Vec<u8>,
 }
 
+/// State shared between the manager and a session's output producer (the local
+/// reader thread, or the SSH channel loop). `pub(crate)` so the `ssh` module can
+/// drive the **same** scrollback/seq/fan-out contract as local PTYs — the
+/// transport differs, the output pipeline does not.
+pub(crate) struct Shared {
+    scrollback: Mutex<Scrollback>,
+    subscribers: Mutex<Vec<Sender<OutputChunk>>>,
+    alive: AtomicBool,
+}
+
+impl Shared {
+    pub(crate) fn new(cap: usize) -> Self {
+        Shared {
+            scrollback: Mutex::new(Scrollback::new(cap)),
+            subscribers: Mutex::new(Vec::new()),
+            alive: AtomicBool::new(true),
+        }
+    }
+
+    /// Append output bytes: assign the next monotonic `seq` in the scrollback and
+    /// fan out to live subscribers (dropping any whose receiver is gone). This is
+    /// the single output contract shared by local and SSH sessions.
+    pub(crate) fn emit(&self, data: &[u8]) {
+        let seq = self.scrollback.lock().unwrap().push(data);
+        let mut subs = self.subscribers.lock().unwrap();
+        subs.retain(|tx| tx.send(OutputChunk { seq, bytes: data.to_vec() }).is_ok());
+    }
+
+    /// Mark the session dead (idempotent). Called on child/connection exit and on
+    /// teardown so `is_alive` and write-rejection stay correct on all paths.
+    pub(crate) fn set_dead(&self) {
+        self.alive.store(false, Ordering::SeqCst);
+    }
+}
+
 /// Byte ring buffer + chunk sequence counter. Guarded by a `Mutex` in [`Shared`]
 /// so `snapshot` and the reader thread's `push` are mutually atomic.
 struct Scrollback {
@@ -70,22 +105,27 @@ impl Scrollback {
     }
 }
 
-/// State shared between the manager and a session's reader thread.
-struct Shared {
-    scrollback: Mutex<Scrollback>,
-    subscribers: Mutex<Vec<Sender<OutputChunk>>>,
-    alive: AtomicBool,
+/// Transport-specific resources behind a session. The output pipeline (`Shared`)
+/// is identical across variants; only input/resize/teardown differ.
+enum Transport {
+    /// Local PTY (portable-pty). The reader thread owns its own cloned reader +
+    /// `Arc<Shared>`; these handles are manager-owned (map-lock serialized).
+    Local {
+        master: Box<dyn MasterPty + Send>,
+        writer: Box<dyn Write + Send>,
+        killer: Box<dyn portable_pty::ChildKiller + Send + Sync>,
+        reader_handle: Option<JoinHandle<()>>,
+    },
+    /// Remote SSH session (russh). Its tokio runtime + channel loop live on a
+    /// dedicated OS thread; [`crate::ssh::SshHandle`] carries the input/resize/
+    /// cancel/join handles.
+    Ssh(crate::ssh::SshHandle),
 }
 
-/// Manager-owned per-session handles. The reader thread does NOT touch these
-/// (it owns its own cloned reader + `Arc<Shared>`); access is serialized by the
-/// manager's map lock.
+/// One session = a shared output pipeline + a transport.
 struct Session {
-    master: Box<dyn MasterPty + Send>,
-    writer: Box<dyn Write + Send>,
-    killer: Box<dyn portable_pty::ChildKiller + Send + Sync>,
     shared: Arc<Shared>,
-    reader_handle: Option<JoinHandle<()>>,
+    transport: Transport,
 }
 
 /// Owns every live PTY for the app run. `Send + Sync` so it can be a Tauri
@@ -154,11 +194,7 @@ impl SessionManager {
         let mut reader = pair.master.try_clone_reader().map_err(|e| e.to_string())?;
         let writer = pair.master.take_writer().map_err(|e| e.to_string())?;
 
-        let shared = Arc::new(Shared {
-            scrollback: Mutex::new(Scrollback::new(self.scrollback_cap)),
-            subscribers: Mutex::new(Vec::new()),
-            alive: AtomicBool::new(true),
-        });
+        let shared = Arc::new(Shared::new(self.scrollback_cap));
 
         // Reader thread: read until EOF/error, append to scrollback with a seq,
         // fan out to subscribers, then mark dead and reap the child (no zombie,
@@ -169,21 +205,10 @@ impl SessionManager {
             loop {
                 match reader.read(&mut buf) {
                     Ok(0) | Err(_) => break,
-                    Ok(n) => {
-                        let chunk = &buf[..n];
-                        let seq = shared_reader.scrollback.lock().unwrap().push(chunk);
-                        let mut subs = shared_reader.subscribers.lock().unwrap();
-                        subs.retain(|tx| {
-                            tx.send(OutputChunk {
-                                seq,
-                                bytes: chunk.to_vec(),
-                            })
-                            .is_ok()
-                        });
-                    }
+                    Ok(n) => shared_reader.emit(&buf[..n]),
                 }
             }
-            shared_reader.alive.store(false, Ordering::SeqCst);
+            shared_reader.set_dead();
             let _ = child.wait();
         });
 
@@ -191,14 +216,42 @@ impl SessionManager {
         self.sessions.lock().unwrap().insert(
             id,
             Session {
-                master: pair.master,
-                writer,
-                killer,
                 shared,
-                reader_handle: Some(handle),
+                transport: Transport::Local {
+                    master: pair.master,
+                    writer,
+                    killer,
+                    reader_handle: Some(handle),
+                },
             },
         );
         Ok(id)
+    }
+
+    /// Spawn a remote SSH session (russh) and return its id immediately. The
+    /// connect/auth/host-key handshake runs on the session's own thread; progress
+    /// and failures surface via the returned [`SshChannels`] status stream (the
+    /// Tauri layer relays them as events). Output flows through the same
+    /// `Shared`/`subscribe`/`snapshot` pipeline as local PTYs.
+    pub fn create_ssh(
+        &self,
+        config: crate::ssh::SshConfig,
+        known_hosts_path: std::path::PathBuf,
+        cols: u16,
+        rows: u16,
+    ) -> (SessionId, crate::ssh::SshChannels) {
+        let shared = Arc::new(Shared::new(self.scrollback_cap));
+        let (handle, channels) =
+            crate::ssh::spawn_ssh(config, Arc::clone(&shared), known_hosts_path, cols, rows);
+        let id = self.next_id.fetch_add(1, Ordering::SeqCst);
+        self.sessions.lock().unwrap().insert(
+            id,
+            Session {
+                shared,
+                transport: Transport::Ssh(handle),
+            },
+        );
+        (id, channels)
     }
 
     /// Write bytes (keystrokes) to the PTY. Errors if the session is unknown or
@@ -209,8 +262,13 @@ impl SessionManager {
         if !s.shared.alive.load(Ordering::SeqCst) {
             return Err("session is dead".into());
         }
-        s.writer.write_all(data).map_err(|e| e.to_string())?;
-        s.writer.flush().map_err(|e| e.to_string())
+        match &mut s.transport {
+            Transport::Local { writer, .. } => {
+                writer.write_all(data).map_err(|e| e.to_string())?;
+                writer.flush().map_err(|e| e.to_string())
+            }
+            Transport::Ssh(h) => h.send_input(data),
+        }
     }
 
     /// Resize the PTY. A 0-dimension (hidden panel) is a harmless no-op; an
@@ -221,14 +279,20 @@ impl SessionManager {
         }
         let map = self.sessions.lock().unwrap();
         let s = map.get(&id).ok_or("no such session")?;
-        s.master
-            .resize(PtySize {
-                rows,
-                cols,
-                pixel_width: 0,
-                pixel_height: 0,
-            })
-            .map_err(|e| e.to_string())
+        match &s.transport {
+            Transport::Local { master, .. } => master
+                .resize(PtySize {
+                    rows,
+                    cols,
+                    pixel_width: 0,
+                    pixel_height: 0,
+                })
+                .map_err(|e| e.to_string()),
+            Transport::Ssh(h) => {
+                h.set_size(cols, rows);
+                Ok(())
+            }
+        }
     }
 
     /// Snapshot the scrollback atomically with its last seq (backfill contract,
@@ -265,8 +329,13 @@ impl SessionManager {
     pub fn kill(&self, id: SessionId) -> Result<(), String> {
         let mut map = self.sessions.lock().unwrap();
         let s = map.get_mut(&id).ok_or("no such session")?;
-        let _ = s.killer.kill();
-        s.shared.alive.store(false, Ordering::SeqCst);
+        match &mut s.transport {
+            Transport::Local { killer, .. } => {
+                let _ = killer.kill();
+            }
+            Transport::Ssh(h) => h.cancel(),
+        }
+        s.shared.set_dead();
         Ok(())
     }
 
@@ -281,12 +350,28 @@ impl SessionManager {
             .unwrap()
             .remove(&id)
             .ok_or("no such session")?;
-        let _ = session.killer.kill();
-        session.shared.alive.store(false, Ordering::SeqCst);
-        // Drop master/writer first so the PTY closes and the reader hits EOF.
-        // (Explicit join below waits for the reader to reap the child.)
-        if let Some(handle) = session.reader_handle.take() {
-            let _ = handle.join();
+        session.shared.set_dead();
+        // Tear down the transport. The map lock is already released (we removed
+        // the session above), so the join below never holds it — a slow SSH
+        // shutdown or reader drain can't block other sessions (codex F3).
+        match &mut session.transport {
+            Transport::Local {
+                killer,
+                reader_handle,
+                ..
+            } => {
+                let _ = killer.kill();
+                // Drop master/writer (in `session`) closes the PTY -> reader EOFs.
+                if let Some(handle) = reader_handle.take() {
+                    let _ = handle.join();
+                }
+            }
+            Transport::Ssh(h) => {
+                // Cancel cancels every await point (connect/auth/host-key/write),
+                // then join waits for the runtime thread to unwind its RAII guard.
+                h.cancel();
+                h.join();
+            }
         }
         Ok(())
     }

@@ -178,6 +178,189 @@ pub fn terminal_close(mgr: State<'_, SessionManager>, id: u64) -> Result<(), App
     mgr.remove(id).map_err(AppError::new)
 }
 
+// ---- SSH (remote terminal via russh) ----
+//
+// SSH sessions ride the SAME `SessionManager` and `terminal-output` relay as
+// local PTYs (write/resize/snapshot/close are id-dispatched in core), so the only
+// SSH-specific glue here is `ssh_create` (assemble config + relay status/host-key
+// streams) and `ssh_hostkey_decision` (feed the user's TOFU answer back to the
+// connecting thread). Host-key challenges come from core over a channel — core
+// stays tauri-free; this layer turns them into events.
+
+/// Pending host-key decisions, keyed by session id. The prompt relay inserts the
+/// reply sender on a challenge; `ssh_hostkey_decision` takes it out and answers.
+#[derive(Default)]
+pub struct SshState {
+    pending: Arc<Mutex<HashMap<u64, core_lib::ssh::HostKeyReply>>>,
+}
+
+/// `ssh-status` payload: connection lifecycle for the panel.
+#[derive(Clone, Serialize)]
+struct SshStatusPayload {
+    id: u64,
+    phase: String,
+    reason: Option<String>,
+}
+
+/// `ssh-hostkey-prompt` payload: shown to the user for a first-seen host (TOFU).
+#[derive(Clone, Serialize)]
+struct HostKeyPromptPayload {
+    id: u64,
+    host: String,
+    port: u16,
+    fingerprint: String,
+}
+
+/// App-private known_hosts path (the global `~/.ssh/known_hosts` is never touched
+/// — review F7). Ensures the parent dir exists so `learn` can write.
+fn ssh_known_hosts_path(app: &AppHandle) -> Result<PathBuf, AppError> {
+    let dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|_| AppError::new("Cannot resolve app data directory"))?;
+    let _ = std::fs::create_dir_all(&dir);
+    Ok(dir.join("known_hosts"))
+}
+
+/// Open a remote SSH session. Returns the session id **immediately**; connect /
+/// auth / host-key happen on the session thread and surface via `ssh-status` (and
+/// `ssh-hostkey-prompt` for unknown hosts). Output streams through the shared
+/// `terminal-output` relay, so the panel renders it exactly like a local PTY.
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+pub fn ssh_create(
+    app: AppHandle,
+    mgr: State<'_, SessionManager>,
+    ssh: State<'_, SshState>,
+    host: String,
+    port: u16,
+    username: String,
+    auth_kind: String,
+    password: Option<String>,
+    key_path: Option<String>,
+    passphrase: Option<String>,
+    cols: u16,
+    rows: u16,
+) -> Result<u64, AppError> {
+    use core_lib::ssh::{AuthMethod, HostKeyChallenge, SshConfig, SshStatus};
+
+    let auth = match auth_kind.as_str() {
+        "password" => AuthMethod::Password(password.unwrap_or_default()),
+        "publickey" => AuthMethod::PublicKey {
+            path: key_path.ok_or_else(|| AppError::new("a key path is required"))?,
+            passphrase,
+        },
+        "agent" => AuthMethod::Agent,
+        _ => return Err(AppError::new("unknown authentication method")),
+    };
+    let config = SshConfig {
+        host,
+        port,
+        username,
+        auth,
+    };
+    let known_hosts = ssh_known_hosts_path(&app)?;
+    let (id, channels) = mgr.create_ssh(config, known_hosts, cols, rows);
+
+    // (a) Output relay -> `terminal-output`, identical to `terminal_create`.
+    let rx = mgr.subscribe(id).map_err(AppError::new)?;
+    {
+        let app = app.clone();
+        thread::spawn(move || {
+            while let Ok(chunk) = rx.recv() {
+                let _ = app.emit(
+                    "terminal-output",
+                    TerminalOutput {
+                        session_id: id,
+                        seq: chunk.seq,
+                        data: chunk.bytes,
+                    },
+                );
+            }
+        });
+    }
+
+    // (b) Status relay -> `ssh-status`.
+    {
+        let app = app.clone();
+        let mut status_rx = channels.status_rx;
+        thread::spawn(move || {
+            while let Some(s) = status_rx.blocking_recv() {
+                let (phase, reason) = match s {
+                    SshStatus::Connecting => ("connecting", None),
+                    SshStatus::Ready => ("ready", None),
+                    SshStatus::Failed(r) => ("failed", Some(r)),
+                    SshStatus::Closed => ("closed", None),
+                };
+                let _ = app.emit(
+                    "ssh-status",
+                    SshStatusPayload {
+                        id,
+                        phase: phase.into(),
+                        reason,
+                    },
+                );
+            }
+        });
+    }
+
+    // (c) Host-key prompt relay -> `ssh-hostkey-prompt`; stash the reply so
+    //     `ssh_hostkey_decision` can answer it.
+    {
+        let app = app.clone();
+        let pending = Arc::clone(&ssh.pending);
+        let mut prompt_rx = channels.prompt_rx;
+        thread::spawn(move || {
+            while let Some(challenge) = prompt_rx.blocking_recv() {
+                let HostKeyChallenge {
+                    host,
+                    port,
+                    fingerprint,
+                    reply,
+                } = challenge;
+                if let Ok(mut p) = pending.lock() {
+                    p.insert(id, reply);
+                }
+                let _ = app.emit(
+                    "ssh-hostkey-prompt",
+                    HostKeyPromptPayload {
+                        id,
+                        host,
+                        port,
+                        fingerprint,
+                    },
+                );
+            }
+        });
+    }
+
+    Ok(id)
+}
+
+/// Answer a host-key prompt (TOFU). `accept=true` trusts and persists the key;
+/// `false` rejects (the connect then fails). A missing entry (already answered or
+/// the session was cancelled) is a no-op (review C2).
+#[tauri::command]
+pub fn ssh_hostkey_decision(ssh: State<'_, SshState>, id: u64, accept: bool) -> Result<(), AppError> {
+    use core_lib::ssh::HostKeyDecision;
+    let reply = ssh
+        .pending
+        .lock()
+        .map_err(|_| AppError::new("ssh state unavailable"))?
+        .remove(&id);
+    if let Some(tx) = reply {
+        let decision = if accept {
+            HostKeyDecision::Accept
+        } else {
+            HostKeyDecision::Reject
+        };
+        // Send can fail if the connecting thread was cancelled meanwhile — that's
+        // a normal closed prompt, not an error (review C2).
+        let _ = tx.send(decision);
+    }
+    Ok(())
+}
+
 // ---- Claude (architecture A: real terminal + session-JSONL tail) ----
 //
 // Instead of the ACP adapter, we spawn the **real** `claude` CLI in a PTY (so
