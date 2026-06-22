@@ -50,30 +50,38 @@ export default function App() {
     localStorage.setItem("fontSize", String(fontSize));
   }, [fontSize]);
 
-  // Ctrl+B toggles focus between the folder tree and wherever you were: from
-  // anywhere it remembers the focused element and focuses the tree; pressing it
-  // again while the tree holds focus restores that exact element (timeline list,
-  // terminal, editor…), so e.g. timeline→tree→timeline round-trips. Falls back to
-  // focusing the active dockview panel when there's no remembered element.
+  // Remember the last focused element OUTSIDE the tree (timeline list, terminal,
+  // editor…), updated on every focus change — mouse click or keyboard — so Ctrl+B
+  // returns to exactly where you were, however you got there.
   const lastFocusRef = useRef<HTMLElement | null>(null);
   useEffect(() => {
+    const onFocusIn = (e: FocusEvent) => {
+      const t = e.target as HTMLElement | null;
+      if (!t || t === document.body) return;
+      const tree = document.getElementById("folder-tree");
+      if (tree && (t === tree || tree.contains(t))) return; // tree isn't a "return" target
+      lastFocusRef.current = t;
+    };
+    document.addEventListener("focusin", onFocusIn);
+    return () => document.removeEventListener("focusin", onFocusIn);
+  }, []);
+
+  // Ctrl+B toggles between the folder tree and your last work spot: from the tree
+  // it restores the remembered element (falling back to the active dockview panel
+  // when there's none); from anywhere else it focuses the tree.
+  useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
-      if (e.ctrlKey && (e.key === "b" || e.key === "B")) {
-        e.preventDefault();
-        const tree = document.getElementById("folder-tree");
-        const treeFocused =
-          !!tree && (tree === document.activeElement || tree.contains(document.activeElement));
-        if (treeFocused) {
-          const prev = lastFocusRef.current;
-          if (prev && document.contains(prev) && prev !== tree && !tree?.contains(prev)) {
-            prev.focus();
-          } else {
-            useAppStore.getState().requestFocusMain();
-          }
-        } else {
-          lastFocusRef.current = document.activeElement as HTMLElement | null;
-          tree?.focus();
-        }
+      if (!(e.ctrlKey && (e.key === "b" || e.key === "B"))) return;
+      e.preventDefault();
+      const tree = document.getElementById("folder-tree");
+      const treeFocused =
+        !!tree && (tree === document.activeElement || tree.contains(document.activeElement));
+      if (treeFocused) {
+        const prev = lastFocusRef.current;
+        if (prev && document.contains(prev) && !tree?.contains(prev)) prev.focus();
+        else useAppStore.getState().requestFocusMain();
+      } else {
+        tree?.focus();
       }
     };
     window.addEventListener("keydown", onKey);

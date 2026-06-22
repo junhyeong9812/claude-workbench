@@ -243,9 +243,31 @@ export function TimelineView({
   // within a turn too), via rAF so layout is settled. Behavior: jump to bottom on
   // first load; afterwards stick to bottom only when already near it, so a manual
   // scroll-up to read history isn't yanked back down.
-  const didFollowInit = useRef(false);
+  // stickBottomRef starts true so a freshly opened (or reopened) timeline lands at
+  // the bottom; the scroll listener flips it off when the user scrolls up to read
+  // history and back on when they return near the bottom.
+  const stickBottomRef = useRef(true);
+  // Attach a scroll listener to the shared scroll container to track stickiness.
   useEffect(() => {
     if (!followBottom) return;
+    let sc: HTMLElement | null = listRef.current?.parentElement ?? null;
+    while (sc) {
+      const oy = getComputedStyle(sc).overflowY;
+      if (oy === "auto" || oy === "scroll") break;
+      sc = sc.parentElement;
+    }
+    if (!sc) return;
+    const el = sc;
+    const onScroll = () => {
+      stickBottomRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < 160;
+    };
+    el.addEventListener("scroll", onScroll, { passive: true });
+    return () => el.removeEventListener("scroll", onScroll);
+  }, [followBottom]);
+  // On any content growth (new turn or items streaming within a turn), follow to
+  // the bottom while sticking. rAF so layout (heights) is settled first.
+  useEffect(() => {
+    if (!followBottom || !stickBottomRef.current) return;
     const raf = requestAnimationFrame(() => {
       let sc: HTMLElement | null = listRef.current?.parentElement ?? null;
       while (sc) {
@@ -253,17 +275,7 @@ export function TimelineView({
         if (oy === "auto" || oy === "scroll") break;
         sc = sc.parentElement;
       }
-      if (!sc) return;
-      const hasContent = items.length > 0 || turnNos.length > 0;
-      if (!didFollowInit.current) {
-        if (hasContent) {
-          sc.scrollTop = sc.scrollHeight;
-          didFollowInit.current = true;
-        }
-        return;
-      }
-      const distFromBottom = sc.scrollHeight - sc.scrollTop - sc.clientHeight;
-      if (distFromBottom < 160) sc.scrollTop = sc.scrollHeight;
+      if (sc) sc.scrollTop = sc.scrollHeight;
     });
     return () => cancelAnimationFrame(raf);
   }, [items, turnNos.length, followBottom]);
