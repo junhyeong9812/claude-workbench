@@ -237,22 +237,36 @@ export function TimelineView({
   }, [selectedId, selectedTurn, selectedScope, scope]);
 
   // New content arrives at the bottom — follow it down so the latest is in view.
-  // Only the live timeline follows (followBottom); the stacked previous-task lists
-  // share one scroll container, so we scroll that container, not the inner list
-  // (which is content-sized). The live list is the last child ⇒ container bottom.
-  const newestTurn = turnNos[turnNos.length - 1] ?? 0;
+  // Only the live timeline follows (followBottom). The stacked lists share one
+  // scroll container, so we scroll that container (the first overflow ancestor),
+  // not the content-sized inner list. Fires on *any* content growth (items stream
+  // within a turn too), via rAF so layout is settled. Behavior: jump to bottom on
+  // first load; afterwards stick to bottom only when already near it, so a manual
+  // scroll-up to read history isn't yanked back down.
+  const didFollowInit = useRef(false);
   useEffect(() => {
     if (!followBottom) return;
-    let n = listRef.current?.parentElement ?? null;
-    while (n) {
-      const oy = getComputedStyle(n).overflowY;
-      if (oy === "auto" || oy === "scroll") {
-        n.scrollTop = n.scrollHeight;
+    const raf = requestAnimationFrame(() => {
+      let sc: HTMLElement | null = listRef.current?.parentElement ?? null;
+      while (sc) {
+        const oy = getComputedStyle(sc).overflowY;
+        if (oy === "auto" || oy === "scroll") break;
+        sc = sc.parentElement;
+      }
+      if (!sc) return;
+      const hasContent = items.length > 0 || turnNos.length > 0;
+      if (!didFollowInit.current) {
+        if (hasContent) {
+          sc.scrollTop = sc.scrollHeight;
+          didFollowInit.current = true;
+        }
         return;
       }
-      n = n.parentElement;
-    }
-  }, [newestTurn, followBottom]);
+      const distFromBottom = sc.scrollHeight - sc.scrollTop - sc.clientHeight;
+      if (distFromBottom < 160) sc.scrollTop = sc.scrollHeight;
+    });
+    return () => cancelAnimationFrame(raf);
+  }, [items, turnNos.length, followBottom]);
 
   const onKeyDown = (e: React.KeyboardEvent<HTMLDivElement>) => {
     if (e.key !== "ArrowDown" && e.key !== "ArrowUp") return;
