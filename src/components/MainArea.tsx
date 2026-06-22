@@ -8,6 +8,7 @@ import {
 } from "dockview-react";
 import "dockview-react/dist/styles/dockview.css";
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import { useAppStore } from "../state/store";
 import { useClaudeUi } from "../state/claudeUi";
 import { PlaceholderPanel } from "./PlaceholderPanel";
@@ -17,6 +18,7 @@ import { EditorPanel } from "./EditorPanel";
 import { DiffPanel } from "./DiffPanel";
 import { fileName } from "./cmLang";
 import { ClaudeTab } from "./ClaudeTab";
+import { SshTab } from "./SshTab";
 
 /** A saved session normalized for the reopen picker (ACP `claude` or A
  * `claudeterm`). `id` is the session UUID. */
@@ -39,19 +41,71 @@ interface SessionSummary {
 function AppTab(props: IDockviewPanelHeaderProps) {
   const kind = props.params.kind;
   if (kind === "claudeterm") return <ClaudeTab {...props} />;
+  if (kind === "ssh") return <SshTab {...props} />;
   return <DockviewDefaultTab {...props} />;
 }
 
-/** dockview component registry — maps component name -> React panel. */
+/** dockview component registry — maps component name -> React panel. SSH reuses
+ * the PTY-backed TerminalPanel (it branches on `kind` internally). */
 const components = {
   placeholder: PlaceholderPanel,
   terminal: TerminalPanel,
+  ssh: TerminalPanel,
   claudeterm: ClaudeTermPanel,
   editor: EditorPanel,
   diff: DiffPanel,
 };
 
 type PanelKind = "terminal" | "editor" | "claudeterm";
+
+/** Transient new-connection dialog form state. The secret fields never enter
+ * panel params or workspace.json — they go to `ssh_create` (this session) and,
+ * when "save" is on, to the OS keychain. */
+interface SshForm {
+  label: string;
+  host: string;
+  port: string;
+  username: string;
+  authKind: "password" | "publickey" | "agent";
+  keyPath: string;
+  password: string;
+  passphrase: string;
+  save: boolean;
+}
+
+const EMPTY_SSH_FORM: SshForm = {
+  label: "",
+  host: "",
+  port: "22",
+  username: "",
+  authKind: "password",
+  keyPath: "",
+  password: "",
+  passphrase: "",
+  save: true,
+};
+
+interface HostKeyPrompt {
+  id: number;
+  host: string;
+  port: number;
+  fingerprint: string;
+}
+
+/** Move DOM focus into the active panel's *content* (xterm/CodeMirror/input),
+ * not just the dockview group. dockview's `setActive()`/`focus()` focuses the
+ * group only, so after a keyboard tab switch keystrokes wouldn't land in the
+ * terminal until the user clicked into it. Runs on the next frame so the
+ * active-group DOM has updated. */
+function focusActivePanelContent() {
+  requestAnimationFrame(() => {
+    const group = document.querySelector(".main-dock .dv-active-group");
+    const el = group?.querySelector(
+      ".xterm-helper-textarea, .cm-content, textarea, input, [tabindex]",
+    ) as HTMLElement | null;
+    el?.focus();
+  });
+}
 
 /**
  * The 80% main area, backed by dockview.
@@ -94,6 +148,19 @@ export function MainArea() {
   const closeRequest = useClaudeUi((s) => s.closeRequest);
   const clearClose = useClaudeUi((s) => s.clearClose);
 
+  // SSH: saved connections + the "+ Terminal" menu / new-connection dialog /
+  // host-key (TOFU) confirmation modal.
+  const savedConnections = useAppStore((s) => s.savedConnections);
+  const upsertConnection = useAppStore((s) => s.upsertConnection);
+  const deleteConnection = useAppStore((s) => s.deleteConnection);
+  const persistScrollback = useAppStore((s) => s.persistScrollback);
+  const setPersistScrollback = useAppStore((s) => s.setPersistScrollback);
+  const [termMenu, setTermMenu] = useState(false);
+  const [sshForm, setSshForm] = useState<SshForm | null>(null);
+  // A queue (not a single slot) so two connections prompting for unknown host
+  // keys at once don't clobber each other — each is answered in turn (P3-R2).
+  const [hostKeyQueue, setHostKeyQueue] = useState<HostKeyPrompt[]>([]);
+
   // The layout for the project this mount belongs to (read once at onReady).
   const savedLayout = projects.find((p) => p.path === activeProject)?.layout;
 
@@ -128,6 +195,9 @@ export function MainArea() {
         const cmd = params.kind === "claudeterm" ? "claude_close" : "terminal_close";
         invoke(cmd, { id: params.sessionId }).catch(() => {});
       }
+      // Persisted scrollback is discarded by the session's own flusher when the
+      // session is removed (it is the file's sole owner — no delete/flush race,
+      // review P4-R1), so there's nothing to clean up here.
     });
   };
 
@@ -161,6 +231,167 @@ export function MainArea() {
         ...(opts?.path ? { path: opts.path } : {}),
       },
     });
+  };
+
+  // Create an SSH session (backend connects async) and open a panel attached to
+  // it. The secret (password/passphrase) is passed to `ssh_create` only — it is
+  // NOT placed in panel params (which persist in the layout): reconnect after a
+  // restart pulls the secret from the keychain via `connectionId` (review F8).
+  const connectSsh = async (o: {
+    title: string;
+    host: string;
+    port: number;
+    username: string;
+    authKind: "password" | "publickey" | "agent";
+    keyPath?: string | null;
+    connectionId?: string | null;
+    password?: string | null;
+    passphrase?: string | null;
+  }) => {
+    const api = apiRef.current;
+    if (!api) return;
+    try {
+      // Generate the panel id up front so it can double as the scrollback
+      // persistence key (opt-in — review F11).
+      const panelId = `ssh-${Date.now()}`;
+      const persistKey = useAppStore.getState().persistScrollback ? panelId : null;
+      const id = await invoke<number>("ssh_create", {
+        host: o.host,
+        port: o.port,
+        username: o.username,
+        authKind: o.authKind,
+        password: o.password ?? null,
+        keyPath: o.keyPath ?? null,
+        passphrase: o.passphrase ?? null,
+        connectionId: o.connectionId ?? null,
+        persistKey,
+        cols: 80,
+        rows: 24,
+      });
+      api.addPanel({
+        id: panelId,
+        component: "ssh",
+        title: o.title,
+        params: {
+          kind: "ssh",
+          title: o.title,
+          sessionId: id,
+          host: o.host,
+          port: o.port,
+          username: o.username,
+          authKind: o.authKind,
+          keyPath: o.keyPath ?? null,
+          connectionId: o.connectionId ?? null,
+        },
+      });
+    } catch (err) {
+      console.error("ssh_create failed", err);
+    }
+  };
+
+  // Connect to a previously saved connection (no dialog). The secret comes from
+  // the keychain via the connection id.
+  const connectSaved = (id: string) => {
+    setTermMenu(false);
+    const c = savedConnections.find((x) => x.id === id);
+    if (!c) return;
+    connectSsh({
+      title: c.label || `${c.username}@${c.host}`,
+      host: c.host,
+      port: c.port,
+      username: c.username,
+      authKind: c.auth_kind,
+      keyPath: c.key_path ?? null,
+      connectionId: c.id,
+    });
+  };
+
+  // Submit the new-connection dialog: optionally save (keychain secret + store
+  // metadata), then connect.
+  const submitSshForm = async () => {
+    const f = sshForm;
+    if (!f) return;
+    const host = f.host.trim();
+    const username = f.username.trim();
+    if (!host || !username) return; // minimal validation; dialog enforces more
+    const port = Number(f.port) || 22;
+    const label = f.label.trim() || `${username}@${host}`;
+    const secret = f.authKind === "password" ? f.password : f.passphrase;
+
+    let connectionId: string | undefined;
+    if (f.save) {
+      const cid = crypto.randomUUID();
+      let storeOk = true;
+      if (secret) {
+        // No plaintext fallback (review F9): if the keychain rejects, we do NOT
+        // create a saved connection (it would be broken on reconnect — P3-R3).
+        try {
+          await invoke("ssh_store_secret", { id: cid, secret });
+        } catch {
+          storeOk = false;
+        }
+      }
+      if (!secret || storeOk) {
+        connectionId = cid;
+        upsertConnection({
+          id: cid,
+          label,
+          host,
+          port,
+          username,
+          auth_kind: f.authKind,
+          key_path: f.authKind === "publickey" ? f.keyPath.trim() || null : null,
+          has_stored_secret: !!secret,
+        });
+      } else {
+        alert(
+          "OS 키체인에 비밀번호를 저장하지 못했습니다. 이 연결은 저장하지 않고 세션 전용으로 접속합니다.",
+        );
+      }
+    }
+    setSshForm(null);
+    setTermMenu(false);
+    await connectSsh({
+      title: label,
+      host,
+      port,
+      username,
+      authKind: f.authKind,
+      keyPath: f.authKind === "publickey" ? f.keyPath.trim() || null : null,
+      connectionId: connectionId ?? null,
+      password: f.authKind === "password" ? f.password : null,
+      passphrase: f.authKind === "publickey" ? f.passphrase : null,
+    });
+  };
+
+  // Global host-key (TOFU) prompt: the backend raises `ssh-hostkey-prompt` for a
+  // first-seen host; we enqueue it and show the fingerprint. Also surface SSH
+  // connect/auth **failures** here — a not-yet-mounted panel can miss the
+  // `ssh-status` event, so handling it globally guarantees it's never silent
+  // (review P3-R1).
+  useEffect(() => {
+    const unPrompt = listen<HostKeyPrompt>("ssh-hostkey-prompt", (e) => {
+      setHostKeyQueue((q) => [...q, e.payload]);
+    });
+    const unStatus = listen<{ id: number; phase: string; reason?: string | null }>(
+      "ssh-status",
+      (e) => {
+        if (e.payload.phase === "failed") {
+          alert(`SSH 연결 실패: ${e.payload.reason ?? "알 수 없는 오류"}`);
+        }
+      },
+    );
+    return () => {
+      unPrompt.then((f) => f()).catch(() => {});
+      unStatus.then((f) => f()).catch(() => {});
+    };
+  }, []);
+
+  const answerHostKey = (accept: boolean) => {
+    const p = hostKeyQueue[0];
+    setHostKeyQueue((q) => q.slice(1));
+    if (!p) return;
+    invoke("ssh_hostkey_decision", { id: p.id, accept }).catch(() => {});
   };
 
   // Open a file in the editor when requested (from the peek viewer or tree). Focus
@@ -358,6 +589,9 @@ export function MainArea() {
         : (idx - 1 + panels.length) % panels.length;
       e.preventDefault();
       panels[next].api.setActive();
+      // Drop focus into the newly-active panel's content so keystrokes land in
+      // the terminal/editor immediately (not just on the group).
+      focusActivePanelContent();
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
@@ -372,21 +606,78 @@ export function MainArea() {
     const api = apiRef.current;
     if (!api) return;
     api.focus();
-    requestAnimationFrame(() => {
-      const group = document.querySelector(".main-dock .dv-active-group");
-      const el = group?.querySelector(
-        ".xterm-helper-textarea, .cm-content, textarea, input, [tabindex]",
-      ) as HTMLElement | null;
-      el?.focus();
-    });
+    focusActivePanelContent();
   }, [focusMainRequest]);
 
   return (
     <div className="main-area">
       <div className="main-toolbar">
-        <button className="toolbar-btn" onClick={() => addPanel("terminal")}>
-          + Terminal
+        <button className="toolbar-btn" onClick={() => setTermMenu((v) => !v)}>
+          + Terminal ▾
         </button>
+        {termMenu && (
+          <div className="claude-picker" onMouseLeave={() => setTermMenu(false)}>
+            <button
+              className="claude-picker-item"
+              onClick={() => {
+                setTermMenu(false);
+                addPanel("terminal");
+              }}
+            >
+              <span className="claude-picker-title">로컬 터미널</span>
+            </button>
+            <button
+              className="claude-picker-item"
+              onClick={() => {
+                setTermMenu(false);
+                setSshForm({ ...EMPTY_SSH_FORM });
+              }}
+            >
+              <span className="claude-picker-title">+ 새 SSH 연결</span>
+            </button>
+            {savedConnections.length > 0 && (
+              <>
+                <div className="claude-picker-sep">저장된 연결</div>
+                {savedConnections.map((c) => (
+                  <div key={c.id} className="claude-picker-row" style={{ paddingLeft: 4 }}>
+                    <button className="claude-picker-item" onClick={() => connectSaved(c.id)}>
+                      <span className="claude-picker-title">{c.label}</span>
+                      <span className="claude-picker-meta">
+                        {c.username}@{c.host}:{c.port} · {c.auth_kind}
+                      </span>
+                    </button>
+                    <span
+                      className="claude-tab-x"
+                      title="연결 삭제"
+                      onMouseDown={(e) => e.stopPropagation()}
+                      onClick={async (e) => {
+                        e.stopPropagation();
+                        if (!confirm(`'${c.label}' 연결을 삭제할까요? (키체인 비밀번호도 삭제)`)) return;
+                        const ok = await deleteConnection(c.id);
+                        if (!ok)
+                          alert(
+                            "키체인 비밀번호 삭제에 실패해 연결을 삭제하지 못했습니다. 다시 시도해 주세요.",
+                          );
+                      }}
+                    >
+                      ×
+                    </span>
+                  </div>
+                ))}
+              </>
+            )}
+            <div className="claude-picker-sep">설정</div>
+            <button
+              className="claude-picker-item"
+              onClick={() => setPersistScrollback(!persistScrollback)}
+            >
+              <span className="claude-picker-title">
+                출력 저장(재시작 복원): {persistScrollback ? "ON" : "OFF"}
+              </span>
+              <span className="claude-picker-meta">출력에 비밀번호가 섞일 수 있어 기본 OFF</span>
+            </button>
+          </div>
+        )}
         <button className="toolbar-btn" onClick={() => openPicker()}>
           + Claude
         </button>
@@ -486,6 +777,140 @@ export function MainArea() {
             </button>
             <button className="claude-modal-opt claude-modal-cancel" onClick={() => clearClose()}>
               취소
+            </button>
+          </div>
+        </div>
+      )}
+
+      {sshForm && (
+        <div className="claude-modal-backdrop" onClick={() => setSshForm(null)}>
+          <div className="claude-modal ssh-dialog" onClick={(e) => e.stopPropagation()}>
+            <div className="claude-modal-title">새 SSH 연결</div>
+            <label className="ssh-field">
+              <span>라벨 (탭 이름)</span>
+              <input
+                value={sshForm.label}
+                placeholder={`${sshForm.username || "user"}@${sshForm.host || "host"}`}
+                onChange={(e) => setSshForm({ ...sshForm, label: e.target.value })}
+              />
+            </label>
+            <div className="ssh-row">
+              <label className="ssh-field ssh-grow">
+                <span>호스트</span>
+                <input
+                  value={sshForm.host}
+                  autoFocus
+                  placeholder="example.com"
+                  onChange={(e) => setSshForm({ ...sshForm, host: e.target.value })}
+                />
+              </label>
+              <label className="ssh-field ssh-port">
+                <span>포트</span>
+                <input
+                  value={sshForm.port}
+                  inputMode="numeric"
+                  onChange={(e) => setSshForm({ ...sshForm, port: e.target.value })}
+                />
+              </label>
+            </div>
+            <label className="ssh-field">
+              <span>사용자명</span>
+              <input
+                value={sshForm.username}
+                placeholder="root"
+                onChange={(e) => setSshForm({ ...sshForm, username: e.target.value })}
+              />
+            </label>
+            <label className="ssh-field">
+              <span>인증 방식</span>
+              <select
+                value={sshForm.authKind}
+                onChange={(e) =>
+                  setSshForm({
+                    ...sshForm,
+                    authKind: e.target.value as SshForm["authKind"],
+                  })
+                }
+              >
+                <option value="password">비밀번호</option>
+                <option value="publickey">PEM 키</option>
+                <option value="agent">ssh-agent</option>
+              </select>
+            </label>
+            {sshForm.authKind === "password" && (
+              <label className="ssh-field">
+                <span>비밀번호</span>
+                <input
+                  type="password"
+                  value={sshForm.password}
+                  onChange={(e) => setSshForm({ ...sshForm, password: e.target.value })}
+                />
+              </label>
+            )}
+            {sshForm.authKind === "publickey" && (
+              <>
+                <label className="ssh-field">
+                  <span>키 파일 경로</span>
+                  <input
+                    value={sshForm.keyPath}
+                    placeholder="~/.ssh/id_ed25519"
+                    onChange={(e) => setSshForm({ ...sshForm, keyPath: e.target.value })}
+                  />
+                </label>
+                <label className="ssh-field">
+                  <span>passphrase (암호화된 키만)</span>
+                  <input
+                    type="password"
+                    value={sshForm.passphrase}
+                    onChange={(e) => setSshForm({ ...sshForm, passphrase: e.target.value })}
+                  />
+                </label>
+              </>
+            )}
+            <label className="ssh-save-row">
+              <input
+                type="checkbox"
+                checked={sshForm.save}
+                onChange={(e) => setSshForm({ ...sshForm, save: e.target.checked })}
+              />
+              <span>이 연결 저장 (비밀번호/passphrase는 OS 키체인에)</span>
+            </label>
+            <div className="ssh-dialog-actions">
+              <button className="claude-modal-opt" onClick={submitSshForm}>
+                접속
+              </button>
+              <button
+                className="claude-modal-opt claude-modal-cancel"
+                onClick={() => setSshForm(null)}
+              >
+                취소
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {hostKeyQueue[0] && (
+        <div className="claude-modal-backdrop">
+          <div className="claude-modal" onClick={(e) => e.stopPropagation()}>
+            <div className="claude-modal-title">처음 접속하는 호스트입니다</div>
+            <div className="ssh-hostkey-body">
+              <div>
+                {hostKeyQueue[0].host}:{hostKeyQueue[0].port}
+              </div>
+              <div className="ssh-fingerprint">{hostKeyQueue[0].fingerprint}</div>
+              <div className="claude-modal-hint">
+                이 호스트키를 신뢰하고 저장할까요? (불일치 시 MITM 위험)
+              </div>
+            </div>
+            <button className="claude-modal-opt" onClick={() => answerHostKey(true)}>
+              신뢰 <span className="claude-modal-hint">키를 저장하고 접속</span>
+            </button>
+            <button
+              className="claude-modal-opt claude-modal-del"
+              onClick={() => answerHostKey(false)}
+            >
+              거부 <span className="claude-modal-hint">접속 취소</span>
             </button>
           </div>
         </div>

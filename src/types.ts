@@ -38,8 +38,23 @@ export interface Project {
   layout?: unknown;
 }
 
+/** A saved SSH connection — non-secret metadata only. Passwords / key
+ * passphrases live in the OS keychain (keyed by `id`), never here. Mirrors
+ * `core::persist::SshConnection`. */
+export interface SshConnection {
+  id: string;
+  label: string;
+  host: string;
+  port: number;
+  username: string;
+  auth_kind: "password" | "publickey" | "agent";
+  key_path?: string | null;
+  has_stored_secret?: boolean;
+}
+
 /** Full persisted workspace state (round-trips through Rust). */
 export interface WorkspaceState {
   open_projects: Project[];
   active_project: string | null;
+  saved_connections?: SshConnection[];
 }

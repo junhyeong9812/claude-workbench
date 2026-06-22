@@ -2510,3 +2510,74 @@ body {
   box-shadow: 0 2px 8px rgba(0, 0, 0, 0.35);
   background: #fff;
 }
+
+/* ---- SSH new-connection dialog + host-key prompt (P3) ---- */
+.ssh-dialog {
+  min-width: 360px;
+  max-width: 440px;
+  padding: 4px 0 0;
+}
+.ssh-field {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  padding: 6px 14px;
+}
+.ssh-field > span {
+  font-size: 10px;
+  color: var(--fg-dim);
+}
+.ssh-field input,
+.ssh-field select {
+  font-size: 13px;
+  padding: 5px 7px;
+  color: var(--fg);
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+}
+.ssh-row {
+  display: flex;
+  gap: 0;
+}
+.ssh-grow {
+  flex: 1;
+}
+.ssh-port {
+  width: 84px;
+}
+.ssh-save-row {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 8px 14px;
+  font-size: 12px;
+  color: var(--fg);
+}
+.ssh-dialog-actions {
+  display: flex;
+  border-top: 1px solid var(--border);
+}
+.ssh-dialog-actions .claude-modal-opt {
+  flex: 1;
+  align-items: center;
+  border-bottom: none;
+}
+.ssh-hostkey-body {
+  padding: 10px 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--fg);
+}
+.ssh-fingerprint {
+  font-family: monospace;
+  font-size: 12px;
+  padding: 6px 8px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  word-break: break-all;
+  color: var(--fg);
+}

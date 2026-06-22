@@ -1,7 +1,7 @@
 import { create } from "zustand";
 import { invoke } from "@tauri-apps/api/core";
 import type { ITheme } from "@xterm/xterm";
-import type { DirEntry, Project, ProjectType, WorkspaceState } from "../types";
+import type { DirEntry, Project, ProjectType, SshConnection, WorkspaceState } from "../types";
 
 /** Clamp a font size to the allowed range (also normalizes NaN). */
 export const clampFontSize = (n: number): number => Math.max(9, Math.min(28, Math.round(n) || 13));
@@ -174,9 +174,24 @@ interface AppState {
   /** Custom terminal color overrides (merged over the theme base), or null to
    * follow the theme. Persisted. */
   termColors: Partial<ITheme> | null;
+  /** Saved SSH connections (app-global, non-secret). Secrets live in the OS
+   * keychain. Persisted as part of WorkspaceState. */
+  savedConnections: SshConnection[];
+  /** Opt-in: persist terminal/SSH scrollback to disk so tabs restore their prior
+   * output after a restart. Default OFF — output can contain secrets (review
+   * F11). Persisted to localStorage. */
+  persistScrollback: boolean;
 
   /** Load persisted state from the backend on startup. */
   init: () => Promise<void>;
+  /** Toggle scrollback disk persistence. */
+  setPersistScrollback: (on: boolean) => void;
+  /** Add or replace (by id) a saved SSH connection and persist. */
+  upsertConnection: (conn: SshConnection) => void;
+  /** Delete a saved SSH connection: remove its keychain secret first, then the
+   * metadata. Returns false (keeping the connection) if the keychain delete
+   * fails, so the secret can't be silently orphaned. */
+  deleteConnection: (id: string) => Promise<boolean>;
   /** Open a folder as a new project tab (or focus it if already open). */
   addProject: (path: string) => Promise<void>;
   /** Close a project tab. */
@@ -266,14 +281,27 @@ export const useAppStore = create<AppState>((set, get) => ({
   studyMode: STUDY0.mode,
   studySessionLayout: null,
   studySessionUuid: localStorage.getItem("studySessionUuid"),
+  savedConnections: [],
+  persistScrollback: localStorage.getItem("persistScrollback") === "1",
+
+  setPersistScrollback: (on) => {
+    localStorage.setItem("persistScrollback", on ? "1" : "0");
+    set({ persistScrollback: on });
+    // Tell the backend so running flushers stop/start writing too (P4-R3).
+    invoke("scrollback_set_enabled", { enabled: on }).catch(() => {});
+  },
 
   init: async () => {
+    // Sync the backend's scrollback-persistence flag with the saved preference
+    // (default OFF) so restored sessions honor it from the first tick (P4-R3).
+    invoke("scrollback_set_enabled", { enabled: get().persistScrollback }).catch(() => {});
     try {
       const ws = await invoke<WorkspaceState>("load_state");
       const loaded = ws.open_projects ?? [];
       set({
         projects: loaded,
         activeProject: ws.active_project ?? null,
+        savedConnections: ws.saved_connections ?? [],
       });
 
       // Self-heal: re-detect types for every loaded project so old saved
@@ -524,10 +552,33 @@ export const useAppStore = create<AppState>((set, get) => ({
     get().persist();
   },
 
+  upsertConnection: (conn) => {
+    set((s) => {
+      const others = s.savedConnections.filter((c) => c.id !== conn.id);
+      return { savedConnections: [...others, conn] };
+    });
+    get().persist();
+  },
+
+  deleteConnection: async (id) => {
+    // Remove the keychain secret first; the backend treats "no entry" as success,
+    // so this only fails on a real keychain error. On failure keep the metadata
+    // so the secret isn't orphaned and the user can retry (review P3-R4).
+    try {
+      await invoke("ssh_delete_secret", { id });
+    } catch {
+      return false;
+    }
+    set((s) => ({ savedConnections: s.savedConnections.filter((c) => c.id !== id) }));
+    get().persist();
+    return true;
+  },
+
   persist: () => {
     const state: WorkspaceState = {
       open_projects: get().projects,
       active_project: get().activeProject,
+      saved_connections: get().savedConnections,
     };
     invoke("save_state", { state }).catch((err) => {
       console.error("save_state failed", err);
