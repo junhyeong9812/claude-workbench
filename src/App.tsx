@@ -50,19 +50,28 @@ export default function App() {
     localStorage.setItem("fontSize", String(fontSize));
   }, [fontSize]);
 
-  // Ctrl+B toggles focus between the folder tree and the open tab: from anywhere
-  // it focuses the tree (so keyboard nav can start without a click); pressing it
-  // again while the tree already holds focus hands focus back to the active
-  // dockview panel (MainArea owns the dockview api — request via the store).
+  // Ctrl+B toggles focus between the folder tree and wherever you were: from
+  // anywhere it remembers the focused element and focuses the tree; pressing it
+  // again while the tree holds focus restores that exact element (timeline list,
+  // terminal, editor…), so e.g. timeline→tree→timeline round-trips. Falls back to
+  // focusing the active dockview panel when there's no remembered element.
+  const lastFocusRef = useRef<HTMLElement | null>(null);
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if (e.ctrlKey && (e.key === "b" || e.key === "B")) {
         e.preventDefault();
         const tree = document.getElementById("folder-tree");
-        const treeFocused = !!tree && (tree === document.activeElement || tree.contains(document.activeElement));
+        const treeFocused =
+          !!tree && (tree === document.activeElement || tree.contains(document.activeElement));
         if (treeFocused) {
-          useAppStore.getState().requestFocusMain();
+          const prev = lastFocusRef.current;
+          if (prev && document.contains(prev) && prev !== tree && !tree?.contains(prev)) {
+            prev.focus();
+          } else {
+            useAppStore.getState().requestFocusMain();
+          }
         } else {
+          lastFocusRef.current = document.activeElement as HTMLElement | null;
           tree?.focus();
         }
       }
