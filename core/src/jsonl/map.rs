@@ -328,9 +328,14 @@ fn complete_tool_result(
     // so — mark it Canceled (⊘) rather than a generic Failed (✗), so a rejected
     // segment reads as "user stopped this", not "the tool broke". The reason text
     // stays in content_text and the tool input (command/path) in raw_input.
+    // Narrow on purpose: a real Bash/test failure could *contain* these words, so
+    // match the rejection envelope Claude emits at the *start* of the result, not
+    // an arbitrary substring.
     let rejected = is_error == Some(true)
         && text.as_deref().is_some_and(|t| {
-            t.contains("interrupted by user") || t.contains("doesn't want to proceed")
+            let tt = t.trim_start();
+            tt.starts_with("The user doesn't want to")
+                || tt.starts_with("[Request interrupted by user")
         });
 
     let (idx, is_new) = timeline.entry(session, tool_use_id);
@@ -370,11 +375,12 @@ fn map_tool_kind(name: &str) -> ItemKind {
     }
 }
 
-/// Whether a user text block is the interrupt sentinel Claude writes when the
-/// user stops a turn (`[Request interrupted by user]` / `… for tool use`), rather
-/// than a real prompt.
+/// Whether a user text block is *exactly* the interrupt sentinel Claude writes
+/// when the user stops a turn — not a real prompt. Exact match (after trim) so a
+/// genuine prompt that merely starts with the phrase isn't swallowed.
 fn is_interrupt_text(s: &str) -> bool {
-    s.trim_start().starts_with("[Request interrupted by user")
+    let t = s.trim();
+    t == "[Request interrupted by user]" || t == "[Request interrupted by user for tool use]"
 }
 
 /// The file path(s) a tool touches, for labelling and the detail view.
@@ -773,6 +779,33 @@ mod tests {
         ];
         let tl = map_lines(&lines);
         assert_eq!(tl.items()[0].agent_status, AgentStatus::Canceled);
+    }
+
+    // A genuine prompt that merely *starts with* the phrase is NOT swallowed.
+    #[test]
+    fn prompt_starting_like_interrupt_still_opens_turn() {
+        let mut m = JsonlMapper::new(ROOT, SID);
+        m.apply_line(&line(user(json!([
+            { "type": "text", "text": "[Request interrupted by user] 이 로그가 왜 생겨?" }
+        ]))));
+        assert_eq!(m.current_turn(), 1, "prefix-only match must not swallow a real prompt");
+        assert!(m.turns().get(&1).is_some());
+    }
+
+    // A real tool failure whose output merely *contains* the words stays Failed.
+    #[test]
+    fn real_failure_mentioning_interrupt_words_stays_failed() {
+        let lines = [
+            line(asst(json!([
+                { "type": "tool_use", "id": "t1", "name": "Bash", "input": { "command": "run" } }
+            ]))),
+            line(user(json!([
+                { "type": "tool_result", "tool_use_id": "t1", "is_error": true,
+                  "content": "error: the job was interrupted by user space watchdog" }
+            ]))),
+        ];
+        let tl = map_lines(&lines);
+        assert_eq!(tl.items()[0].agent_status, AgentStatus::Failed);
     }
 
     // An unknown / future tool name collapses to Other (never an error).
