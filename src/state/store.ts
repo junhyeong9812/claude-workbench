@@ -223,6 +223,14 @@ interface AppState {
   reloadActiveTree: () => Promise<void>;
   /** Save a project's dockview main-area layout (opaque JSON) and persist. */
   setLayout: (path: string, layout: unknown) => void;
+  /** In-memory dockview layouts for popout windows, per project (multiwindow
+   * swap — review R1-5/decision). `windowLabel -> projectPath -> layout`. NOT
+   * persisted (popouts don't survive restart; P4 may add reopen). */
+  popoutLayouts: Record<string, Record<string, unknown>>;
+  /** Save a popout window's layout for a project. */
+  setPopoutLayout: (windowLabel: string, project: string, layout: unknown) => void;
+  /** Read a popout window's saved layout for a project (or null). */
+  getPopoutLayout: (windowLabel: string, project: string) => unknown | null;
   /** Move the folder-tree keyboard cursor. */
   setTreeCursor: (path: string | null) => void;
   /** Open/close the peek viewer on a file (null closes it). */
@@ -268,6 +276,15 @@ interface AppState {
 function basename(path: string): string {
   const parts = path.split(/[\\/]/).filter(Boolean);
   return parts.length > 0 ? parts[parts.length - 1] : path;
+}
+
+/** Broadcast the active project to other windows (origin-tagged so the sender
+ * skips its own echo). Every path that changes `activeProject` calls this so all
+ * windows stay on the same project — switch, open, and close (review R0-3/R1-9). */
+function broadcastActiveProject(path: string | null) {
+  emit("project-sync", { activeProject: path, sourceWindow: getCurrentWindow().label }).catch(
+    () => {},
+  );
 }
 
 export const useAppStore = create<AppState>((set, get) => ({
@@ -342,6 +359,7 @@ export const useAppStore = create<AppState>((set, get) => ({
     if (get().projects.some((p) => p.path === path)) {
       set({ activeProject: path });
       get().persist();
+      broadcastActiveProject(path);
       return;
     }
 
@@ -366,9 +384,11 @@ export const useAppStore = create<AppState>((set, get) => ({
       activeProject: path,
     }));
     get().persist();
+    broadcastActiveProject(path);
   },
 
   closeProject: (path) => {
+    const before = get().activeProject;
     set((s) => {
       const projects = s.projects.filter((p) => p.path !== path);
       let activeProject = s.activeProject;
@@ -378,6 +398,10 @@ export const useAppStore = create<AppState>((set, get) => ({
       return { projects, activeProject };
     });
     get().persist();
+    // If closing the active project moved focus elsewhere, sync other windows
+    // so they swap too (review R1-9).
+    const after = get().activeProject;
+    if (after !== before) broadcastActiveProject(after);
   },
 
   reorderProject: (fromPath, toPath, insertAfter) => {
@@ -400,10 +424,7 @@ export const useAppStore = create<AppState>((set, get) => ({
   setActive: (path) => {
     set({ activeProject: path });
     get().persist();
-    // Broadcast so other windows follow (origin-tagged to skip our own echo).
-    emit("project-sync", { activeProject: path, sourceWindow: getCurrentWindow().label }).catch(
-      () => {},
-    );
+    broadcastActiveProject(path);
   },
   applyRemoteActive: (path) => set({ activeProject: path }),
   initProjectSync: async () => {
@@ -577,6 +598,16 @@ export const useAppStore = create<AppState>((set, get) => ({
     }));
     get().persist();
   },
+
+  popoutLayouts: {},
+  setPopoutLayout: (windowLabel, project, layout) =>
+    set((s) => ({
+      popoutLayouts: {
+        ...s.popoutLayouts,
+        [windowLabel]: { ...(s.popoutLayouts[windowLabel] ?? {}), [project]: layout },
+      },
+    })),
+  getPopoutLayout: (windowLabel, project) => get().popoutLayouts[windowLabel]?.[project] ?? null,
 
   upsertConnection: (conn) => {
     set((s) => {

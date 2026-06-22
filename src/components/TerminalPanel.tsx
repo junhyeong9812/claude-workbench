@@ -169,9 +169,15 @@ export function TerminalPanel(props: IDockviewPanelProps<TerminalParams>) {
       // 2) Re-attach to a persisted session, else create a fresh one.
       const existing = props.params.sessionId;
       if (existing != null) {
+        // Claim the id BEFORE snapshotting so the live listener buffers matching
+        // chunks into `pending` from the first frame. Otherwise chunks emitted
+        // between the backend computing the snapshot and this assignment are
+        // dropped (sessionId still null) AND absent from the snapshot → lost
+        // (review R1-1, relied on by cross-window transfer). The `seq > last_seq`
+        // drain below skips any chunk already included in the snapshot.
+        sessionId = existing;
         try {
           const snap = await invoke<SnapshotResult>("terminal_snapshot", { id: existing });
-          sessionId = existing;
           write(snap.data);
           lastApplied = snap.last_seq;
         } catch {

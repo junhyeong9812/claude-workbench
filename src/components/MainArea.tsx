@@ -11,6 +11,7 @@ import { useAppStore } from "../state/store";
 import { useClaudeUi } from "../state/claudeUi";
 import { recallArea, forgetArea, type PanelArea } from "../state/panelFocus";
 import { isTransferring } from "../state/panelTransfer";
+import { movePanelToNewWindow } from "../state/windowTransfer";
 import { components, AppTab, type PanelKind } from "./panelRegistry";
 import { fileName } from "./cmLang";
 
@@ -676,6 +677,16 @@ export function MainArea() {
         )}
         <button className="toolbar-btn" onClick={() => openPicker()}>
           + Claude
+        </button>
+        <button
+          className="toolbar-btn"
+          title="활성 패널을 새 창으로 분리 (P3에서 탭 드래그로 교체)"
+          onClick={() => {
+            const api = apiRef.current;
+            if (api?.activePanel) void movePanelToNewWindow(api, api.activePanel.id);
+          }}
+        >
+          ⤢ 분리
         </button>
         {picker !== null && (
           <div className="claude-picker">

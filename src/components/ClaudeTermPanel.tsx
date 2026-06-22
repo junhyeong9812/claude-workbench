@@ -597,9 +597,15 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
       pendingAttachRef.current = null;
       const existing = attach?.id ?? props.params.sessionId;
       if (existing != null) {
+        // Claim the id BEFORE snapshotting so both listeners (PTY output +
+        // timeline) match from the first frame — otherwise output chunks emitted
+        // during the snapshot await are dropped yet absent from the snapshot →
+        // lost (review R1-1, relied on by cross-window transfer). The
+        // `seq > last_seq` drain skips snapshot-included dups; timeline applies
+        // whole snapshots so a missed live tick self-heals on the next poll.
+        sessionId = existing;
         try {
           const snap = await invoke<SnapshotResult>("terminal_snapshot", { id: existing });
-          sessionId = existing;
           write(snap.data);
           lastApplied = snap.last_seq;
         } catch {

@@ -1,7 +1,7 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "panel",
-  "description": "Narrower capabilities for popped-out panel windows (label panel-*): core APIs + event IPC only. No folder-picker dialog and NO runtime window creation — those stay on the main window (least privilege, review R0-5).",
+  "description": "Narrower capabilities for popped-out panel windows (label panel-*): core APIs + event IPC + self-destroy (close handler tears down its sessions then destroys the window). No folder-picker dialog and NO runtime window creation — those stay on the main window (least privilege, review R0-5).",
   "windows": ["panel-*"],
-  "permissions": ["core:default"]
+  "permissions": ["core:default", "core:window:allow-destroy", "core:window:allow-close"]
 }
