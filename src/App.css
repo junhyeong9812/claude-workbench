@@ -1393,6 +1393,11 @@ body {
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+.timeline-turn-head-sel {
+  background: rgba(88, 166, 255, 0.18);
+  outline: 1px solid var(--accent);
+  border-radius: 3px;
+}
 .timeline-turn-q {
   font-size: 10px;
   font-weight: 600;

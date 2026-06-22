@@ -134,6 +134,9 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
   const [answers, setAnswers] = useState<Map<number, string>>(new Map());
   const [dates, setDates] = useState<Map<number, string>>(new Map());
   const [selectedId, setSelectedId] = useState<string | null>(null);
+  // The selected question turn (Q&A) for the live timeline — highlights its head
+  // and shows prompt+answer in the detail pane. Mutually exclusive with selectedId.
+  const [selectedTurn, setSelectedTurn] = useState<number | null>(null);
   // A plain text (e.g. a turn's full answer) shown in the detail viewer when the
   // timeline truncates it. Mutually exclusive with `selectedId`.
   const [textView, setTextView] = useState<{ title: string; text: string } | null>(null);
@@ -728,6 +731,7 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
                 onClick={() => {
                   setSelectedId(null);
                   setTextView(null);
+                  setSelectedTurn(null);
                 }}
               >
                 ×
@@ -759,13 +763,18 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
             dates={dates}
             subagents={subagents}
             selectedId={selectedId}
+            selectedTurn={selectedTurn}
             onSelect={(it) => {
               setSelectedId(it.tool_call_id);
               setTextView(null);
+              setSelectedTurn(null);
             }}
-            onSelectAnswer={(turn) => {
-              setTextView({ title: `답변 (Q${turn})`, text: answers.get(turn) ?? "" });
+            onSelectTurn={(turn) => {
+              const q = turns.get(turn) ?? "";
+              const a = answers.get(turn) ?? "";
+              setTextView({ title: `Q${turn}`, text: `질문:\n${q}\n\n답변:\n${a || "(없음)"}` });
               setSelectedId(null);
+              setSelectedTurn(turn);
             }}
           />
           {chainPrev.map((task) => {
@@ -791,11 +800,17 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
                     onSelect={(it) => {
                       setSelectedId(it.tool_call_id);
                       setTextView(null);
+                      setSelectedTurn(null);
                     }}
-                    onSelectAnswer={(turn) => {
+                    onSelectTurn={(turn) => {
+                      const q = new Map(task.turns).get(turn) ?? "";
                       const a = new Map(task.answers).get(turn) ?? "";
-                      setTextView({ title: `답변 (${task.name} Q${turn})`, text: a });
+                      setTextView({
+                        title: `${task.name} Q${turn}`,
+                        text: `질문:\n${q}\n\n답변:\n${a || "(없음)"}`,
+                      });
                       setSelectedId(null);
+                      setSelectedTurn(null);
                     }}
                   />
                 )}

@@ -51,8 +51,9 @@ export function TimelineView({
   dates,
   subagents,
   selectedId,
+  selectedTurn,
   onSelect,
-  onSelectAnswer,
+  onSelectTurn,
 }: {
   items: TimelineItem[];
   turns: Map<number, string>;
@@ -62,9 +63,13 @@ export function TimelineView({
    * under its parent Agent item (recursive tree); orphans nest under their turn. */
   subagents?: [string, string | null, number, TimelineItem[]][];
   selectedId: string | null;
+  /** The turn whose question/answer is selected (highlights its head), or null.
+   * Distinct from `selectedId` (a tool item) — they are mutually exclusive. */
+  selectedTurn?: number | null;
   onSelect: (item: TimelineItem) => void;
-  /** Click a (possibly truncated) turn answer to view it in full (detail pane). */
-  onSelectAnswer?: (turn: number) => void;
+  /** Select a turn (Q&A): view its prompt + full answer in the detail pane.
+   * Used by ↑/↓ landing on a question head and by clicking the head/answer. */
+  onSelectTurn?: (turn: number) => void;
 }) {
   // Collapsed subagent groups (B1), keyed by agentId.
   const [collapsedAgents, setCollapsedAgents] = useState<Set<string>>(new Set());
@@ -154,21 +159,44 @@ export function TimelineView({
       return next;
     });
 
-  // Flat display order (matches the rendered order: newest turn first, then seq
-  // asc within a turn) for ↑/↓ navigation (B4). Skips collapsed date groups (B8).
-  const orderedItems = turnNos
-    .filter((turn) => !collapsedDates.has(dates.get(turn) ?? ""))
-    .flatMap((turn) => items.filter((it) => it.turn === turn).sort((a, b) => a.seq - b.seq));
+  // Unified ↑/↓ navigation order (matches the rendered order exactly: newest turn
+  // first; within a turn the question head, then each tool item, then the subagent
+  // items nested under it — recursively). Skips collapsed date groups (B8) and
+  // collapsed subagent groups (B1), mirroring what is actually on screen. A turn
+  // head is a `turn` entry; tool/agent items are `item` entries.
+  type Nav = { kind: "turn"; turn: number } | { kind: "item"; item: TimelineItem };
+  const navEntries: Nav[] = [];
+  // Push an item then (recursively) the items of any non-collapsed subagent it spawned.
+  const pushItemTree = (it: TimelineItem) => {
+    navEntries.push({ kind: "item", item: it });
+    for (const [aid, its] of agentsByParent.get(it.tool_call_id) ?? []) pushAgentItems(aid, its);
+  };
+  function pushAgentItems(aid: string, its: TimelineItem[]) {
+    if (collapsedAgents.has(aid)) return; // collapsed group hides its rows
+    for (const it of its) pushItemTree(it);
+  }
+  for (const turn of turnNos) {
+    if (collapsedDates.has(dates.get(turn) ?? "")) continue;
+    navEntries.push({ kind: "turn", turn });
+    for (const it of items.filter((x) => x.turn === turn).sort((a, b) => a.seq - b.seq)) {
+      pushItemTree(it);
+    }
+    for (const [aid, its] of orphanAgentsByTurn.get(turn) ?? []) pushAgentItems(aid, its);
+  }
 
   const listRef = useRef<HTMLDivElement>(null);
 
-  // Keep the selected row scrolled into view as the user arrows through it.
+  // Keep the selected row (a tool item or a question head) scrolled into view as
+  // the user arrows through it.
   useEffect(() => {
-    if (!selectedId || !listRef.current) return;
-    listRef.current
-      .querySelector(`[data-tcid="${CSS.escape(selectedId)}"]`)
-      ?.scrollIntoView({ block: "nearest" });
-  }, [selectedId]);
+    if (!listRef.current) return;
+    const sel = selectedId
+      ? `[data-tcid="${CSS.escape(selectedId)}"]`
+      : selectedTurn != null
+        ? `[data-turn="${selectedTurn}"]`
+        : null;
+    if (sel) listRef.current.querySelector(sel)?.scrollIntoView({ block: "nearest" });
+  }, [selectedId, selectedTurn]);
 
   // A new question arrives at the top — scroll there so the current Q is in view (B5).
   const newestTurn = turnNos[0] ?? 0;
@@ -178,14 +206,20 @@ export function TimelineView({
 
   const onKeyDown = (e: React.KeyboardEvent<HTMLDivElement>) => {
     if (e.key !== "ArrowDown" && e.key !== "ArrowUp") return;
-    if (orderedItems.length === 0) return;
+    if (navEntries.length === 0) return;
     e.preventDefault();
-    const idx = orderedItems.findIndex((it) => it.tool_call_id === selectedId);
+    const idx = navEntries.findIndex((n) =>
+      n.kind === "item"
+        ? n.item.tool_call_id === selectedId
+        : selectedTurn != null && n.turn === selectedTurn,
+    );
     let next: number;
-    if (idx === -1) next = e.key === "ArrowDown" ? 0 : orderedItems.length - 1;
-    else if (e.key === "ArrowDown") next = Math.min(idx + 1, orderedItems.length - 1);
+    if (idx === -1) next = e.key === "ArrowDown" ? 0 : navEntries.length - 1;
+    else if (e.key === "ArrowDown") next = Math.min(idx + 1, navEntries.length - 1);
     else next = Math.max(idx - 1, 0);
-    onSelect(orderedItems[next]);
+    const n = navEntries[next];
+    if (n.kind === "item") onSelect(n.item);
+    else onSelectTurn?.(n.turn);
   };
 
   // Insert a date divider whenever the date changes between turns (B6). Turns
@@ -222,7 +256,18 @@ export function TimelineView({
             )}
             {!collapsed && (
           <div className="timeline-turn">
-            <div className="timeline-turn-head" title={prompt ?? ""}>
+            <div
+              data-turn={turn}
+              className={`timeline-turn-head${
+                selectedTurn === turn ? " timeline-turn-head-sel" : ""
+              }`}
+              title={prompt ?? ""}
+              onClick={() => {
+                onSelectTurn?.(turn);
+                listRef.current?.focus();
+              }}
+              style={{ cursor: onSelectTurn ? "pointer" : undefined }}
+            >
               <span className="timeline-turn-q">Q{turn}</span>
               {prompt ?? "(질문)"}
             </div>
@@ -230,8 +275,8 @@ export function TimelineView({
               <div
                 className="timeline-answer"
                 title="클릭하면 전체 답변 보기"
-                onClick={() => onSelectAnswer?.(turn)}
-                style={{ cursor: onSelectAnswer ? "pointer" : undefined }}
+                onClick={() => onSelectTurn?.(turn)}
+                style={{ cursor: onSelectTurn ? "pointer" : undefined }}
               >
                 {answer.length > 140 ? `${answer.slice(0, 140)}…` : answer}
               </div>
