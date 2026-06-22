@@ -346,6 +346,8 @@ fn map_tool_kind(name: &str) -> ItemKind {
         "Glob" | "Grep" => ItemKind::Search,
         "WebSearch" => ItemKind::Search,
         "WebFetch" => ItemKind::Fetch,
+        "AskUserQuestion" => ItemKind::Question,
+        "ExitPlanMode" => ItemKind::Plan,
         _ => ItemKind::Other,
     }
 }
@@ -423,6 +425,32 @@ fn derive_title(name: &str, input: &Value) -> String {
             let first = cmd.lines().next().unwrap_or(cmd);
             return first.chars().take(120).collect();
         }
+    }
+    // AskUserQuestion: the first question's header (or its question text).
+    if name == "AskUserQuestion" {
+        if let Some(q0) = input
+            .get("questions")
+            .and_then(Value::as_array)
+            .and_then(|qs| qs.first())
+        {
+            if let Some(h) = q0
+                .get("header")
+                .and_then(Value::as_str)
+                .or_else(|| q0.get("question").and_then(Value::as_str))
+            {
+                return h.chars().take(120).collect();
+            }
+        }
+        return "질문".to_string();
+    }
+    // ExitPlanMode: the plan's first non-empty line.
+    if name == "ExitPlanMode" {
+        if let Some(plan) = input.get("plan").and_then(Value::as_str) {
+            if let Some(line) = plan.lines().map(str::trim).find(|l| !l.is_empty()) {
+                return line.chars().take(120).collect();
+            }
+        }
+        return "계획".to_string();
     }
     if let Some(p) = input.get("file_path").and_then(Value::as_str) {
         return format!("{name} {p}");
@@ -659,6 +687,35 @@ mod tests {
         let it = &tl.items()[0];
         assert_eq!(it.agent_status, AgentStatus::Completed);
         assert_eq!(it.content_text.as_deref(), Some("out\nmore"));
+    }
+
+    // AskUserQuestion → Question kind; title is the first question's header.
+    #[test]
+    fn ask_user_question_maps_to_question_with_header_title() {
+        let lines = [line(asst(json!([
+            { "type": "tool_use", "id": "t1", "name": "AskUserQuestion", "input": {
+                "questions": [
+                    { "header": "작업 모드", "question": "어떤 모드로?",
+                      "options": [ { "label": "auto" }, { "label": "lazy" } ] }
+                ]
+            } }
+        ])))];
+        let tl = map_lines(&lines);
+        assert_eq!(tl.items()[0].kind, ItemKind::Question);
+        assert_eq!(tl.items()[0].title, "작업 모드");
+    }
+
+    // ExitPlanMode → Plan kind; title is the plan's first non-empty line.
+    #[test]
+    fn exit_plan_mode_maps_to_plan_with_first_line_title() {
+        let lines = [line(asst(json!([
+            { "type": "tool_use", "id": "t1", "name": "ExitPlanMode", "input": {
+                "plan": "\n  단계 1: 폰트 수정\n단계 2: 키보드"
+            } }
+        ])))];
+        let tl = map_lines(&lines);
+        assert_eq!(tl.items()[0].kind, ItemKind::Plan);
+        assert_eq!(tl.items()[0].title, "단계 1: 폰트 수정");
     }
 
     // An unknown / future tool name collapses to Other (never an error).

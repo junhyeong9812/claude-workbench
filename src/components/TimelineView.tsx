@@ -33,6 +33,8 @@ export const KIND_ICON: Record<string, string> = {
   execute: "▶",
   think: "💭",
   fetch: "🌐",
+  question: "❓",
+  plan: "📋",
   other: "•",
 };
 
@@ -292,11 +294,100 @@ export function TimelineView({
   );
 }
 
+interface QOption {
+  label?: string;
+  description?: string;
+}
+interface QQuestion {
+  question?: string;
+  header?: string;
+  multiSelect?: boolean;
+  options?: QOption[];
+}
+
+/** Detail body for an `AskUserQuestion` item: each question with its full option
+ * list, and the option(s) the user chose highlighted (matched against the tool
+ * result text). The raw result is shown below as ground truth. */
+function QuestionDetail({ item }: { item: TimelineItem }) {
+  const raw = (item.raw_input ?? null) as { questions?: QQuestion[] } | null;
+  const questions = Array.isArray(raw?.questions) ? (raw!.questions as QQuestion[]) : [];
+  const chosen = item.content_text ?? "";
+  // Best-effort: an option is "selected" if its label appears in the result text.
+  const isSel = (label?: string) => !!label && label.trim() !== "" && chosen.includes(label);
+  return (
+    <div className="timeline-detail">
+      <div className="timeline-detail-head">
+        {KIND_ICON.question} {item.title || "질문"}
+      </div>
+      {questions.length === 0 && (
+        <div className="timeline-detail-empty">질문 내용을 해석할 수 없습니다.</div>
+      )}
+      {questions.map((q, qi) => (
+        <div key={qi} className="timeline-diff-block">
+          {q.header && <div className="timeline-detail-label">{q.header}</div>}
+          {q.question && <div className="tl-question-text">{q.question}</div>}
+          <div className="tl-options">
+            {(q.options ?? []).map((o, oi) => (
+              <div key={oi} className={`tl-option${isSel(o.label) ? " tl-option-sel" : ""}`}>
+                <div className="tl-option-label">
+                  {isSel(o.label) ? "✓ " : ""}
+                  {o.label}
+                </div>
+                {o.description && <div className="tl-option-desc">{o.description}</div>}
+              </div>
+            ))}
+          </div>
+        </div>
+      ))}
+      {chosen !== "" && (
+        <div className="timeline-diff-block">
+          <div className="timeline-detail-label">선택 (응답)</div>
+          <pre className="timeline-detail-text">{chosen}</pre>
+        </div>
+      )}
+    </div>
+  );
+}
+
+/** Detail body for an `ExitPlanMode` item: the proposed plan text. */
+function PlanDetail({ item }: { item: TimelineItem }) {
+  const raw = (item.raw_input ?? null) as { plan?: string } | null;
+  const plan = typeof raw?.plan === "string" ? raw.plan : null;
+  return (
+    <div className="timeline-detail">
+      <div className="timeline-detail-head">
+        {KIND_ICON.plan} {item.title || "계획"}
+      </div>
+      <div className="timeline-diff-block">
+        <div className="timeline-detail-label">계획</div>
+        {plan != null ? (
+          <pre className="timeline-detail-text">{plan}</pre>
+        ) : (
+          <div className="timeline-detail-empty">계획 내용이 없습니다.</div>
+        )}
+      </div>
+      {item.content_text && (
+        <div className="timeline-diff-block">
+          <div className="timeline-detail-label">응답</div>
+          <pre className="timeline-detail-text">{item.content_text}</pre>
+        </div>
+      )}
+    </div>
+  );
+}
+
 /** The viewer body for the selected item (B4): the tool input (명령/경로), file
  * diffs (이전→이후), its text content (read result, output, 작성 내용), and — for
  * a read with no inline content — the file itself, fetched on demand. */
 export function ItemDetail({ item }: { item: TimelineItem }) {
-  const rawInput = item.raw_input != null ? JSON.stringify(item.raw_input, null, 2) : null;
+  // Bash (execute): show the command from raw_input prominently, then the output
+  // (content_text), instead of a raw JSON dump.
+  const bashCmd =
+    item.kind === "execute"
+      ? ((item.raw_input as { command?: string } | null)?.command ?? null)
+      : null;
+  const rawInput =
+    item.raw_input != null && bashCmd == null ? JSON.stringify(item.raw_input, null, 2) : null;
   const firstPath = item.locations[0] ?? null;
   const hasContent = item.content_text != null && item.content_text !== "";
   // A read (or any location-only item) with no diff/content: show the file.
@@ -322,11 +413,20 @@ export function ItemDetail({ item }: { item: TimelineItem }) {
     };
   }, [item.tool_call_id, needsFile, firstPath]);
 
+  if (item.kind === "question") return <QuestionDetail item={item} />;
+  if (item.kind === "plan") return <PlanDetail item={item} />;
+
   return (
     <div className="timeline-detail">
       <div className="timeline-detail-head">
         {KIND_ICON[item.kind] ?? "•"} {item.title || item.kind}
       </div>
+      {bashCmd != null && (
+        <div className="timeline-diff-block">
+          <div className="timeline-detail-label">명령</div>
+          <pre className="timeline-detail-text">{bashCmd}</pre>
+        </div>
+      )}
       {rawInput != null && (
         <div className="timeline-diff-block">
           <div className="timeline-detail-label">입력</div>
