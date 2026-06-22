@@ -177,9 +177,15 @@ interface AppState {
   /** Saved SSH connections (app-global, non-secret). Secrets live in the OS
    * keychain. Persisted as part of WorkspaceState. */
   savedConnections: SshConnection[];
+  /** Opt-in: persist terminal/SSH scrollback to disk so tabs restore their prior
+   * output after a restart. Default OFF — output can contain secrets (review
+   * F11). Persisted to localStorage. */
+  persistScrollback: boolean;
 
   /** Load persisted state from the backend on startup. */
   init: () => Promise<void>;
+  /** Toggle scrollback disk persistence. */
+  setPersistScrollback: (on: boolean) => void;
   /** Add or replace (by id) a saved SSH connection and persist. */
   upsertConnection: (conn: SshConnection) => void;
   /** Delete a saved SSH connection: remove its keychain secret first, then the
@@ -276,8 +282,19 @@ export const useAppStore = create<AppState>((set, get) => ({
   studySessionLayout: null,
   studySessionUuid: localStorage.getItem("studySessionUuid"),
   savedConnections: [],
+  persistScrollback: localStorage.getItem("persistScrollback") === "1",
+
+  setPersistScrollback: (on) => {
+    localStorage.setItem("persistScrollback", on ? "1" : "0");
+    set({ persistScrollback: on });
+    // Tell the backend so running flushers stop/start writing too (P4-R3).
+    invoke("scrollback_set_enabled", { enabled: on }).catch(() => {});
+  },
 
   init: async () => {
+    // Sync the backend's scrollback-persistence flag with the saved preference
+    // (default OFF) so restored sessions honor it from the first tick (P4-R3).
+    invoke("scrollback_set_enabled", { enabled: get().persistScrollback }).catch(() => {});
     try {
       const ws = await invoke<WorkspaceState>("load_state");
       const loaded = ws.open_projects ?? [];

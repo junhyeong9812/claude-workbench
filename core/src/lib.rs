@@ -15,6 +15,7 @@ pub mod jsonl;
 pub mod label;
 pub mod persist;
 pub mod project_type;
+pub mod scrollback_store;
 pub mod session;
 pub mod snapshot;
 pub mod ssh;

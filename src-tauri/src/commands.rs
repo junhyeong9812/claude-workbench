@@ -109,8 +109,58 @@ pub struct TerminalSnapshot {
     last_seq: u64,
 }
 
+/// Runtime toggle for scrollback disk persistence (opt-in — review F11/P4-R3). A
+/// running flusher checks this every tick, so turning persistence OFF stops
+/// further writes for *existing* sessions, not just new ones.
+#[derive(Default)]
+pub struct ScrollbackState {
+    enabled: AtomicBool,
+}
+
+/// App-data scrollback directory (opt-in persistence — P4).
+fn scrollback_dir(app: &AppHandle) -> Option<PathBuf> {
+    app.path().app_data_dir().ok().map(|d| d.join("scrollback"))
+}
+
+/// Spawn the flusher for a persisted session. It is the **sole owner** of the
+/// session's scrollback file (review P4-R1): it saves at most every ~2s while the
+/// output changes *and* persistence is enabled, keeps polling after the session
+/// dies (so a dead-but-open tab can be reopened), and — only when the session is
+/// finally **removed** (panel closed) — deletes the file and stops. Because no
+/// other code touches the file, there is no delete/flush race. Started only when
+/// a `persist_key` was given (opt-in).
+fn spawn_scrollback_flush(app: AppHandle, id: u64, key: String) {
+    thread::spawn(move || {
+        let Some(dir) = scrollback_dir(&app) else {
+            return;
+        };
+        let mut last_seq = u64::MAX;
+        loop {
+            thread::sleep(Duration::from_secs(2));
+            match app.state::<SessionManager>().snapshot(id) {
+                Ok((bytes, seq)) => {
+                    let enabled = app.state::<ScrollbackState>().enabled.load(Ordering::Relaxed);
+                    if enabled && seq != last_seq {
+                        let _ = core_lib::scrollback_store::save(&dir, &key, &bytes);
+                        last_seq = seq;
+                    }
+                    // Keep polling even when dead-but-not-removed, so we remain the
+                    // file's sole owner until the panel is actually closed.
+                }
+                Err(_) => {
+                    // Session removed (panel permanently closed) → discard on disk.
+                    let _ = core_lib::scrollback_store::delete(&dir, &key);
+                    break;
+                }
+            }
+        }
+    });
+}
+
 /// Spawn a PTY (default shell unless `cmd` given) in `cwd` and start streaming
-/// its output to the `terminal-output` event. Returns the session id.
+/// its output to the `terminal-output` event. Returns the session id. When
+/// `persist_key` is given (opt-in), seed the scrollback from disk and flush it
+/// back periodically so the panel restores its prior output after a restart.
 #[tauri::command]
 pub fn terminal_create(
     app: AppHandle,
@@ -119,24 +169,35 @@ pub fn terminal_create(
     cwd: Option<String>,
     cols: u16,
     rows: u16,
+    persist_key: Option<String>,
 ) -> Result<u64, AppError> {
-    let id = mgr.create(cmd, cwd, cols, rows).map_err(AppError::new)?;
+    let seed = persist_key
+        .as_ref()
+        .and_then(|k| scrollback_dir(&app).and_then(|d| core_lib::scrollback_store::load(&d, k)));
+    let id = mgr
+        .create_seeded(cmd, cwd, cols, rows, seed)
+        .map_err(AppError::new)?;
     let rx = mgr.subscribe(id).map_err(AppError::new)?;
     // Relay core output chunks -> webview event until the session is removed
     // (sender dropped -> recv errors -> thread ends; no leak).
-    let app = app.clone();
-    thread::spawn(move || {
-        while let Ok(chunk) = rx.recv() {
-            let _ = app.emit(
-                "terminal-output",
-                TerminalOutput {
-                    session_id: id,
-                    seq: chunk.seq,
-                    data: chunk.bytes,
-                },
-            );
-        }
-    });
+    {
+        let app = app.clone();
+        thread::spawn(move || {
+            while let Ok(chunk) = rx.recv() {
+                let _ = app.emit(
+                    "terminal-output",
+                    TerminalOutput {
+                        session_id: id,
+                        seq: chunk.seq,
+                        data: chunk.bytes,
+                    },
+                );
+            }
+        });
+    }
+    if let Some(key) = persist_key {
+        spawn_scrollback_flush(app, id, key);
+    }
     Ok(id)
 }
 
@@ -240,6 +301,7 @@ pub fn ssh_create(
     key_path: Option<String>,
     passphrase: Option<String>,
     connection_id: Option<String>,
+    persist_key: Option<String>,
     cols: u16,
     rows: u16,
 ) -> Result<u64, AppError> {
@@ -269,7 +331,10 @@ pub fn ssh_create(
         auth,
     };
     let known_hosts = ssh_known_hosts_path(&app)?;
-    let (id, channels) = mgr.create_ssh(config, known_hosts, cols, rows);
+    let seed = persist_key
+        .as_ref()
+        .and_then(|k| scrollback_dir(&app).and_then(|d| core_lib::scrollback_store::load(&d, k)));
+    let (id, channels) = mgr.create_ssh(config, known_hosts, cols, rows, seed);
 
     // (a) Output relay -> `terminal-output`, identical to `terminal_create`.
     let rx = mgr.subscribe(id).map_err(AppError::new)?;
@@ -343,6 +408,10 @@ pub fn ssh_create(
         });
     }
 
+    if let Some(key) = persist_key {
+        spawn_scrollback_flush(app, id, key);
+    }
+
     Ok(id)
 }
 
@@ -409,6 +478,13 @@ pub fn ssh_delete_secret(id: String) -> Result<(), AppError> {
         Err(keyring::Error::NoEntry) => Ok(()),
         Err(_) => Err(AppError::new("could not delete the keychain secret")),
     }
+}
+
+/// Enable/disable scrollback disk persistence at runtime (the global opt-in
+/// toggle). Affects already-running flushers, not just new sessions (P4-R3).
+#[tauri::command]
+pub fn scrollback_set_enabled(state: State<'_, ScrollbackState>, enabled: bool) {
+    state.enabled.store(enabled, Ordering::Relaxed);
 }
 
 // ---- Claude (architecture A: real terminal + session-JSONL tail) ----

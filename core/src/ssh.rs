@@ -490,7 +490,7 @@ mod tests {
             username: "nobody".into(),
             auth: AuthMethod::Password("nopass".into()),
         };
-        let (id, mut chans) = mgr.create_ssh(cfg, temp_known_hosts("refused"), 80, 24);
+        let (id, mut chans) = mgr.create_ssh(cfg, temp_known_hosts("refused"), 80, 24, None);
 
         // The status stream must surface a terminal outcome (Failed and/or Closed).
         let mut saw_terminal = false;
@@ -634,7 +634,7 @@ W8CkSL2Yx++XP/fxFe/RAAAAD210LXRlc3QtaG9zdGtleQECAwQFBg==\n\
             username: "tester".into(),
             auth: AuthMethod::Password("testpass".into()),
         };
-        let (id, mut chans) = mgr.create_ssh(cfg, temp_known_hosts("echo"), 80, 24);
+        let (id, mut chans) = mgr.create_ssh(cfg, temp_known_hosts("echo"), 80, 24, None);
 
         // Accept the first-seen host key (TOFU) and wait for Ready.
         let mut ready = false;

@@ -89,6 +89,7 @@ pub fn run() {
         .manage(core_lib::SessionManager::new())
         .manage(commands::ClaudeState::default())
         .manage(commands::SshState::default())
+        .manage(commands::ScrollbackState::default())
         .invoke_handler(tauri::generate_handler![
             commands::read_dir,
             commands::detect_project_types,
@@ -103,6 +104,7 @@ pub fn run() {
             commands::ssh_hostkey_decision,
             commands::ssh_store_secret,
             commands::ssh_delete_secret,
+            commands::scrollback_set_enabled,
             commands::claude_start,
             commands::claude_close,
             commands::claude_sessions,

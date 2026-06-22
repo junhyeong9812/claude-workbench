@@ -75,6 +75,19 @@ impl Shared {
     pub(crate) fn set_dead(&self) {
         self.alive.store(false, Ordering::SeqCst);
     }
+
+    /// Seed the scrollback with restored bytes (opt-in persistence — P4). The
+    /// seq counter stays at 0, so seeded bytes are pure backfill returned by
+    /// `snapshot`; the first live chunk still gets `seq = 1` and the no-loss /
+    /// no-dup backfill contract is preserved.
+    pub(crate) fn seed(&self, bytes: &[u8]) {
+        let mut sb = self.scrollback.lock().unwrap();
+        sb.buf.clear();
+        sb.buf.extend(bytes.iter().copied());
+        while sb.buf.len() > sb.cap {
+            sb.buf.pop_front();
+        }
+    }
 }
 
 /// Byte ring buffer + chunk sequence counter. Guarded by a `Mutex` in [`Shared`]
@@ -165,6 +178,19 @@ impl SessionManager {
         cols: u16,
         rows: u16,
     ) -> Result<SessionId, String> {
+        self.create_seeded(cmd, cwd, cols, rows, None)
+    }
+
+    /// Like [`create`], but seed the scrollback with restored bytes (opt-in
+    /// persistence — P4). `seed` is shown as backfill on the first snapshot.
+    pub fn create_seeded(
+        &self,
+        cmd: Option<Vec<String>>,
+        cwd: Option<String>,
+        cols: u16,
+        rows: u16,
+        seed: Option<Vec<u8>>,
+    ) -> Result<SessionId, String> {
         let pty_system = native_pty_system();
         let size = PtySize {
             rows: rows.max(1),
@@ -195,6 +221,9 @@ impl SessionManager {
         let writer = pair.master.take_writer().map_err(|e| e.to_string())?;
 
         let shared = Arc::new(Shared::new(self.scrollback_cap));
+        if let Some(s) = &seed {
+            shared.seed(s);
+        }
 
         // Reader thread: read until EOF/error, append to scrollback with a seq,
         // fan out to subscribers, then mark dead and reap the child (no zombie,
@@ -239,8 +268,12 @@ impl SessionManager {
         known_hosts_path: std::path::PathBuf,
         cols: u16,
         rows: u16,
+        seed: Option<Vec<u8>>,
     ) -> (SessionId, crate::ssh::SshChannels) {
         let shared = Arc::new(Shared::new(self.scrollback_cap));
+        if let Some(s) = &seed {
+            shared.seed(s);
+        }
         let (handle, channels) =
             crate::ssh::spawn_ssh(config, Arc::clone(&shared), known_hosts_path, cols, rows);
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
@@ -487,6 +520,25 @@ mod tests {
         // After the child exits, resize may error but must not panic.
         wait_until(2000, || mgr.is_alive(id) == Some(false));
         let _ = mgr.resize(id, 120, 50);
+    }
+
+    #[test]
+    fn seeded_scrollback_is_returned_as_backfill() {
+        let mgr = SessionManager::new();
+        // Seed restored bytes; they must appear as backfill immediately (before
+        // any live output), preceding the child's own output.
+        let id = mgr
+            .create_seeded(sh("printf NEW"), None, 80, 24, Some(b"PRIOR".to_vec()))
+            .unwrap();
+        let (buf, _) = mgr.snapshot(id).unwrap();
+        assert!(buf.starts_with(b"PRIOR"), "seed must be present as backfill");
+        assert!(wait_until(2000, || {
+            let (b, _) = mgr.snapshot(id).unwrap();
+            b.windows(3).any(|w| w == b"NEW")
+        }));
+        // Seed precedes live output.
+        let (buf, _) = mgr.snapshot(id).unwrap();
+        assert!(buf.starts_with(b"PRIOR"));
     }
 
     #[test]

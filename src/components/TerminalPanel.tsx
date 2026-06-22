@@ -166,6 +166,9 @@ export function TerminalPanel(props: IDockviewPanelProps<TerminalParams>) {
       }
       if (disposed) return;
       if (sessionId == null) {
+        // Opt-in scrollback persistence keys on the (layout-stable) panel id, so
+        // a restored panel restores its own prior output (review F11).
+        const persistKey = useAppStore.getState().persistScrollback ? props.api.id : null;
         if (isSsh) {
           // Recreate after restart: no secret here — the backend reads it from
           // the keychain via connectionId. An ad-hoc (unsaved) connection has no
@@ -181,6 +184,7 @@ export function TerminalPanel(props: IDockviewPanelProps<TerminalParams>) {
             keyPath: p.keyPath ?? null,
             passphrase: null,
             connectionId: p.connectionId ?? null,
+            persistKey,
             cols: term.cols,
             rows: term.rows,
           });
@@ -191,6 +195,7 @@ export function TerminalPanel(props: IDockviewPanelProps<TerminalParams>) {
             cwd,
             cols: term.cols,
             rows: term.rows,
+            persistKey,
           });
         }
         props.api.updateParameters({ ...props.params, sessionId });

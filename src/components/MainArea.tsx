@@ -153,6 +153,8 @@ export function MainArea() {
   const savedConnections = useAppStore((s) => s.savedConnections);
   const upsertConnection = useAppStore((s) => s.upsertConnection);
   const deleteConnection = useAppStore((s) => s.deleteConnection);
+  const persistScrollback = useAppStore((s) => s.persistScrollback);
+  const setPersistScrollback = useAppStore((s) => s.setPersistScrollback);
   const [termMenu, setTermMenu] = useState(false);
   const [sshForm, setSshForm] = useState<SshForm | null>(null);
   // A queue (not a single slot) so two connections prompting for unknown host
@@ -193,6 +195,9 @@ export function MainArea() {
         const cmd = params.kind === "claudeterm" ? "claude_close" : "terminal_close";
         invoke(cmd, { id: params.sessionId }).catch(() => {});
       }
+      // Persisted scrollback is discarded by the session's own flusher when the
+      // session is removed (it is the file's sole owner — no delete/flush race,
+      // review P4-R1), so there's nothing to clean up here.
     });
   };
 
@@ -246,6 +251,10 @@ export function MainArea() {
     const api = apiRef.current;
     if (!api) return;
     try {
+      // Generate the panel id up front so it can double as the scrollback
+      // persistence key (opt-in — review F11).
+      const panelId = `ssh-${Date.now()}`;
+      const persistKey = useAppStore.getState().persistScrollback ? panelId : null;
       const id = await invoke<number>("ssh_create", {
         host: o.host,
         port: o.port,
@@ -255,11 +264,12 @@ export function MainArea() {
         keyPath: o.keyPath ?? null,
         passphrase: o.passphrase ?? null,
         connectionId: o.connectionId ?? null,
+        persistKey,
         cols: 80,
         rows: 24,
       });
       api.addPanel({
-        id: `ssh-${Date.now()}`,
+        id: panelId,
         component: "ssh",
         title: o.title,
         params: {
@@ -656,6 +666,16 @@ export function MainArea() {
                 ))}
               </>
             )}
+            <div className="claude-picker-sep">설정</div>
+            <button
+              className="claude-picker-item"
+              onClick={() => setPersistScrollback(!persistScrollback)}
+            >
+              <span className="claude-picker-title">
+                출력 저장(재시작 복원): {persistScrollback ? "ON" : "OFF"}
+              </span>
+              <span className="claude-picker-meta">출력에 비밀번호가 섞일 수 있어 기본 OFF</span>
+            </button>
           </div>
         )}
         <button className="toolbar-btn" onClick={() => openPicker()}>
