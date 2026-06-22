@@ -7,7 +7,7 @@ import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import "@xterm/xterm/css/xterm.css";
 import { useAppStore } from "../state/store";
 import { xtermTheme } from "./xtermTheme";
-import { TimelineView, ItemDetail, type TimelineItem } from "./TimelineView";
+import { TimelineView, ItemDetail, MarkdownText, type TimelineItem } from "./TimelineView";
 
 /**
  * Architecture A Claude panel: the **real** `claude` CLI in an xterm PTY (left)
@@ -140,6 +140,9 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
   // numbers repeat across the live session and each previous task.
   const [selectedTurn, setSelectedTurn] = useState<number | null>(null);
   const [selectedTurnScope, setSelectedTurnScope] = useState<string>("live");
+  // Detail pane render mode for pure-content (non-diff) views: rendered markdown
+  // (뷰모드, default) vs raw text (원본). Toggled from the detail head.
+  const [detailMarkdown, setDetailMarkdown] = useState(true);
   // A plain text (e.g. a turn's full answer) shown in the detail viewer when the
   // timeline truncates it. Mutually exclusive with `selectedId`.
   const [textView, setTextView] = useState<{ title: string; text: string } | null>(null);
@@ -728,6 +731,19 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
               <span className="claudeterm-pane-head-title">
                 {textView ? textView.title : `변경 상세 — ${selectedItem!.title || selectedItem!.kind}`}
               </span>
+              {/* 뷰모드/원본 toggle — only for pure content (no diff, not a question). */}
+              {(textView != null ||
+                (selectedItem != null &&
+                  selectedItem.diffs.length === 0 &&
+                  selectedItem.kind !== "question")) && (
+                <span
+                  className="claudeterm-viewmode-toggle"
+                  title={detailMarkdown ? "원본 텍스트로 보기" : "뷰모드(마크다운)로 보기"}
+                  onClick={() => setDetailMarkdown((v) => !v)}
+                >
+                  {detailMarkdown ? "원본" : "뷰모드"}
+                </span>
+              )}
               <span
                 className="claudeterm-viewer-x"
                 title="닫기"
@@ -742,9 +758,13 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
             </div>
             <div className="claudeterm-viewer-body">
               {textView ? (
-                <pre className="claudeterm-text">{textView.text}</pre>
+                detailMarkdown ? (
+                  <MarkdownText text={textView.text} />
+                ) : (
+                  <pre className="claudeterm-text">{textView.text}</pre>
+                )
               ) : (
-                <ItemDetail item={selectedItem!} />
+                <ItemDetail item={selectedItem!} markdown={detailMarkdown} />
               )}
             </div>
           </div>

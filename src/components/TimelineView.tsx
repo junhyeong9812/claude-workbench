@@ -4,8 +4,20 @@
  * that splits the chat area (left), keeping this list as a single column.
  * Presentational; ClaudeTermPanel feeds it the items/turns for *its* session. */
 
-import { Fragment, useEffect, useRef, useState } from "react";
+import { Fragment, useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { marked } from "marked";
+import DOMPurify from "dompurify";
+
+/** Render text as sanitized markdown (뷰모드). Same marked+DOMPurify pipeline as
+ * the study viewer — the content is local session text, sanitized before inject. */
+export function MarkdownText({ text }: { text: string }) {
+  const html = useMemo(
+    () => DOMPurify.sanitize(marked.parse(text, { async: false }) as string),
+    [text],
+  );
+  return <div className="study-md tl-markdown" dangerouslySetInnerHTML={{ __html: html }} />;
+}
 
 export interface TimelineItem {
   turn: number;
@@ -368,8 +380,8 @@ function QuestionDetail({ item }: { item: TimelineItem }) {
   );
 }
 
-/** Detail body for an `ExitPlanMode` item: the proposed plan text. */
-function PlanDetail({ item }: { item: TimelineItem }) {
+/** Detail body for an `ExitPlanMode` item: the proposed plan text (markdown). */
+function PlanDetail({ item, markdown }: { item: TimelineItem; markdown: boolean }) {
   const raw = (item.raw_input ?? null) as { plan?: string } | null;
   const plan = typeof raw?.plan === "string" ? raw.plan : null;
   return (
@@ -380,7 +392,11 @@ function PlanDetail({ item }: { item: TimelineItem }) {
       <div className="timeline-diff-block">
         <div className="timeline-detail-label">계획</div>
         {plan != null ? (
-          <pre className="timeline-detail-text">{plan}</pre>
+          markdown ? (
+            <MarkdownText text={plan} />
+          ) : (
+            <pre className="timeline-detail-text">{plan}</pre>
+          )
         ) : (
           <div className="timeline-detail-empty">계획 내용이 없습니다.</div>
         )}
@@ -398,7 +414,7 @@ function PlanDetail({ item }: { item: TimelineItem }) {
 /** The viewer body for the selected item (B4): the tool input (명령/경로), file
  * diffs (이전→이후), its text content (read result, output, 작성 내용), and — for
  * a read with no inline content — the file itself, fetched on demand. */
-export function ItemDetail({ item }: { item: TimelineItem }) {
+export function ItemDetail({ item, markdown = true }: { item: TimelineItem; markdown?: boolean }) {
   // Bash (execute): show the command from raw_input prominently, then the output
   // (content_text), instead of a raw JSON dump.
   const bashCmd =
@@ -433,7 +449,7 @@ export function ItemDetail({ item }: { item: TimelineItem }) {
   }, [item.tool_call_id, needsFile, firstPath]);
 
   if (item.kind === "question") return <QuestionDetail item={item} />;
-  if (item.kind === "plan") return <PlanDetail item={item} />;
+  if (item.kind === "plan") return <PlanDetail item={item} markdown={markdown} />;
 
   return (
     <div className="timeline-detail">
@@ -464,13 +480,22 @@ export function ItemDetail({ item }: { item: TimelineItem }) {
       {hasContent && (
         <div className="timeline-diff-block">
           <div className="timeline-detail-label">내용</div>
-          <pre className="timeline-detail-text">{item.content_text}</pre>
+          {markdown ? (
+            <MarkdownText text={item.content_text!} />
+          ) : (
+            <pre className="timeline-detail-text">{item.content_text}</pre>
+          )}
         </div>
       )}
       {needsFile && (
         <div className="timeline-diff-block">
           <div className="timeline-detail-path">{firstPath}</div>
-          {fileText != null && <pre className="timeline-detail-text">{fileText}</pre>}
+          {fileText != null &&
+            (markdown ? (
+              <MarkdownText text={fileText} />
+            ) : (
+              <pre className="timeline-detail-text">{fileText}</pre>
+            ))}
           {fileErr != null && <div className="timeline-detail-empty">{fileErr}</div>}
           {fileText == null && fileErr == null && (
             <div className="timeline-detail-empty">불러오는 중…</div>

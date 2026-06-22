@@ -15,6 +15,11 @@
   --git-ref-local: #4493f8;
   --git-ref-remote: #c678dd;
   --git-ref-tag: #d29922;
+  /* timeline change-detail diff colors (bright text on the dark bg) */
+  --diff-add-bg: rgba(63, 185, 80, 0.12);
+  --diff-add-fg: #a8d8a8;
+  --diff-del-bg: rgba(248, 81, 73, 0.12);
+  --diff-del-fg: #f0a0a0;
 }
 
 /* Light theme — toggled via document.documentElement[data-theme="light"]. */
@@ -35,6 +40,11 @@
   --git-ref-local: #0969da;
   --git-ref-remote: #8250df;
   --git-ref-tag: #9a6700;
+  /* darker diff text + fainter tints so they read on white */
+  --diff-add-bg: rgba(26, 127, 55, 0.12);
+  --diff-add-fg: #0a5d2a;
+  --diff-del-bg: rgba(207, 34, 46, 0.10);
+  --diff-del-fg: #a01722;
 }
 
 * {
@@ -1038,9 +1048,30 @@ body {
   border-bottom: 1px solid var(--border, #333);
 }
 .claudeterm-pane-head-title {
+  flex: 1;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+/* 뷰모드/원본 toggle in the detail pane head. */
+.claudeterm-viewmode-toggle {
+  flex: 0 0 auto;
+  cursor: pointer;
+  padding: 1px 6px;
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  color: var(--fg-dim);
+  user-select: none;
+}
+.claudeterm-viewmode-toggle:hover {
+  color: var(--fg);
+  background: var(--bg-hover);
+}
+/* Rendered-markdown view inside the detail pane (뷰모드). Inherits .study-md
+   element styling; constrain the font to the detail pane scale. */
+.tl-markdown {
+  font-size: 12px;
+  padding: 2px 2px 14px;
 }
 .claudeterm-tokens {
   flex: 0 0 auto;
@@ -1474,7 +1505,7 @@ body {
 }
 .tl-option-sel {
   border-color: var(--accent);
-  background: rgba(63, 185, 80, 0.12);
+  background: var(--diff-add-bg);
 }
 .tl-option-label {
   font-size: 11px;
@@ -1484,7 +1515,7 @@ body {
   word-break: break-word;
 }
 .tl-option-sel .tl-option-label {
-  color: #a8d8a8;
+  color: var(--diff-add-fg);
 }
 .tl-option-desc {
   font-size: 10px;
@@ -1523,16 +1554,17 @@ body {
   overflow-x: auto;
   max-height: 240px;
   overflow-y: auto;
-  padding: 4px 6px;
+  /* extra bottom padding so the horizontal scrollbar doesn't cover the last line */
+  padding: 4px 6px 14px;
   border-radius: 3px;
 }
 .timeline-diff-old {
-  background: rgba(248, 81, 73, 0.12);
-  color: #f0a0a0;
+  background: var(--diff-del-bg);
+  color: var(--diff-del-fg);
 }
 .timeline-diff-new {
-  background: rgba(63, 185, 80, 0.12);
-  color: #a8d8a8;
+  background: var(--diff-add-bg);
+  color: var(--diff-add-fg);
 }
 .timeline-item.ts-canceled,
 .timeline-item.ts-failed {
