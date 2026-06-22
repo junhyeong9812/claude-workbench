@@ -664,6 +664,11 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
         .find((it) => it.tool_call_id === selectedId) ?? null)
     : null;
 
+  // "Pure content" (no diff, not a question) → the 뷰모드(html)/원본 toggle applies.
+  const detailIsPureContent =
+    textView != null ||
+    (selectedItem != null && selectedItem.diffs.length === 0 && selectedItem.kind !== "question");
+
   return (
     <div className="claudeterm" ref={containerRef} onKeyDown={onContainerKey}>
       <div className="claudeterm-pane claudeterm-term-pane">
@@ -718,6 +723,12 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
             tabIndex={0}
             style={{ flex: `0 0 ${viewerWidth}px` }}
             onKeyDown={(e) => {
+              // v: 뷰모드(html)/원본 전환 (순수 내용일 때만).
+              if ((e.key === "v" || e.key === "V") && detailIsPureContent) {
+                e.preventDefault();
+                setDetailMarkdown((v) => !v);
+                return;
+              }
               if (["ArrowDown", "ArrowUp", "PageDown", "PageUp"].includes(e.key)) {
                 const body = viewerRef.current?.querySelector(
                   ".claudeterm-viewer-body",
@@ -734,19 +745,6 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
               <span className="claudeterm-pane-head-title">
                 {textView ? textView.title : `변경 상세 — ${selectedItem!.title || selectedItem!.kind}`}
               </span>
-              {/* 뷰모드/원본 toggle — only for pure content (no diff, not a question). */}
-              {(textView != null ||
-                (selectedItem != null &&
-                  selectedItem.diffs.length === 0 &&
-                  selectedItem.kind !== "question")) && (
-                <span
-                  className="claudeterm-viewmode-toggle"
-                  title={detailMarkdown ? "원본 텍스트로 보기" : "뷰모드(마크다운)로 보기"}
-                  onClick={() => setDetailMarkdown((v) => !v)}
-                >
-                  {detailMarkdown ? "원본" : "뷰모드"}
-                </span>
-              )}
               <span
                 className="claudeterm-viewer-x"
                 title="닫기"
@@ -757,6 +755,20 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
                 }}
               >
                 ×
+              </span>
+            </div>
+            {/* Control row under the header: view/raw button + 1-line shortcut hint. */}
+            <div className="claudeterm-viewer-hint">
+              {detailIsPureContent && (
+                <button
+                  className="claudeterm-viewmode-btn"
+                  onClick={() => setDetailMarkdown((v) => !v)}
+                >
+                  {detailMarkdown ? "원본 보기" : "뷰모드 보기"}
+                </button>
+              )}
+              <span className="claudeterm-viewer-hint-keys">
+                {detailIsPureContent ? "v 뷰/원본 · " : ""}↑↓ 스크롤 · Ctrl+←/→ 패널 이동
               </span>
             </div>
             <div className="claudeterm-viewer-body">

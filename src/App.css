@@ -1053,19 +1053,35 @@ body {
   text-overflow: ellipsis;
   white-space: nowrap;
 }
-/* 뷰모드/원본 toggle in the detail pane head. */
-.claudeterm-viewmode-toggle {
+/* Control row under the detail-pane header: view/raw button + shortcut hint. */
+.claudeterm-viewer-hint {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 2px 8px;
+  font-size: 10px;
+  color: var(--fg-dim);
+  background: rgba(127, 127, 127, 0.05);
+  border-bottom: 1px solid var(--border);
+}
+.claudeterm-viewmode-btn {
   flex: 0 0 auto;
   cursor: pointer;
-  padding: 1px 6px;
+  padding: 1px 8px;
   border: 1px solid var(--border);
   border-radius: 3px;
-  color: var(--fg-dim);
-  user-select: none;
-}
-.claudeterm-viewmode-toggle:hover {
+  background: var(--bg-alt);
   color: var(--fg);
+  font-size: 10px;
+}
+.claudeterm-viewmode-btn:hover {
   background: var(--bg-hover);
+}
+.claudeterm-viewer-hint-keys {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 /* Rendered-markdown view inside the detail pane (뷰모드). Inherits .study-md
    element styling; constrain the font to the detail pane scale. */
