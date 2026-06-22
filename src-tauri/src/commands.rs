@@ -239,16 +239,25 @@ pub fn ssh_create(
     password: Option<String>,
     key_path: Option<String>,
     passphrase: Option<String>,
+    connection_id: Option<String>,
     cols: u16,
     rows: u16,
 ) -> Result<u64, AppError> {
     use core_lib::ssh::{AuthMethod, HostKeyChallenge, SshConfig, SshStatus};
 
+    // A directly supplied arg (new, unsaved connection) takes precedence; only
+    // when it's absent do we hit the keychain for a saved connection's secret —
+    // so a fresh connection or agent auth never triggers a keychain unlock
+    // (review P2-R1). The secret never round-trips through the UI.
     let auth = match auth_kind.as_str() {
-        "password" => AuthMethod::Password(password.unwrap_or_default()),
+        "password" => AuthMethod::Password(
+            password
+                .or_else(|| connection_id.as_deref().and_then(ssh_get_secret))
+                .unwrap_or_default(),
+        ),
         "publickey" => AuthMethod::PublicKey {
             path: key_path.ok_or_else(|| AppError::new("a key path is required"))?,
-            passphrase,
+            passphrase: passphrase.or_else(|| connection_id.as_deref().and_then(ssh_get_secret)),
         },
         "agent" => AuthMethod::Agent,
         _ => return Err(AppError::new("unknown authentication method")),
@@ -359,6 +368,47 @@ pub fn ssh_hostkey_decision(ssh: State<'_, SshState>, id: u64, accept: bool) -> 
         let _ = tx.send(decision);
     }
     Ok(())
+}
+
+// ---- SSH secrets (OS keychain) ----
+//
+// Passwords and key passphrases live in the OS keychain keyed by the saved
+// connection's id — never in `workspace.json` (review F8). There is **no
+// plaintext fallback**: if the keychain is unavailable, storing fails and the UI
+// falls back to a session-only (re-prompt each time) connection (review F9).
+
+const SSH_KEYRING_SERVICE: &str = "claude-workbench-ssh";
+
+/// Best-effort secret read for a connection id — `None` on any miss/error (the
+/// connect path then proceeds without a stored secret).
+fn ssh_get_secret(id: &str) -> Option<String> {
+    keyring::Entry::new(SSH_KEYRING_SERVICE, id)
+        .ok()?
+        .get_password()
+        .ok()
+}
+
+/// Store a connection's secret (password or key passphrase) in the OS keychain.
+#[tauri::command]
+pub fn ssh_store_secret(id: String, secret: String) -> Result<(), AppError> {
+    let entry = keyring::Entry::new(SSH_KEYRING_SERVICE, &id)
+        .map_err(|_| AppError::new("OS keychain is unavailable"))?;
+    entry
+        .set_password(&secret)
+        .map_err(|_| AppError::new("could not save to the OS keychain (is a keyring service running?)"))
+}
+
+/// Delete a connection's stored secret. A missing entry is a no-op (so deleting a
+/// connection without a stored secret still succeeds — review F9).
+#[tauri::command]
+pub fn ssh_delete_secret(id: String) -> Result<(), AppError> {
+    let entry = keyring::Entry::new(SSH_KEYRING_SERVICE, &id)
+        .map_err(|_| AppError::new("OS keychain is unavailable"))?;
+    match entry.delete_credential() {
+        Ok(()) => Ok(()),
+        Err(keyring::Error::NoEntry) => Ok(()),
+        Err(_) => Err(AppError::new("could not delete the keychain secret")),
+    }
 }
 
 // ---- Claude (architecture A: real terminal + session-JSONL tail) ----

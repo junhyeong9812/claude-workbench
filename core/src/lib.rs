@@ -25,6 +25,6 @@ pub use timeline::{
 };
 pub use fs::{list_dir, DirEntry};
 pub use label::nearest_project_marker;
-pub use persist::{load_state, save_state, Project, TreeState, WorkspaceState};
+pub use persist::{load_state, save_state, Project, SshConnection, TreeState, WorkspaceState};
 pub use project_type::{detect_project_types, ProjectType};
 pub use session::{OutputChunk, SessionId, SessionManager};

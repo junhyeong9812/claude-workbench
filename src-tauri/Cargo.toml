@@ -22,3 +22,7 @@ serde_json = "1"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 # Renamed to `core_lib` in code to avoid shadowing the std `core` crate.
 core_lib = { path = "../core", package = "core" }
+# OS keychain for SSH secrets (passwords / key passphrases). `sync-secret-service`
+# uses the Secret Service (gnome-keyring/KWallet) over the system libdbus;
+# `crypto-rust` avoids an OpenSSL build dependency.
+keyring = { version = "3", features = ["sync-secret-service", "crypto-rust"] }

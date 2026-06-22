@@ -101,6 +101,8 @@ pub fn run() {
             commands::terminal_close,
             commands::ssh_create,
             commands::ssh_hostkey_decision,
+            commands::ssh_store_secret,
+            commands::ssh_delete_secret,
             commands::claude_start,
             commands::claude_close,
             commands::claude_sessions,

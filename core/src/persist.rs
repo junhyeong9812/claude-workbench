@@ -46,7 +46,33 @@ pub struct Project {
     pub layout: Option<serde_json::Value>,
 }
 
-/// The full persisted workspace: open projects + which one is active.
+/// A saved SSH connection — **non-secret metadata only**. Passwords and key
+/// passphrases are *never* stored here; they live in the OS keychain keyed by
+/// [`SshConnection::id`] (review F8: the type structurally cannot leak a secret
+/// into `workspace.json`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SshConnection {
+    /// Stable unique id (UUID). Used as the keychain account and the panel's
+    /// reconnect reference. Never reused (review F9).
+    pub id: String,
+    /// User-facing label; also the default tab title.
+    pub label: String,
+    pub host: String,
+    pub port: u16,
+    pub username: String,
+    /// `"password"` | `"publickey"` | `"agent"`.
+    pub auth_kind: String,
+    /// Path to the private key file (public-key auth only).
+    #[serde(default)]
+    pub key_path: Option<String>,
+    /// Whether a secret (password or key passphrase) is stored in the keychain
+    /// for this connection — lets the UI know whether to prompt.
+    #[serde(default)]
+    pub has_stored_secret: bool,
+}
+
+/// The full persisted workspace: open projects + which one is active + saved SSH
+/// connections.
 ///
 /// `Eq` is not derived because it contains [`Project`], which is `PartialEq`
 /// only (see its docs).
@@ -57,6 +83,10 @@ pub struct WorkspaceState {
     /// Path of the active project, if any.
     #[serde(default)]
     pub active_project: Option<String>,
+    /// Saved SSH connections (app-global, not per-project). `#[serde(default)]`
+    /// so state saved before this field loads as an empty list.
+    #[serde(default)]
+    pub saved_connections: Vec<SshConnection>,
 }
 
 /// Serialize `state` to `path` as pretty JSON, creating parent dirs as needed.
@@ -129,6 +159,7 @@ mod tests {
                 },
             ],
             active_project: Some("/home/u/proj-b".into()),
+            saved_connections: vec![],
         }
     }
 
@@ -190,11 +221,69 @@ mod tests {
                 layout: Some(layout.clone()),
             }],
             active_project: Some("/home/u/proj-a".into()),
+            saved_connections: vec![],
         };
         save_state(&state, &path).unwrap();
         let loaded = load_state(&path);
         assert_eq!(loaded, state);
         assert_eq!(loaded.open_projects[0].layout, Some(layout));
+    }
+
+    fn sample_connection(id: &str, auth: &str) -> SshConnection {
+        SshConnection {
+            id: id.into(),
+            label: format!("conn-{id}"),
+            host: "example.com".into(),
+            port: 22,
+            username: "deploy".into(),
+            auth_kind: auth.into(),
+            key_path: if auth == "publickey" {
+                Some("/home/u/.ssh/id_ed25519".into())
+            } else {
+                None
+            },
+            has_stored_secret: auth == "password",
+        }
+    }
+
+    #[test]
+    fn saved_connections_round_trip() {
+        let path = temp_path("ssh_conns");
+        let state = WorkspaceState {
+            open_projects: vec![],
+            active_project: None,
+            saved_connections: vec![
+                sample_connection("uuid-1", "password"),
+                sample_connection("uuid-2", "publickey"),
+            ],
+        };
+        save_state(&state, &path).unwrap();
+        let loaded = load_state(&path);
+        assert_eq!(loaded, state);
+        assert_eq!(loaded.saved_connections.len(), 2);
+    }
+
+    #[test]
+    fn old_state_without_connections_loads_as_empty() {
+        let path = temp_path("ssh_migration");
+        // Pre-phase-02 state: no `saved_connections` key.
+        let json = r#"{ "open_projects": [], "active_project": null }"#;
+        fs::write(&path, json).unwrap();
+        let loaded = load_state(&path);
+        assert!(loaded.saved_connections.is_empty());
+    }
+
+    #[test]
+    fn connection_json_never_contains_a_secret() {
+        // Structural invariant (review F8): SshConnection has no password /
+        // passphrase field, so a serialized connection cannot leak one. Check for
+        // the field *keys* (`"password":`) — the value `"auth_kind":"password"`
+        // is the auth method name, not a secret.
+        let conn = sample_connection("uuid-x", "password");
+        let json = serde_json::to_string(&conn).unwrap();
+        assert!(!json.contains("\"password\":"), "no password field");
+        assert!(!json.contains("\"passphrase\":"), "no passphrase field");
+        assert!(!json.contains("\"secret\":"), "no secret field");
     }
 
     #[test]
