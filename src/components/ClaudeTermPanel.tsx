@@ -7,7 +7,7 @@ import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import "@xterm/xterm/css/xterm.css";
 import { useAppStore } from "../state/store";
 import { xtermTheme } from "./xtermTheme";
-import { TimelineView, ItemDetail, type TimelineItem } from "./TimelineView";
+import { TimelineView, ItemDetail, MarkdownText, type TimelineItem } from "./TimelineView";
 
 /**
  * Architecture A Claude panel: the **real** `claude` CLI in an xterm PTY (left)
@@ -134,6 +134,18 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
   const [answers, setAnswers] = useState<Map<number, string>>(new Map());
   const [dates, setDates] = useState<Map<number, string>>(new Map());
   const [selectedId, setSelectedId] = useState<string | null>(null);
+  // The selected question turn (Q&A) — highlights its head and shows prompt+answer
+  // in the detail pane. Mutually exclusive with selectedId. `selectedTurnScope`
+  // disambiguates which timeline owns it ("live" or a prev-task uuid), since turn
+  // numbers repeat across the live session and each previous task.
+  const [selectedTurn, setSelectedTurn] = useState<number | null>(null);
+  const [selectedTurnScope, setSelectedTurnScope] = useState<string>("live");
+  // Detail pane render mode for pure-content (non-diff) views: rendered markdown
+  // (뷰모드, default) vs raw text (원본). Toggled from the detail head.
+  const [detailMarkdown, setDetailMarkdown] = useState(true);
+  // Hide the whole previous-task history region (it renders above the live
+  // timeline, oldest-first). Each task is still individually collapsible.
+  const [hidePrev, setHidePrev] = useState(false);
   // A plain text (e.g. a turn's full answer) shown in the detail viewer when the
   // timeline truncates it. Mutually exclusive with `selectedId`.
   const [textView, setTextView] = useState<{ title: string; text: string } | null>(null);
@@ -652,6 +664,11 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
         .find((it) => it.tool_call_id === selectedId) ?? null)
     : null;
 
+  // "Pure content" (no diff, not a question) → the 뷰모드(html)/원본 toggle applies.
+  const detailIsPureContent =
+    textView != null ||
+    (selectedItem != null && selectedItem.diffs.length === 0 && selectedItem.kind !== "question");
+
   return (
     <div className="claudeterm" ref={containerRef} onKeyDown={onContainerKey}>
       <div className="claudeterm-pane claudeterm-term-pane">
@@ -706,6 +723,12 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
             tabIndex={0}
             style={{ flex: `0 0 ${viewerWidth}px` }}
             onKeyDown={(e) => {
+              // v: 뷰모드(html)/원본 전환 (순수 내용일 때만).
+              if ((e.key === "v" || e.key === "V") && detailIsPureContent) {
+                e.preventDefault();
+                setDetailMarkdown((v) => !v);
+                return;
+              }
               if (["ArrowDown", "ArrowUp", "PageDown", "PageUp"].includes(e.key)) {
                 const body = viewerRef.current?.querySelector(
                   ".claudeterm-viewer-body",
@@ -728,16 +751,35 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
                 onClick={() => {
                   setSelectedId(null);
                   setTextView(null);
+                  setSelectedTurn(null);
                 }}
               >
                 ×
               </span>
             </div>
+            {/* Control row under the header: view/raw button + 1-line shortcut hint. */}
+            <div className="claudeterm-viewer-hint">
+              {detailIsPureContent && (
+                <button
+                  className="claudeterm-viewmode-btn"
+                  onClick={() => setDetailMarkdown((v) => !v)}
+                >
+                  {detailMarkdown ? "원본 보기" : "뷰모드 보기"}
+                </button>
+              )}
+              <span className="claudeterm-viewer-hint-keys">
+                {detailIsPureContent ? "v 뷰/원본 · " : ""}↑↓ 스크롤 · Ctrl+←/→ 패널 이동
+              </span>
+            </div>
             <div className="claudeterm-viewer-body">
               {textView ? (
-                <pre className="claudeterm-text">{textView.text}</pre>
+                detailMarkdown ? (
+                  <MarkdownText text={textView.text} />
+                ) : (
+                  <pre className="claudeterm-text">{textView.text}</pre>
+                )
               ) : (
-                <ItemDetail item={selectedItem!} />
+                <ItemDetail item={selectedItem!} markdown={detailMarkdown} />
               )}
             </div>
           </div>
@@ -750,8 +792,74 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
         ref={timelineRef}
         style={{ flex: `0 0 ${timelineWidth}px` }}
       >
-        <div className="claudeterm-pane-head">타임라인</div>
+        {/* Prev-task expand/collapse lives IN the header (outside the scroll
+            container) so the live timeline's auto-scroll-to-bottom can't hide it.
+            Only shown when a handoff chain exists. */}
+        <div className="claudeterm-pane-head">
+          <span className="claudeterm-pane-head-title">타임라인</span>
+          {chainPrev.length > 0 && (
+            <span
+              className="claudeterm-prevtasks-toggle"
+              title={hidePrev ? "이전 task 펼치기" : "이전 task 접기"}
+              onClick={() => setHidePrev((h) => !h)}
+            >
+              <span className="timeline-date-caret">{hidePrev ? "▸" : "▾"}</span> 이전 task{" "}
+              {chainPrev.length}개
+            </span>
+          )}
+        </div>
         <div className="claudeterm-timeline">
+          {/* Previous tasks render ABOVE the live timeline (older = higher), each
+              collapsible. Reverse the (newest-first) chain so the oldest task sits
+              at the very top — chronological down. */}
+          {chainPrev.length > 0 && !hidePrev && (
+            <div className="claudeterm-prevtasks">
+              {[...chainPrev].reverse().map((task) => {
+                  const collapsed = collapsedTasks.has(task.uuid);
+                  return (
+                    <div key={task.uuid} className="claudeterm-prevtask">
+                      <div
+                        className="claudeterm-prevtask-head"
+                        title={collapsed ? "펼치기" : "접기"}
+                        onClick={() => toggleTask(task.uuid)}
+                      >
+                        <span className="timeline-date-caret">{collapsed ? "▸" : "▾"}</span> ◀ 이전 task —{" "}
+                        {task.name} · {task.date}
+                      </div>
+                      {!collapsed && (
+                        <TimelineView
+                          items={task.items}
+                          turns={new Map(task.turns)}
+                          answers={new Map(task.answers)}
+                          dates={new Map(task.dates)}
+                          subagents={[]}
+                          selectedId={selectedId}
+                          selectedTurn={selectedTurn}
+                          selectedScope={selectedTurnScope}
+                          scope={task.uuid}
+                          onSelect={(it) => {
+                            setSelectedId(it.tool_call_id);
+                            setTextView(null);
+                            setSelectedTurn(null);
+                          }}
+                          onSelectTurn={(turn) => {
+                            const q = new Map(task.turns).get(turn) ?? "";
+                            const a = new Map(task.answers).get(turn) ?? "";
+                            setTextView({
+                              title: `${task.name} Q${turn}`,
+                              text: `질문:\n${q}\n\n답변:\n${a || "(없음)"}`,
+                            });
+                            setSelectedId(null);
+                            setSelectedTurn(turn);
+                            setSelectedTurnScope(task.uuid);
+                          }}
+                        />
+                      )}
+                    </div>
+                  );
+                })}
+            </div>
+          )}
           <TimelineView
             items={items}
             turns={turns}
@@ -759,49 +867,24 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
             dates={dates}
             subagents={subagents}
             selectedId={selectedId}
+            selectedTurn={selectedTurn}
+            selectedScope={selectedTurnScope}
+            scope="live"
+            followBottom
             onSelect={(it) => {
               setSelectedId(it.tool_call_id);
               setTextView(null);
+              setSelectedTurn(null);
             }}
-            onSelectAnswer={(turn) => {
-              setTextView({ title: `답변 (Q${turn})`, text: answers.get(turn) ?? "" });
+            onSelectTurn={(turn) => {
+              const q = turns.get(turn) ?? "";
+              const a = answers.get(turn) ?? "";
+              setTextView({ title: `Q${turn}`, text: `질문:\n${q}\n\n답변:\n${a || "(없음)"}` });
               setSelectedId(null);
+              setSelectedTurn(turn);
+              setSelectedTurnScope("live");
             }}
           />
-          {chainPrev.map((task) => {
-            const collapsed = collapsedTasks.has(task.uuid);
-            return (
-              <div key={task.uuid} className="claudeterm-prevtask">
-                <div
-                  className="claudeterm-prevtask-head"
-                  title={collapsed ? "펼치기" : "접기"}
-                  onClick={() => toggleTask(task.uuid)}
-                >
-                  <span className="timeline-date-caret">{collapsed ? "▸" : "▾"}</span> ◀ 이전 task —{" "}
-                  {task.name} · {task.date}
-                </div>
-                {!collapsed && (
-                  <TimelineView
-                    items={task.items}
-                    turns={new Map(task.turns)}
-                    answers={new Map(task.answers)}
-                    dates={new Map(task.dates)}
-                    subagents={[]}
-                    selectedId={selectedId}
-                    onSelect={(it) => {
-                      setSelectedId(it.tool_call_id);
-                      setTextView(null);
-                    }}
-                    onSelectAnswer={(turn) => {
-                      const a = new Map(task.answers).get(turn) ?? "";
-                      setTextView({ title: `답변 (${task.name} Q${turn})`, text: a });
-                      setSelectedId(null);
-                    }}
-                  />
-                )}
-              </div>
-            );
-          })}
         </div>
       </div>
 

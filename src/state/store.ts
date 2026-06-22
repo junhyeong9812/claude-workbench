@@ -145,6 +145,10 @@ interface AppState {
   editorOpenRequest: string | null;
   /** A request to open a diff panel (consumed by MainArea), or null. Transient. */
   diffRequest: DiffSpec | null;
+  /** Bumped to ask MainArea to focus the active dockview panel (Ctrl+B from the
+   * already-focused tree toggles focus back to the open tab). A counter so every
+   * press re-fires even when the value would otherwise be unchanged. */
+  focusMainRequest: number;
   /** Color theme (persisted to localStorage). Drives CSS vars + xterm palette. */
   theme: "dark" | "light";
   /** Code font size in px (terminals + editor/viewer), persisted. */
@@ -203,6 +207,8 @@ interface AppState {
   requestEditorOpen: (path: string | null) => void;
   /** Request opening a diff panel (MainArea consumes + clears with null). */
   requestDiff: (spec: DiffSpec | null) => void;
+  /** Ask MainArea to focus the active dockview panel (Ctrl+B tree→tab toggle). */
+  requestFocusMain: () => void;
   /** Switch the color theme. */
   setTheme: (theme: "dark" | "light") => void;
   /** Set the code font size (clamped 9–28). */
@@ -249,6 +255,7 @@ export const useAppStore = create<AppState>((set, get) => ({
   peekFile: null,
   editorOpenRequest: null,
   diffRequest: null,
+  focusMainRequest: 0,
   theme: (localStorage.getItem("theme") as "dark" | "light") || "dark",
   fontSize: clampFontSize(Number(localStorage.getItem("fontSize")) || 13),
   termColors: loadTermColors(),
@@ -362,6 +369,7 @@ export const useAppStore = create<AppState>((set, get) => ({
   setPeekFile: (path) => set({ peekFile: path }),
   requestEditorOpen: (path) => set({ editorOpenRequest: path }),
   requestDiff: (spec) => set({ diffRequest: spec }),
+  requestFocusMain: () => set((s) => ({ focusMainRequest: s.focusMainRequest + 1 })),
   setTheme: (theme) => set({ theme }),
   setFontSize: (n) => set({ fontSize: clampFontSize(n) }),
   setTermColors: (c) => {

@@ -79,6 +79,12 @@ pub enum ItemKind {
     Execute,
     Think,
     Fetch,
+    /// An interactive question to the user (`AskUserQuestion`) — its options and
+    /// the chosen answer render in the detail pane.
+    Question,
+    /// A plan presented for approval (`ExitPlanMode`) — the plan body renders in
+    /// the detail pane.
+    Plan,
     Other,
 }
 

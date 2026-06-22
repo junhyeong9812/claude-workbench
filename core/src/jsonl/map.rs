@@ -103,6 +103,14 @@ impl JsonlMapper {
                 _ => None,
             };
             if let Some(p) = prompt {
+                // `[Request interrupted by user]` is not a real prompt — it marks
+                // that the user cut the turn off. Don't open a new turn for it;
+                // instead cancel any still-open (in-flight) items so the rejected
+                // segment shows as Canceled (⊘) under the turn it interrupted.
+                if is_interrupt_text(&p) {
+                    self.timeline.cancel_open();
+                    return Vec::new();
+                }
                 self.current_turn += 1;
                 self.turns.insert(self.current_turn, p);
                 if let Some(d) = date {
@@ -316,13 +324,28 @@ fn complete_tool_result(
     is_error: Option<bool>,
 ) -> usize {
     let text = extract_result_text(content);
+    // A tool the user declined/interrupted comes back as an error whose text says
+    // so — mark it Canceled (⊘) rather than a generic Failed (✗), so a rejected
+    // segment reads as "user stopped this", not "the tool broke". The reason text
+    // stays in content_text and the tool input (command/path) in raw_input.
+    // Narrow on purpose: a real Bash/test failure could *contain* these words, so
+    // match the rejection envelope Claude emits at the *start* of the result, not
+    // an arbitrary substring.
+    let rejected = is_error == Some(true)
+        && text.as_deref().is_some_and(|t| {
+            let tt = t.trim_start();
+            tt.starts_with("The user doesn't want to")
+                || tt.starts_with("[Request interrupted by user")
+        });
 
     let (idx, is_new) = timeline.entry(session, tool_use_id);
     let item = timeline.item_mut(idx);
     if is_new {
         item.turn = turn;
     }
-    item.agent_status = if is_error == Some(true) {
+    item.agent_status = if rejected {
+        AgentStatus::Canceled
+    } else if is_error == Some(true) {
         AgentStatus::Failed
     } else {
         AgentStatus::Completed
@@ -346,8 +369,18 @@ fn map_tool_kind(name: &str) -> ItemKind {
         "Glob" | "Grep" => ItemKind::Search,
         "WebSearch" => ItemKind::Search,
         "WebFetch" => ItemKind::Fetch,
+        "AskUserQuestion" => ItemKind::Question,
+        "ExitPlanMode" => ItemKind::Plan,
         _ => ItemKind::Other,
     }
+}
+
+/// Whether a user text block is *exactly* the interrupt sentinel Claude writes
+/// when the user stops a turn — not a real prompt. Exact match (after trim) so a
+/// genuine prompt that merely starts with the phrase isn't swallowed.
+fn is_interrupt_text(s: &str) -> bool {
+    let t = s.trim();
+    t == "[Request interrupted by user]" || t == "[Request interrupted by user for tool use]"
 }
 
 /// The file path(s) a tool touches, for labelling and the detail view.
@@ -423,6 +456,32 @@ fn derive_title(name: &str, input: &Value) -> String {
             let first = cmd.lines().next().unwrap_or(cmd);
             return first.chars().take(120).collect();
         }
+    }
+    // AskUserQuestion: the first question's header (or its question text).
+    if name == "AskUserQuestion" {
+        if let Some(q0) = input
+            .get("questions")
+            .and_then(Value::as_array)
+            .and_then(|qs| qs.first())
+        {
+            if let Some(h) = q0
+                .get("header")
+                .and_then(Value::as_str)
+                .or_else(|| q0.get("question").and_then(Value::as_str))
+            {
+                return h.chars().take(120).collect();
+            }
+        }
+        return "질문".to_string();
+    }
+    // ExitPlanMode: the plan's first non-empty line.
+    if name == "ExitPlanMode" {
+        if let Some(plan) = input.get("plan").and_then(Value::as_str) {
+            if let Some(line) = plan.lines().map(str::trim).find(|l| !l.is_empty()) {
+                return line.chars().take(120).collect();
+            }
+        }
+        return "계획".to_string();
     }
     if let Some(p) = input.get("file_path").and_then(Value::as_str) {
         return format!("{name} {p}");
@@ -659,6 +718,94 @@ mod tests {
         let it = &tl.items()[0];
         assert_eq!(it.agent_status, AgentStatus::Completed);
         assert_eq!(it.content_text.as_deref(), Some("out\nmore"));
+    }
+
+    // AskUserQuestion → Question kind; title is the first question's header.
+    #[test]
+    fn ask_user_question_maps_to_question_with_header_title() {
+        let lines = [line(asst(json!([
+            { "type": "tool_use", "id": "t1", "name": "AskUserQuestion", "input": {
+                "questions": [
+                    { "header": "작업 모드", "question": "어떤 모드로?",
+                      "options": [ { "label": "auto" }, { "label": "lazy" } ] }
+                ]
+            } }
+        ])))];
+        let tl = map_lines(&lines);
+        assert_eq!(tl.items()[0].kind, ItemKind::Question);
+        assert_eq!(tl.items()[0].title, "작업 모드");
+    }
+
+    // ExitPlanMode → Plan kind; title is the plan's first non-empty line.
+    #[test]
+    fn exit_plan_mode_maps_to_plan_with_first_line_title() {
+        let lines = [line(asst(json!([
+            { "type": "tool_use", "id": "t1", "name": "ExitPlanMode", "input": {
+                "plan": "\n  단계 1: 폰트 수정\n단계 2: 키보드"
+            } }
+        ])))];
+        let tl = map_lines(&lines);
+        assert_eq!(tl.items()[0].kind, ItemKind::Plan);
+        assert_eq!(tl.items()[0].title, "단계 1: 폰트 수정");
+    }
+
+    // `[Request interrupted by user]` opens no turn and cancels in-flight items.
+    #[test]
+    fn interrupt_marker_cancels_open_items_and_opens_no_turn() {
+        let lines = [
+            line(user(json!("첫 질문"))),
+            line(asst(json!([
+                { "type": "tool_use", "id": "t1", "name": "Read", "input": { "file_path": "/a.rs" } }
+            ]))),
+            // user interrupts before the tool returns
+            line(user(json!([{ "type": "text", "text": "[Request interrupted by user]" }]))),
+        ];
+        let tl = map_lines(&lines);
+        // The marker is not a prompt — only the real question is a turn.
+        assert_eq!(tl.items()[0].agent_status, AgentStatus::Canceled);
+    }
+
+    // A tool the user declined comes back as an error → Canceled, not Failed.
+    #[test]
+    fn user_declined_tool_result_is_canceled() {
+        let lines = [
+            line(asst(json!([
+                { "type": "tool_use", "id": "t1", "name": "Bash", "input": { "command": "rm -rf x" } }
+            ]))),
+            line(user(json!([
+                { "type": "tool_result", "tool_use_id": "t1", "is_error": true,
+                  "content": "The user doesn't want to proceed with this tool use." }
+            ]))),
+        ];
+        let tl = map_lines(&lines);
+        assert_eq!(tl.items()[0].agent_status, AgentStatus::Canceled);
+    }
+
+    // A genuine prompt that merely *starts with* the phrase is NOT swallowed.
+    #[test]
+    fn prompt_starting_like_interrupt_still_opens_turn() {
+        let mut m = JsonlMapper::new(ROOT, SID);
+        m.apply_line(&line(user(json!([
+            { "type": "text", "text": "[Request interrupted by user] 이 로그가 왜 생겨?" }
+        ]))));
+        assert_eq!(m.current_turn(), 1, "prefix-only match must not swallow a real prompt");
+        assert!(m.turns().get(&1).is_some());
+    }
+
+    // A real tool failure whose output merely *contains* the words stays Failed.
+    #[test]
+    fn real_failure_mentioning_interrupt_words_stays_failed() {
+        let lines = [
+            line(asst(json!([
+                { "type": "tool_use", "id": "t1", "name": "Bash", "input": { "command": "run" } }
+            ]))),
+            line(user(json!([
+                { "type": "tool_result", "tool_use_id": "t1", "is_error": true,
+                  "content": "error: the job was interrupted by user space watchdog" }
+            ]))),
+        ];
+        let tl = map_lines(&lines);
+        assert_eq!(tl.items()[0].agent_status, AgentStatus::Failed);
     }
 
     // An unknown / future tool name collapses to Other (never an error).

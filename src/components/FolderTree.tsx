@@ -168,8 +168,16 @@ export function FolderTree() {
       case "Enter":
         if (cur) {
           e.preventDefault();
-          if (cur.is_dir) toggleExpanded(cur.path);
-          else setPeekFile(cur.path);
+          if (cur.is_dir) {
+            toggleExpanded(cur.path);
+          } else {
+            // Open the peek and hand focus to it, so ↑/↓ scroll its content (like
+            // opening a timeline detail tab). Ctrl+B / Esc return focus to the tree.
+            setPeekFile(cur.path);
+            requestAnimationFrame(() =>
+              document.querySelector<HTMLElement>(".peek-viewer")?.focus(),
+            );
+          }
         }
         break;
       case "Escape":

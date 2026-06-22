@@ -15,6 +15,11 @@
   --git-ref-local: #4493f8;
   --git-ref-remote: #c678dd;
   --git-ref-tag: #d29922;
+  /* timeline change-detail diff colors (bright text on the dark bg) */
+  --diff-add-bg: rgba(63, 185, 80, 0.12);
+  --diff-add-fg: #a8d8a8;
+  --diff-del-bg: rgba(248, 81, 73, 0.12);
+  --diff-del-fg: #f0a0a0;
 }
 
 /* Light theme — toggled via document.documentElement[data-theme="light"]. */
@@ -35,6 +40,11 @@
   --git-ref-local: #0969da;
   --git-ref-remote: #8250df;
   --git-ref-tag: #9a6700;
+  /* darker diff text + fainter tints so they read on white */
+  --diff-add-bg: rgba(26, 127, 55, 0.12);
+  --diff-add-fg: #0a5d2a;
+  --diff-del-bg: rgba(207, 34, 46, 0.10);
+  --diff-del-fg: #a01722;
 }
 
 * {
@@ -227,6 +237,12 @@ body {
   display: flex;
   flex-direction: column;
   background: var(--bg);
+  outline: none;
+}
+/* When the peek holds keyboard focus (Enter from the tree), show a thin inset
+   ring so it's clear ↑/↓ now scroll the content rather than move the tree. */
+.peek-viewer:focus {
+  box-shadow: inset 0 0 0 2px var(--accent);
 }
 .peek-head {
   flex: 0 0 auto;
@@ -1032,9 +1048,46 @@ body {
   border-bottom: 1px solid var(--border, #333);
 }
 .claudeterm-pane-head-title {
+  flex: 1;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+/* Control row under the detail-pane header: view/raw button + shortcut hint. */
+.claudeterm-viewer-hint {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 2px 8px;
+  font-size: 10px;
+  color: var(--fg-dim);
+  background: rgba(127, 127, 127, 0.05);
+  border-bottom: 1px solid var(--border);
+}
+.claudeterm-viewmode-btn {
+  flex: 0 0 auto;
+  cursor: pointer;
+  padding: 1px 8px;
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  background: var(--bg-alt);
+  color: var(--fg);
+  font-size: 10px;
+}
+.claudeterm-viewmode-btn:hover {
+  background: var(--bg-hover);
+}
+.claudeterm-viewer-hint-keys {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+/* Rendered-markdown view inside the detail pane (뷰모드). Inherits .study-md
+   element styling; constrain the font to the detail pane scale. */
+.tl-markdown {
+  font-size: 12px;
+  padding: 2px 2px 14px;
 }
 .claudeterm-tokens {
   flex: 0 0 auto;
@@ -1210,6 +1263,21 @@ body {
 .claudeterm-timeline .timeline-list {
   flex: 0 0 auto;
   overflow-y: visible;
+}
+/* Prev-task expand/collapse control inside the timeline pane header. */
+.claudeterm-prevtasks-toggle {
+  flex: 0 0 auto;
+  cursor: pointer;
+  user-select: none;
+  font-size: 10px;
+  color: var(--fg-dim);
+  padding: 1px 6px;
+  border: 1px solid var(--border);
+  border-radius: 3px;
+}
+.claudeterm-prevtasks-toggle:hover {
+  color: var(--fg);
+  background: var(--bg-hover);
 }
 /* A previous task in the handoff chain — a task-layer header above its dates. */
 .claudeterm-prevtask {
@@ -1387,6 +1455,11 @@ body {
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+.timeline-turn-head-sel {
+  background: rgba(88, 166, 255, 0.18);
+  outline: 1px solid var(--accent);
+  border-radius: 3px;
+}
 .timeline-turn-q {
   font-size: 10px;
   font-weight: 600;
@@ -1429,7 +1502,7 @@ body {
   margin: 0;
 }
 .timeline-detail-path {
-  font-family: monospace;
+  font-family: "JetBrains Mono", "DejaVu Sans Mono", "Noto Sans Mono CJK KR", monospace;
   font-size: 11px;
   color: var(--accent);
   word-break: break-all;
@@ -1443,6 +1516,44 @@ body {
 .timeline-diff-block {
   margin-bottom: 6px;
 }
+/* AskUserQuestion detail: question text + option cards, chosen one highlighted. */
+.tl-question-text {
+  font-size: 12px;
+  color: var(--fg);
+  padding: 2px 0 4px;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.tl-options {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.tl-option {
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 4px 6px;
+}
+.tl-option-sel {
+  border-color: var(--accent);
+  background: var(--diff-add-bg);
+}
+.tl-option-label {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--fg);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.tl-option-sel .tl-option-label {
+  color: var(--diff-add-fg);
+}
+.tl-option-desc {
+  font-size: 10px;
+  color: var(--fg-dim);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
 .timeline-detail-label {
   font-size: 10px;
   text-transform: uppercase;
@@ -1452,13 +1563,13 @@ body {
 }
 .timeline-detail-text {
   margin: 0;
-  font-family: monospace;
+  font-family: "JetBrains Mono", "DejaVu Sans Mono", "Noto Sans Mono CJK KR", monospace;
   font-size: 11px;
   line-height: 1.45;
   white-space: pre-wrap;
   word-break: break-word;
-  max-height: 280px;
-  overflow-y: auto;
+  /* No inner vertical cap: content flows full-height so the focusable detail pane
+     (.claudeterm-viewer-body) scrolls it all with ↑↓/PageUp·Down (no trapped box). */
   padding: 4px 6px;
   border-radius: 3px;
   background: var(--bg-alt);
@@ -1467,23 +1578,23 @@ body {
 .timeline-diff-old,
 .timeline-diff-new {
   margin: 0;
-  font-family: monospace;
+  font-family: "JetBrains Mono", "DejaVu Sans Mono", "Noto Sans Mono CJK KR", monospace;
   font-size: 11px;
   line-height: 1.45;
   white-space: pre;
+  /* horizontal scroll only; no vertical cap so the outer detail pane scrolls the
+     whole diff with the keyboard (extra bottom padding clears the h-scrollbar). */
   overflow-x: auto;
-  max-height: 240px;
-  overflow-y: auto;
-  padding: 4px 6px;
+  padding: 4px 6px 14px;
   border-radius: 3px;
 }
 .timeline-diff-old {
-  background: rgba(248, 81, 73, 0.12);
-  color: #f0a0a0;
+  background: var(--diff-del-bg);
+  color: var(--diff-del-fg);
 }
 .timeline-diff-new {
-  background: rgba(63, 185, 80, 0.12);
-  color: #a8d8a8;
+  background: var(--diff-add-bg);
+  color: var(--diff-add-fg);
 }
 .timeline-item.ts-canceled,
 .timeline-item.ts-failed {

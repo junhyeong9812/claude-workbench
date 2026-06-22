@@ -4,8 +4,26 @@
  * that splits the chat area (left), keeping this list as a single column.
  * Presentational; ClaudeTermPanel feeds it the items/turns for *its* session. */
 
-import { Fragment, useEffect, useRef, useState } from "react";
+import { Fragment, useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { marked } from "marked";
+import DOMPurify from "dompurify";
+
+/** Render text as sanitized markdown (뷰모드). Same marked+DOMPurify pipeline as
+ * the study viewer — the content is local session text, sanitized before inject. */
+export function MarkdownText({ text }: { text: string }) {
+  const html = useMemo(
+    () =>
+      DOMPurify.sanitize(marked.parse(text, { async: false }) as string, {
+        // Tool output / read results are rendered here — block media tags so a
+        // `![x](https://attacker/…)` can't make the webview fetch a remote URL
+        // just by opening the detail pane (codex).
+        FORBID_TAGS: ["img", "picture", "source", "video", "audio", "iframe", "object", "embed"],
+      }),
+    [text],
+  );
+  return <div className="study-md tl-markdown" dangerouslySetInnerHTML={{ __html: html }} />;
+}
 
 export interface TimelineItem {
   turn: number;
@@ -33,6 +51,8 @@ export const KIND_ICON: Record<string, string> = {
   execute: "▶",
   think: "💭",
   fetch: "🌐",
+  question: "❓",
+  plan: "📋",
   other: "•",
 };
 
@@ -51,8 +71,12 @@ export function TimelineView({
   dates,
   subagents,
   selectedId,
+  selectedTurn,
+  selectedScope,
+  scope = "live",
+  followBottom = false,
   onSelect,
-  onSelectAnswer,
+  onSelectTurn,
 }: {
   items: TimelineItem[];
   turns: Map<number, string>;
@@ -62,9 +86,23 @@ export function TimelineView({
    * under its parent Agent item (recursive tree); orphans nest under their turn. */
   subagents?: [string, string | null, number, TimelineItem[]][];
   selectedId: string | null;
+  /** The turn whose question/answer is selected (highlights its head), or null.
+   * Distinct from `selectedId` (a tool item) — they are mutually exclusive. */
+  selectedTurn?: number | null;
+  /** Which timeline owns the turn selection. Turn numbers repeat across the live
+   * session and each previous task, so a turn is "selected here" only when this
+   * view's `scope` matches `selectedScope` — otherwise the same number would
+   * highlight/anchor nav in the wrong list. (Tool ids are globally unique, so
+   * `selectedId` needs no scope.) */
+  selectedScope?: string;
+  scope?: string;
+  /** When true, scroll the shared container to the bottom as new content arrives
+   * (the live timeline). Previous-task lists leave this false. */
+  followBottom?: boolean;
   onSelect: (item: TimelineItem) => void;
-  /** Click a (possibly truncated) turn answer to view it in full (detail pane). */
-  onSelectAnswer?: (turn: number) => void;
+  /** Select a turn (Q&A): view its prompt + full answer in the detail pane.
+   * Used by ↑/↓ landing on a question head and by clicking the head/answer. */
+  onSelectTurn?: (turn: number) => void;
 }) {
   // Collapsed subagent groups (B1), keyed by agentId.
   const [collapsedAgents, setCollapsedAgents] = useState<Set<string>>(new Set());
@@ -138,11 +176,12 @@ export function TimelineView({
     );
   };
   // Every turn shows, even one with no tool calls (a plain Q&A): derive the
-  // turn list from the union of prompts, answers, and items (B3). Newest turn
-  // first — the current question sits at the top, older history below (B5).
+  // turn list from the union of prompts, answers, and items (B3). Chronological —
+  // oldest at top, newest at the bottom (chat-like); the view follows new content
+  // downward so the latest is always at the bottom.
   const turnNos = [
     ...new Set<number>([...turns.keys(), ...answers.keys(), ...items.map((it) => it.turn)]),
-  ].sort((a, b) => b - a);
+  ].sort((a, b) => a - b);
 
   // Collapsed date groups (B8): clicking a date header folds/unfolds its turns.
   const [collapsedDates, setCollapsedDates] = useState<Set<string>>(new Set());
@@ -154,42 +193,111 @@ export function TimelineView({
       return next;
     });
 
-  // Flat display order (matches the rendered order: newest turn first, then seq
-  // asc within a turn) for ↑/↓ navigation (B4). Skips collapsed date groups (B8).
-  const orderedItems = turnNos
-    .filter((turn) => !collapsedDates.has(dates.get(turn) ?? ""))
-    .flatMap((turn) => items.filter((it) => it.turn === turn).sort((a, b) => a.seq - b.seq));
+  // Unified ↑/↓ navigation order (matches the rendered order exactly: newest turn
+  // first; within a turn the question head, then each tool item, then the subagent
+  // items nested under it — recursively). Skips collapsed date groups (B8) and
+  // collapsed subagent groups (B1), mirroring what is actually on screen. A turn
+  // head is a `turn` entry; tool/agent items are `item` entries.
+  type Nav = { kind: "turn"; turn: number } | { kind: "item"; item: TimelineItem };
+  const navEntries: Nav[] = [];
+  // Push an item then (recursively) the items of any non-collapsed subagent it spawned.
+  const pushItemTree = (it: TimelineItem) => {
+    navEntries.push({ kind: "item", item: it });
+    for (const [aid, its] of agentsByParent.get(it.tool_call_id) ?? []) pushAgentItems(aid, its);
+  };
+  function pushAgentItems(aid: string, its: TimelineItem[]) {
+    if (collapsedAgents.has(aid)) return; // collapsed group hides its rows
+    for (const it of its) pushItemTree(it);
+  }
+  for (const turn of turnNos) {
+    if (collapsedDates.has(dates.get(turn) ?? "")) continue;
+    navEntries.push({ kind: "turn", turn });
+    for (const it of items.filter((x) => x.turn === turn).sort((a, b) => a.seq - b.seq)) {
+      pushItemTree(it);
+    }
+    for (const [aid, its] of orphanAgentsByTurn.get(turn) ?? []) pushAgentItems(aid, its);
+  }
 
   const listRef = useRef<HTMLDivElement>(null);
 
-  // Keep the selected row scrolled into view as the user arrows through it.
-  useEffect(() => {
-    if (!selectedId || !listRef.current) return;
-    listRef.current
-      .querySelector(`[data-tcid="${CSS.escape(selectedId)}"]`)
-      ?.scrollIntoView({ block: "nearest" });
-  }, [selectedId]);
+  // A turn is selected *in this view* only when this view owns the turn selection
+  // (scope match) — turn numbers repeat across the live session and prior tasks.
+  const turnSelected = (turn: number) => selectedTurn === turn && selectedScope === scope;
 
-  // A new question arrives at the top — scroll there so the current Q is in view (B5).
-  const newestTurn = turnNos[0] ?? 0;
+  // Keep the selected row (a tool item or a question head) scrolled into view as
+  // the user arrows through it.
   useEffect(() => {
-    listRef.current?.scrollTo({ top: 0 });
-  }, [newestTurn]);
+    if (!listRef.current) return;
+    const sel = selectedId
+      ? `[data-tcid="${CSS.escape(selectedId)}"]`
+      : selectedTurn != null && selectedScope === scope
+        ? `[data-turn="${selectedTurn}"]`
+        : null;
+    if (sel) listRef.current.querySelector(sel)?.scrollIntoView({ block: "nearest" });
+  }, [selectedId, selectedTurn, selectedScope, scope]);
+
+  // New content arrives at the bottom — follow it down so the latest is in view.
+  // Only the live timeline follows (followBottom). The stacked lists share one
+  // scroll container, so we scroll that container (the first overflow ancestor),
+  // not the content-sized inner list. Fires on *any* content growth (items stream
+  // within a turn too), via rAF so layout is settled. Behavior: jump to bottom on
+  // first load; afterwards stick to bottom only when already near it, so a manual
+  // scroll-up to read history isn't yanked back down.
+  // stickBottomRef starts true so a freshly opened (or reopened) timeline lands at
+  // the bottom; the scroll listener flips it off when the user scrolls up to read
+  // history and back on when they return near the bottom.
+  const stickBottomRef = useRef(true);
+  // Attach a scroll listener to the shared scroll container to track stickiness.
+  useEffect(() => {
+    if (!followBottom) return;
+    let sc: HTMLElement | null = listRef.current?.parentElement ?? null;
+    while (sc) {
+      const oy = getComputedStyle(sc).overflowY;
+      if (oy === "auto" || oy === "scroll") break;
+      sc = sc.parentElement;
+    }
+    if (!sc) return;
+    const el = sc;
+    const onScroll = () => {
+      stickBottomRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < 160;
+    };
+    el.addEventListener("scroll", onScroll, { passive: true });
+    return () => el.removeEventListener("scroll", onScroll);
+  }, [followBottom]);
+  // On any content growth (new turn or items streaming within a turn), follow to
+  // the bottom while sticking. rAF so layout (heights) is settled first.
+  useEffect(() => {
+    if (!followBottom || !stickBottomRef.current) return;
+    const raf = requestAnimationFrame(() => {
+      let sc: HTMLElement | null = listRef.current?.parentElement ?? null;
+      while (sc) {
+        const oy = getComputedStyle(sc).overflowY;
+        if (oy === "auto" || oy === "scroll") break;
+        sc = sc.parentElement;
+      }
+      if (sc) sc.scrollTop = sc.scrollHeight;
+    });
+    return () => cancelAnimationFrame(raf);
+  }, [items, turnNos.length, followBottom]);
 
   const onKeyDown = (e: React.KeyboardEvent<HTMLDivElement>) => {
     if (e.key !== "ArrowDown" && e.key !== "ArrowUp") return;
-    if (orderedItems.length === 0) return;
+    if (navEntries.length === 0) return;
     e.preventDefault();
-    const idx = orderedItems.findIndex((it) => it.tool_call_id === selectedId);
+    const idx = navEntries.findIndex((n) =>
+      n.kind === "item" ? n.item.tool_call_id === selectedId : turnSelected(n.turn),
+    );
     let next: number;
-    if (idx === -1) next = e.key === "ArrowDown" ? 0 : orderedItems.length - 1;
-    else if (e.key === "ArrowDown") next = Math.min(idx + 1, orderedItems.length - 1);
+    if (idx === -1) next = e.key === "ArrowDown" ? 0 : navEntries.length - 1;
+    else if (e.key === "ArrowDown") next = Math.min(idx + 1, navEntries.length - 1);
     else next = Math.max(idx - 1, 0);
-    onSelect(orderedItems[next]);
+    const n = navEntries[next];
+    if (n.kind === "item") onSelect(n.item);
+    else onSelectTurn?.(n.turn);
   };
 
   // Insert a date divider whenever the date changes between turns (B6). Turns
-  // are newest-first, so dates read newest→oldest down the list.
+  // are oldest-first, so dates read oldest→newest down the list.
   let prevDate: string | null = null;
   const turnRows = turnNos.map((turn) => {
     const date = dates.get(turn) ?? "";
@@ -222,7 +330,18 @@ export function TimelineView({
             )}
             {!collapsed && (
           <div className="timeline-turn">
-            <div className="timeline-turn-head" title={prompt ?? ""}>
+            <div
+              data-turn={turn}
+              className={`timeline-turn-head${
+                turnSelected(turn) ? " timeline-turn-head-sel" : ""
+              }`}
+              title={prompt ?? ""}
+              onClick={() => {
+                onSelectTurn?.(turn);
+                listRef.current?.focus();
+              }}
+              style={{ cursor: onSelectTurn ? "pointer" : undefined }}
+            >
               <span className="timeline-turn-q">Q{turn}</span>
               {prompt ?? "(질문)"}
             </div>
@@ -230,8 +349,8 @@ export function TimelineView({
               <div
                 className="timeline-answer"
                 title="클릭하면 전체 답변 보기"
-                onClick={() => onSelectAnswer?.(turn)}
-                style={{ cursor: onSelectAnswer ? "pointer" : undefined }}
+                onClick={() => onSelectTurn?.(turn)}
+                style={{ cursor: onSelectTurn ? "pointer" : undefined }}
               >
                 {answer.length > 140 ? `${answer.slice(0, 140)}…` : answer}
               </div>
@@ -247,11 +366,112 @@ export function TimelineView({
   );
 }
 
+interface QOption {
+  label?: string;
+  description?: string;
+}
+interface QQuestion {
+  question?: string;
+  header?: string;
+  multiSelect?: boolean;
+  options?: QOption[];
+}
+
+/** Detail body for an `AskUserQuestion` item: each question with its full option
+ * list, and the option(s) the user chose highlighted (matched against the tool
+ * result text). The raw result is shown below as ground truth. */
+function QuestionDetail({ item }: { item: TimelineItem }) {
+  const raw = (item.raw_input ?? null) as { questions?: QQuestion[] } | null;
+  const questions = Array.isArray(raw?.questions) ? (raw!.questions as QQuestion[]) : [];
+  const chosen = item.content_text ?? "";
+  // Whether an option was chosen, matched against the result text. Precise on
+  // purpose: a bare substring would mark "auto" selected when the answer is
+  // "autonomous". Accept a quoted label (the AskUserQuestion result wraps answers
+  // in quotes) or a whole line equal to the label.
+  const isSel = (label?: string) => {
+    const l = label?.trim();
+    if (!l) return false;
+    if (chosen.includes(`"${l}"`)) return true;
+    return chosen.split(/\r?\n/).some((line) => line.trim() === l);
+  };
+  return (
+    <div className="timeline-detail">
+      <div className="timeline-detail-head">
+        {KIND_ICON.question} {item.title || "질문"}
+      </div>
+      {questions.length === 0 && (
+        <div className="timeline-detail-empty">질문 내용을 해석할 수 없습니다.</div>
+      )}
+      {questions.map((q, qi) => (
+        <div key={qi} className="timeline-diff-block">
+          {q.header && <div className="timeline-detail-label">{q.header}</div>}
+          {q.question && <div className="tl-question-text">{q.question}</div>}
+          <div className="tl-options">
+            {(q.options ?? []).map((o, oi) => (
+              <div key={oi} className={`tl-option${isSel(o.label) ? " tl-option-sel" : ""}`}>
+                <div className="tl-option-label">
+                  {isSel(o.label) ? "✓ " : ""}
+                  {o.label}
+                </div>
+                {o.description && <div className="tl-option-desc">{o.description}</div>}
+              </div>
+            ))}
+          </div>
+        </div>
+      ))}
+      {chosen !== "" && (
+        <div className="timeline-diff-block">
+          <div className="timeline-detail-label">선택 (응답)</div>
+          <pre className="timeline-detail-text">{chosen}</pre>
+        </div>
+      )}
+    </div>
+  );
+}
+
+/** Detail body for an `ExitPlanMode` item: the proposed plan text (markdown). */
+function PlanDetail({ item, markdown }: { item: TimelineItem; markdown: boolean }) {
+  const raw = (item.raw_input ?? null) as { plan?: string } | null;
+  const plan = typeof raw?.plan === "string" ? raw.plan : null;
+  return (
+    <div className="timeline-detail">
+      <div className="timeline-detail-head">
+        {KIND_ICON.plan} {item.title || "계획"}
+      </div>
+      <div className="timeline-diff-block">
+        <div className="timeline-detail-label">계획</div>
+        {plan != null ? (
+          markdown ? (
+            <MarkdownText text={plan} />
+          ) : (
+            <pre className="timeline-detail-text">{plan}</pre>
+          )
+        ) : (
+          <div className="timeline-detail-empty">계획 내용이 없습니다.</div>
+        )}
+      </div>
+      {item.content_text && (
+        <div className="timeline-diff-block">
+          <div className="timeline-detail-label">응답</div>
+          <pre className="timeline-detail-text">{item.content_text}</pre>
+        </div>
+      )}
+    </div>
+  );
+}
+
 /** The viewer body for the selected item (B4): the tool input (명령/경로), file
  * diffs (이전→이후), its text content (read result, output, 작성 내용), and — for
  * a read with no inline content — the file itself, fetched on demand. */
-export function ItemDetail({ item }: { item: TimelineItem }) {
-  const rawInput = item.raw_input != null ? JSON.stringify(item.raw_input, null, 2) : null;
+export function ItemDetail({ item, markdown = true }: { item: TimelineItem; markdown?: boolean }) {
+  // Bash (execute): show the command from raw_input prominently, then the output
+  // (content_text), instead of a raw JSON dump.
+  const bashCmd =
+    item.kind === "execute"
+      ? ((item.raw_input as { command?: string } | null)?.command ?? null)
+      : null;
+  const rawInput =
+    item.raw_input != null && bashCmd == null ? JSON.stringify(item.raw_input, null, 2) : null;
   const firstPath = item.locations[0] ?? null;
   const hasContent = item.content_text != null && item.content_text !== "";
   // A read (or any location-only item) with no diff/content: show the file.
@@ -277,11 +497,20 @@ export function ItemDetail({ item }: { item: TimelineItem }) {
     };
   }, [item.tool_call_id, needsFile, firstPath]);
 
+  if (item.kind === "question") return <QuestionDetail item={item} />;
+  if (item.kind === "plan") return <PlanDetail item={item} markdown={markdown} />;
+
   return (
     <div className="timeline-detail">
       <div className="timeline-detail-head">
         {KIND_ICON[item.kind] ?? "•"} {item.title || item.kind}
       </div>
+      {bashCmd != null && (
+        <div className="timeline-diff-block">
+          <div className="timeline-detail-label">명령</div>
+          <pre className="timeline-detail-text">{bashCmd}</pre>
+        </div>
+      )}
       {rawInput != null && (
         <div className="timeline-diff-block">
           <div className="timeline-detail-label">입력</div>
@@ -300,13 +529,22 @@ export function ItemDetail({ item }: { item: TimelineItem }) {
       {hasContent && (
         <div className="timeline-diff-block">
           <div className="timeline-detail-label">내용</div>
-          <pre className="timeline-detail-text">{item.content_text}</pre>
+          {markdown ? (
+            <MarkdownText text={item.content_text!} />
+          ) : (
+            <pre className="timeline-detail-text">{item.content_text}</pre>
+          )}
         </div>
       )}
       {needsFile && (
         <div className="timeline-diff-block">
           <div className="timeline-detail-path">{firstPath}</div>
-          {fileText != null && <pre className="timeline-detail-text">{fileText}</pre>}
+          {fileText != null &&
+            (markdown ? (
+              <MarkdownText text={fileText} />
+            ) : (
+              <pre className="timeline-detail-text">{fileText}</pre>
+            ))}
           {fileErr != null && <div className="timeline-detail-empty">{fileErr}</div>}
           {fileText == null && fileErr == null && (
             <div className="timeline-detail-empty">불러오는 중…</div>
