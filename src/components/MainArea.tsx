@@ -11,6 +11,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { useAppStore } from "../state/store";
 import { useClaudeUi } from "../state/claudeUi";
+import { recallArea, forgetArea, type PanelArea } from "../state/panelFocus";
 import { PlaceholderPanel } from "./PlaceholderPanel";
 import { TerminalPanel } from "./TerminalPanel";
 import { ClaudeTermPanel } from "./ClaudeTermPanel";
@@ -93,18 +94,35 @@ interface HostKeyPrompt {
 }
 
 /** Move DOM focus into the active panel's *content* (xterm/CodeMirror/input),
- * not just the dockview group. dockview's `setActive()`/`focus()` focuses the
- * group only, so after a keyboard tab switch keystrokes wouldn't land in the
- * terminal until the user clicked into it. Runs on the next frame so the
- * active-group DOM has updated. */
-function focusActivePanelContent() {
-  requestAnimationFrame(() => {
+ * not just the dockview group — dockview's `focus()` focuses the group only.
+ *
+ * Tab *switches* (Alt/click) are handled by the panels themselves (they focus
+ * their content on remount); this is the Ctrl+B path, where the active panel is
+ * already mounted but focus is elsewhere (the tree). `area` restores a Claude
+ * panel's last sub-area; it retries across a few frames in case content is still
+ * laying out. Under dockview's onlyWhenVisible mode only the active panel's
+ * content is in `.dv-active-group`, so this never targets a hidden panel. */
+function focusActivePanelContent(area?: PanelArea) {
+  let tries = 0;
+  const tick = () => {
     const group = document.querySelector(".main-dock .dv-active-group");
-    const el = group?.querySelector(
-      ".xterm-helper-textarea, .cm-content, textarea, input, [tabindex]",
-    ) as HTMLElement | null;
-    el?.focus();
-  });
+    if (group) {
+      const selectors: string[] = [];
+      if (area === "timeline") selectors.push(".claudeterm-timeline-pane .timeline-list");
+      else if (area === "viewer") selectors.push(".claudeterm-viewer-pane");
+      // Fallback (and the "term"/non-Claude case): first focusable content.
+      selectors.push(".xterm-helper-textarea", ".cm-content", "textarea", "input", "[tabindex]");
+      for (const sel of selectors) {
+        const el = group.querySelector(sel) as HTMLElement | null;
+        if (el && el.offsetParent !== null) {
+          el.focus();
+          return;
+        }
+      }
+    }
+    if (tries++ < 10) requestAnimationFrame(tick);
+  };
+  requestAnimationFrame(tick);
 }
 
 /**
@@ -188,6 +206,8 @@ export function MainArea() {
     // Real panel removal (close) -> close the backing session (spec §0.1). Tab/
     // project switches don't fire this, so those only detach (session lives).
     api.onDidRemovePanel((panel) => {
+      // Drop this panel's remembered focus area (closed for good — not a switch).
+      forgetArea(panel.id);
       const params = panel.params as { kind?: string; sessionId?: number } | undefined;
       if (typeof params?.sessionId === "number") {
         // claudeterm sessions also need their poll thread stopped (claude_close);
@@ -589,9 +609,9 @@ export function MainArea() {
         : (idx - 1 + panels.length) % panels.length;
       e.preventDefault();
       panels[next].api.setActive();
-      // Drop focus into the newly-active panel's content so keystrokes land in
-      // the terminal/editor immediately (not just on the group).
-      focusActivePanelContent();
+      // The newly-active panel remounts (onlyWhenVisible) and focuses its own
+      // content on mount — no focus call needed here (doing it now would race the
+      // not-yet-created xterm, the original Claude-tab focus bug).
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
@@ -606,7 +626,9 @@ export function MainArea() {
     const api = apiRef.current;
     if (!api) return;
     api.focus();
-    focusActivePanelContent();
+    // Restore the active Claude panel's last sub-area (terminal/viewer/timeline);
+    // for other panels `area` is undefined → first focusable content.
+    focusActivePanelContent(recallArea(api.activePanel?.id ?? ""));
   }, [focusMainRequest]);
 
   return (

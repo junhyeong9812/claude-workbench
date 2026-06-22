@@ -70,6 +70,16 @@ export function TerminalPanel(props: IDockviewPanelProps<TerminalParams>) {
     if (termRef.current) termRef.current.options.theme = xtermTheme(theme, termColors);
   }, [theme, termColors]);
 
+  // When this panel becomes the active tab without remounting (e.g. it stays
+  // mounted in a split while another group is clicked), pull DOM focus into the
+  // terminal — dockview's group focus alone wouldn't deliver keystrokes here.
+  useEffect(() => {
+    const d = props.api.onDidActiveChange(() => {
+      if (props.api.isActive) termRef.current?.focus();
+    });
+    return () => d.dispose();
+  }, [props.api]);
+
   // Live-update terminal font size (+ refit).
   const fontSize = useAppStore((s) => s.fontSize);
   useEffect(() => {
@@ -102,6 +112,10 @@ export function TerminalPanel(props: IDockviewPanelProps<TerminalParams>) {
     } catch {
       /* host not laid out yet — ResizeObserver will fit shortly */
     }
+    // onlyWhenVisible: a tab switch (Alt/click/programmatic) remounts the now-
+    // active panel, so focusing here lands keystrokes in the terminal without a
+    // second click. dockview's setActive() only focuses the group, not content.
+    term.focus();
 
     let disposed = false;
     let unlisten: UnlistenFn | undefined;

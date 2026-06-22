@@ -7,6 +7,7 @@ import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import "@xterm/xterm/css/xterm.css";
 import { useAppStore } from "../state/store";
 import { xtermTheme } from "./xtermTheme";
+import { recallArea, rememberArea, type PanelArea } from "../state/panelFocus";
 import { TimelineView, ItemDetail, MarkdownText, type TimelineItem } from "./TimelineView";
 
 /**
@@ -328,6 +329,66 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
       navPane(e.key === "ArrowRight" ? 1 : -1);
     }
   };
+
+  // Focus a specific sub-area's content. Returns whether the target existed —
+  // the viewer pane only renders when something is selected, so a stale "viewer"
+  // request falls through to the terminal.
+  const focusArea = (area: PanelArea): boolean => {
+    if (area === "timeline") {
+      const el = timelineRef.current?.querySelector(".timeline-list") as HTMLElement | null;
+      if (el) {
+        el.focus();
+        return true;
+      }
+    } else if (area === "viewer") {
+      if (viewerRef.current) {
+        viewerRef.current.focus();
+        return true;
+      }
+    }
+    if (termRef.current) {
+      termRef.current.focus();
+      return true;
+    }
+    return false;
+  };
+
+  // Restore focus to the sub-area this panel last held it in (default: the
+  // terminal). dockview's onlyWhenVisible mode remounts the panel on every tab
+  // switch, so the "last area" is read from the module-level panelFocus map
+  // (component state would have been wiped by the remount).
+  const restoreFocus = () => {
+    focusArea(recallArea(props.api.id) ?? "term");
+  };
+
+  // Track which sub-area holds focus so a later tab switch can restore it.
+  useEffect(() => {
+    const c = containerRef.current;
+    if (!c) return;
+    const onFocusIn = () => {
+      const a = document.activeElement;
+      if (!a) return;
+      let area: PanelArea | null = null;
+      if (timelineRef.current?.contains(a)) area = "timeline";
+      else if (viewerRef.current?.contains(a)) area = "viewer";
+      else if (hostRef.current?.contains(a)) area = "term";
+      if (area) rememberArea(props.api.id, area);
+    };
+    c.addEventListener("focusin", onFocusIn);
+    return () => c.removeEventListener("focusin", onFocusIn);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // Becoming the active tab without a remount (e.g. activated in a split while
+  // another group is clicked) doesn't re-run the mount effect, so restore focus
+  // here too. The mount path calls restoreFocus() directly once xterm is ready.
+  useEffect(() => {
+    const d = props.api.onDidActiveChange(() => {
+      if (props.api.isActive) restoreFocus();
+    });
+    return () => d.dispose();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [props.api]);
   // Drag the terminal|viewer splitter to resize the viewer (timeline stays 360px).
   const startDrag = (e: React.MouseEvent) => {
     e.preventDefault();
@@ -642,6 +703,11 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
       }
     });
     ro.observe(host);
+
+    // Mount = activation under onlyWhenVisible (the panel only mounts when it
+    // becomes the visible tab), so land focus in the last-used sub-area now that
+    // xterm exists — fixing the race where MainArea focused one frame too early.
+    restoreFocus();
 
     return () => {
       // Detach only — the PTY + poll thread live on (closed by claude_close on
