@@ -1429,7 +1429,7 @@ body {
   margin: 0;
 }
 .timeline-detail-path {
-  font-family: monospace;
+  font-family: "JetBrains Mono", "DejaVu Sans Mono", "Noto Sans Mono CJK KR", monospace;
   font-size: 11px;
   color: var(--accent);
   word-break: break-all;
@@ -1452,7 +1452,7 @@ body {
 }
 .timeline-detail-text {
   margin: 0;
-  font-family: monospace;
+  font-family: "JetBrains Mono", "DejaVu Sans Mono", "Noto Sans Mono CJK KR", monospace;
   font-size: 11px;
   line-height: 1.45;
   white-space: pre-wrap;
@@ -1467,7 +1467,7 @@ body {
 .timeline-diff-old,
 .timeline-diff-new {
   margin: 0;
-  font-family: monospace;
+  font-family: "JetBrains Mono", "DejaVu Sans Mono", "Noto Sans Mono CJK KR", monospace;
   font-size: 11px;
   line-height: 1.45;
   white-space: pre;
