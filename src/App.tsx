@@ -50,12 +50,21 @@ export default function App() {
     localStorage.setItem("fontSize", String(fontSize));
   }, [fontSize]);
 
-  // Ctrl+B focuses the folder tree (so keyboard nav can start without a click).
+  // Ctrl+B toggles focus between the folder tree and the open tab: from anywhere
+  // it focuses the tree (so keyboard nav can start without a click); pressing it
+  // again while the tree already holds focus hands focus back to the active
+  // dockview panel (MainArea owns the dockview api — request via the store).
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if (e.ctrlKey && (e.key === "b" || e.key === "B")) {
         e.preventDefault();
-        document.getElementById("folder-tree")?.focus();
+        const tree = document.getElementById("folder-tree");
+        const treeFocused = !!tree && (tree === document.activeElement || tree.contains(document.activeElement));
+        if (treeFocused) {
+          useAppStore.getState().requestFocusMain();
+        } else {
+          tree?.focus();
+        }
       }
     };
     window.addEventListener("keydown", onKey);

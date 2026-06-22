@@ -55,15 +55,53 @@ export function FilePeekViewer({ path, onClose }: { path: string; onClose: () =>
   return (
     <div
       className="peek-viewer"
+      tabIndex={0}
       onKeyDown={(e) => {
         if (e.key === "Escape") {
           e.stopPropagation();
           onClose();
-        } else if (e.ctrlKey && (e.key === "e" || e.key === "E")) {
+          // Return focus to the tree so navigation can continue (the peek is an
+          // overlay; once closed there's nothing focusable left here).
+          document.getElementById("folder-tree")?.focus();
+          return;
+        }
+        if (e.ctrlKey && (e.key === "e" || e.key === "E")) {
           e.preventDefault();
           e.stopPropagation();
           requestEditorOpen(path);
           onClose();
+          return;
+        }
+        // ↑/↓/PageUp/PageDown/Home/End scroll the read-only content (the viewer is
+        // focused via Enter from the tree — mirrors the timeline detail pane).
+        const scroller = hostRef.current?.querySelector<HTMLElement>(".cm-scroller");
+        if (!scroller) return;
+        const page = scroller.clientHeight * 0.9;
+        switch (e.key) {
+          case "ArrowDown":
+            e.preventDefault();
+            scroller.scrollTop += 48;
+            break;
+          case "ArrowUp":
+            e.preventDefault();
+            scroller.scrollTop -= 48;
+            break;
+          case "PageDown":
+            e.preventDefault();
+            scroller.scrollTop += page;
+            break;
+          case "PageUp":
+            e.preventDefault();
+            scroller.scrollTop -= page;
+            break;
+          case "Home":
+            e.preventDefault();
+            scroller.scrollTop = 0;
+            break;
+          case "End":
+            e.preventDefault();
+            scroller.scrollTop = scroller.scrollHeight;
+            break;
         }
       }}
     >

@@ -227,6 +227,12 @@ body {
   display: flex;
   flex-direction: column;
   background: var(--bg);
+  outline: none;
+}
+/* When the peek holds keyboard focus (Enter from the tree), show a thin inset
+   ring so it's clear ↑/↓ now scroll the content rather than move the tree. */
+.peek-viewer:focus {
+  box-shadow: inset 0 0 0 2px var(--accent);
 }
 .peek-head {
   flex: 0 0 auto;

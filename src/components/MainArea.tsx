@@ -69,6 +69,7 @@ export function MainArea() {
   const requestEditorOpen = useAppStore((s) => s.requestEditorOpen);
   const diffRequest = useAppStore((s) => s.diffRequest);
   const requestDiff = useAppStore((s) => s.requestDiff);
+  const focusMainRequest = useAppStore((s) => s.focusMainRequest);
   const setLayout = useAppStore((s) => s.setLayout);
 
   const apiRef = useRef<DockviewApi | null>(null);
@@ -361,6 +362,14 @@ export function MainArea() {
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
   }, []);
+
+  // Ctrl+B from the already-focused tree asks to focus the open tab (App bumps
+  // focusMainRequest). dockview's focus() focuses the active panel if one exists.
+  // Skip the initial 0 so a fresh mount doesn't steal focus.
+  useEffect(() => {
+    if (focusMainRequest === 0) return;
+    apiRef.current?.focus();
+  }, [focusMainRequest]);
 
   return (
     <div className="main-area">
