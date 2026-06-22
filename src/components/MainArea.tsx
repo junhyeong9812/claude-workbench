@@ -92,6 +92,21 @@ interface HostKeyPrompt {
   fingerprint: string;
 }
 
+/** Move DOM focus into the active panel's *content* (xterm/CodeMirror/input),
+ * not just the dockview group. dockview's `setActive()`/`focus()` focuses the
+ * group only, so after a keyboard tab switch keystrokes wouldn't land in the
+ * terminal until the user clicked into it. Runs on the next frame so the
+ * active-group DOM has updated. */
+function focusActivePanelContent() {
+  requestAnimationFrame(() => {
+    const group = document.querySelector(".main-dock .dv-active-group");
+    const el = group?.querySelector(
+      ".xterm-helper-textarea, .cm-content, textarea, input, [tabindex]",
+    ) as HTMLElement | null;
+    el?.focus();
+  });
+}
+
 /**
  * The 80% main area, backed by dockview.
  *
@@ -564,6 +579,9 @@ export function MainArea() {
         : (idx - 1 + panels.length) % panels.length;
       e.preventDefault();
       panels[next].api.setActive();
+      // Drop focus into the newly-active panel's content so keystrokes land in
+      // the terminal/editor immediately (not just on the group).
+      focusActivePanelContent();
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
@@ -578,13 +596,7 @@ export function MainArea() {
     const api = apiRef.current;
     if (!api) return;
     api.focus();
-    requestAnimationFrame(() => {
-      const group = document.querySelector(".main-dock .dv-active-group");
-      const el = group?.querySelector(
-        ".xterm-helper-textarea, .cm-content, textarea, input, [tabindex]",
-      ) as HTMLElement | null;
-      el?.focus();
-    });
+    focusActivePanelContent();
   }, [focusMainRequest]);
 
   return (
