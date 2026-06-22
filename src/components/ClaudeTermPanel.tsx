@@ -134,9 +134,12 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
   const [answers, setAnswers] = useState<Map<number, string>>(new Map());
   const [dates, setDates] = useState<Map<number, string>>(new Map());
   const [selectedId, setSelectedId] = useState<string | null>(null);
-  // The selected question turn (Q&A) for the live timeline — highlights its head
-  // and shows prompt+answer in the detail pane. Mutually exclusive with selectedId.
+  // The selected question turn (Q&A) — highlights its head and shows prompt+answer
+  // in the detail pane. Mutually exclusive with selectedId. `selectedTurnScope`
+  // disambiguates which timeline owns it ("live" or a prev-task uuid), since turn
+  // numbers repeat across the live session and each previous task.
   const [selectedTurn, setSelectedTurn] = useState<number | null>(null);
+  const [selectedTurnScope, setSelectedTurnScope] = useState<string>("live");
   // A plain text (e.g. a turn's full answer) shown in the detail viewer when the
   // timeline truncates it. Mutually exclusive with `selectedId`.
   const [textView, setTextView] = useState<{ title: string; text: string } | null>(null);
@@ -764,6 +767,8 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
             subagents={subagents}
             selectedId={selectedId}
             selectedTurn={selectedTurn}
+            selectedScope={selectedTurnScope}
+            scope="live"
             onSelect={(it) => {
               setSelectedId(it.tool_call_id);
               setTextView(null);
@@ -775,6 +780,7 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
               setTextView({ title: `Q${turn}`, text: `질문:\n${q}\n\n답변:\n${a || "(없음)"}` });
               setSelectedId(null);
               setSelectedTurn(turn);
+              setSelectedTurnScope("live");
             }}
           />
           {chainPrev.map((task) => {
@@ -797,6 +803,9 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
                     dates={new Map(task.dates)}
                     subagents={[]}
                     selectedId={selectedId}
+                    selectedTurn={selectedTurn}
+                    selectedScope={selectedTurnScope}
+                    scope={task.uuid}
                     onSelect={(it) => {
                       setSelectedId(it.tool_call_id);
                       setTextView(null);
@@ -810,7 +819,8 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
                         text: `질문:\n${q}\n\n답변:\n${a || "(없음)"}`,
                       });
                       setSelectedId(null);
-                      setSelectedTurn(null);
+                      setSelectedTurn(turn);
+                      setSelectedTurnScope(task.uuid);
                     }}
                   />
                 )}

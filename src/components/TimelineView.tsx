@@ -54,6 +54,8 @@ export function TimelineView({
   subagents,
   selectedId,
   selectedTurn,
+  selectedScope,
+  scope = "live",
   onSelect,
   onSelectTurn,
 }: {
@@ -68,6 +70,13 @@ export function TimelineView({
   /** The turn whose question/answer is selected (highlights its head), or null.
    * Distinct from `selectedId` (a tool item) — they are mutually exclusive. */
   selectedTurn?: number | null;
+  /** Which timeline owns the turn selection. Turn numbers repeat across the live
+   * session and each previous task, so a turn is "selected here" only when this
+   * view's `scope` matches `selectedScope` — otherwise the same number would
+   * highlight/anchor nav in the wrong list. (Tool ids are globally unique, so
+   * `selectedId` needs no scope.) */
+  selectedScope?: string;
+  scope?: string;
   onSelect: (item: TimelineItem) => void;
   /** Select a turn (Q&A): view its prompt + full answer in the detail pane.
    * Used by ↑/↓ landing on a question head and by clicking the head/answer. */
@@ -188,17 +197,21 @@ export function TimelineView({
 
   const listRef = useRef<HTMLDivElement>(null);
 
+  // A turn is selected *in this view* only when this view owns the turn selection
+  // (scope match) — turn numbers repeat across the live session and prior tasks.
+  const turnSelected = (turn: number) => selectedTurn === turn && selectedScope === scope;
+
   // Keep the selected row (a tool item or a question head) scrolled into view as
   // the user arrows through it.
   useEffect(() => {
     if (!listRef.current) return;
     const sel = selectedId
       ? `[data-tcid="${CSS.escape(selectedId)}"]`
-      : selectedTurn != null
+      : selectedTurn != null && selectedScope === scope
         ? `[data-turn="${selectedTurn}"]`
         : null;
     if (sel) listRef.current.querySelector(sel)?.scrollIntoView({ block: "nearest" });
-  }, [selectedId, selectedTurn]);
+  }, [selectedId, selectedTurn, selectedScope, scope]);
 
   // A new question arrives at the top — scroll there so the current Q is in view (B5).
   const newestTurn = turnNos[0] ?? 0;
@@ -211,9 +224,7 @@ export function TimelineView({
     if (navEntries.length === 0) return;
     e.preventDefault();
     const idx = navEntries.findIndex((n) =>
-      n.kind === "item"
-        ? n.item.tool_call_id === selectedId
-        : selectedTurn != null && n.turn === selectedTurn,
+      n.kind === "item" ? n.item.tool_call_id === selectedId : turnSelected(n.turn),
     );
     let next: number;
     if (idx === -1) next = e.key === "ArrowDown" ? 0 : navEntries.length - 1;
@@ -261,7 +272,7 @@ export function TimelineView({
             <div
               data-turn={turn}
               className={`timeline-turn-head${
-                selectedTurn === turn ? " timeline-turn-head-sel" : ""
+                turnSelected(turn) ? " timeline-turn-head-sel" : ""
               }`}
               title={prompt ?? ""}
               onClick={() => {
@@ -312,8 +323,16 @@ function QuestionDetail({ item }: { item: TimelineItem }) {
   const raw = (item.raw_input ?? null) as { questions?: QQuestion[] } | null;
   const questions = Array.isArray(raw?.questions) ? (raw!.questions as QQuestion[]) : [];
   const chosen = item.content_text ?? "";
-  // Best-effort: an option is "selected" if its label appears in the result text.
-  const isSel = (label?: string) => !!label && label.trim() !== "" && chosen.includes(label);
+  // Whether an option was chosen, matched against the result text. Precise on
+  // purpose: a bare substring would mark "auto" selected when the answer is
+  // "autonomous". Accept a quoted label (the AskUserQuestion result wraps answers
+  // in quotes) or a whole line equal to the label.
+  const isSel = (label?: string) => {
+    const l = label?.trim();
+    if (!l) return false;
+    if (chosen.includes(`"${l}"`)) return true;
+    return chosen.split(/\r?\n/).some((line) => line.trim() === l);
+  };
   return (
     <div className="timeline-detail">
       <div className="timeline-detail-head">
