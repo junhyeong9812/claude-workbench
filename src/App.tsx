@@ -15,7 +15,6 @@ import { TerminalSettings } from "./components/TerminalSettings";
 import { StudyView } from "./components/StudyView";
 import { PopoutWorkbench } from "./components/PopoutWorkbench";
 import { useAppStore } from "./state/store";
-import { WebviewWindow } from "@tauri-apps/api/webviewWindow";
 import "./App.css";
 
 export default function App() {
@@ -23,19 +22,6 @@ export default function App() {
   // and renders only the minimal panel workbench (multiwindow).
   if (window.location.hash.startsWith("#popout")) return <PopoutWorkbench />;
   return <AppMain />;
-}
-
-/** Open an empty popout window. TEMPORARY P1 verification trigger — P3 replaces
- * it with the tab drag-out gesture. */
-function openEmptyPopout() {
-  const label = `panel-${Date.now()}`;
-  const w = new WebviewWindow(label, {
-    url: `${window.location.pathname}#popout=${label}`,
-    title: "패널 창",
-    width: 900,
-    height: 640,
-  });
-  w.once("tauri://error", (e) => console.error("[popout] create failed", e));
 }
 
 function AppMain() {
@@ -172,13 +158,6 @@ function AppMain() {
         <span className="toolbar-title">
           {activeProject ?? "multi-terminal"}
         </span>
-        <button
-          className="toolbar-btn"
-          title="빈 패널 창 열기 (멀티윈도우 P1 검증 — P3에서 드래그 제스처로 대체)"
-          onClick={openEmptyPopout}
-        >
-          🪟 새 창
-        </button>
       </div>
       {mode === "study" ? (
         <StudyView />

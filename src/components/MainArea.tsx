@@ -12,6 +12,7 @@ import { useClaudeUi } from "../state/claudeUi";
 import { recallArea, forgetArea, type PanelArea } from "../state/panelFocus";
 import { isTransferring } from "../state/panelTransfer";
 import { movePanelToNewWindow } from "../state/windowTransfer";
+import { isOutsideCurrentWindow } from "../state/dropOut";
 import { components, AppTab, type PanelKind } from "./panelRegistry";
 import { fileName } from "./cmLang";
 
@@ -116,6 +117,11 @@ export function MainArea() {
   const setLayout = useAppStore((s) => s.setLayout);
 
   const apiRef = useRef<DockviewApi | null>(null);
+  // Drop-out gesture (P3): one AbortController per in-progress tab drag bounds
+  // the dragover/dragend listeners, and the onWillDragPanel subscription is
+  // disposed on unmount — no stale listener can fire a late popout (review P3 #1).
+  const dragAbortRef = useRef<AbortController | null>(null);
+  const dragSubRef = useRef<{ dispose: () => void } | null>(null);
   // Monotonic per-mount counter for human-friendly panel titles.
   const counterRef = useRef(0);
   // Saved-session picker for "+ Claude" (null = closed) + the name a "새 세션"
@@ -194,7 +200,59 @@ export function MainArea() {
       // session is removed (it is the file's sole owner — no delete/flush race,
       // review P4-R1), so there's nothing to clean up here.
     });
+
+    // Drop-out gesture (P3): when a tab drag is released OUTSIDE this window
+    // (onto the desktop / another monitor), pop that panel into a new window at
+    // the drop point. A drop back inside dockview rearranges as usual (the
+    // outside check is false), so this never fights normal tab dragging.
+    dragSubRef.current = api.onWillDragPanel((e) => {
+      const panelId = e.panel.id;
+      // Replace any prior gesture's listeners (review P3 #1).
+      dragAbortRef.current?.abort();
+      const ac = new AbortController();
+      dragAbortRef.current = ac;
+      // Track the last credible screen point — some platforms report a degraded
+      // (0,0/NaN) coordinate on the final `dragend` (review P3 #3).
+      let last: { x: number; y: number } | null = null;
+      window.addEventListener(
+        "dragover",
+        (ev: DragEvent) => {
+          if (Number.isFinite(ev.screenX) && (ev.screenX !== 0 || ev.screenY !== 0)) {
+            last = { x: ev.screenX, y: ev.screenY };
+          }
+        },
+        { capture: true, signal: ac.signal },
+      );
+      window.addEventListener(
+        "dragend",
+        (ev: DragEvent) => {
+          ac.abort(); // one-shot: tear down this gesture's listeners
+          const credible =
+            Number.isFinite(ev.screenX) && (ev.screenX !== 0 || ev.screenY !== 0)
+              ? { x: ev.screenX, y: ev.screenY }
+              : last;
+          if (!credible) return;
+          void isOutsideCurrentWindow(credible.x, credible.y).then((outside) => {
+            if (!outside) return;
+            // Offset so the cursor lands near the new window's title bar instead
+            // of its corner, and clamp to keep the top-left on-screen (P3 #5).
+            const x = Math.max(0, Math.round(credible.x - 200));
+            const y = Math.max(0, Math.round(credible.y - 10));
+            void movePanelToNewWindow(api, panelId, { x, y });
+          });
+        },
+        { capture: true, signal: ac.signal },
+      );
+    });
   };
+
+  // Tear down the drag gesture wiring on unmount (review P3 #1).
+  useEffect(() => {
+    return () => {
+      dragAbortRef.current?.abort();
+      dragSubRef.current?.dispose();
+    };
+  }, []);
 
   const addPanel = (
     kind: PanelKind,
@@ -680,7 +738,7 @@ export function MainArea() {
         </button>
         <button
           className="toolbar-btn"
-          title="활성 패널을 새 창으로 분리 (P3에서 탭 드래그로 교체)"
+          title="활성 패널을 새 창으로 분리 (또는 탭을 창 밖으로 드래그)"
           onClick={() => {
             const api = apiRef.current;
             if (api?.activePanel) void movePanelToNewWindow(api, api.activePanel.id);

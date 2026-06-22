@@ -51,7 +51,11 @@ const ACCEPT_TIMEOUT_MS = 8000;
  * Single-owner is structural: the source detaches BEFORE the target attaches, so
  * the same session is never rendered by two windows at once.
  */
-export async function movePanelToNewWindow(api: DockviewApi, panelId: string): Promise<void> {
+export async function movePanelToNewWindow(
+  api: DockviewApi,
+  panelId: string,
+  position?: { x: number; y: number },
+): Promise<void> {
   if (inFlight.has(panelId)) return;
   const panel = api.getPanel(panelId);
   if (!panel) return;
@@ -138,6 +142,8 @@ export async function movePanelToNewWindow(api: DockviewApi, panelId: string): P
     title,
     width: 900,
     height: 640,
+    // Drop-out gesture: open at the cursor so the panel lands where released.
+    ...(position ? { x: Math.round(position.x), y: Math.round(position.y) } : {}),
   });
   w.once("tauri://error", (e) => {
     if (settled) return;
