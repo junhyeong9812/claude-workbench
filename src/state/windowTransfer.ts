@@ -219,15 +219,22 @@ async function appWindowBounds(): Promise<{ label: string; l: number; t: number;
  * (review R4-1). */
 async function windowAtPoint(screenX: number, screenY: number): Promise<string | null> {
   if (!Number.isFinite(screenX) || !Number.isFinite(screenY)) return null;
-  const bounds = await appWindowBounds();
-  let best: { label: string; area: number } | null = null;
-  for (const b of bounds) {
-    if (screenX >= b.l && screenX <= b.r && screenY >= b.t && screenY <= b.b) {
-      const area = (b.r - b.l) * (b.b - b.t);
-      if (!best || area < best.area) best = { label: b.label, area };
+  try {
+    const bounds = await appWindowBounds();
+    let best: { label: string; area: number } | null = null;
+    for (const b of bounds) {
+      if (screenX >= b.l && screenX <= b.r && screenY >= b.t && screenY <= b.b) {
+        const area = (b.r - b.l) * (b.b - b.t);
+        if (!best || area < best.area) best = { label: b.label, area };
+      }
     }
+    return best?.label ?? null;
+  } catch (err) {
+    // Enumeration failed (e.g. a missing window permission) — fall back to
+    // "desktop" so a drop-out still pops a new window rather than no-op.
+    console.error("[transfer] windowAtPoint failed; treating as desktop", err);
+    return null;
   }
-  return best?.label ?? null;
 }
 
 /**

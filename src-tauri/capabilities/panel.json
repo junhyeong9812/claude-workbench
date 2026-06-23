@@ -7,6 +7,9 @@
     "core:default",
     "core:window:allow-destroy",
     "core:window:allow-close",
+    "core:window:allow-get-all-windows",
+    "core:window:allow-is-visible",
+    "core:window:allow-is-minimized",
     "core:webview:allow-create-webview-window"
   ]
 }
