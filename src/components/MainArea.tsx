@@ -629,27 +629,69 @@ export function MainArea() {
     addPanel("claudeterm", { title: name, loadSessionId: crypto.randomUUID() });
   };
 
-  // Alt+←/→/↑/↓ cycles the active session tab (dockview panel). Left/Up = prev,
-  // Right/Down = next (wraps). Distinct from a Claude panel's Ctrl+←/→ pane focus.
+  // Alt+←/→/↑/↓ moves between panels by SCREEN POSITION: when the layout is split
+  // into groups (regions), it jumps to the nearest group in the pressed direction
+  // (so a vertical split moves with ↑/↓, a side-by-side split with ←/→); within a
+  // single region it cycles that region's tabs. Distinct from a Claude panel's
+  // Ctrl+←/→ pane focus. (The newly-active panel focuses its own content on the
+  // onlyWhenVisible remount — no focus call here, which would race the xterm.)
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if (!e.altKey) return;
-      const isNext = e.key === "ArrowRight" || e.key === "ArrowDown";
-      const isPrev = e.key === "ArrowLeft" || e.key === "ArrowUp";
-      if (!isNext && !isPrev) return;
+      const dir =
+        e.key === "ArrowRight"
+          ? "right"
+          : e.key === "ArrowLeft"
+            ? "left"
+            : e.key === "ArrowDown"
+              ? "down"
+              : e.key === "ArrowUp"
+                ? "up"
+                : null;
+      if (!dir) return;
       const api = apiRef.current;
       if (!api) return;
-      const panels = api.panels;
+      const cur = api.activeGroup;
+
+      // 1) Directional jump to the nearest group (region) in the pressed direction.
+      if (api.groups.length >= 2 && cur) {
+        const cr = cur.element.getBoundingClientRect();
+        const cx = cr.left + cr.width / 2;
+        const cy = cr.top + cr.height / 2;
+        const horizontal = dir === "left" || dir === "right";
+        let best: (typeof api.groups)[number] | null = null;
+        let bestDist = Infinity;
+        for (const g of api.groups) {
+          if (g === cur) continue;
+          const r = g.element.getBoundingClientRect();
+          const dx = r.left + r.width / 2 - cx;
+          const dy = r.top + r.height / 2 - cy;
+          const inDir =
+            dir === "right" ? dx > 1 : dir === "left" ? dx < -1 : dir === "down" ? dy > 1 : dy < -1;
+          if (!inDir) continue;
+          // Penalize the off-axis distance so the picked region is the aligned one.
+          const dist = (horizontal ? Math.abs(dx) : Math.abs(dy)) + (horizontal ? Math.abs(dy) : Math.abs(dx)) * 2;
+          if (dist < bestDist) {
+            bestDist = dist;
+            best = g;
+          }
+        }
+        if (best) {
+          e.preventDefault();
+          best.activePanel?.api.setActive();
+          return;
+        }
+      }
+
+      // 2) No aligned region (or a single group): cycle tabs within the current
+      // region. Right/Down = next, Left/Up = prev (wraps).
+      const panels = cur?.panels ?? api.panels;
       if (panels.length < 2) return;
+      const fwd = dir === "right" || dir === "down";
       const idx = api.activePanel ? panels.indexOf(api.activePanel) : -1;
-      const next = isNext
-        ? (idx + 1) % panels.length
-        : (idx - 1 + panels.length) % panels.length;
+      const nextIdx = fwd ? (idx + 1) % panels.length : (idx - 1 + panels.length) % panels.length;
       e.preventDefault();
-      panels[next].api.setActive();
-      // The newly-active panel remounts (onlyWhenVisible) and focuses its own
-      // content on mount — no focus call needed here (doing it now would race the
-      // not-yet-created xterm, the original Claude-tab focus bug).
+      panels[nextIdx].api.setActive();
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
