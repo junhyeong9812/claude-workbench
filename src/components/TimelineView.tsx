@@ -25,6 +25,10 @@ export function MarkdownText({ text }: { text: string }) {
   return <div className="study-md tl-markdown" dangerouslySetInnerHTML={{ __html: html }} />;
 }
 
+/** A path whose written content is markdown — its diff `new_text` is rendered
+ * (not raw) in 뷰모드 so a written .md reads as formatted markdown. */
+const isMarkdownPath = (path: string): boolean => /\.(md|markdown|mdx)$/i.test(path);
+
 export interface TimelineItem {
   turn: number;
   session_id: string;
@@ -523,7 +527,13 @@ export function ItemDetail({ item, markdown = true }: { item: TimelineItem; mark
           {d.old_text != null && d.old_text !== "" && (
             <pre className="timeline-diff-old">{d.old_text}</pre>
           )}
-          <pre className="timeline-diff-new">{d.new_text}</pre>
+          {markdown && isMarkdownPath(d.path) ? (
+            <div className="timeline-diff-new-md">
+              <MarkdownText text={d.new_text} />
+            </div>
+          ) : (
+            <pre className="timeline-diff-new">{d.new_text}</pre>
+          )}
         </div>
       ))}
       {hasContent && (

@@ -1604,6 +1604,14 @@ body {
   background: var(--diff-add-bg);
   color: var(--diff-add-fg);
 }
+/* 뷰모드 + 마크다운 파일: 작성된 new_text를 렌더링하되 "추가됨" 단서(좌측 녹색 보더 +
+   옅은 배경)는 유지. */
+.timeline-diff-new-md {
+  background: var(--diff-add-bg);
+  border-left: 3px solid var(--diff-add-fg, #4ec9b0);
+  border-radius: 3px;
+  padding: 2px 8px;
+}
 .timeline-item.ts-canceled,
 .timeline-item.ts-failed {
   opacity: 0.6;
