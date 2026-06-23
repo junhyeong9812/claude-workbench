@@ -789,16 +789,49 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
             tabIndex={0}
             style={{ flex: `0 0 ${viewerWidth}px` }}
             onKeyDown={(e) => {
+              const body = viewerRef.current?.querySelector(
+                ".claudeterm-viewer-body",
+              ) as HTMLElement | null;
+              // Focusable code/diff blocks in reading order, and which one (if any)
+              // currently holds focus.
+              const blocks = body
+                ? (Array.from(body.querySelectorAll(".timeline-diff-block")) as HTMLElement[])
+                : [];
+              const focusedIdx = blocks.findIndex((b) => b.contains(document.activeElement));
+
               // v: 뷰모드(html)/원본 전환 (순수 내용일 때만).
               if ((e.key === "v" || e.key === "V") && detailIsPureContent) {
                 e.preventDefault();
                 setDetailMarkdown((v) => !v);
                 return;
               }
+              // Enter: 변경상세(또는 현재 블록)에서 **다음 코드블럭으로 내려가며** 포커스.
+              // 마지막 블록에선 그대로 유지(래핑 안 함 — 덜 놀람).
+              if (e.key === "Enter" && blocks.length > 0) {
+                e.preventDefault();
+                const next = focusedIdx === -1 ? 0 : Math.min(focusedIdx + 1, blocks.length - 1);
+                blocks[next].focus();
+                blocks[next].scrollIntoView({ block: "nearest" });
+                return;
+              }
+              // Esc: 코드블럭에서 변경상세 패널로 포커스 복귀(뷰어는 닫지 않음).
+              if (e.key === "Escape" && focusedIdx !== -1) {
+                e.preventDefault();
+                e.stopPropagation();
+                viewerRef.current?.focus();
+                return;
+              }
+              // ←/→: 포커스된 블록 안에서 가로 스크롤(긴 diff 라인의 뒷부분 읽기).
+              if ((e.key === "ArrowLeft" || e.key === "ArrowRight") && focusedIdx !== -1) {
+                e.preventDefault();
+                const dx = e.key === "ArrowRight" ? 64 : -64;
+                blocks[focusedIdx]
+                  .querySelectorAll("pre")
+                  .forEach((p) => ((p as HTMLElement).scrollLeft += dx));
+                return;
+              }
+              // ↑/↓/PageUp/PageDown: 뷰어 바디 세로 스크롤(읽기).
               if (["ArrowDown", "ArrowUp", "PageDown", "PageUp"].includes(e.key)) {
-                const body = viewerRef.current?.querySelector(
-                  ".claudeterm-viewer-body",
-                ) as HTMLElement | null;
                 if (body) {
                   e.preventDefault();
                   const step = e.key.startsWith("Page") ? body.clientHeight * 0.9 : 48;
@@ -834,7 +867,7 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
                 </button>
               )}
               <span className="claudeterm-viewer-hint-keys">
-                {detailIsPureContent ? "v 뷰/원본 · " : ""}↑↓ 스크롤 · Ctrl+←/→ 패널 이동
+                {detailIsPureContent ? "v 뷰/원본 · " : ""}Enter 코드블럭 · ←→ 가로 · Esc 복귀 · ↑↓ 스크롤 · Ctrl+←/→ 패널
               </span>
             </div>
             <div className="claudeterm-viewer-body">

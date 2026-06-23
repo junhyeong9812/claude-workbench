@@ -420,7 +420,7 @@ function QuestionDetail({ item }: { item: TimelineItem }) {
         </div>
       ))}
       {chosen !== "" && (
-        <div className="timeline-diff-block">
+        <div className="timeline-diff-block" tabIndex={-1}>
           <div className="timeline-detail-label">선택 (응답)</div>
           <pre className="timeline-detail-text">{chosen}</pre>
         </div>
@@ -438,7 +438,7 @@ function PlanDetail({ item, markdown }: { item: TimelineItem; markdown: boolean 
       <div className="timeline-detail-head">
         {KIND_ICON.plan} {item.title || "계획"}
       </div>
-      <div className="timeline-diff-block">
+      <div className="timeline-diff-block" tabIndex={-1}>
         <div className="timeline-detail-label">계획</div>
         {plan != null ? (
           markdown ? (
@@ -451,7 +451,7 @@ function PlanDetail({ item, markdown }: { item: TimelineItem; markdown: boolean 
         )}
       </div>
       {item.content_text && (
-        <div className="timeline-diff-block">
+        <div className="timeline-diff-block" tabIndex={-1}>
           <div className="timeline-detail-label">응답</div>
           <pre className="timeline-detail-text">{item.content_text}</pre>
         </div>
@@ -506,19 +506,19 @@ export function ItemDetail({ item, markdown = true }: { item: TimelineItem; mark
         {KIND_ICON[item.kind] ?? "•"} {item.title || item.kind}
       </div>
       {bashCmd != null && (
-        <div className="timeline-diff-block">
+        <div className="timeline-diff-block" tabIndex={-1}>
           <div className="timeline-detail-label">명령</div>
           <pre className="timeline-detail-text">{bashCmd}</pre>
         </div>
       )}
       {rawInput != null && (
-        <div className="timeline-diff-block">
+        <div className="timeline-diff-block" tabIndex={-1}>
           <div className="timeline-detail-label">입력</div>
           <pre className="timeline-detail-text">{rawInput}</pre>
         </div>
       )}
       {item.diffs.map((d, i) => (
-        <div key={i} className="timeline-diff-block">
+        <div key={i} className="timeline-diff-block" tabIndex={-1}>
           <div className="timeline-detail-path">{d.path}</div>
           {d.old_text != null && d.old_text !== "" && (
             <pre className="timeline-diff-old">{d.old_text}</pre>
@@ -527,7 +527,7 @@ export function ItemDetail({ item, markdown = true }: { item: TimelineItem; mark
         </div>
       ))}
       {hasContent && (
-        <div className="timeline-diff-block">
+        <div className="timeline-diff-block" tabIndex={-1}>
           <div className="timeline-detail-label">내용</div>
           {markdown ? (
             <MarkdownText text={item.content_text!} />
@@ -537,7 +537,7 @@ export function ItemDetail({ item, markdown = true }: { item: TimelineItem; mark
         </div>
       )}
       {needsFile && (
-        <div className="timeline-diff-block">
+        <div className="timeline-diff-block" tabIndex={-1}>
           <div className="timeline-detail-path">{firstPath}</div>
           {fileText != null &&
             (markdown ? (

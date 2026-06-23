@@ -1516,6 +1516,14 @@ body {
 .timeline-diff-block {
   margin-bottom: 6px;
 }
+/* Keyboard reading (Enter steps blocks): the focused code/diff block gets a
+   ring + scroll-margin so it's clearly visible after scrollIntoView. */
+.timeline-diff-block:focus {
+  outline: 2px solid var(--accent, #4a9eff);
+  outline-offset: 1px;
+  border-radius: 3px;
+  scroll-margin: 8px;
+}
 /* AskUserQuestion detail: question text + option cards, chosen one highlighted. */
 .tl-question-text {
   font-size: 12px;
