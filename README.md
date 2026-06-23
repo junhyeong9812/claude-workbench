@@ -10,6 +10,7 @@
 ## 핵심 기능
 
 - **멀티 프로젝트 워크스페이스** — 폴더를 탭으로 열고, 패널 배치·트리 상태를 영속(재시작 복원).
+- **멀티 윈도우 (탭 드래그 → 창 분리·도킹)** — 패널 탭을 끌어 별도 OS 창으로 떼어내고, 다시 끌어 원래 창으로 도킹. 양방향 전송, 드롭 위치 인디케이터, 멀티모니터 좌표(z-order·물리좌표 hit-test), 팝아웃 창 재시작 영속.
 - **멀티 터미널** — xterm.js + PTY. 테마/폰트 크기/색 커스텀.
 - **Claude Code 세션 (아키텍처 A)** — 진짜 `claude` CLI를 PTY로 띄우고, 세션 JSONL(`~/.claude/projects/<slug>/<uuid>.jsonl`)을 tail 해 **타임라인**으로 렌더.
   - 멀티 세션, 세션 관리(생성/재오픈/닫기/삭제/rename), 토큰 사용량·서브에이전트 트리.
@@ -90,9 +91,3 @@ Categories=Development;Utility;
 ## 아키텍처 노트 (A)
 
 앱이 UUID를 생성해 `claude --session-id <uuid>`로 세션을 시작(또는 `--resume <uuid>`로 이어붙임)하고, claude가 쓰는 **네이티브 세션 JSONL**을 tail 한다. 즉 앱이 이벤트를 따로 저장하지 않고 **claude의 파일을 단일 출처로** 읽어 타임라인을 구성한다. (구버전 B = ACP 커스텀 프로토콜은 제거됨.)
-
----
-
-## 문서
-
-설계·구현 기록은 `docs/plans/<날짜>/<작업>/`에 작업별로 정리되어 있다 — `OVERVIEW`(추상 지도) · `TECHNICAL`(동작 모델) · `changelog`(의사결정 로그) · `learned`(사용 요소) · `review-log`(리뷰 findings). 측정 로그는 `docs/measurement-log.md`.

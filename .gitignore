@@ -13,3 +13,7 @@ dist-ssr
 # Editor / OS
 .DS_Store
 *.log
+
+# Dev docs & local agent state (kept local, not published)
+/docs
+.claude/
