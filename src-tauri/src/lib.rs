@@ -154,6 +154,33 @@ pub fn run() {
             commands::git_resolve_ours,
             commands::git_resolve_theirs,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(|app_handle, event| {
+            use tauri::Manager;
+            match event {
+                // Normal quit (last window closed / OS quit): kill every PTY child
+                // so no orphaned `claude`/shell process lingers after exit. The
+                // window-close itself is driven by the frontend (`win.destroy()`);
+                // this only guarantees clean child teardown on the way out.
+                tauri::RunEvent::ExitRequested { .. } => {
+                    app_handle.state::<core_lib::SessionManager>().kill_all();
+                }
+                // Main window gone = the app should quit — even if a popout
+                // teardown stalled and left other windows alive. Without this,
+                // `ExitRequested` only fires when the *last* window closes, so a
+                // hung shutdown that force-destroys only the main window would
+                // leave the process (and popouts) running. exit(0) force-quits
+                // everything; kill_all() reaps children first.
+                tauri::RunEvent::WindowEvent {
+                    label,
+                    event: tauri::WindowEvent::Destroyed,
+                    ..
+                } if label == "main" => {
+                    app_handle.state::<core_lib::SessionManager>().kill_all();
+                    app_handle.exit(0);
+                }
+                _ => {}
+            }
+        });
 }

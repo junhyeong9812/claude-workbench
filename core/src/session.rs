@@ -417,6 +417,29 @@ impl SessionManager {
         }
         Ok(())
     }
+
+    /// Signal **every** session's child to terminate. Used on app shutdown so no
+    /// PTY child (claude/shell) is left orphaned when the process exits.
+    ///
+    /// Unlike [`remove`], this does **not** join reader threads: at process exit
+    /// the threads are torn down by the OS anyway, and a reader blocked on a PTY
+    /// read must never make shutdown hang. We only deliver the kill signal and
+    /// mark each session dead; the map itself is left intact (the process is
+    /// about to exit).
+    pub fn kill_all(&self) {
+        // Best-effort: this is the shutdown path, so a poisoned lock (a panicked
+        // session thread) must NOT skip PTY cleanup — recover the guard and reap.
+        let mut map = self.sessions.lock().unwrap_or_else(|p| p.into_inner());
+        for session in map.values_mut() {
+            match &mut session.transport {
+                Transport::Local { killer, .. } => {
+                    let _ = killer.kill();
+                }
+                Transport::Ssh(h) => h.cancel(),
+            }
+            session.shared.set_dead();
+        }
+    }
 }
 
 #[cfg(test)]
@@ -548,6 +571,57 @@ mod tests {
         // Seed precedes live output.
         let (buf, _) = mgr.snapshot(id).unwrap();
         assert!(buf.starts_with(b"PRIOR"));
+    }
+
+    #[test]
+    fn kill_all_terminates_every_child() {
+        let mgr = SessionManager::new();
+        // Two long-running children that would outlive the process if not killed.
+        let a = mgr.create(sh("sleep 30"), None, 80, 24).unwrap();
+        let b = mgr.create(sh("sleep 30"), None, 80, 24).unwrap();
+        assert_eq!(mgr.is_alive(a), Some(true));
+        assert_eq!(mgr.is_alive(b), Some(true));
+        // Shutdown backstop: every child must be signalled to die (no orphans).
+        mgr.kill_all();
+        assert!(
+            wait_until(2000, || mgr.is_alive(a) == Some(false))
+                && wait_until(2000, || mgr.is_alive(b) == Some(false)),
+            "kill_all must terminate all session children"
+        );
+        // Sessions stay queryable (the map is intact — process is exiting).
+        assert!(mgr.is_alive(a).is_some(), "session still queryable after kill_all");
+    }
+
+    /// Stronger than the `is_alive` check: prove `kill_all` actually terminates
+    /// the OS child (not just flips the `alive` flag). The child writes its pid,
+    /// and we wait for `/proc/<pid>` to disappear after `kill_all`. Linux-only
+    /// (the app's runtime target); the flag-level invariant is covered above.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn kill_all_reaps_the_child_process() {
+        let mgr = SessionManager::new();
+        let pidfile = std::env::temp_dir().join(format!("mt_killall_{}.pid", std::process::id()));
+        let _ = std::fs::remove_file(&pidfile);
+        // `$$` is the shell pid; `exec` makes `sleep` inherit it, so the pidfile
+        // holds the surviving child's real pid.
+        let script = format!("echo $$ > {}; exec sleep 30", pidfile.display());
+        let id = mgr.create(sh(&script), None, 80, 24).unwrap();
+        assert!(
+            wait_until(2000, || std::fs::read_to_string(&pidfile)
+                .map(|s| !s.trim().is_empty())
+                .unwrap_or(false)),
+            "child should report its pid"
+        );
+        let pid: i32 = std::fs::read_to_string(&pidfile).unwrap().trim().parse().unwrap();
+        let alive = || std::path::Path::new(&format!("/proc/{pid}")).exists();
+        assert!(alive(), "child process must be alive before kill_all");
+        let _ = id;
+        mgr.kill_all();
+        assert!(
+            wait_until(3000, || !alive()),
+            "kill_all must actually terminate the child process (pid {pid})"
+        );
+        let _ = std::fs::remove_file(&pidfile);
     }
 
     #[test]

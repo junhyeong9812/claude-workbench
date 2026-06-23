@@ -238,26 +238,40 @@ export function MainArea() {
     if (win.label !== "main") return;
     const unP = win.onCloseRequested(async (event) => {
       event.preventDefault();
-      const others = (await getAllWindows()).filter((w) => w.label !== "main");
-      if (others.length > 0) {
-        const expected = others.map((w) => w.label);
-        const acked = new Set<string>();
-        const unAck = await listen<{ label: string }>("app-shutdown-ack", (e) =>
-          acked.add(e.payload.label),
-        );
-        await emit("app-shutdown");
-        const start = Date.now();
-        await new Promise<void>((resolve) => {
-          const tick = () => {
-            if (expected.every((l) => acked.has(l)) || Date.now() - start > 2500) resolve();
-            else setTimeout(tick, 50);
-          };
-          tick();
-        });
-        unAck();
-        await Promise.all(others.map((w) => w.destroy().catch(() => {})));
+      // We took over the close: from here ONLY an explicit destroy() actually
+      // closes the window. A teardown that throws or hangs must never leave the
+      // app un-closable, so destroy() runs in `finally` AND a watchdog forces it
+      // if the teardown stalls past the bound (the ack-wait below is already
+      // capped at 2.5s; the watchdog covers a stuck IPC call too).
+      const watchdog = setTimeout(() => {
+        void win.destroy().catch(() => {});
+      }, 4000);
+      try {
+        const others = (await getAllWindows()).filter((w) => w.label !== "main");
+        if (others.length > 0) {
+          const expected = others.map((w) => w.label);
+          const acked = new Set<string>();
+          const unAck = await listen<{ label: string }>("app-shutdown-ack", (e) =>
+            acked.add(e.payload.label),
+          );
+          await emit("app-shutdown");
+          const start = Date.now();
+          await new Promise<void>((resolve) => {
+            const tick = () => {
+              if (expected.every((l) => acked.has(l)) || Date.now() - start > 2500) resolve();
+              else setTimeout(tick, 50);
+            };
+            tick();
+          });
+          unAck();
+          await Promise.all(others.map((w) => w.destroy().catch(() => {})));
+        }
+      } catch (err) {
+        console.error("main shutdown teardown failed; closing anyway", err);
+      } finally {
+        clearTimeout(watchdog);
+        await win.destroy().catch(() => {});
       }
-      await win.destroy();
     });
     return () => {
       void unP.then((f) => f());

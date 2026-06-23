@@ -134,11 +134,23 @@ export function PopoutWorkbench() {
     const win = getCurrentWindow();
     const unP = win.onCloseRequested(async (event) => {
       event.preventDefault();
-      await closeOwnedSessions();
-      if (!shuttingDownRef.current) {
-        useAppStore.getState().removePopoutLayout(label);
+      // Same guarantee as the main window: a failed/stuck session teardown must
+      // never leave this popout un-closable. destroy() runs in `finally` and a
+      // watchdog forces it if teardown stalls.
+      const watchdog = setTimeout(() => {
+        void win.destroy().catch(() => {});
+      }, 4000);
+      try {
+        await closeOwnedSessions();
+        if (!shuttingDownRef.current) {
+          useAppStore.getState().removePopoutLayout(label);
+        }
+      } catch (err) {
+        console.error("popout close teardown failed; closing anyway", err);
+      } finally {
+        clearTimeout(watchdog);
+        await win.destroy().catch(() => {});
       }
-      await win.destroy();
     });
     return () => {
       void unP.then((f) => f());
