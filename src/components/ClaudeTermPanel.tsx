@@ -556,6 +556,7 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
     let unlistenTerm: UnlistenFn | undefined;
     let unlistenTl: UnlistenFn | undefined;
     let unlistenDriver: UnlistenFn | undefined;
+    let unlistenClosed: UnlistenFn | undefined;
     let sessionId: number | null = null;
     let lastApplied = 0;
     let ready = false;
@@ -617,6 +618,15 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
         const driving = e.payload.driver === myLabel;
         isDriverRef.current = driving;
         setIsDriver(driving);
+      });
+      // Another window deleted/force-closed this session — it's dead now; lock
+      // input and tell the user (review P6-impl #2).
+      unlistenClosed = await listen<number>("claude-session-closed", (e) => {
+        if (sessionId == null || e.payload !== sessionId) return;
+        inputLockedRef.current = true;
+        isDriverRef.current = false;
+        setIsDriver(false);
+        if (!disposed) term.write("\r\n\x1b[2m[세션이 다른 창에서 종료되었습니다]\x1b[0m\r\n");
       });
       if (disposed) return;
 
@@ -755,6 +765,7 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
       if (unlistenTerm) unlistenTerm();
       if (unlistenTl) unlistenTl();
       if (unlistenDriver) unlistenDriver();
+      if (unlistenClosed) unlistenClosed();
       termRef.current = null;
       term.dispose();
     };

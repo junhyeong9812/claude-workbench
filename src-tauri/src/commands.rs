@@ -618,7 +618,14 @@ fn spawn_claude(
     let id = mgr
         .create(Some(cmd), Some(cwd.clone()), cols, rows)
         .map_err(AppError::new)?;
-    let rx = mgr.subscribe(id).map_err(AppError::new)?;
+    // Clean up the orphan PTY if we can't subscribe to it (review P6-impl #4).
+    let rx = match mgr.subscribe(id) {
+        Ok(rx) => rx,
+        Err(e) => {
+            let _ = mgr.remove(id);
+            return Err(AppError::new(e));
+        }
+    };
     let stop = Arc::new(AtomicBool::new(false));
 
     // (a) Relay PTY output -> webview (global emit; every attached window filters
@@ -678,16 +685,37 @@ pub fn claude_open_or_attach(
                     if !sess.attached.contains(&label) {
                         sess.attached.push(label.clone());
                     }
-                    return Ok(ClaudeOpened {
+                    // Promote this window to driver if the current driver is gone
+                    // (e.g. it detached during a transfer, leaving a stale label) —
+                    // else the new viewer is locked as a mirror with no driver
+                    // (review P6-impl #1). `role` is computed from the real driver (#5).
+                    let mut handoff = None;
+                    if !sess.attached.iter().any(|l| l == &sess.driver) {
+                        sess.driver = label.clone();
+                        sess.rev += 1;
+                        handoff = Some((sess.driver.clone(), sess.rev));
+                    }
+                    let role = if sess.driver == label { "driver" } else { "mirror" };
+                    let opened = ClaudeOpened {
                         id,
                         session_uuid: u.clone(),
-                        role: "mirror".into(),
+                        role: role.into(),
                         driver: sess.driver.clone(),
                         rev: sess.rev,
-                    });
+                    };
+                    drop(rt);
+                    if let Some((driver, rev)) = handoff {
+                        let _ = app.emit("claude-driver-changed", ClaudeDriver { id, driver, rev });
+                    }
+                    return Ok(opened);
                 }
             }
-            rt.live.remove(&key); // stale (PTY gone) — fall through to start
+            // Stale live entry (PTY gone): clean BOTH maps + stop flag so
+            // `claude_live_uuids` can't keep reporting it (review P6-impl #3).
+            if let Some(s) = rt.by_id.remove(&id) {
+                s.stop.store(true, Ordering::Relaxed);
+            }
+            rt.live.remove(&key);
         }
     }
 
@@ -1060,12 +1088,18 @@ fn run_timeline_poll(
 
     // The PTY died on its own (claude exited) — drop the runtime entry so a later
     // id collision can't see stale live/driver state (review R7-3 cleanup).
+    let mut existed = false;
     if let Some(state) = app.try_state::<ClaudeState>() {
         if let Ok(mut rt) = state.rt.lock() {
             if let Some(sess) = rt.by_id.remove(&id) {
                 rt.live.remove(&(sess.project, sess.uuid));
+                existed = true;
             }
         }
+    }
+    // Notify any mirror windows that the session ended (review P6-impl #2).
+    if existed {
+        let _ = app.emit("claude-session-closed", id);
     }
 }
 
@@ -1376,6 +1410,7 @@ pub fn claude_delete(app: AppHandle, project: String, uuid: String) -> Result<()
 /// persisted timeline is kept unless separately deleted.
 #[tauri::command]
 pub fn claude_close(
+    app: AppHandle,
     mgr: State<'_, SessionManager>,
     claude: State<'_, ClaudeState>,
     id: u64,
@@ -1390,7 +1425,11 @@ pub fn claude_close(
     if let Some(stop) = stop {
         stop.store(true, Ordering::Relaxed);
     }
-    mgr.remove(id).map_err(AppError::new)
+    let res = mgr.remove(id).map_err(AppError::new);
+    // Tell every window the session is gone so mirrors don't linger as dead UI
+    // (review P6-impl #2).
+    let _ = app.emit("claude-session-closed", id);
+    res
 }
 
 
