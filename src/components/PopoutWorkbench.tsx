@@ -14,6 +14,7 @@ import { isTransferring } from "../state/panelTransfer";
 import { closePanelSession, sessionsInLayout } from "../state/panelSession";
 import { installDragOut, hasInFlight } from "../state/windowTransfer";
 import { installTransferTarget } from "../state/panelTransferTarget";
+import { DropTargetOverlay } from "./DropTargetOverlay";
 import { components, AppTab } from "./panelRegistry";
 
 const AUTOCLOSE_DEBOUNCE_MS = 1500;
@@ -49,6 +50,10 @@ export function PopoutWorkbench() {
   const [apiReady, setApiReady] = useState(false);
   const [listenerReady, setListenerReady] = useState(false);
   const announcedRef = useRef(false);
+  // True once the MAIN window is quitting (app-shutdown). Distinguishes a quit —
+  // where this popout's layout must survive to reopen next launch — from a
+  // genuine close (user X / empty auto-close), which must NOT reopen (P2).
+  const shuttingDownRef = useRef(false);
 
   // Claude 닫기/삭제 modal — each window has its own useClaudeUi instance, so the
   // popout must handle its own Claude tab × (review R1-6).
@@ -122,12 +127,17 @@ export function PopoutWorkbench() {
     emit("popout-ready", { label, project: activeProject }).catch(() => {});
   }, [apiReady, listenerReady, activeProject, label]);
 
-  // Close-by-X: tear down owned sessions, then destroy (review R1-7).
+  // Close-by-X: tear down owned sessions, then destroy (review R1-7). A genuine
+  // close (not an app quit) drops this popout's persisted layout so it won't
+  // reopen next launch (P2) — the shutdown path sets shuttingDownRef to skip this.
   useEffect(() => {
     const win = getCurrentWindow();
     const unP = win.onCloseRequested(async (event) => {
       event.preventDefault();
       await closeOwnedSessions();
+      if (!shuttingDownRef.current) {
+        useAppStore.getState().removePopoutLayout(label);
+      }
       await win.destroy();
     });
     return () => {
@@ -141,6 +151,26 @@ export function PopoutWorkbench() {
   useEffect(() => {
     let un: (() => void) | undefined;
     listen("app-shutdown", async () => {
+      // App quit: keep this popout's layout (it reopens next launch) and capture
+      // its geometry so it lands in place. Mark shutting-down so the close handler
+      // doesn't drop the entry if destroy() routes through onCloseRequested (P2).
+      shuttingDownRef.current = true;
+      const win = getCurrentWindow();
+      try {
+        const [pos, size, scale] = await Promise.all([
+          win.outerPosition(),
+          win.outerSize(),
+          win.scaleFactor(),
+        ]);
+        useAppStore.getState().setPopoutGeometry(label, {
+          x: Math.round(pos.x / scale),
+          y: Math.round(pos.y / scale),
+          width: Math.round(size.width / scale),
+          height: Math.round(size.height / scale),
+        });
+      } catch {
+        /* geometry best-effort — reopen falls back to default placement */
+      }
       await closeOwnedSessions();
       void emit("app-shutdown-ack", { label });
     })
@@ -237,6 +267,7 @@ export function PopoutWorkbench() {
 
   return (
     <div className="popout-workbench" style={{ display: "flex", flexDirection: "column", height: "100vh" }}>
+      <DropTargetOverlay />
       <div className="toolbar">
         <span className="toolbar-title" title="공유 활성 프로젝트">
           🪟 {activeProject ?? "(프로젝트 없음)"}

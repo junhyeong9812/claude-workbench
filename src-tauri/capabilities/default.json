@@ -9,6 +9,8 @@
     "core:webview:allow-create-webview-window",
     "core:window:allow-get-all-windows",
     "core:window:allow-is-visible",
-    "core:window:allow-is-minimized"
+    "core:window:allow-is-minimized",
+    "core:window:allow-is-focused",
+    "core:window:allow-cursor-position"
   ]
 }

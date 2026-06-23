@@ -13,6 +13,7 @@ import { recallArea, forgetArea, type PanelArea } from "../state/panelFocus";
 import { isTransferring } from "../state/panelTransfer";
 import { closePanelSession } from "../state/panelSession";
 import { installDragOut, movePanelToNewWindow } from "../state/windowTransfer";
+import { DropTargetOverlay } from "./DropTargetOverlay";
 import { installTransferTarget } from "../state/panelTransferTarget";
 import { components, AppTab, type PanelKind } from "./panelRegistry";
 import { getAllWindows, getCurrentWindow } from "@tauri-apps/api/window";
@@ -713,6 +714,7 @@ export function MainArea() {
 
   return (
     <div className="main-area">
+      <DropTargetOverlay />
       <div className="main-toolbar">
         <button className="toolbar-btn" onClick={() => setTermMenu((v) => !v)}>
           + Terminal ▾
