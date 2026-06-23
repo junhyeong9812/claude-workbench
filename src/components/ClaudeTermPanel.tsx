@@ -730,11 +730,6 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
         .find((it) => it.tool_call_id === selectedId) ?? null)
     : null;
 
-  // "Pure content" (no diff, not a question) → the 뷰모드(html)/원본 toggle applies.
-  const detailIsPureContent =
-    textView != null ||
-    (selectedItem != null && selectedItem.diffs.length === 0 && selectedItem.kind !== "question");
-
   return (
     <div className="claudeterm" ref={containerRef} onKeyDown={onContainerKey}>
       <div className="claudeterm-pane claudeterm-term-pane">
@@ -799,8 +794,8 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
                 : [];
               const focusedIdx = blocks.findIndex((b) => b.contains(document.activeElement));
 
-              // v: 뷰모드(html)/원본 전환 (순수 내용일 때만).
-              if ((e.key === "v" || e.key === "V") && detailIsPureContent) {
+              // v: 뷰모드(html)/원본 전환 — 항상(일관성). diff엔 효과 없지만 토글은 유지.
+              if (e.key === "v" || e.key === "V") {
                 e.preventDefault();
                 setDetailMarkdown((v) => !v);
                 return;
@@ -844,6 +839,14 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
               <span className="claudeterm-pane-head-title">
                 {textView ? textView.title : `변경 상세 — ${selectedItem!.title || selectedItem!.kind}`}
               </span>
+              {/* 뷰모드↔원본 토글: 항상 표시(일관성) + 단축키 v. */}
+              <button
+                className="claudeterm-viewmode-btn"
+                title="뷰모드 ↔ 원본 (단축키 v)"
+                onClick={() => setDetailMarkdown((v) => !v)}
+              >
+                {detailMarkdown ? "원본 보기" : "뷰모드 보기"}
+              </button>
               <span
                 className="claudeterm-viewer-x"
                 title="닫기"
@@ -856,18 +859,10 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
                 ×
               </span>
             </div>
-            {/* Control row under the header: view/raw button + 1-line shortcut hint. */}
+            {/* Shortcut hint row. */}
             <div className="claudeterm-viewer-hint">
-              {detailIsPureContent && (
-                <button
-                  className="claudeterm-viewmode-btn"
-                  onClick={() => setDetailMarkdown((v) => !v)}
-                >
-                  {detailMarkdown ? "원본 보기" : "뷰모드 보기"}
-                </button>
-              )}
               <span className="claudeterm-viewer-hint-keys">
-                {detailIsPureContent ? "v 뷰/원본 · " : ""}Enter 코드블럭 · ←→ 가로 · Esc 복귀 · ↑↓ 스크롤 · Ctrl+←/→ 패널
+                v 뷰/원본 · Enter 코드블럭 · ←→ 가로 · Esc 복귀 · ↑↓ 스크롤 · Ctrl+←/→ 패널
               </span>
             </div>
             <div className="claudeterm-viewer-body">
