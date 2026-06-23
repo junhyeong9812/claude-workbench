@@ -14,6 +14,8 @@ import { FilePeekViewer } from "./components/FilePeekViewer";
 import { TerminalSettings } from "./components/TerminalSettings";
 import { StudyView } from "./components/StudyView";
 import { PopoutWorkbench } from "./components/PopoutWorkbench";
+import { WebviewWindow } from "@tauri-apps/api/webviewWindow";
+import { getAllWindows } from "@tauri-apps/api/window";
 import { useAppStore } from "./state/store";
 import "./App.css";
 
@@ -45,6 +47,39 @@ function AppMain() {
   useEffect(() => {
     void init();
   }, [init]);
+
+  // Reopen popout windows that were open at the last quit (multiwindow P2). Runs
+  // once on main-window startup; each reopened popout self-restores its layout
+  // (its own init() loads the active project, onReady → getPopoutLayout) and the
+  // panels recreate their sessions like the main window does. Genuinely-closed
+  // popouts were dropped from popoutLayouts so they don't come back.
+  const reopenedRef = useRef(false);
+  useEffect(() => {
+    if (reopenedRef.current) return;
+    reopenedRef.current = true;
+    const { popoutLayouts, popoutGeometry } = useAppStore.getState();
+    const labels = Object.keys(popoutLayouts);
+    if (labels.length === 0) return;
+    void (async () => {
+      let existing = new Set<string>();
+      try {
+        existing = new Set((await getAllWindows()).map((w) => w.label));
+      } catch {
+        /* enumerate failed — proceed; a duplicate label would just error out */
+      }
+      for (const label of labels) {
+        if (existing.has(label)) continue;
+        const geo = popoutGeometry[label];
+        new WebviewWindow(label, {
+          url: `${window.location.pathname}#popout=${label}`,
+          title: "Workbench",
+          width: geo?.width ?? 900,
+          height: geo?.height ?? 640,
+          ...(geo ? { x: geo.x, y: geo.y } : {}),
+        });
+      }
+    })();
+  }, []);
 
   // Follow cross-window project switches (multiwindow, review R0-4).
   useEffect(() => {

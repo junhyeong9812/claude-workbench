@@ -109,6 +109,100 @@ function loadTermColors(): Partial<ITheme> | null {
   return Object.keys(out).length > 0 ? (out as Partial<ITheme>) : null;
 }
 
+/** Persisted popout window geometry (logical px) so a reopened popout lands where
+ * it was (multiwindow P2). */
+export interface PopoutGeo {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+}
+
+/** Safe-parse the persisted popout layouts (`label -> projectPath -> dockview
+ * JSON`). Layouts are opaque blobs — validate only the nesting shape so a
+ * corrupt/old entry can't break startup (multiwindow P2). */
+function loadPopoutLayouts(): Record<string, Record<string, unknown>> {
+  try {
+    const v = JSON.parse(localStorage.getItem("popoutLayouts") || "null");
+    if (!v || typeof v !== "object" || Array.isArray(v)) return {};
+    const out: Record<string, Record<string, unknown>> = {};
+    for (const [label, byProj] of Object.entries(v as Record<string, unknown>)) {
+      if (byProj && typeof byProj === "object" && !Array.isArray(byProj)) {
+        out[label] = byProj as Record<string, unknown>;
+      }
+    }
+    return out;
+  } catch {
+    return {};
+  }
+}
+function savePopoutLayouts(m: Record<string, Record<string, unknown>>) {
+  try {
+    localStorage.setItem("popoutLayouts", JSON.stringify(m));
+  } catch {
+    /* quota / serialization — best-effort */
+  }
+}
+
+/** Safe-parse the persisted popout geometry, dropping non-finite / non-positive
+ * entries (multiwindow P2). */
+function loadPopoutGeometry(): Record<string, PopoutGeo> {
+  try {
+    const v = JSON.parse(localStorage.getItem("popoutGeometry") || "null");
+    if (!v || typeof v !== "object" || Array.isArray(v)) return {};
+    const num = (x: unknown): number | null =>
+      typeof x === "number" && Number.isFinite(x) ? x : null;
+    const out: Record<string, PopoutGeo> = {};
+    for (const [label, g] of Object.entries(v as Record<string, unknown>)) {
+      const o = (g ?? {}) as Record<string, unknown>;
+      const x = num(o.x);
+      const y = num(o.y);
+      const w = num(o.width);
+      const h = num(o.height);
+      if (x != null && y != null && w != null && h != null && w > 0 && h > 0) {
+        out[label] = { x, y, width: w, height: h };
+      }
+    }
+    return out;
+  } catch {
+    return {};
+  }
+}
+function savePopoutGeometry(m: Record<string, PopoutGeo>) {
+  try {
+    localStorage.setItem("popoutGeometry", JSON.stringify(m));
+  } catch {
+    /* quota — best-effort */
+  }
+}
+
+// Each window has its OWN Zustand store, but localStorage is shared. Writing the
+// whole in-memory map would let one popout clobber another popout's entry
+// (last-writer-wins — codex P2). So persistence is label-granular: re-read the
+// shared store, merge/delete just THIS label, write back (multiwindow P2).
+function persistPopoutLayout(label: string, byProject: Record<string, unknown>) {
+  const fresh = loadPopoutLayouts();
+  fresh[label] = byProject;
+  savePopoutLayouts(fresh);
+}
+function persistRemovePopout(label: string) {
+  const fresh = loadPopoutLayouts();
+  if (label in fresh) {
+    delete fresh[label];
+    savePopoutLayouts(fresh);
+  }
+  const freshGeo = loadPopoutGeometry();
+  if (label in freshGeo) {
+    delete freshGeo[label];
+    savePopoutGeometry(freshGeo);
+  }
+}
+function persistPopoutGeometry(label: string, geo: PopoutGeo) {
+  const fresh = loadPopoutGeometry();
+  fresh[label] = geo;
+  savePopoutGeometry(fresh);
+}
+
 /** A request to open a diff in the main area (file change or a commit). */
 export interface DiffSpec {
   title: string;
@@ -223,14 +317,21 @@ interface AppState {
   reloadActiveTree: () => Promise<void>;
   /** Save a project's dockview main-area layout (opaque JSON) and persist. */
   setLayout: (path: string, layout: unknown) => void;
-  /** In-memory dockview layouts for popout windows, per project (multiwindow
-   * swap — review R1-5/decision). `windowLabel -> projectPath -> layout`. NOT
-   * persisted (popouts don't survive restart; P4 may add reopen). */
+  /** Dockview layouts for popout windows, per project (multiwindow swap — review
+   * R1-5/decision). `windowLabel -> projectPath -> layout`. Persisted to
+   * localStorage so popouts reopen on restart (P2). */
   popoutLayouts: Record<string, Record<string, unknown>>;
-  /** Save a popout window's layout for a project. */
+  /** Save a popout window's layout for a project (persists). */
   setPopoutLayout: (windowLabel: string, project: string, layout: unknown) => void;
   /** Read a popout window's saved layout for a project (or null). */
   getPopoutLayout: (windowLabel: string, project: string) => unknown | null;
+  /** Drop a popout's persisted layout + geometry — a genuine close (user X /
+   * empty auto-close) must NOT reopen next launch (P2). */
+  removePopoutLayout: (windowLabel: string) => void;
+  /** Persisted popout window geometry (logical px) for restart reopen (P2). */
+  popoutGeometry: Record<string, PopoutGeo>;
+  /** Save a popout window's geometry (persists). */
+  setPopoutGeometry: (windowLabel: string, geo: PopoutGeo) => void;
   /** Move the folder-tree keyboard cursor. */
   setTreeCursor: (path: string | null) => void;
   /** Open/close the peek viewer on a file (null closes it). */
@@ -599,15 +700,31 @@ export const useAppStore = create<AppState>((set, get) => ({
     get().persist();
   },
 
-  popoutLayouts: {},
+  popoutLayouts: loadPopoutLayouts(),
   setPopoutLayout: (windowLabel, project, layout) =>
-    set((s) => ({
-      popoutLayouts: {
-        ...s.popoutLayouts,
-        [windowLabel]: { ...(s.popoutLayouts[windowLabel] ?? {}), [project]: layout },
-      },
-    })),
+    set((s) => {
+      const byProject = { ...(s.popoutLayouts[windowLabel] ?? {}), [project]: layout };
+      // Read-merge-write the shared store at label granularity (codex P2).
+      persistPopoutLayout(windowLabel, byProject);
+      return { popoutLayouts: { ...s.popoutLayouts, [windowLabel]: byProject } };
+    }),
   getPopoutLayout: (windowLabel, project) => get().popoutLayouts[windowLabel]?.[project] ?? null,
+  removePopoutLayout: (windowLabel) =>
+    set((s) => {
+      // Always drop from the shared store even if our in-memory map lacks it.
+      persistRemovePopout(windowLabel);
+      const next = { ...s.popoutLayouts };
+      delete next[windowLabel];
+      const nextGeo = { ...s.popoutGeometry };
+      delete nextGeo[windowLabel];
+      return { popoutLayouts: next, popoutGeometry: nextGeo };
+    }),
+  popoutGeometry: loadPopoutGeometry(),
+  setPopoutGeometry: (windowLabel, geo) =>
+    set((s) => {
+      persistPopoutGeometry(windowLabel, geo);
+      return { popoutGeometry: { ...s.popoutGeometry, [windowLabel]: geo } };
+    }),
 
   upsertConnection: (conn) => {
     set((s) => {
