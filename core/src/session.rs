@@ -289,6 +289,15 @@ impl SessionManager {
 
     /// Write bytes (keystrokes) to the PTY. Errors if the session is unknown or
     /// dead — never panics (spec invariant ④).
+    /// True if a session with this id exists and is still alive (multiwindow
+    /// mirror needs to know a 2nd window can attach to a running PTY).
+    pub fn exists(&self, id: SessionId) -> bool {
+        self.sessions
+            .lock()
+            .map(|m| m.get(&id).is_some_and(|s| s.shared.alive.load(Ordering::SeqCst)))
+            .unwrap_or(false)
+    }
+
     pub fn write(&self, id: SessionId, data: &[u8]) -> Result<(), String> {
         let mut map = self.sessions.lock().unwrap();
         let s = map.get_mut(&id).ok_or("no such session")?;

@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 
 use core_lib::{DirEntry, ProjectType, SessionManager, TimelineItem, TokenUsage, WorkspaceState};
 use serde::Serialize;
-use tauri::{AppHandle, Emitter, Manager, State};
+use tauri::{AppHandle, Emitter, Manager, State, Window};
 
 /// A single, consistent error type shared by all commands.
 #[derive(Debug, Serialize)]
@@ -496,19 +496,66 @@ pub fn scrollback_set_enabled(state: State<'_, ScrollbackState>, enabled: bool) 
 // (the `terminal-output` event, exactly like `terminal_create`) and spawns a
 // polling thread that drives a `SessionTail` and emits `claude-timeline` events.
 
-/// Managed state: the stop flag for each Claude session's polling thread, keyed
-/// by the PTY session id. Setting it (on `claude_close`) ends the thread.
-#[derive(Default)]
-pub struct ClaudeState {
-    polls: Mutex<HashMap<u64, Arc<AtomicBool>>>,
+/// One live Claude session shared across windows (multiwindow mirror, P6). A
+/// session is ONE PTY (`id`) + JSONL (`uuid`); multiple windows can render it,
+/// but only the `driver` window may type into it (single-writer). `attached` is
+/// the windows currently viewing, in attach order — when the driver detaches,
+/// the next in order takes over. `rev` monotonically tags driver changes so the
+/// frontend can drop stale `claude-driver-changed` events.
+struct Sess {
+    project: String,
+    uuid: String,
+    attached: Vec<String>,
+    driver: String,
+    rev: u64,
+    /// Poll-thread stop flag (set on real close / PTY death).
+    stop: Arc<AtomicBool>,
 }
 
-/// Returned by `claude_start`: the PTY session id (used by the panel for output
-/// filtering, input, and close) and the Claude session UUID we generated.
+/// All live Claude sessions, behind ONE lock so `live`/`by_id` never tear
+/// (review R7-3). Mutations + the *actions* to run after unlocking (PTY remove,
+/// event emit) are computed under the lock; the side effects run after release.
+#[derive(Default)]
+struct ClaudeRuntime {
+    /// (project, uuid) -> live PTY id, so a 2nd window finds the running session.
+    live: HashMap<(String, String), u64>,
+    /// PTY id -> session.
+    by_id: HashMap<u64, Sess>,
+}
+
+/// Managed state: all live Claude sessions (single lock).
+#[derive(Default)]
+pub struct ClaudeState {
+    rt: Mutex<ClaudeRuntime>,
+}
+
+/// Result of opening a Claude session: whether we attached to an already-running
+/// PTY (mirror) or started a fresh one (driver), plus the current driver/rev.
 #[derive(Serialize)]
-pub struct ClaudeStarted {
+pub struct ClaudeOpened {
     id: u64,
     session_uuid: String,
+    /// "driver" (we started it / first viewer) or "mirror" (read-only viewer).
+    role: String,
+    driver: String,
+    rev: u64,
+}
+
+/// Broadcast on `claude-driver-changed` + returned by driver-changing commands.
+#[derive(Clone, Serialize)]
+pub struct ClaudeDriver {
+    id: u64,
+    driver: String,
+    rev: u64,
+}
+
+/// Result of `claude_detach`: whether the PTY was actually closed (last viewer)
+/// and the resulting driver/rev.
+#[derive(Serialize)]
+pub struct ClaudeDetached {
+    closed: bool,
+    driver: String,
+    rev: u64,
 }
 
 /// The full timeline snapshot for a Claude session, emitted as `claude-timeline`
@@ -542,32 +589,25 @@ fn new_session_uuid() -> Result<String, AppError> {
 
 /// Spawn the real `claude` CLI in a PTY rooted at `cwd` and start (a) relaying
 /// its output to `terminal-output` (xterm) and (b) tailing its session JSONL to
-/// emit `claude-timeline` items. `resume` continues an existing session by its
-/// UUID (same file, append); omitting it starts a new `--session-id` session.
-#[tauri::command]
-#[allow(clippy::too_many_arguments)] // Tauri injects State + the panel's params
-pub fn claude_start(
-    app: AppHandle,
-    mgr: State<'_, SessionManager>,
-    claude: State<'_, ClaudeState>,
-    cwd: Option<String>,
+/// emit `claude-timeline` items. Does NOT register into `ClaudeRuntime` — the
+/// caller does that under its lock. `resume` continues an existing session by
+/// UUID; None starts a fresh `--session-id`. Returns (id, uuid, poll-stop flag).
+fn spawn_claude(
+    app: &AppHandle,
+    mgr: &SessionManager,
+    cwd: String,
     resume: Option<String>,
-    name: Option<String>,
+    name: String,
     cols: u16,
     rows: u16,
-) -> Result<ClaudeStarted, AppError> {
-    // Claude must be rooted at the project; refuse rather than guess.
-    let cwd = cwd.ok_or_else(|| AppError::new("Claude requires an active project"))?;
-    // Resume reuses the original id (same JSONL file); a new session gets a
-    // fresh UUID we pass via --session-id (so we know exactly which file to tail).
+) -> Result<(u64, String, Arc<AtomicBool>), AppError> {
     let session_uuid = match &resume {
         Some(u) => u.clone(),
         None => new_session_uuid()?,
     };
-    // Resume only if the session's transcript already exists. An empty/never-used
-    // session has no JSONL yet, so `--resume` would fail and spawn a *different*
-    // new session — in that case create with this exact id via `--session-id` so
-    // the id stays stable across restarts (e.g. the study session before any chat).
+    // Resume only if the transcript already exists; otherwise `--resume` would
+    // fork a *different* new session, so create with this exact id via
+    // `--session-id` (keeps the id stable across restarts).
     let resuming = resume.is_some()
         && core_lib::jsonl::claude_projects_root()
             .and_then(|root| core_lib::jsonl::find_session_jsonl(&root, &session_uuid).ok().flatten())
@@ -579,18 +619,11 @@ pub fn claude_start(
         .create(Some(cmd), Some(cwd.clone()), cols, rows)
         .map_err(AppError::new)?;
     let rx = mgr.subscribe(id).map_err(AppError::new)?;
-
     let stop = Arc::new(AtomicBool::new(false));
-    claude
-        .polls
-        .lock()
-        .map_err(|_| AppError::new("Claude state unavailable"))?
-        .insert(id, stop.clone());
 
-    // (a) Relay PTY output -> webview, like `terminal_create`. When the PTY dies
-    // (claude exits on its own, or failed to start), the sender drops and this
-    // loop ends — we then set `stop` so the poll thread doesn't tail forever
-    // (codex B-2b #1).
+    // (a) Relay PTY output -> webview (global emit; every attached window filters
+    // by id). When the PTY dies the sender drops, the loop ends, and `stop` is
+    // set so the poll thread stops tailing.
     {
         let app = app.clone();
         let stop = stop.clone();
@@ -598,27 +631,242 @@ pub fn claude_start(
             while let Ok(chunk) = rx.recv() {
                 let _ = app.emit(
                     "terminal-output",
-                    TerminalOutput {
-                        session_id: id,
-                        seq: chunk.seq,
-                        data: chunk.bytes,
-                    },
+                    TerminalOutput { session_id: id, seq: chunk.seq, data: chunk.bytes },
                 );
             }
             stop.store(true, Ordering::Relaxed);
         });
     }
-
-    // (b) Tail the session JSONL -> emit timeline items + persist snapshot.
+    // (b) Tail the JSONL -> claude-timeline + persist snapshot.
     {
         let app = app.clone();
-        let cwd = cwd.clone();
         let uuid = session_uuid.clone();
-        let name = name.unwrap_or_else(|| "Claude".to_string());
+        let stop = stop.clone();
         thread::spawn(move || run_timeline_poll(app, id, cwd, uuid, name, stop));
     }
+    Ok((id, session_uuid, stop))
+}
 
-    Ok(ClaudeStarted { id, session_uuid })
+/// Open a Claude session for THIS window: if its PTY is already live (another
+/// window started it), attach as a read-only **mirror**; otherwise start a fresh
+/// PTY and become the **driver**. Atomic under the runtime lock so two windows
+/// can't both start the same session (review R7-2/R7-3). `uuid` None = brand new.
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+pub fn claude_open_or_attach(
+    window: Window,
+    app: AppHandle,
+    mgr: State<'_, SessionManager>,
+    claude: State<'_, ClaudeState>,
+    project: String,
+    uuid: Option<String>,
+    cwd: Option<String>,
+    name: Option<String>,
+    cols: u16,
+    rows: u16,
+) -> Result<ClaudeOpened, AppError> {
+    let label = window.label().to_string();
+    let cwd = cwd.ok_or_else(|| AppError::new("Claude requires an active project"))?;
+    let mut rt = claude.rt.lock().map_err(|_| AppError::new("Claude state unavailable"))?;
+
+    // Mirror: attach to the running PTY if this uuid is live.
+    if let Some(u) = &uuid {
+        let key = (project.clone(), u.clone());
+        if let Some(&id) = rt.live.get(&key) {
+            if mgr.exists(id) {
+                if let Some(sess) = rt.by_id.get_mut(&id) {
+                    if !sess.attached.contains(&label) {
+                        sess.attached.push(label.clone());
+                    }
+                    return Ok(ClaudeOpened {
+                        id,
+                        session_uuid: u.clone(),
+                        role: "mirror".into(),
+                        driver: sess.driver.clone(),
+                        rev: sess.rev,
+                    });
+                }
+            }
+            rt.live.remove(&key); // stale (PTY gone) — fall through to start
+        }
+    }
+
+    // Driver: start a fresh PTY (lock held so a concurrent open can't double-start).
+    let (id, session_uuid, stop) = spawn_claude(
+        &app,
+        &mgr,
+        cwd,
+        uuid,
+        name.unwrap_or_else(|| "Claude".to_string()),
+        cols,
+        rows,
+    )?;
+    rt.live.insert((project.clone(), session_uuid.clone()), id);
+    rt.by_id.insert(
+        id,
+        Sess {
+            project,
+            uuid: session_uuid.clone(),
+            attached: vec![label.clone()],
+            driver: label.clone(),
+            rev: 0,
+            stop,
+        },
+    );
+    Ok(ClaudeOpened { id, session_uuid, role: "driver".into(), driver: label, rev: 0 })
+}
+
+/// Driver-only input: write to the PTY only if `window` is the session's current
+/// driver (single-writer — a mirror's stray input is a silent no-op, review
+/// R7-1). Claude panels call this instead of `terminal_write`.
+#[tauri::command]
+pub fn claude_write(
+    window: Window,
+    mgr: State<'_, SessionManager>,
+    claude: State<'_, ClaudeState>,
+    id: u64,
+    data: Vec<u8>,
+) -> Result<(), AppError> {
+    let is_driver = {
+        let rt = claude.rt.lock().map_err(|_| AppError::new("Claude state unavailable"))?;
+        rt.by_id.get(&id).map(|s| s.driver == window.label()).unwrap_or(false)
+    };
+    if is_driver {
+        mgr.write(id, &data).map_err(AppError::new)
+    } else {
+        Ok(()) // not the driver — ignore
+    }
+}
+
+/// Driver-only resize (the PTY size is shared; only the driver drives it).
+#[tauri::command]
+pub fn claude_resize(
+    window: Window,
+    mgr: State<'_, SessionManager>,
+    claude: State<'_, ClaudeState>,
+    id: u64,
+    cols: u16,
+    rows: u16,
+) -> Result<(), AppError> {
+    let is_driver = {
+        let rt = claude.rt.lock().map_err(|_| AppError::new("Claude state unavailable"))?;
+        rt.by_id.get(&id).map(|s| s.driver == window.label()).unwrap_or(false)
+    };
+    if is_driver {
+        mgr.resize(id, cols, rows).map_err(AppError::new)
+    } else {
+        Ok(())
+    }
+}
+
+/// Take over input control of a session (mirror → driver). No-op if `window`
+/// isn't attached. Bumps `rev` and broadcasts `claude-driver-changed` so every
+/// window locks/unlocks accordingly (review R7-4).
+#[tauri::command]
+pub fn claude_set_driver(
+    window: Window,
+    app: AppHandle,
+    claude: State<'_, ClaudeState>,
+    id: u64,
+) -> Result<ClaudeDriver, AppError> {
+    let label = window.label().to_string();
+    let changed = {
+        let mut rt = claude.rt.lock().map_err(|_| AppError::new("Claude state unavailable"))?;
+        match rt.by_id.get_mut(&id) {
+            Some(s) if s.attached.contains(&label) && s.driver != label => {
+                s.driver = label.clone();
+                s.rev += 1;
+                Some((s.driver.clone(), s.rev))
+            }
+            Some(s) => Some((s.driver.clone(), s.rev)), // already driver / not attached
+            None => None,
+        }
+    };
+    match changed {
+        Some((driver, rev)) => {
+            if driver == label {
+                let _ = app.emit("claude-driver-changed", ClaudeDriver { id, driver: driver.clone(), rev });
+            }
+            Ok(ClaudeDriver { id, driver, rev })
+        }
+        None => Err(AppError::new("no such session")),
+    }
+}
+
+/// `window` stops viewing session `id`. Removes it from `attached`; when
+/// `close_if_last` and no viewers remain, really closes the PTY (refcount). If
+/// the leaver was the driver and viewers remain, the next-in-order takes over
+/// (broadcast). Claude panels call this instead of `claude_close` (review R7-5/7).
+#[tauri::command]
+pub fn claude_detach(
+    window: Window,
+    app: AppHandle,
+    mgr: State<'_, SessionManager>,
+    claude: State<'_, ClaudeState>,
+    id: u64,
+    close_if_last: bool,
+) -> Result<ClaudeDetached, AppError> {
+    let label = window.label().to_string();
+    enum Act {
+        None,
+        Close(Arc<AtomicBool>),
+        Handoff(String, u64),
+    }
+    let (act, driver, rev) = {
+        let mut rt = claude.rt.lock().map_err(|_| AppError::new("Claude state unavailable"))?;
+        let Some(sess) = rt.by_id.get_mut(&id) else {
+            return Ok(ClaudeDetached { closed: false, driver: String::new(), rev: 0 });
+        };
+        sess.attached.retain(|l| l != &label);
+        if sess.attached.is_empty() {
+            if close_if_last {
+                let key = (sess.project.clone(), sess.uuid.clone());
+                let stop = sess.stop.clone();
+                rt.by_id.remove(&id);
+                rt.live.remove(&key);
+                (Act::Close(stop), String::new(), 0)
+            } else {
+                // Transfer in progress: keep the PTY (target will attach); leave
+                // driver as-is (target will set_driver).
+                (Act::None, sess.driver.clone(), sess.rev)
+            }
+        } else if sess.driver == label {
+            sess.driver = sess.attached[0].clone();
+            sess.rev += 1;
+            (Act::Handoff(sess.driver.clone(), sess.rev), sess.driver.clone(), sess.rev)
+        } else {
+            (Act::None, sess.driver.clone(), sess.rev)
+        }
+    };
+    match act {
+        Act::Close(stop) => {
+            stop.store(true, Ordering::Relaxed);
+            mgr.remove(id).map_err(AppError::new)?;
+            Ok(ClaudeDetached { closed: true, driver, rev })
+        }
+        Act::Handoff(d, r) => {
+            let _ = app.emit("claude-driver-changed", ClaudeDriver { id, driver: d, rev: r });
+            Ok(ClaudeDetached { closed: false, driver, rev })
+        }
+        Act::None => Ok(ClaudeDetached { closed: false, driver, rev }),
+    }
+}
+
+/// UUIDs of sessions currently live (any window) in `project` — lets the picker
+/// mark "running in another window — open as mirror".
+#[tauri::command]
+pub fn claude_live_uuids(claude: State<'_, ClaudeState>, project: String) -> Vec<String> {
+    claude
+        .rt
+        .lock()
+        .map(|rt| {
+            rt.by_id
+                .values()
+                .filter(|s| s.project == project)
+                .map(|s| s.uuid.clone())
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// The polling loop for one Claude session (its own thread). Waits for the
@@ -810,10 +1058,13 @@ fn run_timeline_poll(
         }
     }
 
-    // Drop our stop-flag entry so a later id collision can't see a stale flag.
+    // The PTY died on its own (claude exited) — drop the runtime entry so a later
+    // id collision can't see stale live/driver state (review R7-3 cleanup).
     if let Some(state) = app.try_state::<ClaudeState>() {
-        if let Ok(mut polls) = state.polls.lock() {
-            polls.remove(&id);
+        if let Ok(mut rt) = state.rt.lock() {
+            if let Some(sess) = rt.by_id.remove(&id) {
+                rt.live.remove(&(sess.project, sess.uuid));
+            }
         }
     }
 }
@@ -1119,18 +1370,25 @@ pub fn claude_delete(app: AppHandle, project: String, uuid: String) -> Result<()
         .map_err(|e| AppError::new(io_message("Cannot delete session", &e)))
 }
 
-/// Close a Claude session: stop its polling thread and kill the PTY (which ends
-/// the output relay). The persisted timeline is kept (the `닫기` action).
+/// Force-close a Claude session regardless of viewers: stop the poll thread and
+/// kill the PTY (every attached window's relay ends). Used by "삭제" and as a
+/// hard close; the normal per-window close is `claude_detach` (refcount). The
+/// persisted timeline is kept unless separately deleted.
 #[tauri::command]
 pub fn claude_close(
     mgr: State<'_, SessionManager>,
     claude: State<'_, ClaudeState>,
     id: u64,
 ) -> Result<(), AppError> {
-    if let Ok(mut polls) = claude.polls.lock() {
-        if let Some(stop) = polls.remove(&id) {
-            stop.store(true, Ordering::Relaxed);
-        }
+    let stop = {
+        let mut rt = claude.rt.lock().map_err(|_| AppError::new("Claude state unavailable"))?;
+        rt.by_id.remove(&id).map(|s| {
+            rt.live.remove(&(s.project.clone(), s.uuid.clone()));
+            s.stop
+        })
+    };
+    if let Some(stop) = stop {
+        stop.store(true, Ordering::Relaxed);
     }
     mgr.remove(id).map_err(AppError::new)
 }
