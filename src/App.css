@@ -2608,3 +2608,26 @@ body {
   word-break: break-all;
   color: var(--fg);
 }
+
+/* Drop-target highlight: shown on the window that will receive a cross-window tab
+   drop (multiwindow backlog ①). Click-through so it never blocks the drag. */
+.drop-target-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 9999;
+  pointer-events: none;
+  border: 3px solid var(--accent);
+  background: color-mix(in srgb, var(--accent) 12%, transparent);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.drop-target-overlay-label {
+  background: var(--accent);
+  color: #ffffff;
+  padding: 8px 18px;
+  border-radius: 6px;
+  font-size: 14px;
+  font-weight: 600;
+  box-shadow: 0 2px 12px rgba(0, 0, 0, 0.4);
+}

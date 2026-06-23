@@ -14,6 +14,7 @@ import { isTransferring } from "../state/panelTransfer";
 import { closePanelSession, sessionsInLayout } from "../state/panelSession";
 import { installDragOut, hasInFlight } from "../state/windowTransfer";
 import { installTransferTarget } from "../state/panelTransferTarget";
+import { DropTargetOverlay } from "./DropTargetOverlay";
 import { components, AppTab } from "./panelRegistry";
 
 const AUTOCLOSE_DEBOUNCE_MS = 1500;
@@ -266,6 +267,7 @@ export function PopoutWorkbench() {
 
   return (
     <div className="popout-workbench" style={{ display: "flex", flexDirection: "column", height: "100vh" }}>
+      <DropTargetOverlay />
       <div className="toolbar">
         <span className="toolbar-title" title="공유 활성 프로젝트">
           🪟 {activeProject ?? "(프로젝트 없음)"}

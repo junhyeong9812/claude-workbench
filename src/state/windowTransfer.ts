@@ -263,25 +263,33 @@ async function appWindowBounds(): Promise<{ label: string; l: number; t: number;
   return out;
 }
 
-/** Label of the app window containing the PHYSICAL-pixel point, or null (desktop).
- * When windows overlap, the most-recently-focused match wins (topmost ≈ last
- * focused); smallest area breaks a tie between equally-ranked windows (review
- * backlog ②/③). */
+type WinBounds = { label: string; l: number; t: number; r: number; b: number };
+
+/** Pure pick: label of the window containing the PHYSICAL point over a known
+ * bounds set, or null (desktop). When windows overlap, the most-recently-focused
+ * match wins (topmost ≈ last focused); smallest area breaks an equal-rank tie
+ * (review backlog ②/③). Sync so the drag preview can reuse a cached snapshot
+ * without per-move IPC (review backlog ①). */
+function pickWindow(bounds: WinBounds[], physX: number, physY: number): string | null {
+  if (!Number.isFinite(physX) || !Number.isFinite(physY)) return null;
+  let best: { label: string; rank: number; area: number } | null = null;
+  for (const b of bounds) {
+    if (physX >= b.l && physX <= b.r && physY >= b.t && physY <= b.b) {
+      const rank = focusRank(b.label);
+      const area = (b.r - b.l) * (b.b - b.t);
+      if (!best || rank < best.rank || (rank === best.rank && area < best.area)) {
+        best = { label: b.label, rank, area };
+      }
+    }
+  }
+  return best?.label ?? null;
+}
+
+/** Label of the app window containing the PHYSICAL-pixel point, or null (desktop). */
 async function windowAtPoint(physX: number, physY: number): Promise<string | null> {
   if (!Number.isFinite(physX) || !Number.isFinite(physY)) return null;
   try {
-    const bounds = await appWindowBounds();
-    let best: { label: string; rank: number; area: number } | null = null;
-    for (const b of bounds) {
-      if (physX >= b.l && physX <= b.r && physY >= b.t && physY <= b.b) {
-        const rank = focusRank(b.label);
-        const area = (b.r - b.l) * (b.b - b.t);
-        if (!best || rank < best.rank || (rank === best.rank && area < best.area)) {
-          best = { label: b.label, rank, area };
-        }
-      }
-    }
-    return best?.label ?? null;
+    return pickWindow(await appWindowBounds(), physX, physY);
   } catch (err) {
     // Enumeration failed (e.g. a missing window permission) — fall back to
     // "desktop" so a drop-out still pops a new window rather than no-op.
@@ -342,12 +350,35 @@ export function installDragOut(api: DockviewApi): { dispose: () => void } {
     ac?.abort();
     ac = new AbortController();
     const { signal } = ac;
+    const selfLabel = getCurrentWindow().label;
     let last: { x: number; y: number } | null = null;
+    // Snapshot window bounds + source DPR once at drag start so the live preview
+    // can pick the hovered window each move WITHOUT per-move IPC — windows don't
+    // move during a tab drag (review backlog ①).
+    let snapBounds: WinBounds[] | null = null;
+    let snapScale = 1;
+    let lastTarget: string | null | undefined = undefined;
+    void appWindowBounds()
+      .then((b) => (snapBounds = b))
+      .catch(() => {});
+    void getCurrentWindow()
+      .scaleFactor()
+      .then((s) => (snapScale = s))
+      .catch(() => {});
     window.addEventListener(
       "dragover",
       (ev: DragEvent) => {
         if (Number.isFinite(ev.screenX) && (ev.screenX !== 0 || ev.screenY !== 0)) {
           last = { x: ev.screenX, y: ev.screenY };
+        }
+        // Drive the target window's drop indicator (review backlog ①). Preview
+        // uses the cheap screenX*DPR estimate; the actual drop still routes via
+        // the precise cursorPosition() at dragend.
+        if (!snapBounds || !last) return;
+        const target = pickWindow(snapBounds, last.x * snapScale, last.y * snapScale);
+        if (target !== lastTarget) {
+          lastTarget = target;
+          void emit("mt://drop-target", { source: selfLabel, target });
         }
       },
       { capture: true, signal },
@@ -356,6 +387,7 @@ export function installDragOut(api: DockviewApi): { dispose: () => void } {
       "dragend",
       (ev: DragEvent) => {
         ac?.abort();
+        void emit("mt://drop-end", { source: selfLabel });
         void (async () => {
           // Prefer the OS global cursor (physical px) — accurate across mixed-scale
           // monitors. Fall back to the last credible CSS screen point, scaled to
