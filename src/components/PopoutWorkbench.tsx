@@ -12,23 +12,27 @@ import { useAppStore } from "../state/store";
 import { useClaudeUi } from "../state/claudeUi";
 import { isTransferring } from "../state/panelTransfer";
 import { closePanelSession, sessionsInLayout } from "../state/panelSession";
-import type { TransferEnvelope } from "../state/windowTransfer";
+import { installDragOut, hasInFlight } from "../state/windowTransfer";
+import { installTransferTarget } from "../state/panelTransferTarget";
 import { components, AppTab } from "./panelRegistry";
+
+const AUTOCLOSE_DEBOUNCE_MS = 1500;
 
 /**
  * Root of a popped-out panel window (`#popout` hash). A minimal workbench: a
  * thin toolbar showing the cross-window-synced active project, over a dockview
- * that holds the panels transferred into this window.
+ * that holds the panels docked into this window.
  *
- * Per the "전 창 같이 swap" decision the dockview IS keyed by the active project
- * (like the main window): switching the shared project remounts it and restores
- * that project's layout for THIS window (in-memory `popoutLayouts`, review R1-5).
- * Panels detach on switch (sessions survive) and re-attach on return.
+ * Docking works in every direction (review P4): this window both RECEIVES
+ * panels (installTransferTarget) and lets its own tabs be dragged out to other
+ * windows or the desktop (installDragOut). The dockview is keyed by the active
+ * project (like the main window) so a project switch swaps it.
  *
- * Lifecycle: a transferred panel re-creates with the same backend session
- * (params.sessionId → snapshot re-attach). Closing this window closes every
- * session it owns — current panels AND ones detached into other projects'
- * layouts (review R1-5/R1-7) — so nothing leaks.
+ * Lifecycle: a transferred panel re-creates with the same backend session.
+ * Closing this window closes every session it owns — current panels AND ones
+ * detached into other projects' layouts (review R1-5/R1-7). When its last panel
+ * is dragged away it auto-closes, but only once no transfer is in flight so a
+ * rejected move can be re-inserted first (review R4-4).
  */
 export function PopoutWorkbench() {
   const label = getCurrentWindow().label;
@@ -39,15 +43,37 @@ export function PopoutWorkbench() {
 
   const apiRef = useRef<DockviewApi | null>(null);
   const dockDisposablesRef = useRef<Array<{ dispose: () => void }>>([]);
+  const processedRef = useRef<Set<string>>(new Set());
+  const everHadPanelRef = useRef(false);
+  const autoCloseTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [apiReady, setApiReady] = useState(false);
   const [listenerReady, setListenerReady] = useState(false);
   const announcedRef = useRef(false);
-  const processedRef = useRef<Set<string>>(new Set());
 
   // Claude 닫기/삭제 modal — each window has its own useClaudeUi instance, so the
   // popout must handle its own Claude tab × (review R1-6).
   const closeRequest = useClaudeUi((s) => s.closeRequest);
   const clearClose = useClaudeUi((s) => s.clearClose);
+
+  // Close every session this window owns (current panels + ones detached into
+  // other projects' saved layouts) — review R1-5/R1-7.
+  const closeOwnedSessions = async () => {
+    const seen = new Set<number>();
+    const tasks: Promise<void>[] = [];
+    const add = (params: { kind?: unknown; sessionId?: unknown } | undefined) => {
+      const sid = params?.sessionId;
+      if (typeof sid === "number" && !seen.has(sid)) {
+        seen.add(sid);
+        tasks.push(closePanelSession(params));
+      }
+    };
+    for (const p of apiRef.current?.panels ?? []) add(p.params as never);
+    const layouts = useAppStore.getState().popoutLayouts[label] ?? {};
+    for (const layout of Object.values(layouts)) {
+      for (const s of sessionsInLayout(layout)) add({ kind: s.kind, sessionId: s.sessionId });
+    }
+    await Promise.all(tasks);
+  };
 
   // Load the workspace (for the synced active project) + follow cross-window
   // project switches (review R0-4).
@@ -67,38 +93,18 @@ export function PopoutWorkbench() {
   }, [theme]);
 
   // Dispose dock listeners on unmount (window close).
-  useEffect(() => () => dockDisposablesRef.current.forEach((d) => d.dispose()), []);
+  useEffect(
+    () => () => {
+      dockDisposablesRef.current.forEach((d) => d.dispose());
+      if (autoCloseTimerRef.current) clearTimeout(autoCloseTimerRef.current);
+    },
+    [],
+  );
 
-  // Receive a transferred panel and re-create it with the same backend session.
-  // Acknowledge accept/reject so the source can recover a failed add instead of
-  // losing the panel (review P2-impl #3); only mark processed on success.
+  // Receive panels docked INTO this window (shared with the main window).
   useEffect(() => {
     let un: (() => void) | undefined;
-    listen<TransferEnvelope>("panel-transfer", (e) => {
-      const env = e.payload;
-      if (env.targetLabel !== label) return; // addressed to another window
-      if (processedRef.current.has(env.transferId)) return; // de-dup late delivery
-      const api = apiRef.current;
-      // Only accept if we're on the panel's project — our dockview is keyed by
-      // project, so a mismatch would attach it under the wrong layout (#2).
-      const sameProject = env.project === useAppStore.getState().activeProject;
-      let ok = false;
-      if (api && sameProject) {
-        try {
-          api.addPanel({
-            id: env.panel.id,
-            component: env.panel.component,
-            title: env.panel.title,
-            params: env.panel.params,
-          });
-          ok = true;
-        } catch (err) {
-          console.error("[popout] addPanel failed", err);
-        }
-      }
-      if (ok) processedRef.current.add(env.transferId);
-      void emit("transfer-result", { transferId: env.transferId, ok });
-    })
+    installTransferTarget(label, () => apiRef.current, processedRef.current)
       .then((f) => {
         un = f;
         setListenerReady(true);
@@ -108,41 +114,64 @@ export function PopoutWorkbench() {
   }, [label]);
 
   // Announce readiness AFTER the dock + transfer listener are up AND the project
-  // has settled — so the source detaches only into a window that can accept the
-  // panel, and the transfer's project matches ours (review R1-4).
+  // has settled, so the source detaches only into a window that can accept the
+  // panel and the transfer's project matches ours (review R1-4).
   useEffect(() => {
     if (announcedRef.current || !apiReady || !listenerReady || !activeProject) return;
     announcedRef.current = true;
     emit("popout-ready", { label, project: activeProject }).catch(() => {});
   }, [apiReady, listenerReady, activeProject, label]);
 
-  // Close every session this window owns before it is destroyed (review R1-7).
+  // Close-by-X: tear down owned sessions, then destroy (review R1-7).
   useEffect(() => {
     const win = getCurrentWindow();
     const unP = win.onCloseRequested(async (event) => {
       event.preventDefault();
-      const seen = new Set<number>();
-      const tasks: Promise<void>[] = [];
-      const add = (params: { kind?: unknown; sessionId?: unknown } | undefined) => {
-        const sid = params?.sessionId;
-        if (typeof sid === "number" && !seen.has(sid)) {
-          seen.add(sid);
-          tasks.push(closePanelSession(params));
-        }
-      };
-      // Current panels + sessions detached into other projects' saved layouts.
-      for (const p of apiRef.current?.panels ?? []) add(p.params as never);
-      const layouts = useAppStore.getState().popoutLayouts[label] ?? {};
-      for (const layout of Object.values(layouts)) {
-        for (const s of sessionsInLayout(layout)) add({ kind: s.kind, sessionId: s.sessionId });
-      }
-      await Promise.all(tasks);
+      await closeOwnedSessions();
       await win.destroy();
     });
     return () => {
       void unP.then((f) => f());
     };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [label]);
+
+  // Main-window shutdown: close our sessions, then ACK so main only destroys us
+  // after teardown actually ran (no 250ms race — review P4-impl #2).
+  useEffect(() => {
+    let un: (() => void) | undefined;
+    listen("app-shutdown", async () => {
+      await closeOwnedSessions();
+      void emit("app-shutdown-ack", { label });
+    })
+      .then((f) => {
+        un = f;
+      })
+      .catch(() => {});
+    return () => un?.();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [label]);
+
+  // Auto-close once this window's last panel is dragged away — but only in a
+  // stable empty state (no transfer in flight), debounced, and only if it ever
+  // held a panel, so a brand-new window or a mid-transfer reject can't trigger a
+  // close that loses a panel (review R4-4).
+  const maybeAutoClose = () => {
+    if (autoCloseTimerRef.current) clearTimeout(autoCloseTimerRef.current);
+    autoCloseTimerRef.current = setTimeout(() => {
+      autoCloseTimerRef.current = null;
+      const empty = (apiRef.current?.panels.length ?? 0) === 0;
+      if (!everHadPanelRef.current || !empty) return;
+      // A move is still settling — re-evaluate after it resolves so a rejected
+      // last-tab move (re-inserted) doesn't get the window closed, and a
+      // successful one still closes it (review P4-impl #3).
+      if (hasInFlight()) {
+        maybeAutoClose();
+        return;
+      }
+      void getCurrentWindow().close();
+    }, AUTOCLOSE_DEBOUNCE_MS);
+  };
 
   const onReady = (event: DockviewReadyEvent) => {
     const api = event.api;
@@ -159,18 +188,23 @@ export function PopoutWorkbench() {
         }
       }
     }
-    // Dispose any listeners from a previous mount (project-keyed remount) so a
-    // stale dock can't save the wrong project's layout (review P2-impl #4).
+    if (api.panels.length > 0) everHadPanelRef.current = true;
+    // Dispose listeners from a previous mount (project-keyed remount) so a stale
+    // dock can't save the wrong project's layout (review P2-impl #4).
     for (const d of dockDisposablesRef.current) d.dispose();
     dockDisposablesRef.current = [
+      installDragOut(api),
+      api.onDidAddPanel(() => {
+        everHadPanelRef.current = true;
+      }),
       api.onDidLayoutChange(() => {
         const p = useAppStore.getState().activeProject;
         if (p) useAppStore.getState().setPopoutLayout(label, p, api.toJSON());
       }),
       api.onDidRemovePanel((panel) => {
         // A transfer-out detaches (session survives); a real tab close ends it.
-        if (isTransferring(panel.id)) return;
-        void closePanelSession(panel.params as never);
+        if (!isTransferring(panel.id)) void closePanelSession(panel.params as never);
+        if (api.panels.length === 0) maybeAutoClose();
       }),
     ];
     setApiReady(true);

@@ -6,14 +6,15 @@ import {
 } from "dockview-react";
 import "dockview-react/dist/styles/dockview.css";
 import { invoke } from "@tauri-apps/api/core";
-import { listen } from "@tauri-apps/api/event";
+import { emit, listen } from "@tauri-apps/api/event";
 import { useAppStore } from "../state/store";
 import { useClaudeUi } from "../state/claudeUi";
 import { recallArea, forgetArea, type PanelArea } from "../state/panelFocus";
 import { isTransferring } from "../state/panelTransfer";
-import { movePanelToNewWindow } from "../state/windowTransfer";
-import { isOutsideCurrentWindow } from "../state/dropOut";
+import { installDragOut, movePanelToNewWindow } from "../state/windowTransfer";
+import { installTransferTarget } from "../state/panelTransferTarget";
 import { components, AppTab, type PanelKind } from "./panelRegistry";
+import { getAllWindows, getCurrentWindow } from "@tauri-apps/api/window";
 import { fileName } from "./cmLang";
 
 /** A saved session normalized for the reopen picker (ACP `claude` or A
@@ -120,8 +121,9 @@ export function MainArea() {
   // Drop-out gesture (P3): one AbortController per in-progress tab drag bounds
   // the dragover/dragend listeners, and the onWillDragPanel subscription is
   // disposed on unmount — no stale listener can fire a late popout (review P3 #1).
-  const dragAbortRef = useRef<AbortController | null>(null);
   const dragSubRef = useRef<{ dispose: () => void } | null>(null);
+  // De-dup set for panels docked INTO the main window from other windows (P4).
+  const transferProcessedRef = useRef<Set<string>>(new Set());
   // Monotonic per-mount counter for human-friendly panel titles.
   const counterRef = useRef(0);
   // Saved-session picker for "+ Claude" (null = closed) + the name a "새 세션"
@@ -201,56 +203,64 @@ export function MainArea() {
       // review P4-R1), so there's nothing to clean up here.
     });
 
-    // Drop-out gesture (P3): when a tab drag is released OUTSIDE this window
-    // (onto the desktop / another monitor), pop that panel into a new window at
-    // the drop point. A drop back inside dockview rearranges as usual (the
-    // outside check is false), so this never fights normal tab dragging.
-    dragSubRef.current = api.onWillDragPanel((e) => {
-      const panelId = e.panel.id;
-      // Replace any prior gesture's listeners (review P3 #1).
-      dragAbortRef.current?.abort();
-      const ac = new AbortController();
-      dragAbortRef.current = ac;
-      // Track the last credible screen point — some platforms report a degraded
-      // (0,0/NaN) coordinate on the final `dragend` (review P3 #3).
-      let last: { x: number; y: number } | null = null;
-      window.addEventListener(
-        "dragover",
-        (ev: DragEvent) => {
-          if (Number.isFinite(ev.screenX) && (ev.screenX !== 0 || ev.screenY !== 0)) {
-            last = { x: ev.screenX, y: ev.screenY };
-          }
-        },
-        { capture: true, signal: ac.signal },
-      );
-      window.addEventListener(
-        "dragend",
-        (ev: DragEvent) => {
-          ac.abort(); // one-shot: tear down this gesture's listeners
-          const credible =
-            Number.isFinite(ev.screenX) && (ev.screenX !== 0 || ev.screenY !== 0)
-              ? { x: ev.screenX, y: ev.screenY }
-              : last;
-          if (!credible) return;
-          void isOutsideCurrentWindow(credible.x, credible.y).then((outside) => {
-            if (!outside) return;
-            // Offset so the cursor lands near the new window's title bar instead
-            // of its corner, and clamp to keep the top-left on-screen (P3 #5).
-            const x = Math.max(0, Math.round(credible.x - 200));
-            const y = Math.max(0, Math.round(credible.y - 10));
-            void movePanelToNewWindow(api, panelId, { x, y });
-          });
-        },
-        { capture: true, signal: ac.signal },
-      );
-    });
+    // Drop-out / dock gesture: a tab released over another window docks into it,
+    // over the desktop opens a new window, inside this window rearranges as usual
+    // (review P3/P4). Shared wiring with popouts. Dispose any prior gesture from
+    // an earlier (project-keyed) mount before re-installing (review P4-impl #5).
+    dragSubRef.current?.dispose();
+    dragSubRef.current = installDragOut(api);
   };
 
-  // Tear down the drag gesture wiring on unmount (review P3 #1).
+  // Tear down the drag gesture wiring on unmount.
   useEffect(() => {
+    return () => dragSubRef.current?.dispose();
+  }, []);
+
+  // Receive panels docked INTO this (main) window from popouts — re-dock back
+  // to main (review P4). apiRef is read per-event so a project-keyed remount
+  // never leaves a stale dock.
+  useEffect(() => {
+    const label = getCurrentWindow().label;
+    let un: (() => void) | undefined;
+    installTransferTarget(label, () => apiRef.current, transferProcessedRef.current)
+      .then((f) => {
+        un = f;
+      })
+      .catch(() => {});
+    return () => un?.();
+  }, []);
+
+  // Main-window shutdown: tell popouts to tear down their sessions and WAIT for
+  // their acks (with a fallback timeout) before destroying them, so nothing
+  // leaks — destroy() may skip a popout's own close handler (review P4-impl #2).
+  useEffect(() => {
+    const win = getCurrentWindow();
+    if (win.label !== "main") return;
+    const unP = win.onCloseRequested(async (event) => {
+      event.preventDefault();
+      const others = (await getAllWindows()).filter((w) => w.label !== "main");
+      if (others.length > 0) {
+        const expected = others.map((w) => w.label);
+        const acked = new Set<string>();
+        const unAck = await listen<{ label: string }>("app-shutdown-ack", (e) =>
+          acked.add(e.payload.label),
+        );
+        await emit("app-shutdown");
+        const start = Date.now();
+        await new Promise<void>((resolve) => {
+          const tick = () => {
+            if (expected.every((l) => acked.has(l)) || Date.now() - start > 2500) resolve();
+            else setTimeout(tick, 50);
+          };
+          tick();
+        });
+        unAck();
+        await Promise.all(others.map((w) => w.destroy().catch(() => {})));
+      }
+      await win.destroy();
+    });
     return () => {
-      dragAbortRef.current?.abort();
-      dragSubRef.current?.dispose();
+      void unP.then((f) => f());
     };
   }, []);
 

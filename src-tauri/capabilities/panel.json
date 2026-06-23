@@ -1,7 +1,12 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "panel",
-  "description": "Narrower capabilities for popped-out panel windows (label panel-*): core APIs + event IPC + self-destroy (close handler tears down its sessions then destroys the window). No folder-picker dialog and NO runtime window creation — those stay on the main window (least privilege, review R0-5).",
+  "description": "Capabilities for popped-out panel windows (label panel-*): core APIs + event IPC + window self-destroy/close + runtime window creation (a popout tab can also be dragged out to spawn another popout — review R4-6; popouts only ever create `#popout` windows of this same app, never external URLs). No folder-picker dialog.",
   "windows": ["panel-*"],
-  "permissions": ["core:default", "core:window:allow-destroy", "core:window:allow-close"]
+  "permissions": [
+    "core:default",
+    "core:window:allow-destroy",
+    "core:window:allow-close",
+    "core:webview:allow-create-webview-window"
+  ]
 }
