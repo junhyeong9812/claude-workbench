@@ -1,5 +1,5 @@
 import { WebviewWindow } from "@tauri-apps/api/webviewWindow";
-import { getAllWindows, getCurrentWindow } from "@tauri-apps/api/window";
+import { getAllWindows, getCurrentWindow, cursorPosition } from "@tauri-apps/api/window";
 import { emit, listen } from "@tauri-apps/api/event";
 import type { DockviewApi, IDockviewPanel } from "dockview-react";
 import { useAppStore } from "./store";
@@ -188,23 +188,73 @@ export async function movePanelToNewWindow(
   });
 }
 
-/** Logical-space bounds of every app window. */
+// ---- z-order via focus recency (review backlog ②) ----
+// Linux/WebKitGTK exposes no cross-window z-order query, and `getAllWindows()`
+// order isn't a stack. We approximate "topmost" with focus recency: every window
+// broadcasts when it gains focus, and each window keeps a shared most-recent-first
+// list. Among windows overlapping a drop point, the most-recently-focused wins
+// (focus≈raise) — strictly better than the old smallest-area guess.
+const focusOrder: string[] = [];
+let focusTrackingStarted = false;
+
+/** Move `label` to the front (most-recent) of the focus-recency list. */
+function bumpFocus(label: string): void {
+  const i = focusOrder.indexOf(label);
+  if (i !== -1) focusOrder.splice(i, 1);
+  focusOrder.unshift(label);
+}
+
+/** focus-recency rank: 0 = most recent (topmost); Infinity = never seen. */
+function focusRank(label: string): number {
+  const i = focusOrder.indexOf(label);
+  return i === -1 ? Infinity : i;
+}
+
+/** Idempotent per-window: subscribe to the shared focus broadcast and announce
+ * our own focus. A window's own `tauri://focus` isn't visible to other windows,
+ * so each window relays its focus through a global event the others listen to.
+ * Pure state update on receive (no re-emit) → no echo loop. */
+function ensureFocusTracking(): void {
+  if (focusTrackingStarted) return;
+  focusTrackingStarted = true;
+  const self = getCurrentWindow();
+  void listen<{ label: string }>("mt://window-focused", (e) => bumpFocus(e.payload.label));
+  void self.onFocusChanged(({ payload: focused }) => {
+    if (focused) void emit("mt://window-focused", { label: self.label });
+  });
+  // Seed: if we're focused right now, we're topmost (a focus event may not fire
+  // until the next focus change). Best-effort — degrades to area tiebreak.
+  void self
+    .isFocused()
+    .then((focused) => {
+      if (focused) {
+        bumpFocus(self.label);
+        void emit("mt://window-focused", { label: self.label });
+      }
+    })
+    .catch(() => {});
+}
+
+/** Physical-pixel bounds of every app window. Everything in the hit-test runs in
+ * one physical-pixel space so asymmetric multi-monitor scale (one display at 1.0,
+ * another at 2.0) can't desync the comparison — per-window logical px don't share
+ * a global frame (review backlog ③). */
 async function appWindowBounds(): Promise<{ label: string; l: number; t: number; r: number; b: number }[]> {
   const wins = await getAllWindows();
   const out = [];
   for (const w of wins) {
     try {
       // Skip hidden/minimized windows — the user can't drop onto them, and they
-      // shouldn't win the smallest-area tiebreak (review P4-impl #4).
+      // shouldn't win the overlap tiebreak (review P4-impl #4).
       const [visible, minimized] = await Promise.all([w.isVisible(), w.isMinimized()]);
       if (!visible || minimized) continue;
-      const [pos, size, scale] = await Promise.all([w.outerPosition(), w.outerSize(), w.scaleFactor()]);
+      const [pos, size] = await Promise.all([w.outerPosition(), w.outerSize()]);
       out.push({
         label: w.label,
-        l: pos.x / scale,
-        t: pos.y / scale,
-        r: (pos.x + size.width) / scale,
-        b: (pos.y + size.height) / scale,
+        l: pos.x,
+        t: pos.y,
+        r: pos.x + size.width,
+        b: pos.y + size.height,
       });
     } catch {
       /* window gone mid-enumerate — skip */
@@ -213,19 +263,22 @@ async function appWindowBounds(): Promise<{ label: string; l: number; t: number;
   return out;
 }
 
-/** Label of the app window containing the screen point, or null (desktop). When
- * windows overlap, the SMALLEST-area match wins (most specific / likely topmost)
- * — `getAllWindows()` order isn't z-order, so we can't trust "first match"
- * (review R4-1). */
-async function windowAtPoint(screenX: number, screenY: number): Promise<string | null> {
-  if (!Number.isFinite(screenX) || !Number.isFinite(screenY)) return null;
+/** Label of the app window containing the PHYSICAL-pixel point, or null (desktop).
+ * When windows overlap, the most-recently-focused match wins (topmost ≈ last
+ * focused); smallest area breaks a tie between equally-ranked windows (review
+ * backlog ②/③). */
+async function windowAtPoint(physX: number, physY: number): Promise<string | null> {
+  if (!Number.isFinite(physX) || !Number.isFinite(physY)) return null;
   try {
     const bounds = await appWindowBounds();
-    let best: { label: string; area: number } | null = null;
+    let best: { label: string; rank: number; area: number } | null = null;
     for (const b of bounds) {
-      if (screenX >= b.l && screenX <= b.r && screenY >= b.t && screenY <= b.b) {
+      if (physX >= b.l && physX <= b.r && physY >= b.t && physY <= b.b) {
+        const rank = focusRank(b.label);
         const area = (b.r - b.l) * (b.b - b.t);
-        if (!best || area < best.area) best = { label: b.label, area };
+        if (!best || rank < best.rank || (rank === best.rank && area < best.area)) {
+          best = { label: b.label, rank, area };
+        }
       }
     }
     return best?.label ?? null;
@@ -246,17 +299,32 @@ async function windowAtPoint(screenX: number, screenY: number): Promise<string |
 export async function dropPanelAt(
   api: DockviewApi,
   panelId: string,
-  point: { x: number; y: number },
+  phys: { x: number; y: number },
 ): Promise<void> {
-  const self = getCurrentWindow().label;
-  const target = await windowAtPoint(point.x, point.y);
-  if (target === self) return;
-  if (target) dockPanelToWindow(api, panelId, target);
-  else
-    void movePanelToNewWindow(api, panelId, {
-      x: Math.max(0, Math.round(point.x - 200)),
-      y: Math.max(0, Math.round(point.y - 10)),
-    });
+  const self = getCurrentWindow();
+  // `phys` is a PHYSICAL-pixel global point (from `cursorPosition()` — accurate
+  // across mixed-scale monitors, unlike a CSS-px screenX scaled by the source DPR
+  // which mis-projects onto another monitor; review backlog ③ / codex P1-#1).
+  const target = await windowAtPoint(phys.x, phys.y);
+  if (target === self.label) return;
+  if (target) {
+    dockPanelToWindow(api, panelId, target);
+    return;
+  }
+  // New window: WebviewWindow x/y are logical px. Convert the physical drop point
+  // with the source window's scale — identical to the old logical screen point on
+  // a single 1.0 monitor (no regression); slight offset near a mixed-scale edge is
+  // cosmetic (placement only, not routing).
+  let scale = 1;
+  try {
+    scale = await self.scaleFactor();
+  } catch {
+    /* default 1 — logical == physical */
+  }
+  void movePanelToNewWindow(api, panelId, {
+    x: Math.max(0, Math.round(phys.x / scale - 200)),
+    y: Math.max(0, Math.round(phys.y / scale - 10)),
+  });
 }
 
 /**
@@ -267,6 +335,7 @@ export async function dropPanelAt(
  * down the subscription and any live listeners.
  */
 export function installDragOut(api: DockviewApi): { dispose: () => void } {
+  ensureFocusTracking();
   let ac: AbortController | null = null;
   const sub = api.onWillDragPanel((e) => {
     const panelId = e.panel.id;
@@ -287,11 +356,32 @@ export function installDragOut(api: DockviewApi): { dispose: () => void } {
       "dragend",
       (ev: DragEvent) => {
         ac?.abort();
-        const credible =
-          Number.isFinite(ev.screenX) && (ev.screenX !== 0 || ev.screenY !== 0)
-            ? { x: ev.screenX, y: ev.screenY }
-            : last;
-        if (credible) void dropPanelAt(api, panelId, credible);
+        void (async () => {
+          // Prefer the OS global cursor (physical px) — accurate across mixed-scale
+          // monitors. Fall back to the last credible CSS screen point, scaled to
+          // physical by the source DPR, if the query fails (review backlog ③).
+          try {
+            const p = await cursorPosition();
+            if (Number.isFinite(p.x) && Number.isFinite(p.y)) {
+              await dropPanelAt(api, panelId, { x: p.x, y: p.y });
+              return;
+            }
+          } catch {
+            /* fall through to the screen-point fallback */
+          }
+          const credible =
+            Number.isFinite(ev.screenX) && (ev.screenX !== 0 || ev.screenY !== 0)
+              ? { x: ev.screenX, y: ev.screenY }
+              : last;
+          if (!credible) return;
+          let scale = 1;
+          try {
+            scale = await getCurrentWindow().scaleFactor();
+          } catch {
+            /* default 1 */
+          }
+          await dropPanelAt(api, panelId, { x: credible.x * scale, y: credible.y * scale });
+        })();
       },
       { capture: true, signal },
     );
