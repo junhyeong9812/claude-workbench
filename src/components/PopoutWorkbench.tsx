@@ -202,8 +202,17 @@ export function PopoutWorkbench() {
         if (p) useAppStore.getState().setPopoutLayout(label, p, api.toJSON());
       }),
       api.onDidRemovePanel((panel) => {
-        // A transfer-out detaches (session survives); a real tab close ends it.
-        if (!isTransferring(panel.id)) void closePanelSession(panel.params as never);
+        const params = panel.params as { kind?: string; sessionId?: number } | undefined;
+        const transferring = isTransferring(panel.id);
+        // Claude sessions are refcounted: detach this window (closeIfLast=false on
+        // transfer). Terminals are single-owner: a transfer skips their close.
+        if (typeof params?.sessionId === "number") {
+          if (params.kind === "claudeterm") {
+            void closePanelSession(params as never, { closeIfLast: !transferring });
+          } else if (!transferring) {
+            void closePanelSession(params as never);
+          }
+        }
         if (api.panels.length === 0) maybeAutoClose();
       }),
     ];
@@ -215,11 +224,11 @@ export function PopoutWorkbench() {
     clearClose();
     if (!req) return;
     const project = req.project ?? activeProject;
-    if (req.kind === "claudeterm") {
-      if (typeof req.ptyId === "number") {
-        await invoke("claude_close", { id: req.ptyId }).catch(() => {});
-      }
-      if (deleteHistory && req.sessionId && project) {
+    // 삭제: force-close the whole session before deleting history. 닫기: close the
+    // panel → onDidRemovePanel detaches this window (refcount, P6).
+    if (req.kind === "claudeterm" && deleteHistory && typeof req.ptyId === "number") {
+      await invoke("claude_close", { id: req.ptyId }).catch(() => {});
+      if (req.sessionId && project) {
         await invoke("claude_delete", { project, uuid: req.sessionId }).catch(() => {});
       }
     }

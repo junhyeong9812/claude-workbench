@@ -11,6 +11,7 @@ import { useAppStore } from "../state/store";
 import { useClaudeUi } from "../state/claudeUi";
 import { recallArea, forgetArea, type PanelArea } from "../state/panelFocus";
 import { isTransferring } from "../state/panelTransfer";
+import { closePanelSession } from "../state/panelSession";
 import { installDragOut, movePanelToNewWindow } from "../state/windowTransfer";
 import { installTransferTarget } from "../state/panelTransferTarget";
 import { components, AppTab, type PanelKind } from "./panelRegistry";
@@ -187,20 +188,18 @@ export function MainArea() {
     api.onDidRemovePanel((panel) => {
       // Drop this panel's remembered focus area (closed for good — not a switch).
       forgetArea(panel.id);
-      // A *transfer* to another window removes the panel here but the backend
-      // session must survive (it re-attaches in the target window) — skip close
-      // (detach≠close, review R0-1). The actual move is wired in P2.
-      if (isTransferring(panel.id)) return;
       const params = panel.params as { kind?: string; sessionId?: number } | undefined;
-      if (typeof params?.sessionId === "number") {
-        // claudeterm sessions also need their poll thread stopped (claude_close);
-        // plain terminals just close the PTY.
-        const cmd = params.kind === "claudeterm" ? "claude_close" : "terminal_close";
-        invoke(cmd, { id: params.sessionId }).catch(() => {});
+      if (typeof params?.sessionId !== "number") return;
+      // A *transfer* to another window removes the panel here but the session must
+      // survive (the target re-attaches). Claude sessions are refcounted, so we
+      // still detach this window (closeIfLast=false during transfer); plain
+      // terminals are single-owner, so a transfer skips their close entirely.
+      const transferring = isTransferring(panel.id);
+      if (params.kind === "claudeterm") {
+        void closePanelSession(params as never, { closeIfLast: !transferring });
+      } else if (!transferring) {
+        void closePanelSession(params as never);
       }
-      // Persisted scrollback is discarded by the session's own flusher when the
-      // session is removed (it is the file's sole owner — no delete/flush race,
-      // review P4-R1), so there's nothing to clean up here.
     });
 
     // Drop-out / dock gesture: a tab released over another window docks into it,
@@ -508,17 +507,13 @@ export function MainArea() {
     // Delete must target the session's *own* project (a workspace-wide reopen can
     // open a task from a project other than the active tab) — codex P2 F1.
     const project = req.project ?? activeProject;
-    if (req.kind === "claudeterm") {
-      // Stop the live poll thread BEFORE deleting, so it can't recreate the
-      // snapshot we're about to remove (codex session-UX F4).
-      if (typeof req.ptyId === "number") {
-        await invoke("claude_close", { id: req.ptyId }).catch(() => {});
-      }
-      if (deleteHistory && req.sessionId && project) {
-        await invoke("claude_delete", {
-          project,
-          uuid: req.sessionId,
-        }).catch(() => {});
+    // 삭제: tear the WHOLE session down (force-close every viewer) before deleting
+    // its history, so a mirror in another window can't recreate the snapshot. 닫기:
+    // just close the panel — onDidRemovePanel detaches this window (refcount, P6).
+    if (req.kind === "claudeterm" && deleteHistory && typeof req.ptyId === "number") {
+      await invoke("claude_close", { id: req.ptyId }).catch(() => {});
+      if (req.sessionId && project) {
+        await invoke("claude_delete", { project, uuid: req.sessionId }).catch(() => {});
       }
     }
     apiRef.current?.getPanel(req.panelId)?.api.close();

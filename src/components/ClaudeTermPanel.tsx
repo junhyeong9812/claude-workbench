@@ -8,6 +8,7 @@ import "@xterm/xterm/css/xterm.css";
 import { useAppStore } from "../state/store";
 import { xtermTheme } from "./xtermTheme";
 import { recallArea, rememberArea, type PanelArea } from "../state/panelFocus";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import { TimelineView, ItemDetail, MarkdownText, type TimelineItem } from "./TimelineView";
 
 /**
@@ -46,9 +47,19 @@ interface SnapshotResult {
   data: number[];
   last_seq: number;
 }
-interface ClaudeStarted {
+/** Result of `claude_open_or_attach`: attached to a live PTY (mirror) or started
+ * fresh (driver), plus the current input driver + its revision (P6). */
+interface ClaudeOpened {
   id: number;
   session_uuid: string;
+  role: "driver" | "mirror";
+  driver: string;
+  rev: number;
+}
+interface DriverChanged {
+  id: number;
+  driver: string;
+  rev: number;
 }
 /** A previous task in the handoff chain (a saved session snapshot), rendered
  * read-only below the live timeline so the chain reads as one continuous task
@@ -180,6 +191,13 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
   // that's about to be replaced (which would error or land in the wrong session).
   // A ref so the mount-time input handlers read the live value.
   const inputLockedRef = useRef(false);
+  // Multiwindow mirror (P6): this window's label, whether it's the input *driver*
+  // for the session (mirrors are read-only), and the last driver-change revision
+  // seen (to drop stale `claude-driver-changed` events).
+  const myLabel = getCurrentWindow().label;
+  const isDriverRef = useRef(true);
+  const driverRevRef = useRef(-1);
+  const [isDriver, setIsDriver] = useState(true);
   // The last handoff seed, so the user can re-inject it if the auto-attempt missed
   // the prompt (codex P3 D3 — ready detection is best-effort).
   const [lastSeed, setLastSeed] = useState<string | null>(null);
@@ -205,7 +223,7 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
   const injectSeed = (text: string) => {
     const id = sessionIdRef.current;
     if (id == null) return;
-    invoke("terminal_write", {
+    invoke("claude_write", {
       id,
       data: Array.from(new TextEncoder().encode(text + "\n")),
     }).catch(() => {});
@@ -249,9 +267,10 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
         uuid: draft.oldUuid,
         text: edited,
       });
-      const started = await invoke<ClaudeStarted>("claude_start", {
+      const started = await invoke<ClaudeOpened>("claude_open_or_attach", {
+        project: draft.cwd,
+        uuid: null, // brand-new task session (handoff)
         cwd: draft.cwd,
-        resume: null,
         name: (props.params.title as string) ?? null,
         cols: termRef.current?.cols ?? 80,
         rows: termRef.current?.rows ?? 24,
@@ -524,8 +543,8 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
     if (ta) {
       ta.addEventListener("compositionend", (e) => {
         const text = (e as CompositionEvent).data;
-        if (text && sessionId != null && !inputLockedRef.current) {
-          invoke("terminal_write", {
+        if (text && sessionId != null && !inputLockedRef.current && isDriverRef.current) {
+          invoke("claude_write", {
             id: sessionId,
             data: Array.from(new TextEncoder().encode(text)),
           }).catch(() => {});
@@ -536,6 +555,7 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
     let disposed = false;
     let unlistenTerm: UnlistenFn | undefined;
     let unlistenTl: UnlistenFn | undefined;
+    let unlistenDriver: UnlistenFn | undefined;
     let sessionId: number | null = null;
     let lastApplied = 0;
     let ready = false;
@@ -588,50 +608,61 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
         applySnapshot(e.payload);
         setSubagents(e.payload.subagents ?? []);
       });
+      // Driver changes (P6): lock/unlock input by whether we hold the driver role.
+      // `rev` is monotonic — drop stale events (review R7-4).
+      unlistenDriver = await listen<DriverChanged>("claude-driver-changed", (e) => {
+        if (sessionId == null || e.payload.id !== sessionId) return;
+        if (e.payload.rev <= driverRevRef.current) return;
+        driverRevRef.current = e.payload.rev;
+        const driving = e.payload.driver === myLabel;
+        isDriverRef.current = driving;
+        setIsDriver(driving);
+      });
       if (disposed) return;
 
-      // Re-attach to a persisted PTY, else start a fresh Claude session. A handoff
-      // hands us the exact new session via `pendingAttachRef` so the remount
-      // doesn't race dockview's param propagation (codex P3-impl 2).
+      // Open the session: attach to its live PTY if another window already runs
+      // it (mirror, read-only) or start a fresh one (driver) — atomic in the
+      // backend (P6). A handoff hands the exact new session via `pendingAttachRef`.
       const attach = pendingAttachRef.current;
       pendingAttachRef.current = null;
-      const existing = attach?.id ?? props.params.sessionId;
-      if (existing != null) {
-        // Claim the id BEFORE snapshotting so both listeners (PTY output +
-        // timeline) match from the first frame — otherwise output chunks emitted
-        // during the snapshot await are dropped yet absent from the snapshot →
-        // lost (review R1-1, relied on by cross-window transfer). The
-        // `seq > last_seq` drain skips snapshot-included dups; timeline applies
-        // whole snapshots so a missed live tick self-heals on the next poll.
-        sessionId = existing;
-        try {
-          const snap = await invoke<SnapshotResult>("terminal_snapshot", { id: existing });
-          write(snap.data);
-          lastApplied = snap.last_seq;
-        } catch {
-          sessionId = null; // PTY gone (e.g. after restart) -> start fresh
-        }
-      }
-      if (disposed) return;
-      if (sessionId == null) {
-        const cwd = props.params.project ?? useAppStore.getState().activeProject ?? null;
-        const started = await invoke<ClaudeStarted>("claude_start", {
-          cwd,
-          // Resume the same session after a restart (PTY died) via its persisted
-          // UUID — append to the same JSONL so the timeline continues (P5). A
-          // picker-reopen uses loadSessionId; a normally-started panel uses the
-          // sessionUuid stamped into its params after the first start.
-          resume: props.params.loadSessionId ?? props.params.sessionUuid ?? null,
+      const project = props.params.project ?? useAppStore.getState().activeProject ?? null;
+      const openUuid =
+        attach?.uuid ?? props.params.loadSessionId ?? props.params.sessionUuid ?? null;
+      try {
+        const opened = await invoke<ClaudeOpened>("claude_open_or_attach", {
+          project,
+          uuid: openUuid,
+          cwd: project,
           name: (props.params.title as string) ?? null,
           cols: term.cols,
           rows: term.rows,
         });
-        sessionId = started.id;
+        sessionId = opened.id;
+        driverRevRef.current = opened.rev;
+        const driving = opened.driver === myLabel;
+        isDriverRef.current = driving;
+        setIsDriver(driving);
         props.api.updateParameters({
           ...props.params,
-          sessionId: started.id,
-          sessionUuid: started.session_uuid,
+          sessionId: opened.id,
+          sessionUuid: opened.session_uuid,
         });
+      } catch {
+        sessionId = null; // open failed (no project, etc.)
+      }
+      if (disposed) return;
+      // Backfill scrollback. `sessionId` is set BEFORE the snapshot so the live
+      // listener buffers matching chunks into `pending` from the first frame and
+      // the `seq > last_seq` drain skips snapshot-included dups (review R1-1/R7-8);
+      // a fresh start just returns empty scrollback.
+      if (sessionId != null) {
+        try {
+          const snap = await invoke<SnapshotResult>("terminal_snapshot", { id: sessionId });
+          write(snap.data);
+          lastApplied = snap.last_seq;
+        } catch {
+          /* fresh session — no scrollback yet */
+        }
       }
 
       sessionIdRef.current = sessionId;
@@ -657,7 +688,6 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
       // re-attach) so it isn't empty until the next live change — unless a live
       // event already arrived (which is newer).
       const seedUuid = attach?.uuid ?? props.params.sessionUuid ?? props.params.loadSessionId;
-      const project = props.params.project ?? useAppStore.getState().activeProject ?? null;
       if (seedUuid && project) {
         invoke<{
           items: TimelineItem[];
@@ -683,7 +713,8 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
     })();
 
     const onData = term.onData((d) => {
-      if (sessionId == null || inputLockedRef.current) return;
+      // Mirrors are read-only; only the driver writes (backend also enforces — P6).
+      if (sessionId == null || inputLockedRef.current || !isDriverRef.current) return;
       // Drop IME composition output (multi-byte / non-ASCII) — Hangul only
       // arrives legitimately via `compositionend` (handled above); any CJK here
       // is a duplicate. Keyboard input through onData is ASCII/control only.
@@ -691,13 +722,12 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
         if ((ch.codePointAt(0) ?? 0) > 0x7f) return;
       }
       const bytes = Array.from(new TextEncoder().encode(d));
-      invoke("terminal_write", { id: sessionId, data: bytes }).catch(() => {});
+      invoke("claude_write", { id: sessionId, data: bytes }).catch(() => {});
     });
     const onResize = term.onResize(() => {
       if (sessionId == null) return;
-      invoke("terminal_resize", { id: sessionId, cols: term.cols, rows: term.rows }).catch(
-        () => {},
-      );
+      // Driver-only (backend ignores a mirror's resize — the PTY size is shared).
+      invoke("claude_resize", { id: sessionId, cols: term.cols, rows: term.rows }).catch(() => {});
     });
 
     const ro = new ResizeObserver(() => {
@@ -724,6 +754,7 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
       onResize.dispose();
       if (unlistenTerm) unlistenTerm();
       if (unlistenTl) unlistenTl();
+      if (unlistenDriver) unlistenDriver();
       termRef.current = null;
       term.dispose();
     };
@@ -749,6 +780,23 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
             Claude — {(props.params.title as string) ?? "터미널"}
           </span>
           <span className="claudeterm-head-controls">
+            {!isDriver && (
+              <>
+                <span className="claudeterm-mirror-badge" title="다른 창이 입력 중 — 이 창은 읽기전용 미러">
+                  🪞 미러(읽기전용)
+                </span>
+                <button
+                  className="claudeterm-head-btn"
+                  title="이 창에서 입력하도록 입력 권한을 가져옵니다 (다른 창은 읽기전용)"
+                  onClick={() => {
+                    const id = sessionIdRef.current;
+                    if (id != null) invoke("claude_set_driver", { id }).catch(() => {});
+                  }}
+                >
+                  입력 권한 가져오기
+                </button>
+              </>
+            )}
             {(tokenTotal.input > 0 || tokenTotal.output > 0) && (
               <span className="claudeterm-tokens" title="입력(컨텍스트) / 출력 토큰">
                 ↑{kfmt(tokenTotal.input)} ↓{kfmt(tokenTotal.output)}

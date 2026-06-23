@@ -2,18 +2,27 @@ import { invoke } from "@tauri-apps/api/core";
 
 type PanelParams = { kind?: unknown; sessionId?: unknown } | undefined;
 
-/** The backend close command for a panel kind: claude panels stop their PTY +
- * poll thread, everything else (terminal/ssh) closes the PTY. */
-export function sessionCloseCmd(kind: unknown): "claude_close" | "terminal_close" {
-  return kind === "claudeterm" ? "claude_close" : "terminal_close";
-}
-
-/** Close the backend session behind a panel's params (no-op without a numeric
- * session id). Awaited so callers (e.g. window close) can guarantee teardown
- * ran before the window is destroyed (review R1-7). */
-export async function closePanelSession(params: PanelParams): Promise<void> {
+/** Release this window's hold on the session behind a panel's params (no-op
+ * without a numeric session id). Awaited so callers (e.g. window close) can
+ * guarantee teardown ran before the window is destroyed (review R1-7).
+ *
+ * Claude sessions are reference-counted across windows (mirror, P6): `detach`
+ * removes this window and closes the PTY only when no viewers remain
+ * (`closeIfLast`, false during a transfer since the target re-attaches). Plain
+ * terminals/SSH are single-owner — closing the panel closes the PTY. */
+export async function closePanelSession(
+  params: PanelParams,
+  opts?: { closeIfLast?: boolean },
+): Promise<void> {
   if (!params || typeof params.sessionId !== "number") return;
-  await invoke(sessionCloseCmd(params.kind), { id: params.sessionId }).catch(() => {});
+  if (params.kind === "claudeterm") {
+    await invoke("claude_detach", {
+      id: params.sessionId,
+      closeIfLast: opts?.closeIfLast ?? true,
+    }).catch(() => {});
+  } else {
+    await invoke("terminal_close", { id: params.sessionId }).catch(() => {});
+  }
 }
 
 /** Pull `{sessionId, kind}` out of a dockview-serialized layout's panels. Used

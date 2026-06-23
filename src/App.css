@@ -1112,6 +1112,17 @@ body {
   border-radius: 4px;
   cursor: pointer;
 }
+/* Mirror window badge (P6): this Claude tab is a read-only view of a session
+   another window is driving. */
+.claudeterm-mirror-badge {
+  flex: 0 0 auto;
+  padding: 1px 8px;
+  font-size: 0.92em;
+  color: #e0a030;
+  background: rgba(224, 160, 48, 0.14);
+  border: 1px solid rgba(224, 160, 48, 0.4);
+  border-radius: 4px;
+}
 .claudeterm-head-btn:hover:not(:disabled) {
   background: rgba(137, 180, 250, 0.22);
   color: var(--fg, #cdd6f4);
