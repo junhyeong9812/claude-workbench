@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { errText } from "../utils/error";
+import type { TerminalOutputEvent, SnapshotResult } from "../types";
 import type { IDockviewPanelProps } from "dockview-react";
 import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
@@ -40,15 +41,6 @@ export interface ClaudeTermParams {
   project?: string;
 }
 
-interface TerminalOutputEvent {
-  session_id: number;
-  seq: number;
-  data: number[];
-}
-interface SnapshotResult {
-  data: number[];
-  last_seq: number;
-}
 /** Result of `claude_open_or_attach`: attached to a live PTY (mirror) or started
  * fresh (driver), plus the current input driver + its revision (P6). */
 interface ClaudeOpened {

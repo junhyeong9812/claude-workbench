@@ -58,3 +58,16 @@ export interface WorkspaceState {
   active_project: string | null;
   saved_connections?: SshConnection[];
 }
+
+/** PTY output event pushed from Rust (`*_output` listen) — incremental bytes. */
+export interface TerminalOutputEvent {
+  session_id: number;
+  seq: number;
+  data: number[];
+}
+
+/** Snapshot of a PTY's scrollback on attach (`*_snapshot`) — full bytes + seq. */
+export interface SnapshotResult {
+  data: number[];
+  last_seq: number;
+}
