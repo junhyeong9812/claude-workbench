@@ -9,6 +9,7 @@ import { useAppStore } from "../state/store";
 import { langFor } from "./cmLang";
 import { cmThemeExt } from "./cmTheme";
 import { isMarkdownPath, Markdown } from "./markdown";
+import { useFileText } from "../hooks/useFileText";
 
 const isImage = (p: string): boolean => /\.(png|jpe?g|gif|webp|bmp|svg|ico|avif)$/i.test(p);
 const isPdf = (p: string): boolean => /\.pdf$/i.test(p);
@@ -22,25 +23,7 @@ const isBinary = (p: string): boolean =>
  * UX; the marked+DOMPurify render is delegated to the shared `Markdown` (media
  * allowed here so local `.md` images show — see `.study-md img` styling). */
 function MarkdownView({ path }: { path: string }) {
-  const [text, setText] = useState<string | null>(null);
-  const [err, setErr] = useState<string | null>(null);
-  useEffect(() => {
-    let cancelled = false;
-    // Reset on path change so a previous file's error or content doesn't linger
-    // until the new read resolves (stale state).
-    setText(null);
-    setErr(null);
-    invoke<string>("acp_read_file", { path })
-      .then((t) => {
-        if (!cancelled) setText(t);
-      })
-      .catch((e) => {
-        if (!cancelled) setErr(errText(e, "읽기 실패"));
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [path]);
+  const { text, err } = useFileText(path);
   if (err) return <div className="study-view-err">{err}</div>;
   if (text == null) return <div className="study-md study-md-loading">불러오는 중…</div>;
   return <Markdown text={text} className="study-md" />;

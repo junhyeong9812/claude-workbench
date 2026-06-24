@@ -1,6 +1,4 @@
 import { useEffect, useRef, useState } from "react";
-import { errText } from "../utils/error";
-import { invoke } from "@tauri-apps/api/core";
 import { EditorView, basicSetup } from "codemirror";
 import { EditorState } from "@codemirror/state";
 import { useAppStore } from "../state/store";
@@ -9,6 +7,7 @@ import { cmThemeExt } from "./cmTheme";
 import { MarkdownText } from "./TimelineView";
 import { isMarkdownPath } from "./markdown";
 import { handleScrollKey } from "./scrollKeys";
+import { useFileText } from "../hooks/useFileText";
 
 /**
  * Read-only file peek viewer (P1): opens as an overlay over the main area; the
@@ -23,8 +22,9 @@ export function FilePeekViewer({ path, onClose }: { path: string; onClose: () =>
   const theme = useAppStore((s) => s.theme);
   const hostRef = useRef<HTMLDivElement | null>(null);
   const bodyRef = useRef<HTMLDivElement | null>(null);
-  const [text, setText] = useState<string | null>(null);
-  const [err, setErr] = useState<string | null>(null);
+  // The viewer renders the text either as markdown (뷰모드) or via CodeMirror
+  // (raw), so the text lives in state (the shared read hook), not only in CM.
+  const { text, err } = useFileText(path);
   // Markdown files default to 뷰모드 (rendered); `v` toggles to raw. Non-markdown
   // files ignore this and always show the CodeMirror source.
   const [markdown, setMarkdown] = useState(true);
@@ -34,26 +34,6 @@ export function FilePeekViewer({ path, onClose }: { path: string; onClose: () =>
   // Reset to 뷰모드 when the peeked file changes (follows the tree cursor).
   useEffect(() => {
     setMarkdown(true);
-  }, [path]);
-
-  // Read the file text into state — the viewer renders it either as markdown
-  // (뷰모드) or via CodeMirror (raw), so the text lives here, not only in CM.
-  useEffect(() => {
-    let cancelled = false;
-    setErr(null);
-    setText(null);
-    invoke<string>("acp_read_file", { path })
-      .then((t) => {
-        if (!cancelled) setText(t);
-      })
-      .catch((e) => {
-        if (!cancelled) {
-          setErr(errText(e, "읽기 실패"));
-        }
-      });
-    return () => {
-      cancelled = true;
-    };
   }, [path]);
 
   // Build the read-only CodeMirror view only when showing raw source (the host

@@ -5,9 +5,8 @@
  * Presentational; ClaudeTermPanel feeds it the items/turns for *its* session. */
 
 import { Fragment, useEffect, useRef, useState } from "react";
-import { errText } from "../utils/error";
-import { invoke } from "@tauri-apps/api/core";
 import { isMarkdownPath, Markdown } from "./markdown";
+import { useFileText } from "../hooks/useFileText";
 
 /** Sanitized markdown for tool/session 뷰모드. Media tags are blocked here (unlike
  * the study viewer, which renders local images) — tool output may contain remote
@@ -468,25 +467,14 @@ export function ItemDetail({ item, markdown = true }: { item: TimelineItem; mark
   // A read (or any location-only item) with no diff/content: show the file.
   const needsFile = item.diffs.length === 0 && !hasContent && firstPath != null;
 
-  const [fileText, setFileText] = useState<string | null>(null);
-  const [fileErr, setFileErr] = useState<string | null>(null);
-  useEffect(() => {
-    let cancelled = false;
-    setFileText(null);
-    setFileErr(null);
-    if (needsFile && firstPath) {
-      invoke<string>("acp_read_file", { path: firstPath })
-        .then((t) => {
-          if (!cancelled) setFileText(t);
-        })
-        .catch((e) => {
-          if (!cancelled) setFileErr(errText(e, "읽기 실패"));
-        });
-    }
-    return () => {
-      cancelled = true;
-    };
-  }, [item.tool_call_id, needsFile, firstPath]);
+  // Fetch the file only for a location-only item (read with no inline content).
+  // refreshKey = tool_call_id so selecting a different item re-reads even when it
+  // points at the same path (matches the original per-item reset/re-fetch).
+  const { text: fileText, err: fileErr } = useFileText(
+    needsFile ? firstPath : null,
+    "읽기 실패",
+    item.tool_call_id,
+  );
 
   if (item.kind === "question") return <QuestionDetail item={item} />;
   if (item.kind === "plan") return <PlanDetail item={item} markdown={markdown} />;
