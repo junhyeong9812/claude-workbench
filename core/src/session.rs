@@ -211,6 +211,13 @@ impl SessionManager {
         if let Some(dir) = cwd {
             builder.cwd(dir);
         }
+        // Force a known terminal type so child TUIs (Claude, vim, …) emit escape
+        // sequences xterm.js understands. The app process has no TERM when launched
+        // from a desktop launcher (only inherits one under `tauri dev` from a shell),
+        // so without this the child renders garbled ANSI in production. Mirrors the
+        // SSH transport, which already requests an "xterm-256color" pty.
+        builder.env("TERM", "xterm-256color");
+        builder.env("COLORTERM", "truecolor");
 
         let mut child = pair
             .slave

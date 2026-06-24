@@ -254,21 +254,31 @@ export function TimelineView({
     el.addEventListener("scroll", onScroll, { passive: true });
     return () => el.removeEventListener("scroll", onScroll);
   }, [followBottom]);
-  // On any content growth (new turn or items streaming within a turn), follow to
-  // the bottom while sticking. rAF so layout (heights) is settled first.
+  // Follow content growth to the bottom while sticking. A ResizeObserver on the
+  // content catches EVERY height change — new turns, items streaming within a turn,
+  // answer text growing, detail rows expanding, async/font layout — not just the
+  // [items, turnNos] deps a plain effect would see (which miss text/async growth,
+  // the cause of the timeline not scrolling down as content streams). It also fires
+  // once on observe, so a freshly opened timeline lands at the bottom. Setting
+  // scrollTop doesn't change content size, so there's no observer feedback loop.
   useEffect(() => {
-    if (!followBottom || !stickBottomRef.current) return;
-    const raf = requestAnimationFrame(() => {
-      let sc: HTMLElement | null = listRef.current?.parentElement ?? null;
-      while (sc) {
-        const oy = getComputedStyle(sc).overflowY;
-        if (oy === "auto" || oy === "scroll") break;
-        sc = sc.parentElement;
-      }
-      if (sc) sc.scrollTop = sc.scrollHeight;
+    if (!followBottom) return;
+    const content = listRef.current;
+    if (!content) return;
+    let sc: HTMLElement | null = content.parentElement;
+    while (sc) {
+      const oy = getComputedStyle(sc).overflowY;
+      if (oy === "auto" || oy === "scroll") break;
+      sc = sc.parentElement;
+    }
+    if (!sc) return;
+    const el = sc;
+    const ro = new ResizeObserver(() => {
+      if (stickBottomRef.current) el.scrollTop = el.scrollHeight;
     });
-    return () => cancelAnimationFrame(raf);
-  }, [items, turnNos.length, followBottom]);
+    ro.observe(content);
+    return () => ro.disconnect();
+  }, [followBottom]);
 
   const onKeyDown = (e: React.KeyboardEvent<HTMLDivElement>) => {
     if (e.key !== "ArrowDown" && e.key !== "ArrowUp") return;
