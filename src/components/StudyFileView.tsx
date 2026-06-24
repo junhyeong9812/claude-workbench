@@ -1,7 +1,10 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState, lazy, Suspense } from "react";
 import { errText } from "../utils/error";
 import { invoke, convertFileSrc } from "@tauri-apps/api/core";
-import { PdfView } from "./PdfView";
+
+// Lazy so pdfjs-dist (a large dependency) splits into its own chunk, loaded only
+// when a PDF is actually opened — keeps it out of the main bundle.
+const PdfView = lazy(() => import("./PdfView").then((m) => ({ default: m.PdfView })));
 import { EditorView, basicSetup } from "codemirror";
 import { EditorState } from "@codemirror/state";
 import { keymap } from "@codemirror/view";
@@ -108,7 +111,12 @@ export function StudyFileView({ path, editable = false }: { path: string; editab
         <img src={convertFileSrc(path)} alt={path} />
       </div>
     );
-  if (isPdf(path)) return <PdfView path={path} />;
+  if (isPdf(path))
+    return (
+      <Suspense fallback={<div className="study-view-note">PDF 뷰어 불러오는 중…</div>}>
+        <PdfView path={path} />
+      </Suspense>
+    );
   if (isBinary(path))
     return <div className="study-view-note">바이너리 파일이라 미리볼 수 없습니다.<br />{path.split("/").pop()}</div>;
   if (renderMarkdown) return <MarkdownView path={path} />;
