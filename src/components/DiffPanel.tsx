@@ -68,24 +68,31 @@ export function DiffPanel(props: IDockviewPanelProps<DiffParams>) {
     return () => ro.disconnect();
   }, [text]);
 
+  // Each load() bumps a generation; only the latest applies. Guards the manual
+  // ↻ button (whose return value is discarded) and prop-change reloads against a
+  // slow earlier request resolving last and overwriting the current diff (codex).
+  const loadGen = useRef(0);
   const load = useCallback(() => {
     setText(null);
     setErr(null);
+    const gen = ++loadGen.current;
     const p = hash
       ? invoke<string>("git_show", { cwd, hash })
       : invoke<string>("git_diff", { cwd, path, staged: !!staged });
-    let cancelled = false;
     p.then((t) => {
-      if (!cancelled) setText(t);
+      if (gen === loadGen.current) setText(t);
     }).catch((e) => {
-      if (!cancelled) setErr(errText(e));
+      if (gen === loadGen.current) setErr(errText(e));
     });
-    return () => {
-      cancelled = true;
-    };
   }, [cwd, path, staged, hash]);
 
-  useEffect(() => load(), [load]);
+  useEffect(() => {
+    load();
+    // Invalidate any in-flight request on unmount / dep change.
+    return () => {
+      loadGen.current++;
+    };
+  }, [load]);
 
   const end = Math.min(lines.length, Math.ceil((scrollTop + viewH) / LINE_H) + OVERSCAN);
   const start = Math.max(0, Math.min(Math.floor(scrollTop / LINE_H) - OVERSCAN, end));
