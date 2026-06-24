@@ -75,6 +75,11 @@ fn strip_nested_claude_env() {
 ///
 /// Registers the dialog plugin (folder picker) and the shell + terminal + ACP
 /// commands, all thin wrappers over the `core`/`core-acp` crates.
+// Ensures the main-window close backstop arms its force-quit timer only once,
+// however many times the (wedged, still-visible) window's close is requested.
+static CLOSE_BACKSTOP_ARMED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     // Required for Korean/CJK composition in the webview (confirmed: without it
@@ -180,6 +185,38 @@ pub fn run() {
                 } if label == "main" => {
                     app_handle.state::<core_lib::SessionManager>().kill_all();
                     app_handle.exit(0);
+                }
+                // Hard backstop for the X button: the frontend intercepts the close
+                // (preventDefault) to tear sessions down, then `destroy()`s the
+                // window — which fires `Destroyed` above and exits. But if the
+                // WebView's JS loop freezes mid-teardown, neither `destroy()` nor its
+                // watchdog timer runs and the window can never close. So once the
+                // main window's close is requested, force-quit after a grace period
+                // regardless of the WebView's state. The graceful path normally wins
+                // first (the process is already gone before this fires); this only
+                // bites when the frontend is wedged. `kill_all` reaps PTY children.
+                tauri::RunEvent::WindowEvent {
+                    label,
+                    event: tauri::WindowEvent::CloseRequested { .. },
+                    ..
+                } if label == "main" => {
+                    // Arm exactly once: repeated X clicks (the window is still up
+                    // while wedged) must not pile up timers.
+                    if !CLOSE_BACKSTOP_ARMED.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                        let h = app_handle.clone();
+                        std::thread::spawn(move || {
+                            std::thread::sleep(std::time::Duration::from_secs(5));
+                            // kill_all is non-blocking (signals children, no join,
+                            // poison-tolerant) so it can't wedge this thread; it
+                            // reaps PTY children so none are orphaned.
+                            h.state::<core_lib::SessionManager>().kill_all();
+                            // process::exit, NOT AppHandle::exit: the latter routes
+                            // through the (possibly wedged) event loop — the very
+                            // thing we're escaping. This terminates at the OS level
+                            // immediately and can't hang.
+                            std::process::exit(0);
+                        });
+                    }
                 }
                 _ => {}
             }
