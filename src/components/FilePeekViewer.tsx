@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from "react";
+import { errText } from "../utils/error";
 import { invoke } from "@tauri-apps/api/core";
 import { EditorView, basicSetup } from "codemirror";
 import { EditorState } from "@codemirror/state";
@@ -47,7 +48,7 @@ export function FilePeekViewer({ path, onClose }: { path: string; onClose: () =>
       })
       .catch((e) => {
         if (!cancelled) {
-          setErr(typeof e === "string" ? e : ((e as { message?: string })?.message ?? "읽기 실패"));
+          setErr(errText(e, "읽기 실패"));
         }
       });
     return () => {

@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
+import { errText } from "../utils/error";
 import { invoke } from "@tauri-apps/api/core";
 import { useAppStore } from "../state/store";
 
@@ -8,8 +9,6 @@ interface Worktree {
   branch: string;
 }
 
-const errText = (e: unknown): string =>
-  typeof e === "string" ? e : ((e as { message?: string })?.message ?? String(e));
 
 /**
  * Worktree panel (GP4) — sidebar tab. Lists `git worktree`s for the active

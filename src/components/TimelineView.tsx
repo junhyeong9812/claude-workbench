@@ -5,6 +5,7 @@
  * Presentational; ClaudeTermPanel feeds it the items/turns for *its* session. */
 
 import { Fragment, useEffect, useRef, useState } from "react";
+import { errText } from "../utils/error";
 import { invoke } from "@tauri-apps/api/core";
 import { isMarkdownPath, Markdown } from "./markdown";
 
@@ -479,7 +480,7 @@ export function ItemDetail({ item, markdown = true }: { item: TimelineItem; mark
           if (!cancelled) setFileText(t);
         })
         .catch((e) => {
-          if (!cancelled) setFileErr(typeof e === "string" ? e : (e?.message ?? "읽기 실패"));
+          if (!cancelled) setFileErr(errText(e, "읽기 실패"));
         });
     }
     return () => {
