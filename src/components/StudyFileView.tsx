@@ -52,6 +52,7 @@ function MarkdownView({ path }: { path: string }) {
 export function StudyFileView({ path, editable = false }: { path: string; editable?: boolean }) {
   const theme = useAppStore((s) => s.theme);
   const hostRef = useRef<HTMLDivElement | null>(null);
+  const saveTimer = useRef<number | null>(null);
   const [err, setErr] = useState<string | null>(null);
   const [status, setStatus] = useState("");
 
@@ -80,12 +81,20 @@ export function StudyFileView({ path, editable = false }: { path: string; editab
                 run: (v) => {
                   invoke("write_file", { path, content: v.state.doc.toString() })
                     .then(() => {
+                      if (cancelled) return;
                       setStatus("저장됨");
-                      window.setTimeout(() => setStatus(""), 1500);
+                      // Clear status after a beat — track the timer so a file/tab
+                      // switch (cleanup) cancels it instead of clearing the new view.
+                      if (saveTimer.current != null) clearTimeout(saveTimer.current);
+                      saveTimer.current = window.setTimeout(() => {
+                        saveTimer.current = null;
+                        setStatus("");
+                      }, 1500);
                     })
-                    .catch((e) =>
-                      setStatus(typeof e === "string" ? e : ((e as { message?: string })?.message ?? "저장 실패")),
-                    );
+                    .catch((e) => {
+                      if (cancelled) return;
+                      setStatus(typeof e === "string" ? e : ((e as { message?: string })?.message ?? "저장 실패"));
+                    });
                   return true;
                 },
               },
@@ -101,6 +110,10 @@ export function StudyFileView({ path, editable = false }: { path: string; editab
       });
     return () => {
       cancelled = true;
+      if (saveTimer.current != null) {
+        clearTimeout(saveTimer.current);
+        saveTimer.current = null;
+      }
       view?.destroy();
     };
   }, [path, theme, editable]);
