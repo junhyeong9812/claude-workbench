@@ -10,6 +10,7 @@ import { xtermTheme } from "./xtermTheme";
 import { recallArea, rememberArea, type PanelArea } from "../state/panelFocus";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { TimelineView, ItemDetail, MarkdownText, type TimelineItem } from "./TimelineView";
+import { handleScrollKey } from "./scrollKeys";
 
 /**
  * Architecture A Claude panel: the **real** `claude` CLI in an xterm PTY (left)
@@ -860,7 +861,8 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
               const focusedIdx = blocks.findIndex((b) => b.contains(document.activeElement));
 
               // v: 뷰모드(html)/원본 전환 — 항상(일관성). diff엔 효과 없지만 토글은 유지.
-              if (e.key === "v" || e.key === "V") {
+              // Ctrl/Cmd/Alt+V(붙여넣기 등)는 토글하지 않도록 가드(FilePeekViewer와 일치).
+              if ((e.key === "v" || e.key === "V") && !e.ctrlKey && !e.metaKey && !e.altKey) {
                 e.preventDefault();
                 setDetailMarkdown((v) => !v);
                 return;
@@ -882,7 +884,14 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
                 return;
               }
               // ←/→: 포커스된 블록 안에서 가로 스크롤(긴 diff 라인의 뒷부분 읽기).
-              if ((e.key === "ArrowLeft" || e.key === "ArrowRight") && focusedIdx !== -1) {
+              // Ctrl/Cmd+←/→는 가로스크롤 대신 컨테이너의 패널 이동(onContainerKey)에
+              // 넘기도록 modifier로 가드(이중 발동 방지). stopPropagation은 쓰지 않는다.
+              if (
+                (e.key === "ArrowLeft" || e.key === "ArrowRight") &&
+                focusedIdx !== -1 &&
+                !e.ctrlKey &&
+                !e.metaKey
+              ) {
                 e.preventDefault();
                 const dx = e.key === "ArrowRight" ? 64 : -64;
                 blocks[focusedIdx]
@@ -890,14 +899,8 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
                   .forEach((p) => ((p as HTMLElement).scrollLeft += dx));
                 return;
               }
-              // ↑/↓/PageUp/PageDown: 뷰어 바디 세로 스크롤(읽기).
-              if (["ArrowDown", "ArrowUp", "PageDown", "PageUp"].includes(e.key)) {
-                if (body) {
-                  e.preventDefault();
-                  const step = e.key.startsWith("Page") ? body.clientHeight * 0.9 : 48;
-                  body.scrollTop += e.key === "ArrowDown" || e.key === "PageDown" ? step : -step;
-                }
-              }
+              // ↑/↓/PageUp/PageDown: 뷰어 바디 세로 스크롤(읽기) — 공유 헬퍼.
+              if (handleScrollKey(e, body)) return;
             }}
           >
             <div className="claudeterm-pane-head">
