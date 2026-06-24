@@ -17,10 +17,17 @@ export const isMarkdownPath = (path: string): boolean => /\.(md|markdown|mdx)$/i
  * images render. */
 const MEDIA_TAGS = ["img", "picture", "source", "video", "audio", "iframe", "object", "embed"];
 
-/** Render markdown `text` to sanitized HTML. `marked` is not a sanitizer, so the
+/** Parse markdown `text` to sanitized HTML. `marked` is not a sanitizer, so the
  * output is always run through DOMPurify before injection. `blockMedia` forbids
  * media tags (tool/session output); when false (study viewer) local images render.
- * `className` is applied to the wrapper so each call site keeps its own styling. */
+ * Exported as a pure function so the sanitize policy is unit-testable. */
+export function sanitizeMarkdown(text: string, blockMedia: boolean): string {
+  const parsed = marked.parse(text, { async: false }) as string;
+  return blockMedia ? DOMPurify.sanitize(parsed, { FORBID_TAGS: MEDIA_TAGS }) : DOMPurify.sanitize(parsed);
+}
+
+/** Render markdown `text` to sanitized HTML. `className` is applied to the wrapper
+ * so each call site keeps its own styling. */
 export function Markdown({
   text,
   className,
@@ -30,9 +37,6 @@ export function Markdown({
   className?: string;
   blockMedia?: boolean;
 }) {
-  const html = useMemo(() => {
-    const parsed = marked.parse(text, { async: false }) as string;
-    return blockMedia ? DOMPurify.sanitize(parsed, { FORBID_TAGS: MEDIA_TAGS }) : DOMPurify.sanitize(parsed);
-  }, [text, blockMedia]);
+  const html = useMemo(() => sanitizeMarkdown(text, blockMedia), [text, blockMedia]);
   return <div className={className} dangerouslySetInnerHTML={{ __html: html }} />;
 }
