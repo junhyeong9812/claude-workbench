@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from "react";
+import { errText } from "../utils/error";
 import type { IDockviewPanelProps } from "dockview-react";
 import { invoke } from "@tauri-apps/api/core";
 import { EditorView, basicSetup } from "codemirror";
@@ -68,7 +69,7 @@ export function EditorPanel(props: IDockviewPanelProps<EditorParams>) {
       })
       .catch((e) =>
         setStatus(
-          `저장 실패: ${typeof e === "string" ? e : ((e as { message?: string })?.message ?? e)}`,
+          `저장 실패: ${errText(e)}`,
         ),
       );
     return true;
@@ -113,7 +114,7 @@ export function EditorPanel(props: IDockviewPanelProps<EditorParams>) {
       })
       .catch((e) => {
         if (!cancelled) {
-          const msg = typeof e === "string" ? e : ((e as { message?: string })?.message ?? "읽기 실패");
+          const msg = errText(e, "읽기 실패");
           setErr(`이 파일은 에디터로 열 수 없습니다 — ${msg} (트리에서 Enter로 뷰어로 보세요).`);
         }
       });

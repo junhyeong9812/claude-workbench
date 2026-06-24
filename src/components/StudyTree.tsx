@@ -1,12 +1,11 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { errText } from "../utils/error";
 import { invoke } from "@tauri-apps/api/core";
 import { useAppStore } from "../state/store";
 import type { DirEntry } from "../types";
 import { ContextMenu, copyText, type MenuItem } from "./ContextMenu";
 
 const dirname = (p: string): string => p.split(/[\\/]/).slice(0, -1).join("/") || "/";
-const errText = (e: unknown): string =>
-  typeof e === "string" ? e : ((e as { message?: string })?.message ?? String(e));
 
 interface VisNode {
   entry: DirEntry;

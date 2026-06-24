@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { errText } from "../utils/error";
 import type { IDockviewPanelProps } from "dockview-react";
 import { invoke } from "@tauri-apps/api/core";
 
@@ -17,8 +18,6 @@ export interface DiffParams {
   hash?: string;
 }
 
-const errText = (e: unknown): string =>
-  typeof e === "string" ? e : ((e as { message?: string })?.message ?? "diff 실패");
 
 /** Class for a unified-diff line (color: + green, − red, hunk cyan, meta dim). */
 function lineClass(l: string): string {
@@ -82,7 +81,7 @@ export function DiffPanel(props: IDockviewPanelProps<DiffParams>) {
     p.then((t) => {
       if (gen === loadGen.current) setText(t);
     }).catch((e) => {
-      if (gen === loadGen.current) setErr(errText(e));
+      if (gen === loadGen.current) setErr(errText(e, "diff 실패"));
     });
   }, [cwd, path, staged, hash]);
 

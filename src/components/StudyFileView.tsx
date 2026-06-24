@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from "react";
+import { errText } from "../utils/error";
 import { invoke, convertFileSrc } from "@tauri-apps/api/core";
 import { PdfView } from "./PdfView";
 import { EditorView, basicSetup } from "codemirror";
@@ -34,7 +35,7 @@ function MarkdownView({ path }: { path: string }) {
         if (!cancelled) setText(t);
       })
       .catch((e) => {
-        if (!cancelled) setErr(typeof e === "string" ? e : ((e as { message?: string })?.message ?? "읽기 실패"));
+        if (!cancelled) setErr(errText(e, "읽기 실패"));
       });
     return () => {
       cancelled = true;
@@ -93,7 +94,7 @@ export function StudyFileView({ path, editable = false }: { path: string; editab
                     })
                     .catch((e) => {
                       if (cancelled) return;
-                      setStatus(typeof e === "string" ? e : ((e as { message?: string })?.message ?? "저장 실패"));
+                      setStatus(errText(e, "저장 실패"));
                     });
                   return true;
                 },
@@ -106,7 +107,7 @@ export function StudyFileView({ path, editable = false }: { path: string; editab
         view = new EditorView({ parent: hostRef.current, state: EditorState.create({ doc: text, extensions: exts }) });
       })
       .catch((e) => {
-        if (!cancelled) setErr(typeof e === "string" ? e : ((e as { message?: string })?.message ?? "읽기 실패"));
+        if (!cancelled) setErr(errText(e, "읽기 실패"));
       });
     return () => {
       cancelled = true;

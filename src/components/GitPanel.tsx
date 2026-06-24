@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
+import { errText } from "../utils/error";
 import { invoke } from "@tauri-apps/api/core";
 import { useAppStore } from "../state/store";
 import { computeGraph, GitGraphRow } from "./GitGraph";
@@ -35,8 +36,6 @@ interface Commit {
   subject: string;
 }
 
-const errText = (e: unknown): string =>
-  typeof e === "string" ? e : ((e as { message?: string })?.message ?? String(e));
 
 const localOf = (remote: string): string => remote.split("/").slice(1).join("/") || remote;
 

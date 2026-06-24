@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from "react";
+import { errText } from "../utils/error";
 import { convertFileSrc } from "@tauri-apps/api/core";
 import * as pdfjs from "pdfjs-dist";
 
@@ -38,7 +39,7 @@ export function PdfView({ path }: { path: string }) {
         }
       } catch (e) {
         if (!cancelled)
-          setErr(typeof e === "string" ? e : ((e as { message?: string })?.message ?? "PDF 로드 실패"));
+          setErr(errText(e, "PDF 로드 실패"));
       }
     })();
     return () => {

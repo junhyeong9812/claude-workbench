@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from "react";
+import { errText } from "../utils/error";
 import type { IDockviewPanelProps } from "dockview-react";
 import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
@@ -98,8 +99,6 @@ interface ClaudeTimelineEvent {
 const kfmt = (n: number): string => (n >= 1000 ? `${(n / 1000).toFixed(1)}k` : String(n));
 
 /** A short error string from an invoke rejection (AppError `{message}` or text). */
-const errText = (e: unknown): string =>
-  typeof e === "string" ? e : ((e as { message?: string })?.message ?? String(e));
 
 /**
  * Review/edit step of a handoff: shows the generated summary in a textarea so the
