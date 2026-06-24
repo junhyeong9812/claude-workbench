@@ -536,7 +536,7 @@ export function ItemDetail({ item, markdown = true }: { item: TimelineItem; mark
         <div className="timeline-diff-block" tabIndex={-1}>
           <div className="timeline-detail-path">{firstPath}</div>
           {fileText != null &&
-            (markdown ? (
+            (markdown && !!firstPath && isMarkdownPath(firstPath) ? (
               <MarkdownText text={fileText} />
             ) : (
               <pre className="timeline-detail-text">{fileText}</pre>
