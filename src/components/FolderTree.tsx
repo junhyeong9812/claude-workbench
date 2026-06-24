@@ -144,6 +144,19 @@ export function FolderTree() {
       }
       return;
     }
+    // Ctrl+→ moves focus into the peek viewer (opening it for a file first), so
+    // ↑/↓ scroll its content. Ctrl+← inside the viewer returns focus here —
+    // mirrors the change-detail panel's Ctrl+←/→ focus switching.
+    if (e.ctrlKey && e.key === "ArrowRight") {
+      if (cur && !cur.is_dir) {
+        e.preventDefault();
+        setPeekFile(cur.path);
+        requestAnimationFrame(() =>
+          document.querySelector<HTMLElement>(".peek-viewer")?.focus(),
+        );
+      }
+      return;
+    }
     switch (e.key) {
       case "ArrowDown":
         e.preventDefault();
