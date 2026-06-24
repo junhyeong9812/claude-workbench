@@ -5,41 +5,46 @@ import { EditorState } from "@codemirror/state";
 import { useAppStore } from "../state/store";
 import { langFor, fileName } from "./cmLang";
 import { cmThemeExt } from "./cmTheme";
+import { MarkdownText } from "./TimelineView";
+
+/** A markdown path — opened in 뷰모드 (rendered HTML) by default, toggleable to raw. */
+const isMarkdown = (path: string): boolean => /\.(md|markdown|mdx)$/i.test(path);
 
 /**
- * Read-only file peek viewer (P1): a CodeMirror 6 editor in read-only mode that
- * shows the file at `path`, syntax-highlighted by extension. Opens as an overlay
- * over the main area; the folder tree drives which file it shows (Enter to open,
- * ↑/↓ to follow). `Esc` closes it; `Ctrl+E` opens it in the editor (P2).
+ * Read-only file peek viewer (P1): opens as an overlay over the main area; the
+ * folder tree drives which file it shows (Enter to open, ↑/↓ to follow). For a
+ * markdown file it renders the same 뷰모드 as the change-detail pane (`MarkdownText`
+ * — marked+DOMPurify) and `v` toggles to the raw CodeMirror source; other files
+ * always show raw source. `Esc` closes; `Ctrl+E` opens it in the editor (P2);
+ * `Ctrl+←` returns focus to the tree.
  */
 export function FilePeekViewer({ path, onClose }: { path: string; onClose: () => void }) {
   const requestEditorOpen = useAppStore((s) => s.requestEditorOpen);
   const theme = useAppStore((s) => s.theme);
   const hostRef = useRef<HTMLDivElement | null>(null);
+  const bodyRef = useRef<HTMLDivElement | null>(null);
+  const [text, setText] = useState<string | null>(null);
   const [err, setErr] = useState<string | null>(null);
+  // Markdown files default to 뷰모드 (rendered); `v` toggles to raw. Non-markdown
+  // files ignore this and always show the CodeMirror source.
+  const [markdown, setMarkdown] = useState(true);
+  const md = isMarkdown(path);
+  const showRaw = !md || !markdown;
 
-  // Rebuild the CodeMirror view whenever the path changes (peek follows the tree
-  // cursor). The view is read-only — this is a viewer, not the editor (P2).
+  // Reset to 뷰모드 when the peeked file changes (follows the tree cursor).
+  useEffect(() => {
+    setMarkdown(true);
+  }, [path]);
+
+  // Read the file text into state — the viewer renders it either as markdown
+  // (뷰모드) or via CodeMirror (raw), so the text lives here, not only in CM.
   useEffect(() => {
     let cancelled = false;
-    let view: EditorView | null = null;
     setErr(null);
+    setText(null);
     invoke<string>("acp_read_file", { path })
-      .then((text) => {
-        if (cancelled || !hostRef.current) return;
-        view = new EditorView({
-          parent: hostRef.current,
-          state: EditorState.create({
-            doc: text,
-            extensions: [
-              basicSetup,
-              EditorState.readOnly.of(true),
-              EditorView.editable.of(false),
-              cmThemeExt(theme),
-              ...langFor(path),
-            ],
-          }),
-        });
+      .then((t) => {
+        if (!cancelled) setText(t);
       })
       .catch((e) => {
         if (!cancelled) {
@@ -48,9 +53,28 @@ export function FilePeekViewer({ path, onClose }: { path: string; onClose: () =>
       });
     return () => {
       cancelled = true;
-      view?.destroy();
     };
-  }, [path, theme]);
+  }, [path]);
+
+  // Build the read-only CodeMirror view only when showing raw source (the host
+  // div is only mounted then). Rebuilds on text/path/theme change.
+  useEffect(() => {
+    if (!showRaw || text == null || !hostRef.current) return;
+    const view = new EditorView({
+      parent: hostRef.current,
+      state: EditorState.create({
+        doc: text,
+        extensions: [
+          basicSetup,
+          EditorState.readOnly.of(true),
+          EditorView.editable.of(false),
+          cmThemeExt(theme),
+          ...langFor(path),
+        ],
+      }),
+    });
+    return () => view.destroy();
+  }, [showRaw, text, theme, path]);
 
   return (
     <div
@@ -65,6 +89,13 @@ export function FilePeekViewer({ path, onClose }: { path: string; onClose: () =>
           document.getElementById("folder-tree")?.focus();
           return;
         }
+        if (e.ctrlKey && e.key === "ArrowLeft") {
+          // Ctrl+← hands focus back to the tree (mirror of Ctrl+→ in the tree).
+          e.preventDefault();
+          e.stopPropagation();
+          document.getElementById("folder-tree")?.focus();
+          return;
+        }
         if (e.ctrlKey && (e.key === "e" || e.key === "E")) {
           e.preventDefault();
           e.stopPropagation();
@@ -72,9 +103,17 @@ export function FilePeekViewer({ path, onClose }: { path: string; onClose: () =>
           onClose();
           return;
         }
-        // ↑/↓/PageUp/PageDown/Home/End scroll the read-only content (the viewer is
-        // focused via Enter from the tree — mirrors the timeline detail pane).
-        const scroller = hostRef.current?.querySelector<HTMLElement>(".cm-scroller");
+        if (md && (e.key === "v" || e.key === "V") && !e.ctrlKey && !e.metaKey) {
+          // 뷰모드 ↔ 원본 (same shortcut as the change-detail pane).
+          e.preventDefault();
+          setMarkdown((v) => !v);
+          return;
+        }
+        // ↑/↓/PageUp/PageDown/Home/End scroll the focused content — the markdown
+        // container in 뷰모드, the CodeMirror scroller in raw (mirrors 변경상세).
+        const scroller = showRaw
+          ? hostRef.current?.querySelector<HTMLElement>(".cm-scroller")
+          : bodyRef.current;
         if (!scroller) return;
         const page = scroller.clientHeight * 0.9;
         switch (e.key) {
@@ -108,12 +147,31 @@ export function FilePeekViewer({ path, onClose }: { path: string; onClose: () =>
       <div className="peek-head">
         <span className="peek-title">{fileName(path)}</span>
         <span className="peek-path">{path}</span>
-        <span className="peek-hint">Esc 닫기 · Ctrl+E 에디터로 열기</span>
+        {md && (
+          <button
+            className="claudeterm-viewmode-btn"
+            title="뷰모드 ↔ 원본 (단축키 v)"
+            onClick={() => setMarkdown((v) => !v)}
+          >
+            {markdown ? "원본 보기" : "뷰모드 보기"}
+          </button>
+        )}
+        <span className="peek-hint">
+          {md ? "v 뷰/원본 · " : ""}↑↓ 스크롤 · Ctrl+← 트리 · Esc 닫기 · Ctrl+E 에디터
+        </span>
         <span className="peek-x" title="닫기 (Esc)" onClick={onClose}>
           ×
         </span>
       </div>
-      {err ? <div className="peek-err">{err}</div> : <div className="peek-body" ref={hostRef} />}
+      {err ? (
+        <div className="peek-err">{err}</div>
+      ) : showRaw ? (
+        <div className="peek-body" ref={hostRef} />
+      ) : (
+        <div className="peek-body peek-md" ref={bodyRef}>
+          {text != null && <MarkdownText text={text} />}
+        </div>
+      )}
     </div>
   );
 }
