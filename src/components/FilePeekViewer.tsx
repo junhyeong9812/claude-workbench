@@ -7,6 +7,7 @@ import { langFor, fileName } from "./cmLang";
 import { cmThemeExt } from "./cmTheme";
 import { MarkdownText } from "./TimelineView";
 import { isMarkdownPath } from "./markdown";
+import { handleScrollKey } from "./scrollKeys";
 
 /**
  * Read-only file peek viewer (P1): opens as an overlay over the main area; the
@@ -110,36 +111,9 @@ export function FilePeekViewer({ path, onClose }: { path: string; onClose: () =>
         // ↑/↓/PageUp/PageDown/Home/End scroll the focused content — the markdown
         // container in 뷰모드, the CodeMirror scroller in raw (mirrors 변경상세).
         const scroller = showRaw
-          ? hostRef.current?.querySelector<HTMLElement>(".cm-scroller")
+          ? (hostRef.current?.querySelector<HTMLElement>(".cm-scroller") ?? null)
           : bodyRef.current;
-        if (!scroller) return;
-        const page = scroller.clientHeight * 0.9;
-        switch (e.key) {
-          case "ArrowDown":
-            e.preventDefault();
-            scroller.scrollTop += 48;
-            break;
-          case "ArrowUp":
-            e.preventDefault();
-            scroller.scrollTop -= 48;
-            break;
-          case "PageDown":
-            e.preventDefault();
-            scroller.scrollTop += page;
-            break;
-          case "PageUp":
-            e.preventDefault();
-            scroller.scrollTop -= page;
-            break;
-          case "Home":
-            e.preventDefault();
-            scroller.scrollTop = 0;
-            break;
-          case "End":
-            e.preventDefault();
-            scroller.scrollTop = scroller.scrollHeight;
-            break;
-        }
+        handleScrollKey(e, scroller, { homeEnd: true });
       }}
     >
       <div className="peek-head">
