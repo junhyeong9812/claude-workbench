@@ -7,6 +7,7 @@ import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import "@xterm/xterm/css/xterm.css";
 import { useAppStore } from "../state/store";
 import { xtermTheme } from "./xtermTheme";
+import type { TerminalOutputEvent, SnapshotResult } from "../types";
 
 /** Params attached to a terminal panel. `sessionId` is persisted into the
  * dockview layout so a remount (tab/project switch) re-attaches the same PTY.
@@ -34,17 +35,6 @@ interface SshStatusEvent {
   id: number;
   phase: "connecting" | "ready" | "failed" | "closed";
   reason?: string | null;
-}
-
-interface TerminalOutputEvent {
-  session_id: number;
-  seq: number;
-  data: number[];
-}
-
-interface SnapshotResult {
-  data: number[];
-  last_seq: number;
 }
 
 /**
