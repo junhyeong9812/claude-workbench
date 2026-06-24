@@ -62,6 +62,10 @@ interface ChainTask {
   uuid: string;
   name: string;
   date: string;
+  /** AI-generated one-line title (header label); falls back to `name` if absent. */
+  title?: string | null;
+  /** Handoff summary text — shown as the header hover tooltip. */
+  summary?: string | null;
   items: TimelineItem[];
   turns: [number, string][];
   answers: [number, string][];
@@ -99,15 +103,25 @@ const kfmt = (n: number): string => (n >= 1000 ? `${(n / 1000).toFixed(1)}k` : S
  */
 function HandoffModal(props: {
   initial: string;
+  initialTitle: string;
   busy: boolean;
   onCancel: () => void;
-  onConfirm: (text: string) => void;
+  onConfirm: (text: string, title: string) => void;
 }) {
   const [text, setText] = useState(props.initial);
+  const [title, setTitle] = useState(props.initialTitle);
   return (
     <div className="claudeterm-modal-overlay" onMouseDown={props.onCancel}>
       <div className="claudeterm-modal" onMouseDown={(e) => e.stopPropagation()}>
         <div className="claudeterm-modal-head">핸드오프 요약 — 확인 후 이어가기</div>
+        {/* 1-line title — the prev-task header label. Editable before save. */}
+        <input
+          className="claudeterm-modal-title"
+          value={title}
+          onChange={(e) => setTitle(e.target.value)}
+          placeholder="task 제목 (한 줄)"
+          spellCheck={false}
+        />
         <textarea
           className="claudeterm-modal-body"
           value={text}
@@ -118,7 +132,7 @@ function HandoffModal(props: {
           <button onClick={props.onCancel} disabled={props.busy}>
             취소
           </button>
-          <button onClick={() => props.onConfirm(text)} disabled={props.busy}>
+          <button onClick={() => props.onConfirm(text, title)} disabled={props.busy}>
             {props.busy ? "진행 중…" : "이어가기 (새 task)"}
           </button>
         </div>
@@ -195,9 +209,12 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
   const [lastSeed, setLastSeed] = useState<string | null>(null);
   const [handoffBusy, setHandoffBusy] = useState(false);
   // The generated summary awaiting review/edit (null = modal closed).
-  const [summaryDraft, setSummaryDraft] = useState<{ cwd: string; oldUuid: string; text: string } | null>(
-    null,
-  );
+  const [summaryDraft, setSummaryDraft] = useState<{
+    cwd: string;
+    oldUuid: string;
+    text: string;
+    title: string;
+  } | null>(null);
   // Previous tasks in this session's handoff chain (read-only, newest-first),
   // rendered below the live timeline so the chain reads continuously (Phase 2).
   const [chainPrev, setChainPrev] = useState<ChainTask[]>([]);
@@ -233,11 +250,11 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
     }
     setHandoffBusy(true);
     try {
-      const res = await invoke<{ path: string; text: string }>("generate_task_summary", {
+      const res = await invoke<{ path: string; text: string; title: string }>("generate_task_summary", {
         cwd,
         uuid: oldUuid,
       });
-      setSummaryDraft({ cwd, oldUuid, text: res.text });
+      setSummaryDraft({ cwd, oldUuid, text: res.text, title: res.title });
     } catch (e) {
       alert(`요약 생성 실패: ${errText(e)}`);
     } finally {
@@ -248,7 +265,7 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
   // Step 2: persist the (edited) summary, start a fresh session, link the chain,
   // remount onto it, and seed it. Order per codex P3: start(new) → set_task_meta →
   // remount → close(old), so no step's failure orphans the live session.
-  const confirmHandoff = async (edited: string) => {
+  const confirmHandoff = async (edited: string, editedTitle: string) => {
     const draft = summaryDraft;
     if (!draft) return;
     setHandoffBusy(true);
@@ -258,6 +275,7 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
         cwd: draft.cwd,
         uuid: draft.oldUuid,
         text: edited,
+        title: editedTitle,
       });
       const started = await invoke<ClaudeOpened>("claude_open_or_attach", {
         project: draft.cwd,
@@ -973,11 +991,11 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
                     <div key={task.uuid} className="claudeterm-prevtask">
                       <div
                         className="claudeterm-prevtask-head"
-                        title={collapsed ? "펼치기" : "접기"}
+                        title={task.summary || (collapsed ? "펼치기" : "접기")}
                         onClick={() => toggleTask(task.uuid)}
                       >
                         <span className="timeline-date-caret">{collapsed ? "▸" : "▾"}</span> ◀ 이전 task —{" "}
-                        {task.name} · {task.date}
+                        {task.title || task.name} · {task.date}
                       </div>
                       {!collapsed && (
                         <TimelineView
@@ -1044,6 +1062,7 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
       {summaryDraft && (
         <HandoffModal
           initial={summaryDraft.text}
+          initialTitle={summaryDraft.title}
           busy={handoffBusy}
           onCancel={() => setSummaryDraft(null)}
           onConfirm={confirmHandoff}
