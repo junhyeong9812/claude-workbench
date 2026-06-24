@@ -107,10 +107,17 @@ function buildTree(changes: FileChange[]): TreeNode {
  * commit history with ref badges. Runs against `activeProject`'s cwd.
  */
 export function GitPanel() {
-  const cwd = useAppStore((s) => s.activeProject);
+  const activeProject = useAppStore((s) => s.activeProject);
   const requestDiff = useAppStore((s) => s.requestDiff);
   const requestEditorOpen = useAppStore((s) => s.requestEditorOpen);
   const theme = useAppStore((s) => s.theme);
+  // Multi-root: git roots under the project (enclosing repo + nested .git repos).
+  // `selectedRoot` overrides the project root for every git command below; null =
+  // the project's own cwd (default — identical to single-repo behavior). Keeping
+  // the effective root named `cwd` leaves all downstream invokes untouched.
+  const [roots, setRoots] = useState<string[]>([]);
+  const [selectedRoot, setSelectedRoot] = useState<string | null>(null);
+  const cwd = selectedRoot ?? activeProject;
   const [status, setStatus] = useState<GitStatus | null>(null);
   const [branches, setBranches] = useState<Branches | null>(null);
   const [commits, setCommits] = useState<Commit[]>([]);
@@ -157,6 +164,31 @@ export function GitPanel() {
     void reload();
   }, [reload]);
 
+  // Scan for git roots whenever the project changes; reset the selection to the
+  // default (project cwd) so switching tabs never leaves a stale nested root.
+  useEffect(() => {
+    setSelectedRoot(null);
+    if (!activeProject) {
+      setRoots([]);
+      return;
+    }
+    let cancelled = false;
+    invoke<string[]>("git_roots", { cwd: activeProject })
+      .then((r) => {
+        if (cancelled) return;
+        setRoots(r);
+        // Drop a selection that the fresh scan no longer contains (e.g. the nested
+        // repo was deleted) so git commands never target a stale root (codex P2).
+        setSelectedRoot((cur) => (cur && r.includes(cur) ? cur : null));
+      })
+      .catch(() => {
+        if (!cancelled) setRoots([]);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [activeProject]);
+
   const act = async (fn: () => Promise<unknown>, okNote = ""): Promise<boolean> => {
     setBusy(true);
     setNote("");
@@ -174,8 +206,45 @@ export function GitPanel() {
     return ok;
   };
 
+  // Root selector — built before the early returns so it's reachable even when the
+  // project root itself isn't a repo but has nested ones (codex P1).
+  const nestedRoots = roots.filter((r) => r !== activeProject);
+  const showRootSelect = nestedRoots.length > 0;
+  const shortRoot = (r: string) =>
+    activeProject && r.startsWith(activeProject + "/")
+      ? "./" + r.slice(activeProject.length + 1)
+      : r.split("/").pop() || r;
+  const rootSelect = showRootSelect ? (
+    <div className="git-head git-roots" title="git 루트 선택 (이 프로젝트 하위의 저장소)">
+      <span className="git-branch">
+        ⬚{" "}
+        <select
+          value={selectedRoot ?? ""}
+          disabled={busy}
+          onChange={(e) => setSelectedRoot(e.target.value || null)}
+        >
+          <option value="">{shortRoot(activeProject ?? "")} (현재)</option>
+          {nestedRoots.map((r) => (
+            <option key={r} value={r}>
+              {shortRoot(r)}
+            </option>
+          ))}
+        </select>
+      </span>
+    </div>
+  ) : null;
+
   if (!cwd) return <div className="git-empty">프로젝트를 먼저 여세요.</div>;
-  if (status && !status.is_repo) return <div className="git-empty">git 저장소가 아닙니다.</div>;
+  // Non-repo root: still surface the selector so a nested repo can be picked.
+  if (status && !status.is_repo)
+    return (
+      <div className="git-panel">
+        {rootSelect}
+        <div className="git-empty">
+          {showRootSelect ? "git 저장소가 아닙니다 — 위에서 하위 저장소를 선택하세요." : "git 저장소가 아닙니다."}
+        </div>
+      </div>
+    );
 
   const conflicted = status?.changes.filter((c) => c.conflicted) ?? [];
   const staged = status?.changes.filter((c) => c.staged && !c.conflicted) ?? [];
@@ -262,10 +331,12 @@ export function GitPanel() {
       ? list.map((c) => fileRow(c, c.path, 0, kind))
       : renderNode(buildTree(list), 0, kind);
 
+  // Root selector: only meaningful when nested repos exist under the project.
   return (
     <div className="git-panel">
       {/* Top half: branch, changes, commit */}
       <div className="git-top">
+        {rootSelect}
         <div className="git-head">
           <span className="git-branch" title="브랜치 전환">
             ⎇{" "}

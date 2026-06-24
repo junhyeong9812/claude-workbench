@@ -17,6 +17,18 @@ interface Worktree {
 export function WorktreePanel() {
   const cwd = useAppStore((s) => s.activeProject);
   const addProject = useAppStore((s) => s.addProject);
+  const requestClaudeOpen = useAppStore((s) => s.requestClaudeOpen);
+
+  // Register a worktree as a project tab and open a fresh Claude session bound to
+  // it — one-click "work this worktree with Claude". Must `await addProject` first:
+  // a NOT-yet-open worktree awaits project-type detection before activeProject
+  // flips, and MainArea is keyed by activeProject (remounts per project). Requesting
+  // before the switch would land the panel in the OLD project's dock; awaiting lets
+  // the new mount pick the request up (via apiReady).
+  const openClaude = async (path: string) => {
+    await addProject(path);
+    requestClaudeOpen({ project: path });
+  };
   const [list, setList] = useState<Worktree[]>([]);
   const [busy, setBusy] = useState(false);
   const [note, setNote] = useState("");
@@ -101,6 +113,14 @@ export function WorktreePanel() {
                 열기
               </button>
             )}
+            <button
+              className="git-mini"
+              disabled={busy}
+              title="이 워크트리에서 Claude 세션 열기"
+              onClick={() => void openClaude(w.path)}
+            >
+              Claude
+            </button>
             <button
               className="git-mini"
               disabled={busy}

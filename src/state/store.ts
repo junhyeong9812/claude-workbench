@@ -241,6 +241,10 @@ interface AppState {
   editorOpenRequest: string | null;
   /** A request to open a diff panel (consumed by MainArea), or null. Transient. */
   diffRequest: DiffSpec | null;
+  /** A request to open a new Claude session bound to `project` (consumed by
+   * MainArea, which owns the dockview api), or null. Transient — used by the
+   * worktree panel's one-click "Claude 열기". */
+  claudeOpenRequest: { project: string } | null;
   /** Bumped to ask MainArea to focus the active dockview panel (Ctrl+B from the
    * already-focused tree toggles focus back to the open tab). A counter so every
    * press re-fires even when the value would otherwise be unchanged. */
@@ -340,6 +344,8 @@ interface AppState {
   requestEditorOpen: (path: string | null) => void;
   /** Request opening a diff panel (MainArea consumes + clears with null). */
   requestDiff: (spec: DiffSpec | null) => void;
+  /** Request opening a new Claude session in `project` (MainArea consumes + clears). */
+  requestClaudeOpen: (req: { project: string } | null) => void;
   /** Ask MainArea to focus the active dockview panel (Ctrl+B tree→tab toggle). */
   requestFocusMain: () => void;
   /** Switch the color theme. */
@@ -397,6 +403,7 @@ export const useAppStore = create<AppState>((set, get) => ({
   peekFile: null,
   editorOpenRequest: null,
   diffRequest: null,
+  claudeOpenRequest: null,
   focusMainRequest: 0,
   theme: (localStorage.getItem("theme") as "dark" | "light") || "dark",
   fontSize: clampFontSize(Number(localStorage.getItem("fontSize")) || 13),
@@ -545,6 +552,7 @@ export const useAppStore = create<AppState>((set, get) => ({
   setPeekFile: (path) => set({ peekFile: path }),
   requestEditorOpen: (path) => set({ editorOpenRequest: path }),
   requestDiff: (spec) => set({ diffRequest: spec }),
+  requestClaudeOpen: (req) => set({ claudeOpenRequest: req }),
   requestFocusMain: () => set((s) => ({ focusMainRequest: s.focusMainRequest + 1 })),
   setTheme: (theme) => set({ theme }),
   setFontSize: (n) => set({ fontSize: clampFontSize(n) }),

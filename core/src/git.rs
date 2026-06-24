@@ -5,6 +5,8 @@
 //! separate `Command::args` entries — never interpolated into a shell — so there
 //! is no shell-injection surface.
 
+use std::collections::BTreeSet;
+use std::path::Path;
 use std::process::Command;
 
 use serde::Serialize;
@@ -481,9 +483,157 @@ pub fn delete_tag(cwd: &str, name: &str) -> Result<String, String> {
     run_git(cwd, &["tag", "-d", name])
 }
 
+// ---- multi-root discovery (nested .git detection) ----
+
+const MAX_SCAN_DEPTH: usize = 8;
+const MAX_ROOTS: usize = 200;
+/// Hard cap on directories visited, so a wide shallow tree with few repos (where
+/// the depth/root caps don't bite) still terminates promptly (codex P2).
+const MAX_VISITED_DIRS: usize = 20_000;
+/// Directory names that are pruned during the nested-repo scan — VCS internals and
+/// heavy build/dependency trees that never hold a *separate* project repo we'd want
+/// as a root (and that would make a recursive walk slow).
+const PRUNE_DIRS: &[&str] = &[
+    ".git", ".hg", ".svn", "node_modules", "target", "dist", "build", "out", ".next",
+    "vendor", ".cache", "coverage", "__pycache__", ".venv", "venv", ".tox", ".gradle",
+];
+
+/// Discover the git roots reachable from `cwd`: the enclosing work-tree root (at or
+/// above `cwd`, if any) plus every nested repository found by scanning the subtree
+/// under `cwd`. A directory is a root if it directly contains a `.git` (a dir for a
+/// normal repo, or a gitlink file for a worktree/submodule). The scan prunes
+/// VCS/build dirs, **never follows symlinks** (so it can't escape the tree or loop),
+/// stops descending once a repo is found (its internals aren't more roots), and is
+/// bounded by depth + root-count + visited-dir caps so a pathological tree can't
+/// hang the UI. Returned lexicographically sorted (BTreeSet) — a repo sorts before
+/// its own nested repos, though two unrelated subtrees order by path string.
+pub fn git_roots(cwd: &str) -> Vec<String> {
+    let mut roots: BTreeSet<String> = BTreeSet::new();
+    // Enclosing repo (work-tree root at or above cwd), if cwd is inside one.
+    if let Ok(top) = run_git(cwd, &["rev-parse", "--show-toplevel"]) {
+        if !top.is_empty() {
+            roots.insert(top);
+        }
+    }
+    // Nested repos strictly under cwd.
+    let mut count = 0usize;
+    let mut visited = 0usize;
+    scan_git_roots(Path::new(cwd), 0, &mut roots, &mut count, &mut visited);
+    roots.into_iter().collect()
+}
+
+fn scan_git_roots(
+    dir: &Path,
+    depth: usize,
+    roots: &mut BTreeSet<String>,
+    count: &mut usize,
+    visited: &mut usize,
+) {
+    if depth > MAX_SCAN_DEPTH || *count >= MAX_ROOTS || *visited >= MAX_VISITED_DIRS {
+        return;
+    }
+    *visited += 1;
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(_) => return, // unreadable dir (permissions) — skip, not fatal
+    };
+    for entry in entries.flatten() {
+        let file_type = match entry.file_type() {
+            Ok(t) => t,
+            Err(_) => continue,
+        };
+        // Never follow symlinks (could escape the project tree or cycle); only walk
+        // real directories.
+        if file_type.is_symlink() || !file_type.is_dir() {
+            continue;
+        }
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if PRUNE_DIRS.contains(&name.as_ref()) {
+            continue;
+        }
+        let path = entry.path();
+        // A directory holding a `.git` entry is a repo root — record it and do NOT
+        // descend (a repository's own contents aren't additional roots).
+        if path.join(".git").exists() {
+            roots.insert(path.to_string_lossy().to_string());
+            *count += 1;
+            if *count >= MAX_ROOTS {
+                return;
+            }
+            continue;
+        }
+        scan_git_roots(&path, depth + 1, roots, count, visited);
+        if *count >= MAX_ROOTS || *visited >= MAX_VISITED_DIRS {
+            return;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static COUNTER: AtomicUsize = AtomicUsize::new(0);
+
+    fn temp_dir(tag: &str) -> std::path::PathBuf {
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let mut p = std::env::temp_dir();
+        p.push(format!("mt_git_{tag}_{nanos}_{n}"));
+        std::fs::create_dir_all(&p).unwrap();
+        p
+    }
+
+    #[test]
+    fn scan_finds_nested_repos_prunes_heavy_and_stops_at_boundary() {
+        let root = temp_dir("roots");
+        // Two nested repos at different depths + a heavy dir + a repo-inside-a-repo
+        // (which must NOT be reported — scan stops at the outer repo boundary).
+        std::fs::create_dir_all(root.join("a/.git")).unwrap();
+        std::fs::create_dir_all(root.join("nested/b/.git")).unwrap();
+        std::fs::create_dir_all(root.join("node_modules/pkg/.git")).unwrap(); // pruned
+        std::fs::create_dir_all(root.join("a/inner/.git")).unwrap(); // inside repo a → skipped
+        std::fs::create_dir_all(root.join("plain/sub")).unwrap(); // no repo
+
+        let mut set: BTreeSet<String> = BTreeSet::new();
+        let mut count = 0;
+        let mut visited = 0;
+        scan_git_roots(&root, 0, &mut set, &mut count, &mut visited);
+
+        let a = root.join("a").to_string_lossy().to_string();
+        let b = root.join("nested/b").to_string_lossy().to_string();
+        assert!(set.contains(&a), "direct-child repo found");
+        assert!(set.contains(&b), "depth-2 repo found");
+        assert!(
+            !set.contains(&root.join("node_modules/pkg").to_string_lossy().to_string()),
+            "node_modules pruned"
+        );
+        assert!(
+            !set.contains(&root.join("a/inner").to_string_lossy().to_string()),
+            "repo inside a repo not descended into"
+        );
+        assert_eq!(set.len(), 2);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn gitlink_file_counts_as_repo_root() {
+        // A worktree/submodule has `.git` as a FILE (gitlink), not a dir.
+        let root = temp_dir("gitlink");
+        std::fs::create_dir_all(root.join("wt")).unwrap();
+        std::fs::write(root.join("wt/.git"), "gitdir: /somewhere\n").unwrap();
+        let mut set: BTreeSet<String> = BTreeSet::new();
+        let mut count = 0;
+        let mut visited = 0;
+        scan_git_roots(&root, 0, &mut set, &mut count, &mut visited);
+        assert!(set.contains(&root.join("wt").to_string_lossy().to_string()));
+        std::fs::remove_dir_all(&root).ok();
+    }
 
     #[test]
     fn parse_branch_with_upstream_and_tracking() {

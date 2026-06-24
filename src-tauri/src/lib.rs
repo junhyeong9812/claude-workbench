@@ -145,6 +145,7 @@ pub fn run() {
             commands::git_worktree_add,
             commands::git_worktree_remove,
             commands::git_diff,
+            commands::git_roots,
             commands::git_show,
             commands::git_tags,
             commands::git_create_tag,
