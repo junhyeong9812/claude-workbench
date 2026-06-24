@@ -8,6 +8,7 @@ import { Fragment, useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { marked } from "marked";
 import DOMPurify from "dompurify";
+import { isMarkdownPath } from "./markdown";
 
 /** Render text as sanitized markdown (뷰모드). Same marked+DOMPurify pipeline as
  * the study viewer — the content is local session text, sanitized before inject. */
@@ -24,10 +25,6 @@ export function MarkdownText({ text }: { text: string }) {
   );
   return <div className="study-md tl-markdown" dangerouslySetInnerHTML={{ __html: html }} />;
 }
-
-/** A path whose written content is markdown — its diff `new_text` is rendered
- * (not raw) in 뷰모드 so a written .md reads as formatted markdown. */
-const isMarkdownPath = (path: string): boolean => /\.(md|markdown|mdx)$/i.test(path);
 
 export interface TimelineItem {
   turn: number;
