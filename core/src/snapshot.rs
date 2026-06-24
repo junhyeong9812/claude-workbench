@@ -70,6 +70,16 @@ pub struct SessionSnapshot {
     /// Also sidecar-sourced.
     #[serde(default)]
     pub summary_path: Option<String>,
+    /// AI-generated one-line title of the task (the `<uuid>.title` sidecar), shown
+    /// as the prev-task header instead of the generic display name. Sidecar-sourced
+    /// on [`load`]; `None` for tasks summarized before titles existed (falls back to
+    /// the display name in the UI).
+    #[serde(default)]
+    pub title: Option<String>,
+    /// The handoff summary text itself (the `<uuid>.summary.md` body), surfaced as
+    /// the prev-task header's hover tooltip. Sidecar-sourced on [`load`].
+    #[serde(default)]
+    pub summary: Option<String>,
 }
 
 /// A session summarized for the reopen picker.
@@ -206,6 +216,51 @@ pub fn save_summary(base: &Path, project: &str, uuid: &str, text: &str) -> io::R
     Ok(final_path)
 }
 
+/// Write (overwrite) a task's one-line title to its `<uuid>.title` sidecar
+/// atomically (temp+rename). Decoupled from the body like `.name`/`.task`, so the
+/// poll thread's `.json` overwrite can't clobber it. A blank title removes the
+/// sidecar (so the UI falls back to the display name) rather than persisting "".
+pub fn save_title(base: &Path, project: &str, uuid: &str, title: &str) -> io::Result<()> {
+    if !is_safe_uuid(uuid) {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "unsafe session id"));
+    }
+    let dir = dir(base, project);
+    fs::create_dir_all(&dir)?;
+    let final_path = dir.join(format!("{uuid}.title"));
+    let trimmed = title.trim();
+    if trimmed.is_empty() {
+        // Best-effort cleanup; absence is the "no title" state.
+        let _ = fs::remove_file(&final_path);
+        return Ok(());
+    }
+    let tmp_path = unique_tmp(&dir, &format!("{uuid}.title"));
+    fs::write(&tmp_path, trimmed)?;
+    fs::rename(&tmp_path, final_path)
+}
+
+/// The task's one-line title override (`<uuid>.title`), if present and non-empty.
+pub fn read_title(base: &Path, project: &str, uuid: &str) -> Option<String> {
+    if !is_safe_uuid(uuid) {
+        return None;
+    }
+    fs::read_to_string(dir(base, project).join(format!("{uuid}.title")))
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+/// The task's handoff-summary text (`<uuid>.summary.md`), if present and non-empty
+/// — surfaced as the prev-task header hover tooltip.
+pub fn read_summary(base: &Path, project: &str, uuid: &str) -> Option<String> {
+    if !is_safe_uuid(uuid) {
+        return None;
+    }
+    fs::read_to_string(dir(base, project).join(format!("{uuid}.summary.md")))
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
 /// List the saved sessions for a project, newest first (by date, then name).
 pub fn list(base: &Path, project: &str) -> Vec<SnapshotSummary> {
     let mut out = Vec::new();
@@ -266,6 +321,10 @@ pub fn load(base: &Path, project: &str, uuid: &str) -> Option<SessionSnapshot> {
         snap.prev_uuid = meta.prev_uuid;
         snap.summary_path = meta.summary_path;
     }
+    // Title/summary live in their own sidecars (generated at handoff) — surfaced as
+    // the prev-task header label + hover tooltip.
+    snap.title = read_title(base, project, uuid);
+    snap.summary = read_summary(base, project, uuid);
     Some(snap)
 }
 
@@ -378,6 +437,7 @@ pub fn delete(base: &Path, project: &str, uuid: &str) -> io::Result<()> {
         dir.join(format!("{uuid}.name")),
         dir.join(format!("{uuid}.task")),
         dir.join(format!("{uuid}.summary.md")),
+        dir.join(format!("{uuid}.title")),
     ] {
         match fs::remove_file(path) {
             Ok(()) => {}
@@ -423,6 +483,8 @@ mod tests {
             tokens: vec![],
             prev_uuid: None,
             summary_path: None,
+            title: None,
+            summary: None,
         }
     }
 

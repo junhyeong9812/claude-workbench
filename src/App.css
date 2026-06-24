@@ -1198,6 +1198,19 @@ body {
   color: var(--fg-dim);
   border-bottom: 1px solid var(--border, #333);
 }
+.claudeterm-modal-title {
+  flex: 0 0 auto;
+  margin: 0;
+  padding: 8px 12px;
+  border: 0;
+  border-bottom: 1px solid var(--border, #333);
+  outline: none;
+  background: transparent;
+  color: var(--fg, #cdd6f4);
+  font-family: "JetBrains Mono", "DejaVu Sans Mono", "Noto Sans Mono CJK KR", monospace;
+  font-size: 0.9em;
+  font-weight: 600;
+}
 .claudeterm-modal-body {
   flex: 1 1 auto;
   margin: 0;

@@ -1081,6 +1081,10 @@ fn run_timeline_poll(
                 // these stay `None` here and `load` sources them from the sidecar.
                 prev_uuid: None,
                 summary_path: None,
+                // Title/summary likewise sidecar-sourced on `load` (`.title`/
+                // `.summary.md`), so the per-tick body write never clobbers them.
+                title: None,
+                summary: None,
             };
             let _ = core_lib::snapshot::save(&base, &cwd, &snap);
         }
@@ -1154,6 +1158,8 @@ pub fn claude_session_chain(
 pub struct TaskSummary {
     path: String,
     text: String,
+    /// One-line title parsed from the generation (the prev-task header label).
+    title: String,
 }
 
 /// Run a one-shot `claude -p --output-format text` in `cwd`, feeding `prompt` on
@@ -1309,23 +1315,91 @@ fn generate_task_summary_blocking(
         tokens: tail.tokens().iter().map(|(k, v)| (*k, *v)).collect(),
         prev_uuid: None,
         summary_path: None,
+        title: None,
+        summary: None,
     };
     if snap.turns.is_empty() {
         return Err(AppError::new("요약할 대화가 없습니다"));
     }
     let rendered = core_lib::snapshot::render_for_summary(&snap);
+    // Ask for both a one-line title (first line, `TITLE:` prefix) and the markdown
+    // body in one `claude -p` call, so the prev-task header has a meaningful label
+    // without a second round-trip. `split_summary_title` parses them back apart.
     let prompt = format!(
         "다음은 한 코딩 작업(task)의 전체 타임라인입니다. 이어서 작업할 Claude 세션이 맥락을 빠르게 \
-이어받도록 한국어 핸드오프 요약을 markdown으로 작성하세요. 포함: (1) 목표와 지금까지 한 일 (2) 변경된 \
-핵심 파일과 이유 (3) 미해결·다음 할 일 (4) 주의점. 군더더기 없이 간결하게.\n\n{rendered}"
+이어받도록 한국어 핸드오프 요약을 작성하세요.\n\n출력 형식(반드시 지킬 것):\n\
+- 첫 줄은 정확히 `TITLE: ` 로 시작하는 한 줄 제목 (이 작업이 무엇인지 한눈에 알 수 있게, 40자 이내).\n\
+- 둘째 줄부터 markdown 본문. 포함: (1) 목표와 지금까지 한 일 (2) 변경된 핵심 파일과 이유 \
+(3) 미해결·다음 할 일 (4) 주의점. 군더더기 없이 간결하게.\n\n{rendered}"
     );
-    let text = run_claude_p(&cwd, &prompt, Duration::from_secs(120))?;
+    let raw = run_claude_p(&cwd, &prompt, Duration::from_secs(120))?;
+    let (title, text) = split_summary_title(&raw);
     let path = core_lib::snapshot::save_summary(&base, &cwd, &uuid, &text)
         .map_err(|e| AppError::new(io_message("Cannot save summary", &e)))?;
+    core_lib::snapshot::save_title(&base, &cwd, &uuid, &title)
+        .map_err(|e| AppError::new(io_message("Cannot save title", &e)))?;
     Ok(TaskSummary {
         path: path.to_string_lossy().to_string(),
         text,
+        title,
     })
+}
+
+/// Split a generated summary into (title, body). The model is asked to put a
+/// `TITLE:` first line; if it complied we strip that line and use the rest as the
+/// body. If it didn't (older prompt, model drift), we fall back to the first
+/// non-empty line (de-marked, truncated) as the title and keep the whole text as
+/// the body — so a malformed response never loses the summary.
+fn split_summary_title(raw: &str) -> (String, String) {
+    let trimmed = raw.trim_start();
+    let first_line = trimmed.lines().next().unwrap_or("").trim();
+    let stripped = first_line
+        .strip_prefix("TITLE:")
+        .or_else(|| first_line.strip_prefix("title:"))
+        .or_else(|| first_line.strip_prefix("Title:"));
+    if let Some(t) = stripped {
+        let title = clean_title(t);
+        // Body = everything after the first newline. The summary keeps its full
+        // markdown; only the TITLE line is removed.
+        let body = trimmed
+            .split_once('\n')
+            .map(|(_, rest)| rest)
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        // Degenerate response (only a TITLE line, no body) would persist an empty
+        // `.summary.md` and seed the next session with nothing — fall back to the
+        // title text as the body so the handoff summary is never empty (codex M1).
+        let body = if body.is_empty() { title.clone() } else { body };
+        return (title, body);
+    }
+    // No TITLE marker: derive a title from the first non-empty line, keep full body.
+    let derived = trimmed
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .unwrap_or("");
+    (clean_title(derived), raw.trim().to_string())
+}
+
+/// Normalize a raw title line into a clean one-liner: drop leading markdown
+/// heading/list markers and surrounding quotes, then char-boundary-truncate so an
+/// over-long title can't blow the header layout.
+fn clean_title(s: &str) -> String {
+    let t = s
+        .trim()
+        .trim_start_matches(|c| c == '#' || c == '-' || c == '*' || c == ' ')
+        .trim()
+        .trim_matches('"')
+        .trim_matches('`')
+        .trim();
+    const MAX: usize = 80;
+    if t.chars().count() <= MAX {
+        t.to_string()
+    } else {
+        let cut: String = t.chars().take(MAX).collect();
+        format!("{cut}…")
+    }
 }
 
 /// Overwrite a session's handoff summary with user-edited text (the review/edit
@@ -1336,6 +1410,7 @@ pub fn save_task_summary(
     cwd: String,
     uuid: String,
     text: String,
+    title: String,
 ) -> Result<String, AppError> {
     let base = app
         .path()
@@ -1343,6 +1418,8 @@ pub fn save_task_summary(
         .map_err(|_| AppError::new("Cannot resolve app data directory"))?;
     let path = core_lib::snapshot::save_summary(&base, &cwd, &uuid, &text)
         .map_err(|e| AppError::new(io_message("Cannot save summary", &e)))?;
+    core_lib::snapshot::save_title(&base, &cwd, &uuid, &title)
+        .map_err(|e| AppError::new(io_message("Cannot save title", &e)))?;
     Ok(path.to_string_lossy().to_string())
 }
 
@@ -1688,4 +1765,43 @@ pub fn git_resolve_ours(cwd: String, path: String) -> Result<String, AppError> {
 #[tauri::command]
 pub fn git_resolve_theirs(cwd: String, path: String) -> Result<String, AppError> {
     core_lib::git::resolve_theirs(&cwd, &path).map_err(AppError::new)
+}
+
+#[cfg(test)]
+mod summary_title_tests {
+    use super::{clean_title, split_summary_title};
+
+    #[test]
+    fn parses_title_marker_and_keeps_body() {
+        let raw = "TITLE: 핸드오프 요약 제목\n## 목표\n본문 내용";
+        let (title, body) = split_summary_title(raw);
+        assert_eq!(title, "핸드오프 요약 제목");
+        assert_eq!(body, "## 목표\n본문 내용");
+    }
+
+    #[test]
+    fn falls_back_to_first_line_without_marker() {
+        // No TITLE: marker — derive title from first non-empty line, keep full body.
+        let raw = "\n# 어떤 작업\n세부 내용";
+        let (title, body) = split_summary_title(raw);
+        assert_eq!(title, "어떤 작업"); // heading marker stripped
+        assert_eq!(body, "# 어떤 작업\n세부 내용"); // body untouched on fallback
+    }
+
+    #[test]
+    fn title_only_response_falls_back_body_to_title() {
+        // No body after TITLE → summary must not be empty (would seed nothing).
+        let (title, body) = split_summary_title("TITLE: 제목만");
+        assert_eq!(title, "제목만");
+        assert_eq!(body, "제목만"); // codex M1: fall back to title text
+    }
+
+    #[test]
+    fn clean_title_strips_markers_quotes_and_truncates() {
+        assert_eq!(clean_title("  ## \"제목\" "), "제목");
+        let long: String = "가".repeat(100);
+        let cleaned = clean_title(&long);
+        assert_eq!(cleaned.chars().count(), 81); // 80 chars + ellipsis
+        assert!(cleaned.ends_with('…'));
+    }
 }
