@@ -116,6 +116,8 @@ export function MainArea() {
   const requestEditorOpen = useAppStore((s) => s.requestEditorOpen);
   const diffRequest = useAppStore((s) => s.diffRequest);
   const requestDiff = useAppStore((s) => s.requestDiff);
+  const claudeOpenRequest = useAppStore((s) => s.claudeOpenRequest);
+  const requestClaudeOpen = useAppStore((s) => s.requestClaudeOpen);
   const focusMainRequest = useAppStore((s) => s.focusMainRequest);
   const setLayout = useAppStore((s) => s.setLayout);
 
@@ -159,6 +161,10 @@ export function MainArea() {
   // A queue (not a single slot) so two connections prompting for unknown host
   // keys at once don't clobber each other — each is answered in turn (P3-R2).
   const [hostKeyQueue, setHostKeyQueue] = useState<HostKeyPrompt[]>([]);
+  // Flips true once the dockview api is ready (onReady). A pending claudeOpenRequest
+  // that arrives during a project-switch remount waits on this so the panel lands in
+  // the freshly-restored layout, not a null api.
+  const [apiReady, setApiReady] = useState(false);
 
   // The layout for the project this mount belongs to (read once at onReady).
   const savedLayout = projects.find((p) => p.path === activeProject)?.layout;
@@ -166,6 +172,7 @@ export function MainArea() {
   const onReady = (event: DockviewReadyEvent) => {
     const api = event.api;
     apiRef.current = api;
+    setApiReady(true);
 
     // Restore the saved layout first; a corrupt/incompatible blob must never
     // crash — fall back to an empty layout.
@@ -498,7 +505,11 @@ export function MainArea() {
     if (!api) return;
     const spec = diffRequest;
     requestDiff(null);
-    const key = spec.hash ? `diff:${spec.hash}` : `diff:${spec.path}:${spec.staged ? 1 : 0}`;
+    // Scope the dedupe key by cwd: with multi-root, two repos can share a path or
+    // commit hash, and a cwd-less key would reactivate the wrong repo's diff (codex P1).
+    const key = spec.hash
+      ? `diff:${spec.cwd}:${spec.hash}`
+      : `diff:${spec.cwd}:${spec.path}:${spec.staged ? 1 : 0}`;
     const existing = api.panels.find((p) => p.id === key);
     if (existing) {
       existing.api.setActive();
@@ -512,6 +523,26 @@ export function MainArea() {
     });
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [diffRequest, activeProject]);
+
+  // Open a new Claude session bound to a specific project when requested (the
+  // worktree panel's one-click "Claude 열기"). A fresh loadSessionId seeds a new
+  // task session; `project` pins it to that worktree's cwd regardless of which
+  // tab is active afterwards.
+  useEffect(() => {
+    if (!claudeOpenRequest) return;
+    const { project } = claudeOpenRequest;
+    // Only THIS project's mount may consume the request (MainArea is keyed by
+    // activeProject): otherwise a not-yet-switched old mount would add the Claude
+    // panel to the wrong project's dock (codex P1). Keep the request until the
+    // worktree's mount is active.
+    if (project !== activeProject) return;
+    const api = apiRef.current;
+    if (!api) return; // dock not ready (project-switch remount) — keep the request; apiReady re-runs this
+    requestClaudeOpen(null); // consume only once we can actually act
+    const title = `Claude ${counterRef.current + 1}`;
+    addPanel("claudeterm", { project, loadSessionId: crypto.randomUUID(), title });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [claudeOpenRequest, apiReady, activeProject]);
 
   // Resolve a close request from a Claude tab's × (B3-1): 닫기 keeps the saved
   // history, 삭제 also removes it; both close the panel.

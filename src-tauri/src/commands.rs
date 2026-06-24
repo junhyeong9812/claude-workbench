@@ -1727,6 +1727,13 @@ pub fn git_diff(cwd: String, path: String, staged: bool) -> Result<String, AppEr
     core_lib::git::diff(&cwd, &path, staged).map_err(AppError::new)
 }
 
+/// Discover git roots under `cwd` (enclosing repo + nested repos) for the GitPanel
+/// root selector. Never fails — an unreadable/non-repo tree yields an empty list.
+#[tauri::command]
+pub fn git_roots(cwd: String) -> Vec<String> {
+    core_lib::git::git_roots(&cwd)
+}
+
 #[tauri::command]
 pub fn git_show(cwd: String, hash: String) -> Result<String, AppError> {
     core_lib::git::show(&cwd, &hash).map_err(AppError::new)
