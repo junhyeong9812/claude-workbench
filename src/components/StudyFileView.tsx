@@ -25,6 +25,10 @@ function MarkdownView({ path }: { path: string }) {
   const [err, setErr] = useState<string | null>(null);
   useEffect(() => {
     let cancelled = false;
+    // Reset on path change so a previous file's error or content doesn't linger
+    // until the new read resolves (stale state).
+    setText(null);
+    setErr(null);
     invoke<string>("acp_read_file", { path })
       .then((t) => {
         if (!cancelled) setText(t);
