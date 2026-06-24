@@ -6,9 +6,7 @@ import { useAppStore } from "../state/store";
 import { langFor, fileName } from "./cmLang";
 import { cmThemeExt } from "./cmTheme";
 import { MarkdownText } from "./TimelineView";
-
-/** A markdown path — opened in 뷰모드 (rendered HTML) by default, toggleable to raw. */
-const isMarkdown = (path: string): boolean => /\.(md|markdown|mdx)$/i.test(path);
+import { isMarkdownPath } from "./markdown";
 
 /**
  * Read-only file peek viewer (P1): opens as an overlay over the main area; the
@@ -28,7 +26,7 @@ export function FilePeekViewer({ path, onClose }: { path: string; onClose: () =>
   // Markdown files default to 뷰모드 (rendered); `v` toggles to raw. Non-markdown
   // files ignore this and always show the CodeMirror source.
   const [markdown, setMarkdown] = useState(true);
-  const md = isMarkdown(path);
+  const md = isMarkdownPath(path);
   const showRaw = !md || !markdown;
 
   // Reset to 뷰모드 when the peeked file changes (follows the tree cursor).

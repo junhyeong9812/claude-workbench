@@ -9,8 +9,8 @@ import { keymap } from "@codemirror/view";
 import { useAppStore } from "../state/store";
 import { langFor } from "./cmLang";
 import { cmThemeExt } from "./cmTheme";
+import { isMarkdownPath } from "./markdown";
 
-const isMarkdown = (p: string): boolean => /\.(md|markdown|mdx)$/i.test(p);
 const isImage = (p: string): boolean => /\.(png|jpe?g|gif|webp|bmp|svg|ico|avif)$/i.test(p);
 const isPdf = (p: string): boolean => /\.pdf$/i.test(p);
 /** Known binary/compiled file types — not previewable as text. */
@@ -53,7 +53,7 @@ export function StudyFileView({ path, editable = false }: { path: string; editab
   const [status, setStatus] = useState("");
 
   // Viewer mode renders markdown as formatted HTML; editor mode edits the source.
-  const renderMarkdown = !editable && isMarkdown(path);
+  const renderMarkdown = !editable && isMarkdownPath(path);
   // Images/PDF/binary are shown as media/placeholder, never read as text.
   const renderMedia = isImage(path) || isPdf(path) || isBinary(path);
 
