@@ -1,7 +1,5 @@
 import { useEffect, useRef, useState } from "react";
 import { invoke, convertFileSrc } from "@tauri-apps/api/core";
-import { marked } from "marked";
-import DOMPurify from "dompurify";
 import { PdfView } from "./PdfView";
 import { EditorView, basicSetup } from "codemirror";
 import { EditorState } from "@codemirror/state";
@@ -9,7 +7,7 @@ import { keymap } from "@codemirror/view";
 import { useAppStore } from "../state/store";
 import { langFor } from "./cmLang";
 import { cmThemeExt } from "./cmTheme";
-import { isMarkdownPath } from "./markdown";
+import { isMarkdownPath, Markdown } from "./markdown";
 
 const isImage = (p: string): boolean => /\.(png|jpe?g|gif|webp|bmp|svg|ico|avif)$/i.test(p);
 const isPdf = (p: string): boolean => /\.pdf$/i.test(p);
@@ -19,16 +17,17 @@ const isBinary = (p: string): boolean =>
     p,
   );
 
-/** Rendered-markdown viewer (viewer mode only). */
+/** Rendered-markdown viewer (viewer mode only). Owns the file fetch + loading/error
+ * UX; the marked+DOMPurify render is delegated to the shared `Markdown` (media
+ * allowed here so local `.md` images show — see `.study-md img` styling). */
 function MarkdownView({ path }: { path: string }) {
-  const [html, setHtml] = useState<string | null>(null);
+  const [text, setText] = useState<string | null>(null);
   const [err, setErr] = useState<string | null>(null);
   useEffect(() => {
     let cancelled = false;
     invoke<string>("acp_read_file", { path })
-      .then((text) => {
-        // marked is not a sanitizer — purify before injecting (codex SF-2).
-        if (!cancelled) setHtml(DOMPurify.sanitize(marked.parse(text, { async: false }) as string));
+      .then((t) => {
+        if (!cancelled) setText(t);
       })
       .catch((e) => {
         if (!cancelled) setErr(typeof e === "string" ? e : ((e as { message?: string })?.message ?? "읽기 실패"));
@@ -38,8 +37,8 @@ function MarkdownView({ path }: { path: string }) {
     };
   }, [path]);
   if (err) return <div className="study-view-err">{err}</div>;
-  if (html == null) return <div className="study-md study-md-loading">불러오는 중…</div>;
-  return <div className="study-md" dangerouslySetInnerHTML={{ __html: html }} />;
+  if (text == null) return <div className="study-md study-md-loading">불러오는 중…</div>;
+  return <Markdown text={text} className="study-md" />;
 }
 
 /**

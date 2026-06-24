@@ -4,26 +4,15 @@
  * that splits the chat area (left), keeping this list as a single column.
  * Presentational; ClaudeTermPanel feeds it the items/turns for *its* session. */
 
-import { Fragment, useEffect, useMemo, useRef, useState } from "react";
+import { Fragment, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { marked } from "marked";
-import DOMPurify from "dompurify";
-import { isMarkdownPath } from "./markdown";
+import { isMarkdownPath, Markdown } from "./markdown";
 
-/** Render text as sanitized markdown (뷰모드). Same marked+DOMPurify pipeline as
- * the study viewer — the content is local session text, sanitized before inject. */
+/** Sanitized markdown for tool/session 뷰모드. Media tags are blocked here (unlike
+ * the study viewer, which renders local images) — tool output may contain remote
+ * `![](https://…)` that would make the webview fetch a URL on open. */
 export function MarkdownText({ text }: { text: string }) {
-  const html = useMemo(
-    () =>
-      DOMPurify.sanitize(marked.parse(text, { async: false }) as string, {
-        // Tool output / read results are rendered here — block media tags so a
-        // `![x](https://attacker/…)` can't make the webview fetch a remote URL
-        // just by opening the detail pane (codex).
-        FORBID_TAGS: ["img", "picture", "source", "video", "audio", "iframe", "object", "embed"],
-      }),
-    [text],
-  );
-  return <div className="study-md tl-markdown" dangerouslySetInnerHTML={{ __html: html }} />;
+  return <Markdown text={text} className="study-md tl-markdown" blockMedia />;
 }
 
 export interface TimelineItem {
