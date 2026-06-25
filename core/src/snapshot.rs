@@ -715,6 +715,7 @@ mod tests {
             title: "edit".into(),
             locations: vec![],
             project_label: None,
+            cwd: None,
             diffs: vec![FileDiff {
                 path: PathBuf::from("src/main.rs"),
                 old_text: Some("a".into()),

@@ -672,7 +672,14 @@ export function MainArea() {
     // Give the new session a stable UUID up front so it's saved in the layout
     // immediately → resumes the same session after restart (create-or-resume in
     // claude_start handles the not-yet-chatted case). #6
-    addPanel("claudeterm", { title: name, loadSessionId: crypto.randomUUID() });
+    // Pin the session to the current project so its cwd basis is stable (the panel
+    // reads `params.project` as sessionCwd; an `activeProject` fallback would shift
+    // if the user switches tabs while the session lives — codex P2).
+    addPanel("claudeterm", {
+      title: name,
+      loadSessionId: crypto.randomUUID(),
+      project: activeProject ?? undefined,
+    });
   };
 
   // Alt+←/→/↑/↓ moves between panels by SCREEN POSITION: when the layout is split

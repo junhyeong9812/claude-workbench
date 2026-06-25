@@ -129,6 +129,7 @@ impl JsonlMapper {
                     self.current_turn,
                     is_assistant,
                     rec.uuid.as_deref(),
+                    rec.cwd.as_deref(),
                     blocks,
                 );
                 if let Some(a) = answer {
@@ -192,6 +193,7 @@ fn apply_blocks(
     turn: u64,
     is_assistant: bool,
     record_uuid: Option<&str>,
+    cwd: Option<&str>,
     blocks: &[Value],
 ) -> (Vec<usize>, Option<String>) {
     let mut touched = Vec::new();
@@ -202,7 +204,7 @@ fn apply_blocks(
         };
         match block {
             ContentBlock::ToolUse { id, name, input } => {
-                touched.push(open_tool_use(timeline, session, turn, &id, &name, &input));
+                touched.push(open_tool_use(timeline, session, turn, &id, &name, &input, cwd));
             }
             ContentBlock::ToolResult {
                 tool_use_id,
@@ -216,6 +218,7 @@ fn apply_blocks(
                     &tool_use_id,
                     &content,
                     is_error,
+                    cwd,
                 ));
             }
             // Assistant prose is the turn's answer (the terminal also shows it).
@@ -282,6 +285,7 @@ fn open_tool_use(
     id: &str,
     name: &str,
     input: &Value,
+    cwd: Option<&str>,
 ) -> usize {
     let locations = locations_from_input(input);
     let project_label = timeline.label_for(&locations);
@@ -292,6 +296,9 @@ fn open_tool_use(
     let item = timeline.item_mut(idx);
     if is_new {
         item.turn = turn;
+        // The directory the call ran in — set once on first sighting (a later
+        // re-sighting/result must not change where it happened).
+        item.cwd = cwd.map(str::to_string);
     }
     item.kind = map_tool_kind(name);
     item.title = title;
@@ -322,6 +329,7 @@ fn complete_tool_result(
     tool_use_id: &str,
     content: &Value,
     is_error: Option<bool>,
+    cwd: Option<&str>,
 ) -> usize {
     let text = extract_result_text(content);
     // A tool the user declined/interrupted comes back as an error whose text says
@@ -342,6 +350,10 @@ fn complete_tool_result(
     let item = timeline.item_mut(idx);
     if is_new {
         item.turn = turn;
+        // Result-first (out-of-order/truncated): capture cwd here too so a subagent
+        // worktree item isn't left unlabeled (codex). A later tool_use is `!is_new`,
+        // so it won't overwrite — first sighting wins, as for `turn`.
+        item.cwd = cwd.map(str::to_string);
     }
     item.agent_status = if rejected {
         AgentStatus::Canceled
