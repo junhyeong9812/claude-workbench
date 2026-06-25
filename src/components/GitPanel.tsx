@@ -176,6 +176,12 @@ export function GitPanel() {
     void reload();
   }, [reload]);
 
+  // Reset the branch filter to "all" when the repo (cwd) changes — a branch from
+  // the previous repo may not exist here (git_log would just error → empty graph).
+  useEffect(() => {
+    setLogRef(null);
+  }, [cwd]);
+
   // Scan for git roots whenever the project changes; reset the selection to the
   // default (project cwd) so switching tabs never leaves a stale nested root.
   useEffect(() => {
@@ -728,11 +734,24 @@ export function GitPanel() {
             onChange={(e) => setLogRef(e.target.value || null)}
           >
             <option value="">전체 브랜치</option>
-            {branches?.local.map((b) => (
-              <option key={b} value={b}>
-                {b}
-              </option>
-            ))}
+            {branches && branches.local.length > 0 && (
+              <optgroup label="로컬">
+                {branches.local.map((b) => (
+                  <option key={b} value={b}>
+                    {b}
+                  </option>
+                ))}
+              </optgroup>
+            )}
+            {branches && branches.remote.length > 0 && (
+              <optgroup label="원격">
+                {branches.remote.map((b) => (
+                  <option key={b} value={b}>
+                    {b}
+                  </option>
+                ))}
+              </optgroup>
+            )}
           </select>
           <select
             className="git-sort"

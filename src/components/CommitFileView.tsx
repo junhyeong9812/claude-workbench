@@ -4,6 +4,10 @@ import { errText } from "../utils/error";
 import { Markdown, isMarkdownPath } from "./markdown";
 import { handleScrollKey } from "./scrollKeys";
 
+/** Fixed diff-line metrics for virtualization (must match .diff-line CSS: 18px). */
+const LINE_H = 18;
+const OVERSCAN = 24;
+
 /** Class for a unified-diff line (mirrors DiffPanel.lineClass). */
 function lineClass(l: string): string {
   if (l.startsWith("@@")) return "diff-hunk";
@@ -30,6 +34,8 @@ type Mode = "diff" | "content";
  * sidebar). Like the change-detail viewer: opens over the main area, closes on
  * Esc/✕. Two modes — the commit's per-file diff (default), or the file's full
  * content at that commit ("원본"); a markdown file renders as HTML or raw.
+ * The diff is virtualized (only the visible window of lines is in the DOM) so a
+ * huge file diff stays responsive.
  */
 export function CommitFileView(props: {
   root: string;
@@ -44,6 +50,8 @@ export function CommitFileView(props: {
   const [note, setNote] = useState("");
   const ref = useRef<HTMLDivElement>(null);
   const bodyRef = useRef<HTMLDivElement>(null);
+  const [scrollTop, setScrollTop] = useState(0);
+  const [viewH, setViewH] = useState(800);
   const isMd = isMarkdownPath(path);
 
   // NOTE: intentionally does NOT auto-focus — the commit-files sidebar keeps focus
@@ -64,11 +72,27 @@ export function CommitFileView(props: {
     };
   }, [root, commit, path, mode]);
 
+  // Measure the scroll viewport + reset scroll on new content (so a deep scroll into
+  // a previous file can't leave a shorter diff blank — mirrors DiffPanel).
+  useEffect(() => {
+    setScrollTop(0);
+    const el = bodyRef.current;
+    if (!el) return;
+    el.scrollTop = 0;
+    setViewH(el.clientHeight);
+    const ro = new ResizeObserver(() => setViewH(el.clientHeight));
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, [text, mode]);
+
   const diffLines = useMemo(
     () => (mode === "diff" ? text.split("\n") : []),
     [mode, text],
   );
   const base = path.split("/").pop() || path;
+
+  const end = Math.min(diffLines.length, Math.ceil((scrollTop + viewH) / LINE_H) + OVERSCAN);
+  const start = Math.max(0, Math.min(Math.floor(scrollTop / LINE_H) - OVERSCAN, end));
 
   return (
     <div
@@ -127,16 +151,23 @@ export function CommitFileView(props: {
           ✕
         </span>
       </div>
-      <div className="commit-file-view-body" ref={bodyRef}>
+      <div
+        className="commit-file-view-body"
+        ref={bodyRef}
+        onScroll={(e) => setScrollTop(e.currentTarget.scrollTop)}
+      >
         {note && <div className="git-clean">{note}</div>}
         {!note && mode === "diff" && (
-          <pre className="commit-file-diff">
-            {diffLines.map((l, i) => (
-              <div key={i} className={`diff-line ${lineClass(l)}`}>
-                {l || " "}
-              </div>
-            ))}
-          </pre>
+          // spacer = total height; only the visible window of lines is rendered.
+          <div className="commit-file-diff" style={{ height: diffLines.length * LINE_H, position: "relative" }}>
+            <div style={{ position: "absolute", top: start * LINE_H, left: 0, right: 0 }}>
+              {diffLines.slice(start, end).map((l, i) => (
+                <div key={start + i} className={`diff-line ${lineClass(l)}`}>
+                  {l || " "}
+                </div>
+              ))}
+            </div>
+          </div>
         )}
         {!note && mode === "content" && isMd && asHtml && (
           <Markdown className="commit-file-md" text={text} blockMedia />
