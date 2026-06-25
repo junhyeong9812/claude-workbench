@@ -7,6 +7,14 @@ interface Worktree {
   path: string;
   head: string;
   branch: string;
+  is_main: boolean;
+}
+/** A live Claude session + the directory it runs in (its cwd, possibly a worktree).
+ * `root` is the git-canonicalized worktree root of `cwd` — match against that. */
+interface SessionCwd {
+  uuid: string;
+  cwd: string;
+  root: string;
 }
 
 
@@ -30,31 +38,69 @@ export function WorktreePanel() {
     requestClaudeOpen({ project: path });
   };
   const [list, setList] = useState<Worktree[]>([]);
+  const [sessions, setSessions] = useState<SessionCwd[]>([]);
   const [busy, setBusy] = useState(false);
   const [note, setNote] = useState("");
   const reqRef = useRef(0);
+  // Mirror `busy` into a ref so the polling interval reads the live value (its
+  // closure captures state once) and skips refreshing mid-action.
+  const busyRef = useRef(false);
+  busyRef.current = busy;
+  // Coalesce overlapping reloads (focus + interval + manual + post-action) so they
+  // don't each spawn a concurrent `git_worktrees` subprocess + IPC (codex P2).
+  const loadingRef = useRef(false);
 
   const reload = useCallback(async () => {
     if (!cwd) {
       setList([]);
+      setSessions([]);
       return;
     }
+    if (loadingRef.current) return; // a reload is already in flight
+    loadingRef.current = true;
     const myReq = ++reqRef.current;
     const target = cwd;
     try {
-      const wts = await invoke<Worktree[]>("git_worktrees", { cwd: target });
-      if (reqRef.current === myReq) setList(wts); // ignore superseded (project switch)
+      // Worktrees + live-session cwds together, so each worktree can be badged with
+      // the session(s) running in it. Session list is read-only (never fails hard).
+      const [wts, sess] = await Promise.all([
+        invoke<Worktree[]>("git_worktrees", { cwd: target }),
+        invoke<SessionCwd[]>("claude_session_cwds").catch(() => [] as SessionCwd[]),
+      ]);
+      if (reqRef.current === myReq) {
+        setList(wts); // ignore superseded (project switch)
+        setSessions(sess);
+      }
     } catch (e) {
       if (reqRef.current === myReq) {
         setNote(errText(e));
         setList([]);
       }
+    } finally {
+      loadingRef.current = false;
     }
   }, [cwd]);
 
   useEffect(() => {
     void reload();
   }, [reload]);
+
+  // Auto-refresh: worktrees and sessions change out-of-band (a session opens in a
+  // worktree, a subagent's isolation worktree appears/vanishes). Poll while mounted
+  // and on window focus so the panel stays current without a manual ↻. Skips while
+  // a mutating action is in flight to avoid clobbering its own post-action reload.
+  useEffect(() => {
+    if (!cwd) return;
+    const tick = () => {
+      if (!busyRef.current) void reload();
+    };
+    const id = setInterval(tick, 4000);
+    window.addEventListener("focus", tick);
+    return () => {
+      clearInterval(id);
+      window.removeEventListener("focus", tick);
+    };
+  }, [cwd, reload]);
 
   const act = async (fn: () => Promise<unknown>) => {
     setBusy(true);
@@ -98,9 +144,24 @@ export function WorktreePanel() {
         </button>
       </div>
       <div className="git-body">
-        {list.map((w) => (
+        {list.map((w) => {
+          const wtSessions = sessions.filter((s) => s.root === w.path);
+          return (
           <div key={w.path} className="git-file">
             <span className="git-ref git-ref-local">{w.branch}</span>
+            {w.is_main && (
+              <span className="git-cmeta" title="메인 워크트리">
+                메인
+              </span>
+            )}
+            {wtSessions.length > 0 && (
+              <span
+                className="git-ref git-ref-head"
+                title={`이 워크트리에서 도는 Claude 세션:\n${wtSessions.map((s) => s.uuid).join("\n")}`}
+              >
+                ● 세션 {wtSessions.length}
+              </span>
+            )}
             <span className="git-path" title={`${w.path}\n${w.head}`}>
               {w.path}
             </span>
@@ -133,7 +194,8 @@ export function WorktreePanel() {
               ×
             </button>
           </div>
-        ))}
+          );
+        })}
         {list.length === 0 && <div className="git-clean">워크트리 없음</div>}
         {note && <div className="git-clean">{note}</div>}
       </div>

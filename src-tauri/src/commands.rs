@@ -880,6 +880,44 @@ pub fn claude_detach(
     }
 }
 
+/// One live session's identity + the directory it runs in (its `project` = cwd,
+/// which may be a git worktree). Read-only — for the worktree panel's session
+/// badges (which worktree has a live session).
+#[derive(Serialize)]
+pub struct SessionCwd {
+    uuid: String,
+    cwd: String,
+    /// The worktree root containing `cwd` (git-canonicalized), so the panel matches
+    /// a session to its worktree even when the session runs in a subdirectory and
+    /// without symlink/`..`/trailing-slash false-misses. Falls back to `cwd`.
+    root: String,
+}
+
+/// All currently-live Claude sessions (any window) as (uuid, cwd, worktree root).
+/// The worktree panel matches each worktree's path against `root` to badge "a
+/// session runs here". The runtime lock is read-only and brief (just clone the
+/// cwds); the per-session git `show-toplevel` runs *after* releasing the lock so a
+/// subprocess never blocks session mutations.
+#[tauri::command]
+pub fn claude_session_cwds(claude: State<'_, ClaudeState>) -> Vec<SessionCwd> {
+    let cwds: Vec<(String, String)> = claude
+        .rt
+        .lock()
+        .map(|rt| {
+            rt.by_id
+                .values()
+                .map(|s| (s.uuid.clone(), s.project.clone()))
+                .collect()
+        })
+        .unwrap_or_default();
+    cwds.into_iter()
+        .map(|(uuid, cwd)| {
+            let root = core_lib::git::worktree_root(&cwd).unwrap_or_else(|| cwd.clone());
+            SessionCwd { uuid, cwd, root }
+        })
+        .collect()
+}
+
 /// UUIDs of sessions currently live (any window) in `project` — lets the picker
 /// mark "running in another window — open as mirror".
 #[tauri::command]

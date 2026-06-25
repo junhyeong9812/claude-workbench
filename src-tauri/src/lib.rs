@@ -116,6 +116,7 @@ pub fn run() {
             commands::claude_set_driver,
             commands::claude_detach,
             commands::claude_live_uuids,
+            commands::claude_session_cwds,
             commands::claude_close,
             commands::claude_sessions,
             commands::claude_session_snapshot,
