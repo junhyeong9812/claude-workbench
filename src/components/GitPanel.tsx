@@ -26,6 +26,12 @@ interface Branches {
   local: string[];
   remote: string[];
 }
+/** A git root under the project (enclosing repo + nested .git repos), with the
+ * branch it's on — for the multi-root selector tree. */
+interface GitRoot {
+  path: string;
+  branch: string;
+}
 interface Commit {
   hash: string;
   short: string;
@@ -115,7 +121,7 @@ export function GitPanel() {
   // `selectedRoot` overrides the project root for every git command below; null =
   // the project's own cwd (default — identical to single-repo behavior). Keeping
   // the effective root named `cwd` leaves all downstream invokes untouched.
-  const [roots, setRoots] = useState<string[]>([]);
+  const [roots, setRoots] = useState<GitRoot[]>([]);
   const [selectedRoot, setSelectedRoot] = useState<string | null>(null);
   const cwd = selectedRoot ?? activeProject;
   const [status, setStatus] = useState<GitStatus | null>(null);
@@ -173,13 +179,13 @@ export function GitPanel() {
       return;
     }
     let cancelled = false;
-    invoke<string[]>("git_roots", { cwd: activeProject })
+    invoke<GitRoot[]>("git_roots", { cwd: activeProject })
       .then((r) => {
         if (cancelled) return;
         setRoots(r);
         // Drop a selection that the fresh scan no longer contains (e.g. the nested
         // repo was deleted) so git commands never target a stale root (codex P2).
-        setSelectedRoot((cur) => (cur && r.includes(cur) ? cur : null));
+        setSelectedRoot((cur) => (cur && r.some((x) => x.path === cur) ? cur : null));
       })
       .catch(() => {
         if (!cancelled) setRoots([]);
@@ -208,29 +214,96 @@ export function GitPanel() {
 
   // Root selector — built before the early returns so it's reachable even when the
   // project root itself isn't a repo but has nested ones (codex P1).
-  const nestedRoots = roots.filter((r) => r !== activeProject);
+  // Nested repos strictly under the project (the enclosing root is the "현재" row).
+  const nestedRoots = roots.filter((r) => !!activeProject && r.path.startsWith(activeProject + "/"));
   const showRootSelect = nestedRoots.length > 0;
-  const shortRoot = (r: string) =>
-    activeProject && r.startsWith(activeProject + "/")
-      ? "./" + r.slice(activeProject.length + 1)
-      : r.split("/").pop() || r;
+  const projBase = (activeProject ?? "").split("/").pop() || (activeProject ?? "");
+  // The enclosing repo of the project — `activeProject` itself when it's a repo
+  // root, else the nearest ancestor root (subdir project). Its scanned branch
+  // labels the "현재" row. When the project is the *active* root (no nested root
+  // selected), `status.branch` is live and preferred so a checkout updates the
+  // badge; for the other rows the scanned branch is fine since they aren't active.
+  const enclosingRoot =
+    roots.find((r) => r.path === activeProject) ??
+    roots
+      .filter((r) => !!activeProject && (activeProject + "/").startsWith(r.path + "/"))
+      .sort((a, b) => b.path.length - a.path.length)[0];
+  const curBranch =
+    selectedRoot === null ? (status?.branch ?? enclosingRoot?.branch ?? "") : (enclosingRoot?.branch ?? "");
+
+  // Build a folder tree from the nested roots' relative paths: intermediate path
+  // segments become structural folder nodes, the final segment a selectable repo.
+  type RootNode = { name: string; rel: string; full: string; branch: string; isRoot: boolean; children: Map<string, RootNode> };
+  const rootTree: RootNode = { name: "", rel: "", full: "", branch: "", isRoot: false, children: new Map() };
+  for (const r of nestedRoots) {
+    const segs = r.path.slice((activeProject ?? "").length + 1).split("/").filter(Boolean);
+    let node = rootTree;
+    segs.forEach((seg, i) => {
+      let child = node.children.get(seg);
+      if (!child) {
+        child = { name: seg, rel: node.rel ? `${node.rel}/${seg}` : seg, full: "", branch: "", isRoot: false, children: new Map() };
+        node.children.set(seg, child);
+      }
+      if (i === segs.length - 1) {
+        child.isRoot = true;
+        child.full = r.path;
+        child.branch = r.branch;
+      }
+      node = child;
+    });
+  }
+  const renderRootNodes = (node: RootNode, depth: number): ReactNode[] => {
+    const out: ReactNode[] = [];
+    const entries = [...node.children.values()].sort((a, b) => {
+      const af = !a.isRoot; // folders first
+      const bf = !b.isRoot;
+      if (af !== bf) return af ? -1 : 1;
+      return a.name.localeCompare(b.name);
+    });
+    for (const child of entries) {
+      if (child.isRoot) {
+        const sel = selectedRoot === child.full;
+        // The selected root is the one `status` reflects, so show its live branch
+        // (updates on checkout); other rows show the scanned branch.
+        const branch = sel ? (status?.branch ?? child.branch) : child.branch;
+        out.push(
+          <div
+            key={`r:${child.full}`}
+            className={`git-root-row${sel ? " git-root-sel" : ""}`}
+            style={{ paddingLeft: 6 + depth * 12 }}
+            title={child.full}
+            onClick={() => setSelectedRoot(child.full)}
+          >
+            <span className="git-root-dot">{sel ? "●" : "○"}</span>
+            <span className="git-root-name">{child.name}</span>
+            {branch && <span className="git-root-branch">⎇ {branch}</span>}
+          </div>,
+        );
+        if (child.children.size > 0) out.push(...renderRootNodes(child, depth + 1));
+      } else {
+        out.push(
+          <div key={`d:${child.rel}`} className="git-root-dir" style={{ paddingLeft: 6 + depth * 12 }}>
+            {child.name}/
+          </div>,
+        );
+        out.push(...renderRootNodes(child, depth + 1));
+      }
+    }
+    return out;
+  };
   const rootSelect = showRootSelect ? (
-    <div className="git-head git-roots" title="git 루트 선택 (이 프로젝트 하위의 저장소)">
-      <span className="git-branch">
-        ⬚{" "}
-        <select
-          value={selectedRoot ?? ""}
-          disabled={busy}
-          onChange={(e) => setSelectedRoot(e.target.value || null)}
-        >
-          <option value="">{shortRoot(activeProject ?? "")} (현재)</option>
-          {nestedRoots.map((r) => (
-            <option key={r} value={r}>
-              {shortRoot(r)}
-            </option>
-          ))}
-        </select>
-      </span>
+    <div className="git-roots" title="git 루트 — 클릭해 전환">
+      <div
+        className={`git-root-row git-root-cur${selectedRoot === null ? " git-root-sel" : ""}`}
+        title={activeProject ?? ""}
+        onClick={() => setSelectedRoot(null)}
+      >
+        <span className="git-root-dot">{selectedRoot === null ? "●" : "○"}</span>
+        <span className="git-root-name">{projBase}</span>
+        <span className="git-root-cur-tag">현재</span>
+        {curBranch && <span className="git-root-branch">⎇ {curBranch}</span>}
+      </div>
+      {renderRootNodes(rootTree, 1)}
     </div>
   ) : null;
 

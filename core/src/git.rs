@@ -507,7 +507,16 @@ const PRUNE_DIRS: &[&str] = &[
 /// bounded by depth + root-count + visited-dir caps so a pathological tree can't
 /// hang the UI. Returned lexicographically sorted (BTreeSet) — a repo sorts before
 /// its own nested repos, though two unrelated subtrees order by path string.
-pub fn git_roots(cwd: &str) -> Vec<String> {
+/// A discovered git root: its absolute path + the branch it's currently on (the
+/// short symbolic ref, or "(detached)" for a detached HEAD, "" if unreadable). The
+/// branch lets the UI label each root without a separate status round-trip.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct GitRoot {
+    pub path: String,
+    pub branch: String,
+}
+
+pub fn git_roots(cwd: &str) -> Vec<GitRoot> {
     let mut roots: BTreeSet<String> = BTreeSet::new();
     // Enclosing repo (work-tree root at or above cwd), if cwd is inside one.
     if let Ok(top) = run_git(cwd, &["rev-parse", "--show-toplevel"]) {
@@ -519,7 +528,19 @@ pub fn git_roots(cwd: &str) -> Vec<String> {
     let mut count = 0usize;
     let mut visited = 0usize;
     scan_git_roots(Path::new(cwd), 0, &mut roots, &mut count, &mut visited);
-    roots.into_iter().collect()
+    // Resolve each root's current branch (cheap per-root rev-parse). Detached HEAD
+    // returns the literal "HEAD" → label it as detached.
+    roots
+        .into_iter()
+        .map(|path| {
+            let branch = match run_git(&path, &["rev-parse", "--abbrev-ref", "HEAD"]) {
+                Ok(b) if b == "HEAD" => "(detached)".to_string(),
+                Ok(b) => b,
+                Err(_) => String::new(),
+            };
+            GitRoot { path, branch }
+        })
+        .collect()
 }
 
 fn scan_git_roots(
