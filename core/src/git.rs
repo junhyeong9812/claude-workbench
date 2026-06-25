@@ -58,6 +58,9 @@ pub struct GitStatus {
     pub has_remote: bool,
     /// A merge is in progress (MERGE_HEAD exists) — conflicts may need resolving.
     pub merging: bool,
+    /// A revert is in progress (REVERT_HEAD exists) — conflicts to resolve, then
+    /// `revert --continue`, or `revert --abort` to back out.
+    pub reverting: bool,
     pub changes: Vec<FileChange>,
 }
 
@@ -71,6 +74,7 @@ impl GitStatus {
             behind: 0,
             has_remote: false,
             merging: false,
+            reverting: false,
             changes: Vec::new(),
         }
     }
@@ -152,6 +156,7 @@ pub fn status(cwd: &str) -> GitStatus {
     let (branch, upstream, ahead, behind, changes) = parse_status(&porcelain);
     let has_remote = !run_git(cwd, &["remote"]).unwrap_or_default().is_empty();
     let merging = run_git(cwd, &["rev-parse", "-q", "--verify", "MERGE_HEAD"]).is_ok();
+    let reverting = run_git(cwd, &["rev-parse", "-q", "--verify", "REVERT_HEAD"]).is_ok();
     GitStatus {
         is_repo: true,
         branch,
@@ -160,6 +165,7 @@ pub fn status(cwd: &str) -> GitStatus {
         behind,
         has_remote,
         merging,
+        reverting,
         changes,
     }
 }
@@ -359,6 +365,63 @@ pub fn discard(cwd: &str, path: &str) -> Result<String, String> {
 pub fn delete_branch(cwd: &str, name: &str, force: bool) -> Result<String, String> {
     safe_ref(name)?;
     run_git(cwd, &["branch", if force { "-D" } else { "-d" }, name])
+}
+
+/// Rename a local branch (`git branch -m <old> <new>`).
+pub fn rename_branch(cwd: &str, old: &str, new: &str) -> Result<String, String> {
+    safe_ref(old)?;
+    safe_ref(new)?;
+    run_git(cwd, &["branch", "-m", old, new])
+}
+
+/// Resolve a ref to exactly one commit (`rev-parse --verify <r>^{commit}`), erroring
+/// for ranges/revspecs or non-commit objects — hardens commit-taking commands beyond
+/// `safe_ref` (codex). Returns the resolved 40-char hash.
+fn resolve_commit(cwd: &str, r: &str) -> Result<String, String> {
+    safe_ref(r)?;
+    run_git(cwd, &["rev-parse", "--verify", &format!("{r}^{{commit}}")])
+        .map_err(|_| "유효한 커밋이 아닙니다".to_string())
+}
+
+/// Reword the latest commit (`git commit --amend -m <message>`). Guards (codex):
+/// `hash` must BE HEAD (never reword a non-HEAD row by mistake), the index must be
+/// clean (so staged changes aren't silently folded in), and HEAD must be a
+/// single-line message (a one-line prompt would drop a body/trailers — use a
+/// terminal for those). Rewrites HEAD's hash, so the UI confirms first.
+pub fn amend_message(cwd: &str, hash: &str, message: &str) -> Result<String, String> {
+    if message.trim().is_empty() {
+        return Err("커밋 메시지가 비어 있습니다".to_string());
+    }
+    if resolve_commit(cwd, "HEAD")? != resolve_commit(cwd, hash)? {
+        return Err("HEAD 커밋만 메시지를 수정할 수 있습니다".to_string());
+    }
+    if run_git(cwd, &["diff", "--cached", "--quiet"]).is_err() {
+        return Err("스테이지된 변경이 있습니다 — 먼저 커밋/언스테이지 후 수정하세요".to_string());
+    }
+    let body = run_git(cwd, &["log", "-1", "--format=%B", "HEAD"]).unwrap_or_default();
+    if body.trim().lines().count() > 1 {
+        return Err("본문이 있는 커밋입니다 — 본문 유실 방지를 위해 터미널에서 수정하세요".to_string());
+    }
+    run_git(cwd, &["commit", "--amend", "-m", message])
+}
+
+/// Revert a commit (`git revert --no-edit <hash>`) — a NEW commit undoing it
+/// (non-destructive). `hash` must resolve to a single commit. On conflict it leaves
+/// REVERT_HEAD (status.reverting) for [`revert_abort`] / [`revert_continue`].
+pub fn revert(cwd: &str, hash: &str) -> Result<String, String> {
+    resolve_commit(cwd, hash)?;
+    run_git(cwd, &["revert", "--no-edit", hash])
+}
+
+/// Abort an in-progress revert (`git revert --abort`).
+pub fn revert_abort(cwd: &str) -> Result<String, String> {
+    run_git(cwd, &["revert", "--abort"])
+}
+
+/// Conclude a revert after conflicts are resolved + staged — committing while
+/// REVERT_HEAD exists clears it (no editor; mirrors merge_continue).
+pub fn revert_continue(cwd: &str) -> Result<String, String> {
+    run_git(cwd, &["commit", "--no-edit"])
 }
 
 /// Stash entries (`stash list`), one per line.

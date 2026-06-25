@@ -1737,6 +1737,36 @@ pub fn git_delete_branch(cwd: String, name: String, force: bool) -> Result<Strin
 }
 
 #[tauri::command]
+pub fn git_rename_branch(cwd: String, old: String, new: String) -> Result<String, AppError> {
+    core_lib::git::rename_branch(&cwd, &old, &new).map_err(AppError::new)
+}
+
+/// Reword the latest commit (HEAD). `hash` is the clicked commit; the backend
+/// verifies it is HEAD and the index is clean. UI confirms first.
+#[tauri::command]
+pub fn git_amend_message(cwd: String, hash: String, message: String) -> Result<String, AppError> {
+    core_lib::git::amend_message(&cwd, &hash, &message).map_err(AppError::new)
+}
+
+/// Revert a commit (new undo commit). UI confirms first.
+#[tauri::command]
+pub fn git_revert(cwd: String, hash: String) -> Result<String, AppError> {
+    core_lib::git::revert(&cwd, &hash).map_err(AppError::new)
+}
+
+/// Abort an in-progress revert.
+#[tauri::command]
+pub fn git_revert_abort(cwd: String) -> Result<String, AppError> {
+    core_lib::git::revert_abort(&cwd).map_err(AppError::new)
+}
+
+/// Conclude a revert after conflicts are resolved + staged.
+#[tauri::command]
+pub fn git_revert_continue(cwd: String) -> Result<String, AppError> {
+    core_lib::git::revert_continue(&cwd).map_err(AppError::new)
+}
+
+#[tauri::command]
 pub fn git_stash_list(cwd: String) -> Result<Vec<String>, AppError> {
     core_lib::git::stash_list(&cwd).map_err(AppError::new)
 }

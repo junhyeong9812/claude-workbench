@@ -399,6 +399,47 @@ body {
   padding: 12px 16px;
   line-height: 1.6;
 }
+
+/* ---- Git commit right-click context menu (amend / revert) ---- */
+.git-ctx-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 40;
+}
+.git-ctx-menu {
+  position: fixed;
+  z-index: 41;
+  min-width: 180px;
+  max-width: 280px;
+  display: flex;
+  flex-direction: column;
+  background: var(--bg-alt, #1e1e2e);
+  border: 1px solid var(--border, #444);
+  border-radius: 6px;
+  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.4);
+  overflow: hidden;
+  font-size: 0.85em;
+}
+.git-ctx-title {
+  padding: 5px 10px;
+  color: var(--fg-dim);
+  border-bottom: 1px solid var(--border, #444);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.git-ctx-item {
+  text-align: left;
+  padding: 6px 10px;
+  background: none;
+  border: none;
+  color: var(--fg);
+  cursor: pointer;
+  font-size: inherit;
+}
+.git-ctx-item:hover {
+  background: color-mix(in srgb, var(--accent) 22%, transparent);
+}
 /* When the peek holds keyboard focus (Enter from the tree), show a thin inset
    ring so it's clear ↑/↓ now scroll the content rather than move the tree. */
 .peek-viewer:focus {

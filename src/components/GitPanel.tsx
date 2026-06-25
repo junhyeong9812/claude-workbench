@@ -19,6 +19,7 @@ interface GitStatus {
   behind: number;
   has_remote: boolean;
   merging: boolean;
+  reverting: boolean;
   changes: FileChange[];
 }
 interface Branches {
@@ -135,6 +136,8 @@ export function GitPanel() {
   const [sort, setSort] = useState<"date" | "topo" | "author">("date");
   // Which branch the commit graph is scoped to. null = all branches (--all).
   const [logRef, setLogRef] = useState<string | null>(null);
+  // Right-click context menu on a commit row (amend HEAD / revert), or null.
+  const [ctxMenu, setCtxMenu] = useState<{ x: number; y: number; commit: Commit } | null>(null);
   const reqRef = useRef(0);
 
   const reload = useCallback(async () => {
@@ -335,6 +338,7 @@ export function GitPanel() {
   const staged = status?.changes.filter((c) => c.staged && !c.conflicted) ?? [];
   const unstaged = status?.changes.filter((c) => !c.staged && !c.conflicted) ?? [];
   const merging = status?.merging ?? false;
+  const reverting = status?.reverting ?? false;
   // During a merge, conclude via the banner's '계속'(merge --continue) instead of
   // a normal commit, so the prepared merge message is used (codex TF-2).
   const canCommit = staged.length > 0 && message.trim().length > 0 && !busy && !merging;
@@ -479,6 +483,21 @@ export function GitPanel() {
           <button
             className="git-btn"
             disabled={busy}
+            title="브랜치 이름 변경"
+            onClick={() => {
+              const cur = status?.branch ?? "";
+              const oldName = window.prompt("이름을 바꿀 브랜치", cur);
+              if (!oldName || !oldName.trim()) return;
+              const newName = window.prompt(`'${oldName.trim()}' → 새 이름`, oldName.trim());
+              if (!newName || !newName.trim() || newName.trim() === oldName.trim()) return;
+              act(() => invoke("git_rename_branch", { cwd, old: oldName.trim(), new: newName.trim() }), "브랜치 이름 변경 완료");
+            }}
+          >
+            ✎ 브랜치
+          </button>
+          <button
+            className="git-btn"
+            disabled={busy}
             title="브랜치 머지(현재 브랜치로)"
             onClick={() => {
               const b = window.prompt("현재 브랜치에 머지할 브랜치");
@@ -603,6 +622,29 @@ export function GitPanel() {
                 disabled={busy || conflicted.length > 0}
                 title={conflicted.length > 0 ? "충돌을 모두 해결(stage)한 뒤 가능" : "머지 커밋"}
                 onClick={() => act(() => invoke("git_merge_continue", { cwd }), "머지 완료")}
+              >
+                계속
+              </button>
+            </div>
+          )}
+          {reverting && (
+            <div className="git-merge-banner">
+              <span>되돌리기(revert) 진행 중 — 충돌 {conflicted.length}개</span>
+              <button
+                className="git-mini"
+                disabled={busy}
+                onClick={() => {
+                  if (window.confirm("되돌리기를 중단(abort)할까요? revert 전 상태로 돌아갑니다."))
+                    act(() => invoke("git_revert_abort", { cwd }), "revert 중단");
+                }}
+              >
+                중단
+              </button>
+              <button
+                className="git-mini"
+                disabled={busy || conflicted.length > 0}
+                title={conflicted.length > 0 ? "충돌을 모두 해결(stage)한 뒤 가능" : "revert 커밋"}
+                onClick={() => act(() => invoke("git_revert_continue", { cwd }), "revert 완료")}
               >
                 계속
               </button>
@@ -776,8 +818,15 @@ export function GitPanel() {
                 <div
                   key={c.hash}
                   className="git-commit-row-g git-clickable"
-                  title={`${c.short} · ${c.author} · ${c.date}\n(클릭: 커밋 변경 파일 보기)`}
+                  title={`${c.short} · ${c.author} · ${c.date}\n(클릭: 변경 파일 · 우클릭: 제어)`}
                   onClick={() => cwd && openGitHistory(cwd, c.hash)}
+                  onContextMenu={(e) => {
+                    e.preventDefault();
+                    // Clamp so the menu can't open off-screen (codex).
+                    const x = Math.max(0, Math.min(e.clientX, window.innerWidth - 240));
+                    const y = Math.max(0, Math.min(e.clientY, window.innerHeight - 120));
+                    setCtxMenu({ x, y, commit: c });
+                  }}
                 >
                   <GitGraphRow row={row} maxLanes={maxLanes} theme={theme} />
                   <span className="git-chash">{c.short}</span>
@@ -797,6 +846,71 @@ export function GitPanel() {
           {commits.length === 0 && <div className="git-clean">커밋 없음</div>}
         </div>
       </div>
+      {ctxMenu && (
+        <>
+          {/* full-screen backdrop: any click (or right-click) dismisses the menu */}
+          <div
+            className="git-ctx-backdrop"
+            onClick={() => setCtxMenu(null)}
+            onContextMenu={(e) => {
+              e.preventDefault();
+              setCtxMenu(null);
+            }}
+          />
+          <div
+            className="git-ctx-menu"
+            style={{ left: ctxMenu.x, top: ctxMenu.y }}
+            role="menu"
+            tabIndex={-1}
+            ref={(el) => el?.focus()}
+            onKeyDown={(e) => {
+              if (e.key === "Escape") {
+                e.preventDefault();
+                setCtxMenu(null);
+              }
+            }}
+          >
+            <div className="git-ctx-title" title={ctxMenu.commit.subject}>
+              {ctxMenu.commit.short} {ctxMenu.commit.subject}
+            </div>
+            {ctxMenu.commit.refs
+              .split(", ")
+              .some((r) => r === "HEAD" || r.startsWith("HEAD -> ")) && (
+              <button
+                className="git-ctx-item"
+                role="menuitem"
+                onClick={() => {
+                  const c = ctxMenu.commit;
+                  setCtxMenu(null);
+                  const msg = window.prompt(
+                    "새 커밋 메시지 — HEAD 커밋을 재작성합니다. 이미 push했다면 히스토리가 분기됩니다. (본문/트레일러가 있는 커밋은 터미널에서 수정)",
+                    c.subject,
+                  );
+                  if (msg && msg.trim())
+                    act(
+                      () => invoke("git_amend_message", { cwd, hash: c.hash, message: msg.trim() }),
+                      "메시지 수정 완료",
+                    );
+                }}
+              >
+                메시지 수정 (amend)
+              </button>
+            )}
+            <button
+              className="git-ctx-item"
+              role="menuitem"
+              onClick={() => {
+                const c = ctxMenu.commit;
+                setCtxMenu(null);
+                if (window.confirm(`${c.short} '${c.subject}' 를 되돌리는 새 커밋을 만들까요? (revert)`))
+                  act(() => invoke("git_revert", { cwd, hash: c.hash }), "revert 완료");
+              }}
+            >
+              되돌리기 (revert)
+            </button>
+          </div>
+        </>
+      )}
     </div>
   );
 }
