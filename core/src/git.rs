@@ -253,19 +253,26 @@ fn parse_log(out: &str) -> Vec<Commit> {
 /// Recent commits across all refs for the history graph. `order`: "topo"
 /// (topological — keeps branches contiguous), "author" (author-date), else
 /// "date" (commit-date, default).
-pub fn log(cwd: &str, limit: u32, order: &str) -> Result<Vec<Commit>, String> {
+pub fn log(cwd: &str, limit: u32, order: &str, gitref: Option<&str>) -> Result<Vec<Commit>, String> {
     let order_flag = match order {
         "topo" => "--topo-order",
         "author" => "--author-date-order",
         _ => "--date-order",
     };
     let fmt = "--pretty=format:%H%x1f%h%x1f%P%x1f%an%x1f%ad%x1f%D%x1f%s%x1e";
+    let limit_arg = format!("-{limit}");
+    // A specific branch (e.g. "main") scopes the log to that ref; otherwise `--all`
+    // shows every branch. Reject a ref that would parse as a git option (leading `-`).
+    let ref_arg = match gitref {
+        Some(r) if !r.is_empty() && !r.starts_with('-') => r,
+        _ => "--all",
+    };
     let out = run_git(
         cwd,
         &[
             "log",
-            &format!("-{limit}"),
-            "--all",
+            &limit_arg,
+            ref_arg,
             order_flag,
             "--date=format:%Y-%m-%d %H:%M",
             fmt,

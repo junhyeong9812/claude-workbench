@@ -133,6 +133,8 @@ export function GitPanel() {
   const [note, setNote] = useState("");
   const [view, setView] = useState<"tree" | "flat">("tree");
   const [sort, setSort] = useState<"date" | "topo" | "author">("date");
+  // Which branch the commit graph is scoped to. null = all branches (--all).
+  const [logRef, setLogRef] = useState<string | null>(null);
   const reqRef = useRef(0);
 
   const reload = useCallback(async () => {
@@ -151,9 +153,12 @@ export function GitPanel() {
       if (st.is_repo) {
         const [br, lg] = await Promise.all([
           invoke<Branches>("git_branches", { cwd: target }).catch(() => null),
-          invoke<Commit[]>("git_log", { cwd: target, limit: 200, order: sort }).catch(
-            () => [] as Commit[],
-          ),
+          invoke<Commit[]>("git_log", {
+            cwd: target,
+            limit: 200,
+            order: sort,
+            gitRef: logRef,
+          }).catch(() => [] as Commit[]),
         ]);
         if (reqRef.current !== myReq) return;
         setBranches(br);
@@ -165,7 +170,7 @@ export function GitPanel() {
     } catch (e) {
       if (reqRef.current === myReq) setNote(errText(e));
     }
-  }, [cwd, sort]);
+  }, [cwd, sort, logRef]);
 
   useEffect(() => {
     void reload();
@@ -715,6 +720,20 @@ export function GitPanel() {
       <div className="git-graph-pane">
         <div className="git-section-head">
           히스토리
+          <select
+            className="git-sort"
+            value={logRef ?? ""}
+            disabled={busy}
+            title="브랜치 필터 (그래프에 표시할 브랜치)"
+            onChange={(e) => setLogRef(e.target.value || null)}
+          >
+            <option value="">전체 브랜치</option>
+            {branches?.local.map((b) => (
+              <option key={b} value={b}>
+                {b}
+              </option>
+            ))}
+          </select>
           <select
             className="git-sort"
             value={sort}
