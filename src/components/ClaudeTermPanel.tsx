@@ -1008,6 +1008,7 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
                           selectedTurn={selectedTurn}
                           selectedScope={selectedTurnScope}
                           scope={task.uuid}
+                          sessionCwd={props.params.project ?? useAppStore.getState().activeProject ?? undefined}
                           onSelect={(it) => {
                             setSelectedId(it.tool_call_id);
                             setTextView(null);
@@ -1042,6 +1043,7 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
             selectedScope={selectedTurnScope}
             scope="live"
             followBottom
+            sessionCwd={props.params.project ?? useAppStore.getState().activeProject ?? undefined}
             onSelect={(it) => {
               setSelectedId(it.tool_call_id);
               setTextView(null);

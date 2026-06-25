@@ -1559,6 +1559,16 @@ body {
   border-radius: 8px;
   padding: 0 6px;
 }
+/* "ran in another worktree" badge on a timeline item whose cwd differs from the
+   session's (a subagent in an isolation worktree). Themed via accent. */
+.timeline-worktree {
+  font-size: 10px;
+  color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 14%, transparent);
+  border-radius: 8px;
+  padding: 0 6px;
+  white-space: nowrap;
+}
 .timeline-answer {
   font-size: 11px;
   color: var(--fg-dim);

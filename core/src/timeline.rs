@@ -114,6 +114,12 @@ pub struct TimelineItem {
     /// Nearest project marker for the first location (spec §2). `None` if there
     /// are no locations yet.
     pub project_label: Option<String>,
+    /// The directory this tool call ran in (the JSONL record's `cwd`). For a
+    /// subagent working in an isolation worktree this differs from the session's
+    /// own cwd, so the UI can label "this happened in another worktree". Sidecar-
+    /// free (it rides in the item). `None` for transcripts/old snapshots without it.
+    #[serde(default)]
+    pub cwd: Option<String>,
     pub diffs: Vec<FileDiff>,
     /// Text the tool produced — a read's content, a search/exec output, an
     /// explanation — for the detail view (B4). Concatenated text content.
@@ -140,6 +146,7 @@ impl TimelineItem {
             title: String::new(),
             locations: Vec::new(),
             project_label: None,
+            cwd: None,
             diffs: Vec::new(),
             content_text: None,
             raw_input: None,

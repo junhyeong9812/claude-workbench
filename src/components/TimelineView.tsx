@@ -24,6 +24,9 @@ export interface TimelineItem {
   title: string;
   locations: string[];
   project_label: string | null;
+  /** Directory this call ran in (JSONL cwd). Differs from the session cwd when a
+   * subagent works in an isolation worktree — used to label "another worktree". */
+  cwd?: string | null;
   diffs: { path: string; old_text: string | null; new_text: string }[];
   content_text: string | null;
   raw_input: unknown;
@@ -54,6 +57,12 @@ export const AGENT_BADGE: Record<string, string> = {
   canceled: "⊘",
 };
 
+/** Light path normalization for the worktree-label compare — strips trailing
+ * slashes so `/repo` and `/repo/` don't read as different worktrees. (Symlink
+ * canonicalization isn't available in the webview; same-spelling absolute paths,
+ * which is the normal case, compare correctly.) */
+const normPath = (p: string) => p.replace(/\/+$/, "");
+
 export function TimelineView({
   items,
   turns,
@@ -65,6 +74,7 @@ export function TimelineView({
   selectedScope,
   scope = "live",
   followBottom = false,
+  sessionCwd,
   onSelect,
   onSelectTurn,
 }: {
@@ -89,6 +99,9 @@ export function TimelineView({
   /** When true, scroll the shared container to the bottom as new content arrives
    * (the live timeline). Previous-task lists leave this false. */
   followBottom?: boolean;
+  /** The session's own cwd (project). An item whose `cwd` differs ran in another
+   * worktree (a subagent isolation worktree) — labeled in the row. */
+  sessionCwd?: string;
   onSelect: (item: TimelineItem) => void;
   /** Select a turn (Q&A): view its prompt + full answer in the detail pane.
    * Used by ↑/↓ landing on a question head and by clicking the head/answer. */
@@ -145,6 +158,11 @@ export function TimelineView({
         <span className="timeline-icon">{KIND_ICON[it.kind] ?? "•"}</span>
         <span className="timeline-title">{it.title || it.kind}</span>
         {it.project_label && <span className="timeline-label">{it.project_label}</span>}
+        {it.cwd && sessionCwd && normPath(it.cwd) !== normPath(sessionCwd) && (
+          <span className="timeline-worktree" title={`다른 워크트리에서 실행:\n${it.cwd}`}>
+            ⌥ {it.cwd.replace(/\/$/, "").split("/").pop()}
+          </span>
+        )}
         {it.diffs.length > 0 && <span className="timeline-diff">±{it.diffs.length}</span>}
         {it.write_status === "written" && <span className="timeline-write">💾</span>}
         <span className={`timeline-status ts-${it.agent_status}`}>
