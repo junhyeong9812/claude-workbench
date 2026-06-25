@@ -116,6 +116,7 @@ export function GitPanel() {
   const activeProject = useAppStore((s) => s.activeProject);
   const requestDiff = useAppStore((s) => s.requestDiff);
   const requestEditorOpen = useAppStore((s) => s.requestEditorOpen);
+  const openGitHistory = useAppStore((s) => s.openGitHistory);
   const theme = useAppStore((s) => s.theme);
   // Multi-root: git roots under the project (enclosing repo + nested .git repos).
   // `selectedRoot` overrides the project root for every git command below; null =
@@ -481,6 +482,14 @@ export function GitPanel() {
           </span>
           <button
             className="git-btn"
+            disabled={!commits[0]}
+            title="최신 커밋의 변경 파일 보기"
+            onClick={() => cwd && commits[0] && openGitHistory(cwd, commits[0].hash)}
+          >
+            📜
+          </button>
+          <button
+            className="git-btn"
             disabled={busy || !status?.has_remote}
             title="fetch --all --prune"
             onClick={() => act(() => invoke("git_fetch", { cwd }), "fetch 완료")}
@@ -729,8 +738,8 @@ export function GitPanel() {
                 <div
                   key={c.hash}
                   className="git-commit-row-g git-clickable"
-                  title={`${c.short} · ${c.author} · ${c.date}\n(클릭: 커밋 변경 보기)`}
-                  onClick={() => requestDiff({ title: `${c.short} ${c.subject}`, cwd: cwd as string, hash: c.hash })}
+                  title={`${c.short} · ${c.author} · ${c.date}\n(클릭: 커밋 변경 파일 보기)`}
+                  onClick={() => cwd && openGitHistory(cwd, c.hash)}
                 >
                   <GitGraphRow row={row} maxLanes={maxLanes} theme={theme} />
                   <span className="git-chash">{c.short}</span>

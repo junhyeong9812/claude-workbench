@@ -472,6 +472,68 @@ pub fn show(cwd: &str, hash: &str) -> Result<String, String> {
     run_git(cwd, &["show", hash])
 }
 
+/// One file changed by a commit, for the history viewer's file list.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct CommitFile {
+    pub path: String,
+    /// `git show --name-status` status: M/A/D/R…/C… (rename/copy keep just the
+    /// first letter; the new path is used).
+    pub status: String,
+}
+
+/// Parse `git show --name-status --format=` lines: `<STATUS>\t<path>[\t<newpath>]`.
+fn parse_name_status(out: &str) -> Vec<CommitFile> {
+    let mut res = Vec::new();
+    for line in out.lines() {
+        let line = line.trim_end();
+        if line.is_empty() {
+            continue;
+        }
+        let mut parts = line.split('\t');
+        let Some(code) = parts.next() else { continue };
+        // Rename/copy (R100/C75) carry old + new path — show the new (last) path.
+        let path = parts.last().unwrap_or("").to_string();
+        if path.is_empty() {
+            continue;
+        }
+        let status = code.chars().next().map(|c| c.to_string()).unwrap_or_default();
+        res.push(CommitFile { path, status });
+    }
+    res
+}
+
+/// Files a commit changed (path + status), for the history viewer's file list.
+/// `--format=` drops the commit-message header so only the file list remains.
+pub fn commit_files(cwd: &str, hash: &str) -> Result<Vec<CommitFile>, String> {
+    if hash.starts_with('-') || hash.is_empty() {
+        return Err("잘못된 커밋 해시입니다".to_string());
+    }
+    let out = run_git(cwd, &["show", "--name-status", "--format=", "--no-color", hash])?;
+    Ok(parse_name_status(&out))
+}
+
+/// Unified diff for one file in one commit (`git show <hash> -- <path>`) — the
+/// history viewer's per-file diff (DETAIL mode). `--` so a path can't be parsed as
+/// an option.
+pub fn commit_file_diff(cwd: &str, hash: &str, path: &str) -> Result<String, String> {
+    if hash.starts_with('-') || hash.is_empty() {
+        return Err("잘못된 커밋 해시입니다".to_string());
+    }
+    run_git(cwd, &["show", "--format=", "--no-color", hash, "--", path])
+}
+
+/// A file's full content AT a commit (`git show <hash>:<path>`) — the history
+/// viewer's "원본 보기" toggle (the file as it was in that commit, for md→html /
+/// raw rendering). Errors if the path didn't exist at that commit (e.g. a delete).
+pub fn commit_file_content(cwd: &str, hash: &str, path: &str) -> Result<String, String> {
+    if hash.starts_with('-') || hash.is_empty() {
+        return Err("잘못된 커밋 해시입니다".to_string());
+    }
+    // `<hash>:<path>` is a rev:path spec, not an option, but guard the path anyway.
+    let spec = format!("{hash}:{path}");
+    run_git(cwd, &["show", "--no-color", &spec])
+}
+
 // ---- T1: tags ----
 
 /// Tags, newest first.

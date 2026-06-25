@@ -239,6 +239,164 @@ body {
   background: var(--bg);
   outline: none;
 }
+
+/* ---- Git history: commit-files sidebar (second sidebar) ---- */
+.pane-commit-files {
+  display: flex;
+  flex-direction: column;
+  background: var(--bg);
+  overflow: hidden;
+}
+.commit-files {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  outline: none;
+}
+.commit-files:focus {
+  box-shadow: inset 0 0 0 2px var(--accent);
+}
+.commit-files-head {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 5px 8px;
+  font-size: 0.8em;
+  color: var(--fg-dim);
+  background: rgba(127, 127, 127, 0.08);
+  border-bottom: 1px solid var(--border, #333);
+}
+.commit-files-title {
+  flex: 0 0 auto;
+  font-weight: 600;
+  color: var(--fg);
+  font-family: var(--mono, monospace);
+}
+.commit-files-count {
+  flex: 1 1 auto;
+  opacity: 0.6;
+}
+.commit-files-x {
+  flex: 0 0 auto;
+  cursor: pointer;
+  padding: 0 4px;
+}
+.commit-files-x:hover {
+  color: var(--fg);
+}
+.commit-files-body {
+  flex: 1 1 0;
+  min-height: 0;
+  overflow: auto;
+}
+.commit-file-row {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  padding: 2px 8px;
+  font-size: 0.82em;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.commit-file-row:hover {
+  background: rgba(127, 127, 127, 0.08);
+}
+.commit-file-row.sel {
+  background: color-mix(in srgb, var(--accent) 22%, transparent);
+}
+.commit-file-status {
+  flex: 0 0 auto;
+  font-size: 0.82em;
+  opacity: 0.85;
+}
+.cfs-A { color: var(--git-add, #4caf50); }
+.cfs-M { color: var(--git-mod, #e0a000); }
+.cfs-D { color: var(--git-del, #e05555); }
+.cfs-R, .cfs-C, .cfs-T { color: var(--accent); }
+.commit-file-path {
+  flex: 0 0 auto;
+  color: var(--fg);
+}
+.commit-file-dir {
+  flex: 1 1 auto;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  opacity: 0.45;
+  font-size: 0.85em;
+}
+
+/* ---- Git history: per-file peek view (over the main area) ---- */
+.commit-file-view {
+  position: absolute;
+  inset: 0;
+  z-index: 31;
+  display: flex;
+  flex-direction: column;
+  background: var(--bg);
+  color: var(--fg);
+  outline: none;
+}
+.commit-file-view:focus {
+  box-shadow: inset 0 0 0 2px var(--accent);
+}
+.commit-file-view-head {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 8px;
+  font-size: 0.8em;
+  color: var(--fg-dim);
+  background: rgba(127, 127, 127, 0.08);
+  border-bottom: 1px solid var(--border, #333);
+}
+.commit-file-view-title {
+  flex: 0 0 auto;
+  font-weight: 600;
+  color: var(--fg);
+}
+.commit-file-view-sub {
+  flex: 0 1 auto;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  opacity: 0.5;
+  font-family: var(--mono, monospace);
+}
+.commit-file-view-spacer {
+  flex: 1 1 auto;
+}
+.commit-file-view-x {
+  flex: 0 0 auto;
+  cursor: pointer;
+  font-size: 1.05em;
+  padding: 0 4px;
+}
+.commit-file-view-x:hover {
+  color: var(--fg);
+}
+.commit-file-view-body {
+  flex: 1 1 0;
+  min-height: 0;
+  overflow: auto;
+}
+.commit-file-diff,
+.commit-file-raw {
+  margin: 0;
+  padding: 6px 0;
+  font-family: var(--mono, monospace);
+  font-size: 0.82em;
+}
+.commit-file-raw {
+  padding: 10px 12px;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.commit-file-md {
+  padding: 12px 16px;
+  line-height: 1.6;
+}
 /* When the peek holds keyboard focus (Enter from the tree), show a thin inset
    ring so it's clear ↑/↓ now scroll the content rather than move the tree. */
 .peek-viewer:focus {
