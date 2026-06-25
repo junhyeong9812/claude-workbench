@@ -440,6 +440,23 @@ body {
 .git-ctx-item:hover {
   background: color-mix(in srgb, var(--accent) 22%, transparent);
 }
+.git-ctx-item.danger {
+  color: var(--git-del, #e05555);
+}
+.git-ctx-item.danger:hover {
+  background: color-mix(in srgb, #e05555 22%, transparent);
+}
+.git-ctx-sep {
+  height: 1px;
+  margin: 2px 0;
+  background: var(--border, #444);
+}
+.git-ctx-label {
+  padding: 4px 10px 2px;
+  font-size: 0.74em;
+  color: var(--fg-dim);
+  opacity: 0.7;
+}
 
 /* ---- Git reword modal (HEAD full-message editor) ---- */
 .git-modal-backdrop {
