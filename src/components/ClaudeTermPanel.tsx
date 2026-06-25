@@ -885,11 +885,18 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
                 blocks[next].scrollIntoView({ block: "nearest" });
                 return;
               }
-              // Esc: 코드블럭에서 변경상세 패널로 포커스 복귀(뷰어는 닫지 않음).
-              if (e.key === "Escape" && focusedIdx !== -1) {
+              // Esc: 2단계. 코드블럭에 포커스가 있으면 변경상세 패널로 복귀(뷰어 유지);
+              // 뷰어 자체에 포커스면 뷰어를 닫고 타임라인으로 포커스 복귀(↑↓ 이어가기).
+              if (e.key === "Escape") {
                 e.preventDefault();
                 e.stopPropagation();
-                viewerRef.current?.focus();
+                if (focusedIdx !== -1) {
+                  viewerRef.current?.focus();
+                } else {
+                  setSelectedId(null);
+                  setTextView(null);
+                  (timelineRef.current?.querySelector(".timeline-list") as HTMLElement | null)?.focus();
+                }
                 return;
               }
               // ←/→: 포커스된 블록 안에서 가로 스크롤(긴 diff 라인의 뒷부분 읽기).
