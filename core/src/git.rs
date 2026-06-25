@@ -581,7 +581,58 @@ pub fn backup_ref(cwd: &str) -> Result<String, String> {
     let short = run_git(cwd, &["rev-parse", "--short", "HEAD"]).unwrap_or_default();
     let name = format!("refs/backup/{branch}-{nanos}-{short}");
     run_git(cwd, &["update-ref", &name, "HEAD"])?;
+    // Cap accumulation: backup refs pile up across every reset/reword, blocking gc
+    // and cluttering the ref space. Keep only the most recent BACKUP_KEEP, best-effort
+    // — a prune failure must NOT fail the rewrite (the new backup already exists).
+    // `name` is passed as PROTECTED so the just-created recovery ref is never deleted,
+    // even if a clock-skewed / future-timestamped older ref sorts above it (codex).
+    prune_backup_refs(cwd, BACKUP_KEEP, &name);
     Ok(name)
+}
+
+/// How many `refs/backup/*` to retain (the most recent N by creation). Generous so
+/// recovery for recent destructive ops stays available. Pruned backups are no longer
+/// referenced, so their commits may become unreachable and gc-eligible.
+const BACKUP_KEEP: usize = 20;
+
+/// Parse the creation `nanos` out of a backup ref name
+/// `refs/backup/<branch>-<nanos>-<short>`. `nanos` and `short` are the LAST two
+/// `-`-separated segments (neither contains `-`), so this is robust to branches that
+/// themselves contain `-` or `/`. Returns `None` for a name that doesn't match our
+/// format (e.g. a user-created `refs/backup/*`), which the caller leaves untouched.
+fn backup_ref_nanos(refname: &str) -> Option<u128> {
+    let mut it = refname.rsplitn(3, '-'); // [short, nanos, branch...]
+    let short = it.next();
+    let nanos = it.next().and_then(|s| s.parse::<u128>().ok());
+    // Require both a short segment and a parseable nanos → matches our naming.
+    short.filter(|s| !s.is_empty()).and(nanos)
+}
+
+/// Keep the `keep` most-recent app-created `refs/backup/*` (by embedded nanos), always
+/// keeping `protect` (the just-created ref) regardless of its timestamp, and delete the
+/// rest. Only refs matching our `<branch>-<nanos>-<short>` format are candidates — a
+/// user's own `refs/backup/*` (no parseable nanos) is left alone (codex). Best-effort:
+/// every failure is swallowed so the caller's rewrite never breaks.
+fn prune_backup_refs(cwd: &str, keep: usize, protect: &str) {
+    let listed = match run_git(cwd, &["for-each-ref", "--format=%(refname)", "refs/backup/"]) {
+        Ok(o) => o,
+        Err(_) => return,
+    };
+    // Candidates = our-format refs, excluding the protected (just-created) one.
+    let mut refs: Vec<(u128, String)> = listed
+        .lines()
+        .filter(|l| !l.is_empty() && *l != protect)
+        .filter_map(|l| backup_ref_nanos(l).map(|n| (n, l.to_string())))
+        .collect();
+    // `protect` is always retained, so we keep up to keep-1 of the others.
+    let keep_rest = keep.saturating_sub(1);
+    if refs.len() <= keep_rest {
+        return;
+    }
+    refs.sort_by(|a, b| b.0.cmp(&a.0)); // newest first
+    for (_, r) in refs.into_iter().skip(keep_rest) {
+        let _ = run_git(cwd, &["update-ref", "-d", &r]);
+    }
 }
 
 /// Reset the current branch to `hash` in `mode` (soft|mixed|hard). For `hard` this
@@ -1663,6 +1714,92 @@ mod tests {
         assert_eq!(body(cwd, "HEAD~1"), evil, "message stored literally");
         assert!(!std::path::Path::new(cwd).join("pwned").exists(), "no $() execution");
         assert!(!std::path::Path::new(cwd).join("pwned2").exists(), "no backtick execution");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // ---- Phase 4: backup_ref auto-prune keeps only the most recent BACKUP_KEEP ----
+    #[test]
+    fn backup_ref_prunes_to_most_recent_keep() {
+        let dir = init_repo("bk_prune");
+        let cwd = dir.to_string_lossy().to_string();
+        let cwd = cwd.as_str();
+        mk_commit(cwd, "a", "1", "base", "A <a@x>");
+        let head = rev(cwd, "HEAD");
+        // 25 fake backups with ascending nanos 1000..=1024 (all point at a valid commit).
+        for n in 1000u128..1025 {
+            run_git(cwd, &["update-ref", &format!("refs/backup/main-{n}-deadbee"), &head]).unwrap();
+        }
+        let before = run_git(cwd, &["for-each-ref", "--format=%(refname)", "refs/backup/"]).unwrap();
+        assert_eq!(before.lines().count(), 25, "precondition: 25 backups");
+
+        // A real backup uses current epoch nanos (≫ the fakes) → it is the newest and
+        // its creation triggers the prune down to BACKUP_KEEP (20).
+        let new_ref = backup_ref(cwd).unwrap();
+
+        let after = run_git(cwd, &["for-each-ref", "--format=%(refname)", "refs/backup/"]).unwrap();
+        let refs: Vec<&str> = after.lines().collect();
+        assert_eq!(refs.len(), BACKUP_KEEP, "pruned to BACKUP_KEEP");
+        assert!(refs.iter().any(|r| *r == new_ref), "newly created backup is retained");
+        // 26 total − 20 kept = 6 oldest pruned (nanos 1000..=1005); 1006 survives.
+        for n in 1000u128..1006 {
+            assert!(!refs.iter().any(|r| r.contains(&format!("-{n}-"))), "oldest {n} pruned");
+        }
+        assert!(refs.iter().any(|r| r.contains("-1006-")), "1006 retained as newest-20");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn backup_ref_nanos_parses_branch_with_dashes() {
+        // branch "feat/git-control-reset" contains '-' and '/': nanos must still parse.
+        assert_eq!(backup_ref_nanos("refs/backup/feat/git-control-reset-12345-abc123"), Some(12345));
+        assert_eq!(backup_ref_nanos("refs/backup/main-9999-deadbee"), Some(9999));
+        // Non-conforming (user-created) names → None → left untouched by prune.
+        assert_eq!(backup_ref_nanos("refs/backup/garbage"), None);
+        assert_eq!(backup_ref_nanos("refs/backup/no-nanos-here"), None);
+    }
+
+    // codex High: the just-created backup must survive even when OLDER refs carry
+    // larger (future / clock-skewed) timestamps than the real current nanos.
+    #[test]
+    fn backup_ref_never_prunes_the_new_ref_even_with_future_timestamps() {
+        let dir = init_repo("bk_protect");
+        let cwd = dir.to_string_lossy().to_string();
+        let cwd = cwd.as_str();
+        mk_commit(cwd, "a", "1", "base", "A <a@x>");
+        let head = rev(cwd, "HEAD");
+        // 20 fakes with HUGE nanos (far in the future) → all "newer" than real epoch nanos.
+        let huge = 100_000_000_000_000_000_000u128;
+        for n in huge..huge + 20 {
+            run_git(cwd, &["update-ref", &format!("refs/backup/main-{n}-deadbee"), &head]).unwrap();
+        }
+        let new_ref = backup_ref(cwd).unwrap();
+        let after = run_git(cwd, &["for-each-ref", "--format=%(refname)", "refs/backup/"]).unwrap();
+        let refs: Vec<&str> = after.lines().collect();
+        assert_eq!(refs.len(), BACKUP_KEEP, "pruned to BACKUP_KEEP");
+        assert!(refs.iter().any(|r| *r == new_ref), "new backup survives despite older future-dated refs");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // codex Medium: a user's own non-conforming refs/backup/* ref is NOT pruned.
+    #[test]
+    fn backup_ref_prune_leaves_foreign_refs_alone() {
+        let dir = init_repo("bk_foreign");
+        let cwd = dir.to_string_lossy().to_string();
+        let cwd = cwd.as_str();
+        mk_commit(cwd, "a", "1", "base", "A <a@x>");
+        let head = rev(cwd, "HEAD");
+        // A foreign ref under refs/backup/ that doesn't match our <nanos>-<short> format.
+        run_git(cwd, &["update-ref", "refs/backup/user-keepme", &head]).unwrap();
+        // Plenty of our-format refs so prune definitely runs.
+        for n in 1000u128..1030 {
+            run_git(cwd, &["update-ref", &format!("refs/backup/main-{n}-deadbee"), &head]).unwrap();
+        }
+        backup_ref(cwd).unwrap();
+        let after = run_git(cwd, &["for-each-ref", "--format=%(refname)", "refs/backup/"]).unwrap();
+        assert!(
+            after.lines().any(|r| r == "refs/backup/user-keepme"),
+            "non-conforming foreign ref must not be pruned"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 }
