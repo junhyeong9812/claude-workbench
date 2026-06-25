@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { errText } from "../utils/error";
 import { Markdown, isMarkdownPath } from "./markdown";
+import { handleScrollKey } from "./scrollKeys";
 
 /** Class for a unified-diff line (mirrors DiffPanel.lineClass). */
 function lineClass(l: string): string {
@@ -42,6 +43,7 @@ export function CommitFileView(props: {
   const [text, setText] = useState("");
   const [note, setNote] = useState("");
   const ref = useRef<HTMLDivElement>(null);
+  const bodyRef = useRef<HTMLDivElement>(null);
   const isMd = isMarkdownPath(path);
 
   // NOTE: intentionally does NOT auto-focus — the commit-files sidebar keeps focus
@@ -77,7 +79,17 @@ export function CommitFileView(props: {
         if (e.key === "Escape") {
           e.preventDefault();
           props.onClose();
+          return;
         }
+        // Ctrl+← : hand focus back to the commit-files sidebar (Ctrl+→ comes here).
+        if (e.key === "ArrowLeft" && (e.ctrlKey || e.metaKey)) {
+          e.preventDefault();
+          document.querySelector<HTMLElement>(".commit-files")?.focus();
+          return;
+        }
+        // ↑/↓/PageUp/PageDown scroll the body so a long file is readable while the
+        // view holds focus (the sidebar's ↑/↓ browse files; this view scrolls).
+        if (handleScrollKey(e, bodyRef.current)) return;
       }}
     >
       <div className="commit-file-view-head">
@@ -115,7 +127,7 @@ export function CommitFileView(props: {
           ✕
         </span>
       </div>
-      <div className="commit-file-view-body">
+      <div className="commit-file-view-body" ref={bodyRef}>
         {note && <div className="git-clean">{note}</div>}
         {!note && mode === "diff" && (
           <pre className="commit-file-diff">
