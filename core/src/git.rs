@@ -488,34 +488,42 @@ pub struct CommitFile {
     pub status: String,
 }
 
-/// Parse `git show --name-status --format=` lines: `<STATUS>\t<path>[\t<newpath>]`.
+/// Parse `git show --name-status -z --format=` output. With `-z`, every field is
+/// NUL-terminated (no tabs/newlines), so paths with odd characters parse correctly:
+/// a normal entry is `STATUS\0path\0`; a rename/copy is `R<score>\0old\0new\0`
+/// (use the new path).
 fn parse_name_status(out: &str) -> Vec<CommitFile> {
     let mut res = Vec::new();
-    for line in out.lines() {
-        let line = line.trim_end();
-        if line.is_empty() {
-            continue;
-        }
-        let mut parts = line.split('\t');
-        let Some(code) = parts.next() else { continue };
-        // Rename/copy (R100/C75) carry old + new path — show the new (last) path.
-        let path = parts.last().unwrap_or("").to_string();
-        if path.is_empty() {
-            continue;
-        }
+    let mut it = out.split('\0').filter(|s| !s.is_empty());
+    while let Some(code) = it.next() {
         let status = code.chars().next().map(|c| c.to_string()).unwrap_or_default();
-        res.push(CommitFile { path, status });
+        // Rename/copy carry two path fields (old, new); other statuses carry one.
+        let path = if code.starts_with('R') || code.starts_with('C') {
+            it.next(); // old path — skip
+            it.next()
+        } else {
+            it.next()
+        };
+        if let Some(p) = path {
+            if !p.is_empty() {
+                res.push(CommitFile {
+                    path: p.to_string(),
+                    status,
+                });
+            }
+        }
     }
     res
 }
 
 /// Files a commit changed (path + status), for the history viewer's file list.
-/// `--format=` drops the commit-message header so only the file list remains.
+/// `--format=` drops the commit-message header so only the file list remains; `-z`
+/// makes the field separators NUL so unusual filenames aren't misparsed.
 pub fn commit_files(cwd: &str, hash: &str) -> Result<Vec<CommitFile>, String> {
     if hash.starts_with('-') || hash.is_empty() {
         return Err("잘못된 커밋 해시입니다".to_string());
     }
-    let out = run_git(cwd, &["show", "--name-status", "--format=", "--no-color", hash])?;
+    let out = run_git(cwd, &["show", "--name-status", "-z", "--format=", "--no-color", hash])?;
     Ok(parse_name_status(&out))
 }
 
@@ -826,6 +834,18 @@ mod tests {
         assert_eq!(wts[1].path, "/repo/wt");
         assert_eq!(wts[1].branch, "(detached)");
         assert!(!wts[1].is_main); // linked worktree
+    }
+
+    #[test]
+    fn parse_name_status_z() {
+        // -z output: normal `STATUS\0path\0`, rename `R<score>\0old\0new\0`.
+        let out = "M\0src/a.rs\0A\0b\tc.rs\0R100\0old.rs\0new.rs\0D\0gone.rs\0";
+        let fs = parse_name_status(out);
+        assert_eq!(fs.len(), 4);
+        assert_eq!((fs[0].status.as_str(), fs[0].path.as_str()), ("M", "src/a.rs"));
+        assert_eq!((fs[1].status.as_str(), fs[1].path.as_str()), ("A", "b\tc.rs")); // tab in name
+        assert_eq!((fs[2].status.as_str(), fs[2].path.as_str()), ("R", "new.rs")); // rename → new
+        assert_eq!((fs[3].status.as_str(), fs[3].path.as_str()), ("D", "gone.rs"));
     }
 
     #[test]
