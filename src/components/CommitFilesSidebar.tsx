@@ -68,11 +68,18 @@ export function CommitFilesSidebar() {
 
   const activePath = gitHistoryFile?.path ?? null;
 
-  // ↑/↓ move the selection (and open it); Esc closes the whole view.
+  // ↑/↓ move the selection (and open it); Ctrl+→ hands focus to the file view;
+  // Esc closes the whole view.
   const onKeyDown = (e: React.KeyboardEvent) => {
     if (e.key === "Escape") {
       e.preventDefault();
       closeGitHistory();
+      return;
+    }
+    // Ctrl+→ : focus the peek file view (Ctrl+← there returns focus here).
+    if (e.key === "ArrowRight" && (e.ctrlKey || e.metaKey)) {
+      e.preventDefault();
+      document.querySelector<HTMLElement>(".commit-file-view")?.focus();
       return;
     }
     if (e.key !== "ArrowDown" && e.key !== "ArrowUp") return;
