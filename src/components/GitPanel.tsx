@@ -138,6 +138,8 @@ export function GitPanel() {
   const [logRef, setLogRef] = useState<string | null>(null);
   // Right-click context menu on a commit row (amend HEAD / revert), or null.
   const [ctxMenu, setCtxMenu] = useState<{ x: number; y: number; commit: Commit } | null>(null);
+  // Reword editor modal for the HEAD commit (full multi-line message), or null.
+  const [rewordModal, setRewordModal] = useState<{ hash: string; message: string } | null>(null);
   const reqRef = useRef(0);
 
   const reload = useCallback(async () => {
@@ -876,25 +878,38 @@ export function GitPanel() {
             {ctxMenu.commit.refs
               .split(", ")
               .some((r) => r === "HEAD" || r.startsWith("HEAD -> ")) && (
-              <button
-                className="git-ctx-item"
-                role="menuitem"
-                onClick={() => {
-                  const c = ctxMenu.commit;
-                  setCtxMenu(null);
-                  const msg = window.prompt(
-                    "새 커밋 메시지 — HEAD 커밋을 재작성합니다. 이미 push했다면 히스토리가 분기됩니다. (본문/트레일러가 있는 커밋은 터미널에서 수정)",
-                    c.subject,
-                  );
-                  if (msg && msg.trim())
-                    act(
-                      () => invoke("git_amend_message", { cwd, hash: c.hash, message: msg.trim() }),
-                      "메시지 수정 완료",
-                    );
-                }}
-              >
-                메시지 수정 (amend)
-              </button>
+              <>
+                <button
+                  className="git-ctx-item"
+                  role="menuitem"
+                  onClick={() => {
+                    const c = ctxMenu.commit;
+                    setCtxMenu(null);
+                    // Load the full message (subject + body) into the editor modal.
+                    invoke<string>("git_head_message", { cwd })
+                      .then((m) => setRewordModal({ hash: c.hash, message: m }))
+                      .catch((e) => setNote(errText(e)));
+                  }}
+                >
+                  메시지 수정…
+                </button>
+                <button
+                  className="git-ctx-item"
+                  role="menuitem"
+                  onClick={() => {
+                    const c = ctxMenu.commit;
+                    setCtxMenu(null);
+                    if (
+                      window.confirm(
+                        "마지막 커밋을 취소할까요? 변경 내용은 staged 상태로 남습니다 (reset --soft). reflog로 복구 가능.",
+                      )
+                    )
+                      act(() => invoke("git_uncommit", { cwd, hash: c.hash }), "마지막 커밋 취소됨 (변경 유지)");
+                  }}
+                >
+                  마지막 커밋 취소 (변경 유지)
+                </button>
+              </>
             )}
             <button
               className="git-ctx-item"
@@ -910,6 +925,46 @@ export function GitPanel() {
             </button>
           </div>
         </>
+      )}
+      {rewordModal && (
+        <div className="git-modal-backdrop" onClick={() => !busy && setRewordModal(null)}>
+          <div className="git-modal" onClick={(e) => e.stopPropagation()}>
+            <div className="git-modal-title">커밋 메시지 수정 (HEAD)</div>
+            <textarea
+              className="git-modal-textarea"
+              autoFocus
+              spellCheck={false}
+              value={rewordModal.message}
+              onChange={(e) => setRewordModal({ ...rewordModal, message: e.target.value })}
+              onKeyDown={(e) => {
+                // Don't discard the edited message while a save is in flight (codex).
+                if (e.key === "Escape" && !busy) setRewordModal(null);
+              }}
+            />
+            <div className="git-modal-hint">
+              HEAD 커밋을 재작성합니다 (reflog 복구 가능). 이미 push했다면 히스토리가 분기됩니다.
+            </div>
+            <div className="git-modal-actions">
+              <button className="git-btn" disabled={busy} onClick={() => setRewordModal(null)}>
+                취소
+              </button>
+              <button
+                className="git-btn active"
+                disabled={busy || !rewordModal.message.trim()}
+                onClick={async () => {
+                  const { hash, message } = rewordModal;
+                  const ok = await act(
+                    () => invoke("git_reword", { cwd, hash, message }),
+                    "메시지 수정 완료",
+                  );
+                  if (ok) setRewordModal(null);
+                }}
+              >
+                저장
+              </button>
+            </div>
+          </div>
+        </div>
       )}
     </div>
   );

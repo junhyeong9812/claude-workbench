@@ -1741,13 +1741,6 @@ pub fn git_rename_branch(cwd: String, old: String, new: String) -> Result<String
     core_lib::git::rename_branch(&cwd, &old, &new).map_err(AppError::new)
 }
 
-/// Reword the latest commit (HEAD). `hash` is the clicked commit; the backend
-/// verifies it is HEAD and the index is clean. UI confirms first.
-#[tauri::command]
-pub fn git_amend_message(cwd: String, hash: String, message: String) -> Result<String, AppError> {
-    core_lib::git::amend_message(&cwd, &hash, &message).map_err(AppError::new)
-}
-
 /// Revert a commit (new undo commit). UI confirms first.
 #[tauri::command]
 pub fn git_revert(cwd: String, hash: String) -> Result<String, AppError> {
@@ -1764,6 +1757,25 @@ pub fn git_revert_abort(cwd: String) -> Result<String, AppError> {
 #[tauri::command]
 pub fn git_revert_continue(cwd: String) -> Result<String, AppError> {
     core_lib::git::revert_continue(&cwd).map_err(AppError::new)
+}
+
+/// The HEAD commit's full message — prefills the reword editor.
+#[tauri::command]
+pub fn git_head_message(cwd: String) -> Result<String, AppError> {
+    core_lib::git::head_message(&cwd).map_err(AppError::new)
+}
+
+/// Reword HEAD with a full multi-line message (editor path). UI confirms first.
+#[tauri::command]
+pub fn git_reword(cwd: String, hash: String, message: String) -> Result<String, AppError> {
+    core_lib::git::reword(&cwd, &hash, &message).map_err(AppError::new)
+}
+
+/// Undo the last commit, keeping changes staged (reset --soft). `hash` is the
+/// clicked commit; the backend verifies it is HEAD. UI confirms first.
+#[tauri::command]
+pub fn git_uncommit(cwd: String, hash: String) -> Result<String, AppError> {
+    core_lib::git::uncommit(&cwd, &hash).map_err(AppError::new)
 }
 
 #[tauri::command]

@@ -440,6 +440,58 @@ body {
 .git-ctx-item:hover {
   background: color-mix(in srgb, var(--accent) 22%, transparent);
 }
+
+/* ---- Git reword modal (HEAD full-message editor) ---- */
+.git-modal-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 42;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(0, 0, 0, 0.45);
+}
+.git-modal {
+  width: min(560px, 90vw);
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 14px;
+  background: var(--bg-alt, #1e1e2e);
+  border: 1px solid var(--border, #444);
+  border-radius: 8px;
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.5);
+}
+.git-modal-title {
+  font-weight: 600;
+  color: var(--fg);
+}
+.git-modal-textarea {
+  min-height: 160px;
+  resize: vertical;
+  padding: 8px 10px;
+  font-family: var(--mono, monospace);
+  font-size: 0.85em;
+  line-height: 1.5;
+  color: var(--fg);
+  background: var(--bg);
+  border: 1px solid var(--border, #444);
+  border-radius: 6px;
+  outline: none;
+}
+.git-modal-textarea:focus {
+  border-color: var(--accent);
+}
+.git-modal-hint {
+  font-size: 0.78em;
+  color: var(--fg-dim);
+  opacity: 0.8;
+}
+.git-modal-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+}
 /* When the peek holds keyboard focus (Enter from the tree), show a thin inset
    ring so it's clear ↑/↓ now scroll the content rather than move the tree. */
 .peek-viewer:focus {
