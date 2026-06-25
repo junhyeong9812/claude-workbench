@@ -120,8 +120,16 @@ export function TimelineView({
     }
   }
 
+  // Render-pass cycle/dup guards: the same self-referential subagent graph that
+  // could overflow the nav builder would overflow the recursive render below — and
+  // also duplicate React keys. Each item/agent renders at most once per pass.
+  const renderSeenItem = new Set<string>();
+  const renderSeenAgent = new Set<string>();
   // One tool item + (recursively) any subagent groups spawned by it.
-  const renderItem = (it: TimelineItem, sub: boolean): React.ReactNode => (
+  const renderItem = (it: TimelineItem, sub: boolean): React.ReactNode => {
+    if (renderSeenItem.has(it.tool_call_id)) return null;
+    renderSeenItem.add(it.tool_call_id);
+    return (
     <Fragment key={it.tool_call_id}>
       <div
         data-tcid={it.tool_call_id}
@@ -145,10 +153,13 @@ export function TimelineView({
       </div>
       {(agentsByParent.get(it.tool_call_id) ?? []).map(([aid, its]) => renderAgent(aid, its))}
     </Fragment>
-  );
+    );
+  };
 
   // A collapsible subagent group; its items render recursively (agent-in-agent).
   const renderAgent = (aid: string, its: TimelineItem[]): React.ReactNode => {
+    if (renderSeenAgent.has(aid)) return null;
+    renderSeenAgent.add(aid);
     const collapsed = collapsedAgents.has(aid);
     return (
       <div key={aid} className="timeline-agent">
@@ -190,13 +201,23 @@ export function TimelineView({
   // head is a `turn` entry; tool/agent items are `item` entries.
   type Nav = { kind: "turn"; turn: number } | { kind: "item"; item: TimelineItem };
   const navEntries: Nav[] = [];
+  // Cycle/dup guards: a corrupt or self-referential subagent graph (an item whose
+  // spawned agent's items lead back to it) would otherwise recurse forever and
+  // overflow the stack — crashing the whole panel to a black screen. Each item and
+  // each agent is visited at most once.
+  const seenItem = new Set<string>();
+  const seenAgent = new Set<string>();
   // Push an item then (recursively) the items of any non-collapsed subagent it spawned.
   const pushItemTree = (it: TimelineItem) => {
+    if (seenItem.has(it.tool_call_id)) return;
+    seenItem.add(it.tool_call_id);
     navEntries.push({ kind: "item", item: it });
     for (const [aid, its] of agentsByParent.get(it.tool_call_id) ?? []) pushAgentItems(aid, its);
   };
   function pushAgentItems(aid: string, its: TimelineItem[]) {
     if (collapsedAgents.has(aid)) return; // collapsed group hides its rows
+    if (seenAgent.has(aid)) return; // cycle guard
+    seenAgent.add(aid);
     for (const it of its) pushItemTree(it);
   }
   for (const turn of turnNos) {
