@@ -11,6 +11,7 @@ import { GitPanel } from "./components/GitPanel";
 import { WorktreePanel } from "./components/WorktreePanel";
 import { MainArea } from "./components/MainArea";
 import { FilePeekViewer } from "./components/FilePeekViewer";
+import { GitHistoryViewer } from "./components/GitHistoryViewer";
 import { TerminalSettings } from "./components/TerminalSettings";
 import { StudyView } from "./components/StudyView";
 import { PopoutWorkbench } from "./components/PopoutWorkbench";
@@ -32,6 +33,8 @@ function AppMain() {
   const activeProject = useAppStore((s) => s.activeProject);
   const peekFile = useAppStore((s) => s.peekFile);
   const setPeekFile = useAppStore((s) => s.setPeekFile);
+  const gitHistory = useAppStore((s) => s.gitHistory);
+  const closeGitHistory = useAppStore((s) => s.closeGitHistory);
 
   const treePanelRef = useRef<ImperativePanelHandle>(null);
   const [collapsed, setCollapsed] = useState(false);
@@ -255,6 +258,9 @@ function AppMain() {
           <MainArea />
           {peekFile && (
             <FilePeekViewer path={peekFile} onClose={() => setPeekFile(null)} />
+          )}
+          {gitHistory && (
+            <GitHistoryViewer root={gitHistory.root} onClose={closeGitHistory} />
           )}
         </Panel>
         </PanelGroup>

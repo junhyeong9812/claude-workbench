@@ -236,6 +236,9 @@ interface AppState {
   treeCursor: string | null;
   /** File currently shown in the peek viewer overlay, or null (closed). Transient. */
   peekFile: string | null;
+  /** Git history viewer overlay state (the repo root to show history for), or null
+   * (closed). A peek-style overlay over the main area, not a dockview tab. Transient. */
+  gitHistory: { root: string } | null;
   /** A request to open a file in the editor (consumed by MainArea, which owns the
    * dockview api), or null. Transient. */
   editorOpenRequest: string | null;
@@ -340,6 +343,9 @@ interface AppState {
   setTreeCursor: (path: string | null) => void;
   /** Open/close the peek viewer on a file (null closes it). */
   setPeekFile: (path: string | null) => void;
+  /** Open/close the git history viewer overlay for a repo root. */
+  openGitHistory: (root: string) => void;
+  closeGitHistory: () => void;
   /** Request opening a file in the editor (MainArea consumes + clears with null). */
   requestEditorOpen: (path: string | null) => void;
   /** Request opening a diff panel (MainArea consumes + clears with null). */
@@ -401,6 +407,7 @@ export const useAppStore = create<AppState>((set, get) => ({
   loadingDirs: {},
   treeCursor: null,
   peekFile: null,
+  gitHistory: null,
   editorOpenRequest: null,
   diffRequest: null,
   claudeOpenRequest: null,
@@ -550,6 +557,8 @@ export const useAppStore = create<AppState>((set, get) => ({
 
   setTreeCursor: (path) => set({ treeCursor: path }),
   setPeekFile: (path) => set({ peekFile: path }),
+  openGitHistory: (root) => set({ gitHistory: { root } }),
+  closeGitHistory: () => set({ gitHistory: null }),
   requestEditorOpen: (path) => set({ editorOpenRequest: path }),
   requestDiff: (spec) => set({ diffRequest: spec }),
   requestClaudeOpen: (req) => set({ claudeOpenRequest: req }),

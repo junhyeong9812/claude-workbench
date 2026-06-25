@@ -116,6 +116,7 @@ export function GitPanel() {
   const activeProject = useAppStore((s) => s.activeProject);
   const requestDiff = useAppStore((s) => s.requestDiff);
   const requestEditorOpen = useAppStore((s) => s.requestEditorOpen);
+  const openGitHistory = useAppStore((s) => s.openGitHistory);
   const theme = useAppStore((s) => s.theme);
   // Multi-root: git roots under the project (enclosing repo + nested .git repos).
   // `selectedRoot` overrides the project root for every git command below; null =
@@ -479,6 +480,13 @@ export function GitPanel() {
             {status ? `↑${status.ahead} ↓${status.behind}` : ""}
             {status && !status.has_remote ? " (원격없음)" : ""}
           </span>
+          <button
+            className="git-btn"
+            title="이 저장소의 커밋 히스토리 보기"
+            onClick={() => cwd && openGitHistory(cwd)}
+          >
+            📜
+          </button>
           <button
             className="git-btn"
             disabled={busy || !status?.has_remote}
