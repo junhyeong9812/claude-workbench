@@ -11,7 +11,8 @@ import { GitPanel } from "./components/GitPanel";
 import { WorktreePanel } from "./components/WorktreePanel";
 import { MainArea } from "./components/MainArea";
 import { FilePeekViewer } from "./components/FilePeekViewer";
-import { GitHistoryViewer } from "./components/GitHistoryViewer";
+import { CommitFilesSidebar } from "./components/CommitFilesSidebar";
+import { CommitFileView } from "./components/CommitFileView";
 import { TerminalSettings } from "./components/TerminalSettings";
 import { StudyView } from "./components/StudyView";
 import { PopoutWorkbench } from "./components/PopoutWorkbench";
@@ -34,7 +35,8 @@ function AppMain() {
   const peekFile = useAppStore((s) => s.peekFile);
   const setPeekFile = useAppStore((s) => s.setPeekFile);
   const gitHistory = useAppStore((s) => s.gitHistory);
-  const closeGitHistory = useAppStore((s) => s.closeGitHistory);
+  const gitHistoryFile = useAppStore((s) => s.gitHistoryFile);
+  const closeGitHistoryFile = useAppStore((s) => s.closeGitHistoryFile);
 
   const treePanelRef = useRef<ImperativePanelHandle>(null);
   const [collapsed, setCollapsed] = useState(false);
@@ -202,6 +204,8 @@ function AppMain() {
       ) : (
         <PanelGroup direction="horizontal" className="panes">
         <Panel
+          id="sidebar"
+          order={1}
           ref={treePanelRef}
           defaultSize={20}
           minSize={10}
@@ -253,14 +257,33 @@ function AppMain() {
             )}
           </div>
         </Panel>
+        {gitHistory && (
+          <>
+            <PanelResizeHandle className="resize-handle" />
+            <Panel
+              id="commit-files"
+              order={2}
+              defaultSize={20}
+              minSize={10}
+              className="pane-commit-files"
+            >
+              <CommitFilesSidebar />
+            </Panel>
+          </>
+        )}
         <PanelResizeHandle className="resize-handle" />
-        <Panel defaultSize={80} minSize={30} className="pane-main">
+        <Panel id="main" order={3} defaultSize={60} minSize={30} className="pane-main">
           <MainArea />
           {peekFile && (
             <FilePeekViewer path={peekFile} onClose={() => setPeekFile(null)} />
           )}
-          {gitHistory && (
-            <GitHistoryViewer root={gitHistory.root} onClose={closeGitHistory} />
+          {gitHistoryFile && (
+            <CommitFileView
+              root={gitHistoryFile.root}
+              commit={gitHistoryFile.commit}
+              path={gitHistoryFile.path}
+              onClose={closeGitHistoryFile}
+            />
           )}
         </Panel>
         </PanelGroup>

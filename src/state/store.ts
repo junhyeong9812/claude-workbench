@@ -236,9 +236,13 @@ interface AppState {
   treeCursor: string | null;
   /** File currently shown in the peek viewer overlay, or null (closed). Transient. */
   peekFile: string | null;
-  /** Git history viewer overlay state (the repo root to show history for), or null
-   * (closed). A peek-style overlay over the main area, not a dockview tab. Transient. */
-  gitHistory: { root: string } | null;
+  /** Git history viewer state: a commit selected in the Git panel, shown as a
+   * SECOND sidebar listing that commit's changed files (next to the main sidebar),
+   * or null (closed). Transient. */
+  gitHistory: { root: string; commit: string } | null;
+  /** A file opened from the commit-files sidebar, shown as a peek-style view over
+   * the main area (file content at the commit + diff toggle), or null. Transient. */
+  gitHistoryFile: { root: string; commit: string; path: string } | null;
   /** A request to open a file in the editor (consumed by MainArea, which owns the
    * dockview api), or null. Transient. */
   editorOpenRequest: string | null;
@@ -343,9 +347,13 @@ interface AppState {
   setTreeCursor: (path: string | null) => void;
   /** Open/close the peek viewer on a file (null closes it). */
   setPeekFile: (path: string | null) => void;
-  /** Open/close the git history viewer overlay for a repo root. */
-  openGitHistory: (root: string) => void;
+  /** Open the commit-files sidebar for a commit (closes any prior file view). */
+  openGitHistory: (root: string, commit: string) => void;
+  /** Close the commit-files sidebar (and any open file view). */
   closeGitHistory: () => void;
+  /** Open/close the peek-style file view for a file in the selected commit. */
+  openGitHistoryFile: (root: string, commit: string, path: string) => void;
+  closeGitHistoryFile: () => void;
   /** Request opening a file in the editor (MainArea consumes + clears with null). */
   requestEditorOpen: (path: string | null) => void;
   /** Request opening a diff panel (MainArea consumes + clears with null). */
@@ -408,6 +416,7 @@ export const useAppStore = create<AppState>((set, get) => ({
   treeCursor: null,
   peekFile: null,
   gitHistory: null,
+  gitHistoryFile: null,
   editorOpenRequest: null,
   diffRequest: null,
   claudeOpenRequest: null,
@@ -557,8 +566,12 @@ export const useAppStore = create<AppState>((set, get) => ({
 
   setTreeCursor: (path) => set({ treeCursor: path }),
   setPeekFile: (path) => set({ peekFile: path }),
-  openGitHistory: (root) => set({ gitHistory: { root } }),
-  closeGitHistory: () => set({ gitHistory: null }),
+  openGitHistory: (root, commit) =>
+    set({ gitHistory: { root, commit }, gitHistoryFile: null }),
+  closeGitHistory: () => set({ gitHistory: null, gitHistoryFile: null }),
+  openGitHistoryFile: (root, commit, path) =>
+    set({ gitHistoryFile: { root, commit, path } }),
+  closeGitHistoryFile: () => set({ gitHistoryFile: null }),
   requestEditorOpen: (path) => set({ editorOpenRequest: path }),
   requestDiff: (spec) => set({ diffRequest: spec }),
   requestClaudeOpen: (req) => set({ claudeOpenRequest: req }),

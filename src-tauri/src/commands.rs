@@ -1777,6 +1777,24 @@ pub fn git_show(cwd: String, hash: String) -> Result<String, AppError> {
     core_lib::git::show(&cwd, &hash).map_err(AppError::new)
 }
 
+/// Files a commit changed (path + status) — the git history viewer's file list.
+#[tauri::command]
+pub fn git_commit_files(cwd: String, hash: String) -> Result<Vec<core_lib::git::CommitFile>, AppError> {
+    core_lib::git::commit_files(&cwd, &hash).map_err(AppError::new)
+}
+
+/// Unified diff for one file in one commit — the history viewer's per-file view.
+#[tauri::command]
+pub fn git_commit_file_diff(cwd: String, hash: String, path: String) -> Result<String, AppError> {
+    core_lib::git::commit_file_diff(&cwd, &hash, &path).map_err(AppError::new)
+}
+
+/// A file's full content at a commit — the history viewer's "원본 보기" toggle.
+#[tauri::command]
+pub fn git_commit_file_content(cwd: String, hash: String, path: String) -> Result<String, AppError> {
+    core_lib::git::commit_file_content(&cwd, &hash, &path).map_err(AppError::new)
+}
+
 #[tauri::command]
 pub fn git_tags(cwd: String) -> Result<Vec<String>, AppError> {
     core_lib::git::tags(&cwd).map_err(AppError::new)

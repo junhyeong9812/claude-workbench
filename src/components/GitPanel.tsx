@@ -482,8 +482,9 @@ export function GitPanel() {
           </span>
           <button
             className="git-btn"
-            title="이 저장소의 커밋 히스토리 보기"
-            onClick={() => cwd && openGitHistory(cwd)}
+            disabled={!commits[0]}
+            title="최신 커밋의 변경 파일 보기"
+            onClick={() => cwd && commits[0] && openGitHistory(cwd, commits[0].hash)}
           >
             📜
           </button>
@@ -737,8 +738,8 @@ export function GitPanel() {
                 <div
                   key={c.hash}
                   className="git-commit-row-g git-clickable"
-                  title={`${c.short} · ${c.author} · ${c.date}\n(클릭: 커밋 변경 보기)`}
-                  onClick={() => requestDiff({ title: `${c.short} ${c.subject}`, cwd: cwd as string, hash: c.hash })}
+                  title={`${c.short} · ${c.author} · ${c.date}\n(클릭: 커밋 변경 파일 보기)`}
+                  onClick={() => cwd && openGitHistory(cwd, c.hash)}
                 >
                   <GitGraphRow row={row} maxLanes={maxLanes} theme={theme} />
                   <span className="git-chash">{c.short}</span>
