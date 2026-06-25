@@ -424,6 +424,62 @@ body {
   overflow: hidden;
   text-overflow: ellipsis;
 }
+/* Multi-root git selector tree — fully themed (no native <select> popup, so it
+   matches light/dark exactly). Folder nodes are structural; root rows click to
+   switch the active git root. */
+.git-roots {
+  flex: 0 0 auto;
+  border-bottom: 1px solid var(--border, #333);
+  padding: 3px 0;
+  font-size: 0.82em;
+  max-height: 180px;
+  overflow-y: auto;
+}
+.git-root-dir {
+  padding: 1px 8px;
+  color: var(--fg-dim);
+  opacity: 0.75;
+  white-space: nowrap;
+}
+.git-root-row {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  padding: 1px 8px;
+  cursor: pointer;
+  white-space: nowrap;
+  overflow: hidden;
+  color: var(--fg);
+}
+.git-root-row:hover {
+  background: var(--bg-hover);
+}
+.git-root-sel {
+  background: var(--bg-alt);
+  font-weight: 600;
+}
+.git-root-dot {
+  flex: 0 0 auto;
+  color: var(--accent, #89b4fa);
+  font-size: 0.7em;
+}
+.git-root-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.git-root-cur-tag {
+  flex: 0 0 auto;
+  font-size: 0.85em;
+  color: var(--fg-dim);
+  opacity: 0.8;
+}
+.git-root-branch {
+  flex: 0 0 auto;
+  margin-left: auto;
+  color: var(--fg-dim);
+  font-variant-numeric: tabular-nums;
+  opacity: 0.9;
+}
 .git-branch select {
   background: var(--bg-alt);
   color: var(--fg, #cdd6f4);
