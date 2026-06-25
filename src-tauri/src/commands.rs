@@ -1778,6 +1778,17 @@ pub fn git_uncommit(cwd: String, hash: String) -> Result<String, AppError> {
     core_lib::git::uncommit(&cwd, &hash).map_err(AppError::new)
 }
 
+/// Reset the current branch to `hash` (soft|mixed|hard). Creates a backup ref first
+/// (returned for recovery). `hard` is destructive — UI strong-confirms first.
+#[tauri::command]
+pub fn git_reset_to(
+    cwd: String,
+    hash: String,
+    mode: String,
+) -> Result<core_lib::git::ResetResult, AppError> {
+    core_lib::git::reset_to(&cwd, &hash, &mode).map_err(AppError::new)
+}
+
 #[tauri::command]
 pub fn git_stash_list(cwd: String) -> Result<Vec<String>, AppError> {
     core_lib::git::stash_list(&cwd).map_err(AppError::new)

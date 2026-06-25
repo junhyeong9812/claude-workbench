@@ -151,6 +151,7 @@ pub fn run() {
             commands::git_head_message,
             commands::git_reword,
             commands::git_uncommit,
+            commands::git_reset_to,
             commands::git_stash_list,
             commands::git_stash_save,
             commands::git_stash_pop,

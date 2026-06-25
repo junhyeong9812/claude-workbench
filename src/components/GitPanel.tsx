@@ -923,6 +923,40 @@ export function GitPanel() {
             >
               되돌리기 (revert)
             </button>
+            <div className="git-ctx-sep" />
+            <div className="git-ctx-label">이 커밋으로 리셋 (백업 ref 자동 생성)</div>
+            {(["soft", "mixed", "hard"] as const).map((mode) => (
+              <button
+                key={mode}
+                className={`git-ctx-item${mode === "hard" ? " danger" : ""}`}
+                role="menuitem"
+                onClick={() => {
+                  const c = ctxMenu.commit;
+                  setCtxMenu(null);
+                  const warn =
+                    mode === "hard"
+                      ? `${c.short} 로 HARD 리셋 — 이후 커밋과 추적 파일의 변경이 작업 트리에서 사라집니다.\n(커밋은 백업 ref로, 미커밋 변경은 자동 stash로 보존돼 복구 가능합니다.)\n\n계속할까요?`
+                      : `${c.short} 로 ${mode} 리셋할까요? (백업 ref 자동 생성)`;
+                  if (!window.confirm(warn)) return;
+                  act(async () => {
+                    const r = await invoke<{ backup_ref: string; stashed: boolean; output: string }>(
+                      "git_reset_to",
+                      { cwd, hash: c.hash, mode },
+                    );
+                    // Show the recovery point, not a prescriptive command — for
+                    // soft/mixed, blindly `reset --hard <ref>` would discard the
+                    // changes the user kept (dual-review Med).
+                    const stashMsg = r.stashed ? " · 미커밋 변경은 자동 stash됨(git stash list)" : "";
+                    setNote(`${mode} 리셋 완료 — reset 전 HEAD: ${r.backup_ref}${stashMsg}`);
+                  });
+                }}
+              >
+                {mode}
+                {mode === "soft" && " (변경 유지·staged)"}
+                {mode === "mixed" && " (변경 유지·unstaged)"}
+                {mode === "hard" && " (변경·커밋 폐기 ⚠)"}
+              </button>
+            ))}
           </div>
         </>
       )}

@@ -278,6 +278,9 @@ pub fn log(cwd: &str, limit: u32, order: &str, gitref: Option<&str>) -> Result<V
         &[
             "log",
             &limit_arg,
+            // Keep auto-created reset backups out of the graph (they'd pile up as
+            // decorations/nodes under `--all`). Harmless when ref_arg is a branch.
+            "--exclude=refs/backup/*",
             ref_arg,
             order_flag,
             "--date=format:%Y-%m-%d %H:%M",
@@ -458,6 +461,88 @@ pub fn revert_abort(cwd: &str) -> Result<String, String> {
 /// REVERT_HEAD exists clears it (no editor; mirrors merge_continue).
 pub fn revert_continue(cwd: &str) -> Result<String, String> {
     run_git(cwd, &["commit", "--no-edit"])
+}
+
+/// Result of a reset: the auto-created backup ref (for recovery) + git's output.
+#[derive(Debug, Clone, Serialize)]
+pub struct ResetResult {
+    /// Recovery ref at the pre-reset HEAD (restores the commit position).
+    pub backup_ref: String,
+    /// True if a `--hard` on a dirty tree auto-stashed tracked changes first (those
+    /// are NOT in `backup_ref` — recover with `git stash pop`).
+    pub stashed: bool,
+    pub output: String,
+}
+
+/// Create a recovery ref at the current HEAD before a history rewrite, so the
+/// commit position is always restorable (`git reset --hard <returned ref>`). Named
+/// per branch + nanos + short HEAD so repeat ops never collide (dual-review). Errors
+/// on a detached HEAD (no branch) or a ref-write failure — callers MUST abort the
+/// rewrite if this fails (no backup ⇒ don't proceed). NOTE: a ref only points at a
+/// commit; it does NOT preserve uncommitted working-tree/index changes (see reset_to).
+pub fn backup_ref(cwd: &str) -> Result<String, String> {
+    let branch = run_git(cwd, &["symbolic-ref", "--quiet", "--short", "HEAD"])
+        .map_err(|_| "분리된 HEAD에서는 리셋을 지원하지 않습니다".to_string())?;
+    if branch.is_empty() {
+        return Err("현재 브랜치를 확인할 수 없습니다".to_string());
+    }
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let short = run_git(cwd, &["rev-parse", "--short", "HEAD"]).unwrap_or_default();
+    let name = format!("refs/backup/{branch}-{nanos}-{short}");
+    run_git(cwd, &["update-ref", &name, "HEAD"])?;
+    Ok(name)
+}
+
+/// Reset the current branch to `hash` in `mode` (soft|mixed|hard). For `hard` this
+/// discards index + working tree, so — since the backup ref only restores commits,
+/// not uncommitted changes (dual-review CRITICAL) — a dirty tree is auto-stashed
+/// FIRST (tracked changes; untracked survive `reset --hard`). The backup ref is also
+/// created first; if either safety step fails the reset is NOT performed. Refuses
+/// during a sequencer op. `mode` is whitelisted; the commit is pre-resolved.
+pub fn reset_to(cwd: &str, hash: &str, mode: &str) -> Result<ResetResult, String> {
+    let flag = match mode {
+        "soft" => "--soft",
+        "mixed" => "--mixed",
+        "hard" => "--hard",
+        _ => return Err("잘못된 reset 모드입니다".to_string()),
+    };
+    let target = resolve_commit(cwd, hash)?; // single commit; use the resolved hash
+    if op_in_progress(cwd) {
+        return Err("진행 중인 머지/되돌리기 작업이 있습니다 — 먼저 끝내세요".to_string());
+    }
+    let backup_ref = backup_ref(cwd)?; // no backup ⇒ no reset
+    // `reset --hard` would discard uncommitted tracked changes — AND can delete an
+    // untracked file that obstructs a tracked path in the target commit — none of
+    // which the backup ref restores. So stash everything dirty (incl. untracked;
+    // `git status --porcelain` covers both, ignored files excluded) FIRST, so a pop
+    // recovers all of it (re-review CRITICAL).
+    let mut stashed = false;
+    if flag == "--hard" {
+        let dirty = !run_git(cwd, &["status", "--porcelain"])
+            .unwrap_or_default()
+            .is_empty();
+        if dirty {
+            run_git(cwd, &["stash", "push", "--include-untracked", "-m", "pre-reset (auto)"])?;
+            stashed = true;
+        }
+    }
+    // If the reset itself fails after a successful stash, make sure the user learns
+    // their changes were moved to the stash (re-review Medium).
+    let output = run_git(cwd, &["reset", flag, &target]).map_err(|e| {
+        if stashed {
+            format!("{e}\n(미커밋 변경은 'pre-reset (auto)'로 stash됨 — git stash list 확인)")
+        } else {
+            e
+        }
+    })?;
+    Ok(ResetResult {
+        backup_ref,
+        stashed,
+        output,
+    })
 }
 
 /// Stash entries (`stash list`), one per line.
