@@ -383,26 +383,62 @@ fn resolve_commit(cwd: &str, r: &str) -> Result<String, String> {
         .map_err(|_| "유효한 커밋이 아닙니다".to_string())
 }
 
-/// Reword the latest commit (`git commit --amend -m <message>`). Guards (codex):
-/// `hash` must BE HEAD (never reword a non-HEAD row by mistake), the index must be
-/// clean (so staged changes aren't silently folded in), and HEAD must be a
-/// single-line message (a one-line prompt would drop a body/trailers — use a
-/// terminal for those). Rewrites HEAD's hash, so the UI confirms first.
-pub fn amend_message(cwd: &str, hash: &str, message: &str) -> Result<String, String> {
+/// The HEAD commit's full message (`%B`) — prefills the reword editor.
+pub fn head_message(cwd: &str) -> Result<String, String> {
+    run_git(cwd, &["log", "-1", "--format=%B", "HEAD"])
+}
+
+/// True if a merge/revert/cherry-pick/rebase sequencer operation is in progress —
+/// HEAD-moving commands refuse during these to avoid leaving confusing state.
+fn op_in_progress(cwd: &str) -> bool {
+    for r in ["MERGE_HEAD", "REVERT_HEAD", "CHERRY_PICK_HEAD"] {
+        if run_git(cwd, &["rev-parse", "-q", "--verify", r]).is_ok() {
+            return true;
+        }
+    }
+    for dir in ["rebase-merge", "rebase-apply"] {
+        if let Ok(p) = run_git(cwd, &["rev-parse", "--git-path", dir]) {
+            if Path::new(&p).exists() {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Reword the HEAD commit with a FULL (multi-line) message — the editor path that
+/// preserves body/trailers. Safety guards: `hash` must be HEAD and the index must be
+/// clean (so staged changes aren't folded in). Rewrites HEAD's hash (recoverable via
+/// reflog); UI confirms.
+pub fn reword(cwd: &str, hash: &str, message: &str) -> Result<String, String> {
     if message.trim().is_empty() {
         return Err("커밋 메시지가 비어 있습니다".to_string());
     }
     if resolve_commit(cwd, "HEAD")? != resolve_commit(cwd, hash)? {
-        return Err("HEAD 커밋만 메시지를 수정할 수 있습니다".to_string());
+        return Err("HEAD 커밋만 수정할 수 있습니다".to_string());
     }
     if run_git(cwd, &["diff", "--cached", "--quiet"]).is_err() {
         return Err("스테이지된 변경이 있습니다 — 먼저 커밋/언스테이지 후 수정하세요".to_string());
     }
-    let body = run_git(cwd, &["log", "-1", "--format=%B", "HEAD"]).unwrap_or_default();
-    if body.trim().lines().count() > 1 {
-        return Err("본문이 있는 커밋입니다 — 본문 유실 방지를 위해 터미널에서 수정하세요".to_string());
-    }
     run_git(cwd, &["commit", "--amend", "-m", message])
+}
+
+/// Undo the last commit, keeping its changes staged (`git reset --soft HEAD~1`).
+/// Non-destructive: the working tree is untouched and the change set survives in the
+/// index. Guards (codex): `hash` must still BE HEAD (no soft-resetting a different
+/// commit if HEAD moved), there must be a parent (not the root commit), and no
+/// merge/revert/cherry-pick/rebase may be in progress. Recoverable via reflog.
+pub fn uncommit(cwd: &str, hash: &str) -> Result<String, String> {
+    if resolve_commit(cwd, "HEAD")? != resolve_commit(cwd, hash)? {
+        return Err("HEAD 커밋만 취소할 수 있습니다".to_string());
+    }
+    if op_in_progress(cwd) {
+        return Err("진행 중인 머지/되돌리기 작업이 있습니다 — 먼저 그것을 끝내세요".to_string());
+    }
+    if run_git(cwd, &["rev-parse", "--verify", "HEAD~1"]).is_err() {
+        return Err("부모가 없는 커밋(최초 커밋)은 취소할 수 없습니다".to_string());
+    }
+    run_git(cwd, &["reset", "--soft", "HEAD~1"])
 }
 
 /// Revert a commit (`git revert --no-edit <hash>`) — a NEW commit undoing it
