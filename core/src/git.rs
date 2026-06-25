@@ -385,6 +385,21 @@ pub struct Worktree {
     pub path: String,
     pub head: String,
     pub branch: String,
+    /// The repo's main working tree (vs a linked worktree). `git worktree list`
+    /// emits the main tree first for a non-bare repo, so the first parsed entry is
+    /// the main one (a bare repo would list its bare source first — not a case this
+    /// app opens).
+    pub is_main: bool,
+}
+
+/// The work-tree root containing `cwd` (`git rev-parse --show-toplevel`) — i.e. the
+/// worktree a session running in `cwd` belongs to. `None` if `cwd` isn't in a repo.
+/// Lets the worktree panel match a session to its worktree even when the session's
+/// cwd is a subdirectory (canonicalized by git, so symlinks/`..` don't false-miss).
+pub fn worktree_root(cwd: &str) -> Option<String> {
+    run_git(cwd, &["rev-parse", "--show-toplevel"])
+        .ok()
+        .filter(|s| !s.is_empty())
 }
 
 /// Parse `git worktree list --porcelain`. Pure — tested.
@@ -399,6 +414,7 @@ fn parse_worktrees(out: &str) -> Vec<Worktree> {
                 path: path.to_string(),
                 head: head.to_string(),
                 branch: branch.to_string(),
+                is_main: res.is_empty(), // first entry = main working tree
             });
         }
     };
@@ -737,8 +753,10 @@ mod tests {
         assert_eq!(wts.len(), 2);
         assert_eq!(wts[0].path, "/repo");
         assert_eq!(wts[0].branch, "main");
+        assert!(wts[0].is_main); // first entry = main working tree
         assert_eq!(wts[1].path, "/repo/wt");
         assert_eq!(wts[1].branch, "(detached)");
+        assert!(!wts[1].is_main); // linked worktree
     }
 
     #[test]
