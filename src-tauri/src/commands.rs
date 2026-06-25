@@ -1698,9 +1698,15 @@ pub fn git_log(
     cwd: String,
     limit: Option<u32>,
     order: Option<String>,
+    git_ref: Option<String>,
 ) -> Result<Vec<core_lib::git::Commit>, AppError> {
-    core_lib::git::log(&cwd, limit.unwrap_or(200), order.as_deref().unwrap_or("date"))
-        .map_err(AppError::new)
+    core_lib::git::log(
+        &cwd,
+        limit.unwrap_or(200),
+        order.as_deref().unwrap_or("date"),
+        git_ref.as_deref(),
+    )
+    .map_err(AppError::new)
 }
 
 // ---- Git GP3 (actions) + GP4 (worktrees) ----
