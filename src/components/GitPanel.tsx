@@ -139,7 +139,13 @@ export function GitPanel() {
   // Right-click context menu on a commit row (amend HEAD / revert), or null.
   const [ctxMenu, setCtxMenu] = useState<{ x: number; y: number; commit: Commit } | null>(null);
   // Reword editor modal for the HEAD commit (full multi-line message), or null.
-  const [rewordModal, setRewordModal] = useState<{ hash: string; message: string } | null>(null);
+  const [rewordModal, setRewordModal] = useState<{
+    hash: string;
+    message: string;
+    /// true = a non-HEAD past commit (history rewrite via git_reword_past);
+    /// false/undefined = HEAD reword (git_reword).
+    past?: boolean;
+  } | null>(null);
   const reqRef = useRef(0);
 
   const reload = useCallback(async () => {
@@ -911,6 +917,29 @@ export function GitPanel() {
                 </button>
               </>
             )}
+            {/* Past (non-HEAD) commit reword — history rewrite via commit-tree replay.
+                Shown for any non-HEAD, non-merge commit; the BACKEND is the source of
+                truth and rejects non-ancestors / detached HEAD / in-progress ops with a
+                clear error (the UI can't cheaply know branch-ancestry here). */}
+            {!ctxMenu.commit.refs
+              .split(", ")
+              .some((r) => r === "HEAD" || r.startsWith("HEAD -> ")) &&
+              ctxMenu.commit.parents.length <= 1 && (
+                <button
+                  className="git-ctx-item"
+                  role="menuitem"
+                  onClick={() => {
+                    const c = ctxMenu.commit;
+                    setCtxMenu(null);
+                    // Load the full message (subject + body) of THIS commit.
+                    invoke<string>("git_commit_message", { cwd, hash: c.hash })
+                      .then((m) => setRewordModal({ hash: c.hash, message: m, past: true }))
+                      .catch((e) => setNote(errText(e)));
+                  }}
+                >
+                  메시지 수정… (과거 커밋)
+                </button>
+              )}
             <button
               className="git-ctx-item"
               role="menuitem"
@@ -963,7 +992,9 @@ export function GitPanel() {
       {rewordModal && (
         <div className="git-modal-backdrop" onClick={() => !busy && setRewordModal(null)}>
           <div className="git-modal" onClick={(e) => e.stopPropagation()}>
-            <div className="git-modal-title">커밋 메시지 수정 (HEAD)</div>
+            <div className="git-modal-title">
+              커밋 메시지 수정 {rewordModal.past ? "(과거 커밋)" : "(HEAD)"}
+            </div>
             <textarea
               className="git-modal-textarea"
               autoFocus
@@ -976,7 +1007,9 @@ export function GitPanel() {
               }}
             />
             <div className="git-modal-hint">
-              HEAD 커밋을 재작성합니다 (reflog 복구 가능). 이미 push했다면 히스토리가 분기됩니다.
+              {rewordModal.past
+                ? "이 커밋과 이후 모든 커밋이 새로 작성됩니다 (백업 ref 자동 생성·작업 트리는 그대로). 이미 push했다면 히스토리가 분기됩니다."
+                : "HEAD 커밋을 재작성합니다 (reflog 복구 가능). 이미 push했다면 히스토리가 분기됩니다."}
             </div>
             <div className="git-modal-actions">
               <button className="git-btn" disabled={busy} onClick={() => setRewordModal(null)}>
@@ -986,11 +1019,24 @@ export function GitPanel() {
                 className="git-btn active"
                 disabled={busy || !rewordModal.message.trim()}
                 onClick={async () => {
-                  const { hash, message } = rewordModal;
-                  const ok = await act(
-                    () => invoke("git_reword", { cwd, hash, message }),
-                    "메시지 수정 완료",
-                  );
+                  const { hash, message, past } = rewordModal;
+                  let ok: boolean;
+                  if (past) {
+                    ok = await act(async () => {
+                      const r = await invoke<{
+                        backup_ref: string;
+                        stashed: boolean;
+                        output: string;
+                      }>("git_reword_past", { cwd, hash, message });
+                      // Show the recovery point (not a prescriptive command).
+                      setNote(`과거 커밋 메시지 수정 완료 — reword 전 HEAD: ${r.backup_ref}`);
+                    });
+                  } else {
+                    ok = await act(
+                      () => invoke("git_reword", { cwd, hash, message }),
+                      "메시지 수정 완료",
+                    );
+                  }
                   if (ok) setRewordModal(null);
                 }}
               >

@@ -1765,6 +1765,12 @@ pub fn git_head_message(cwd: String) -> Result<String, AppError> {
     core_lib::git::head_message(&cwd).map_err(AppError::new)
 }
 
+/// A specific commit's full message — prefills the past-commit reword editor.
+#[tauri::command]
+pub fn git_commit_message(cwd: String, hash: String) -> Result<String, AppError> {
+    core_lib::git::commit_message(&cwd, &hash).map_err(AppError::new)
+}
+
 /// Reword HEAD with a full multi-line message (editor path). UI confirms first.
 #[tauri::command]
 pub fn git_reword(cwd: String, hash: String, message: String) -> Result<String, AppError> {
@@ -1787,6 +1793,18 @@ pub fn git_reset_to(
     mode: String,
 ) -> Result<core_lib::git::ResetResult, AppError> {
     core_lib::git::reset_to(&cwd, &hash, &mode).map_err(AppError::new)
+}
+
+/// Reword a PAST (non-HEAD) commit's message via commit-tree replay + CAS — never
+/// touches the working tree. Creates a backup ref first (returned for recovery).
+/// History rewrite — UI strong-confirms first. `message` is the full new message.
+#[tauri::command]
+pub fn git_reword_past(
+    cwd: String,
+    hash: String,
+    message: String,
+) -> Result<core_lib::git::RewordResult, AppError> {
+    core_lib::git::reword_past(&cwd, &hash, &message).map_err(AppError::new)
 }
 
 #[tauri::command]
