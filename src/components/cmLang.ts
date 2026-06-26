@@ -1,7 +1,10 @@
 import type { Extension } from "@codemirror/state";
+import { StreamLanguage } from "@codemirror/language";
 import { javascript } from "@codemirror/lang-javascript";
 import { python } from "@codemirror/lang-python";
 import { rust } from "@codemirror/lang-rust";
+import { java } from "@codemirror/lang-java";
+import { kotlin } from "@codemirror/legacy-modes/mode/clike";
 import { json } from "@codemirror/lang-json";
 import { html } from "@codemirror/lang-html";
 import { css } from "@codemirror/lang-css";
@@ -24,6 +27,13 @@ export function langFor(path: string): Extension[] {
       return [python()];
     case "rs":
       return [rust()];
+    case "java":
+      return [java()];
+    case "kt":
+    case "kts":
+      // No official CM6 package for Kotlin — the legacy clike stream mode gives
+      // solid highlighting (smart indent is weaker than the Lezer grammars).
+      return [StreamLanguage.define(kotlin)];
     case "json":
       return [json()];
     case "html":
