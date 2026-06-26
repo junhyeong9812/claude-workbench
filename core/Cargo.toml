@@ -6,6 +6,9 @@ edition = "2021"
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# Directory traversal that honors .gitignore/.ignore (ripgrep's crate). Used by
+# `fs::list_dir` to drop node_modules/target/etc. and by the file search module.
+ignore = "0.4"
 portable-pty = "0.9"
 # Native SSH client (no system `ssh`/`sshpass` dependency). russh 0.50+ merged
 # russh-keys into `russh::keys`. Runs on a tokio runtime encapsulated inside the
