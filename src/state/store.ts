@@ -236,6 +236,8 @@ interface AppState {
   treeCursor: string | null;
   /** File currently shown in the peek viewer overlay, or null (closed). Transient. */
   peekFile: string | null;
+  /** Optional 1-based line to scroll to in the peek viewer (content-search jump). */
+  peekLine: number | null;
   /** Git history viewer state: a commit selected in the Git panel, shown as a
    * SECOND sidebar listing that commit's changed files (next to the main sidebar),
    * or null (closed). Transient. */
@@ -346,7 +348,7 @@ interface AppState {
   /** Move the folder-tree keyboard cursor. */
   setTreeCursor: (path: string | null) => void;
   /** Open/close the peek viewer on a file (null closes it). */
-  setPeekFile: (path: string | null) => void;
+  setPeekFile: (path: string | null, line?: number) => void;
   /** Open the commit-files sidebar for a commit (closes any prior file view). */
   openGitHistory: (root: string, commit: string) => void;
   /** Close the commit-files sidebar (and any open file view). */
@@ -415,6 +417,7 @@ export const useAppStore = create<AppState>((set, get) => ({
   loadingDirs: {},
   treeCursor: null,
   peekFile: null,
+  peekLine: null,
   gitHistory: null,
   gitHistoryFile: null,
   editorOpenRequest: null,
@@ -565,7 +568,7 @@ export const useAppStore = create<AppState>((set, get) => ({
   },
 
   setTreeCursor: (path) => set({ treeCursor: path }),
-  setPeekFile: (path) => set({ peekFile: path }),
+  setPeekFile: (path, line) => set({ peekFile: path, peekLine: line ?? null }),
   openGitHistory: (root, commit) =>
     set({ gitHistory: { root, commit }, gitHistoryFile: null }),
   closeGitHistory: () => set({ gitHistory: null, gitHistoryFile: null }),

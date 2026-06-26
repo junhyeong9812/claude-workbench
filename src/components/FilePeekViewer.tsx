@@ -17,7 +17,16 @@ import { useFileText } from "../hooks/useFileText";
  * always show raw source. `Esc` closes; `Ctrl+E` opens it in the editor (P2);
  * `Ctrl+←` returns focus to the tree.
  */
-export function FilePeekViewer({ path, onClose }: { path: string; onClose: () => void }) {
+export function FilePeekViewer({
+  path,
+  onClose,
+  line,
+}: {
+  path: string;
+  onClose: () => void;
+  /** 1-based line to jump to (content-search result); forces raw source view. */
+  line?: number;
+}) {
   const requestEditorOpen = useAppStore((s) => s.requestEditorOpen);
   const theme = useAppStore((s) => s.theme);
   const hostRef = useRef<HTMLDivElement | null>(null);
@@ -26,15 +35,16 @@ export function FilePeekViewer({ path, onClose }: { path: string; onClose: () =>
   // (raw), so the text lives in state (the shared read hook), not only in CM.
   const { text, err } = useFileText(path);
   // Markdown files default to 뷰모드 (rendered); `v` toggles to raw. Non-markdown
-  // files ignore this and always show the CodeMirror source.
-  const [markdown, setMarkdown] = useState(true);
+  // files ignore this and always show the CodeMirror source. A line jump forces
+  // raw so the target line is actually visible.
+  const [markdown, setMarkdown] = useState(line == null);
   const md = isMarkdownPath(path);
   const showRaw = !md || !markdown;
 
-  // Reset to 뷰모드 when the peeked file changes (follows the tree cursor).
+  // Reset 뷰모드 when the peeked file (or jump target) changes.
   useEffect(() => {
-    setMarkdown(true);
-  }, [path]);
+    setMarkdown(line == null);
+  }, [path, line]);
 
   // Build the read-only CodeMirror view only when showing raw source (the host
   // div is only mounted then). Rebuilds on text/path/theme change.
@@ -53,8 +63,17 @@ export function FilePeekViewer({ path, onClose }: { path: string; onClose: () =>
         ],
       }),
     });
+    // Jump to the search-result line: select it and center it in view.
+    if (line != null) {
+      const clamped = Math.max(1, Math.min(line, view.state.doc.lines));
+      const ln = view.state.doc.line(clamped);
+      view.dispatch({
+        selection: { anchor: ln.from, head: ln.to },
+        effects: EditorView.scrollIntoView(ln.from, { y: "center" }),
+      });
+    }
     return () => view.destroy();
-  }, [showRaw, text, theme, path]);
+  }, [showRaw, text, theme, path, line]);
 
   return (
     <div

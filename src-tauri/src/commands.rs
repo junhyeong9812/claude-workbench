@@ -58,6 +58,24 @@ pub fn detect_project_types(path: String) -> Vec<ProjectType> {
     core_lib::detect_project_types(path)
 }
 
+/// Hard cap on search results sent to the UI, to bound payload + walk time.
+const SEARCH_LIMIT: usize = 500;
+
+/// Project-wide file-name search under `root` (gitignore-aware). A query with
+/// glob metacharacters (`*?[`) is matched as a glob, else as a case-insensitive
+/// substring. Read-only and infallible (a bad query just yields no hits).
+#[tauri::command]
+pub fn search_files(root: String, query: String) -> Vec<core_lib::FileHit> {
+    core_lib::search_files(&root, &query, SEARCH_LIMIT)
+}
+
+/// Project-wide content (grep) search under `root`: literal, case-insensitive,
+/// gitignore-aware, binary files skipped. Read-only and infallible.
+#[tauri::command]
+pub fn search_content(root: String, query: String) -> Vec<core_lib::ContentHit> {
+    core_lib::search_content(&root, &query, SEARCH_LIMIT)
+}
+
 /// Resolve the on-disk path of the workspace state file inside the app's
 /// config directory.
 fn state_file(app: &AppHandle) -> Result<PathBuf, AppError> {

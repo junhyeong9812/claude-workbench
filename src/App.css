@@ -2986,3 +2986,130 @@ body {
   font-weight: 600;
   box-shadow: 0 2px 12px rgba(0, 0, 0, 0.4);
 }
+
+/* ── 전역 검색 패널 (Ctrl+F) ─────────────────────────────────────────── */
+.search-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 120;
+  background: rgba(0, 0, 0, 0.35);
+  display: flex;
+  justify-content: center;
+  align-items: flex-start;
+  padding-top: 8vh;
+}
+.search-panel {
+  width: 640px;
+  max-width: 90vw;
+  max-height: 72vh;
+  display: flex;
+  flex-direction: column;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.45);
+  overflow: hidden;
+}
+.search-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 10px;
+  border-bottom: 1px solid var(--border);
+  background: var(--bg-alt);
+}
+.search-modes {
+  display: flex;
+  gap: 2px;
+}
+.search-mode {
+  padding: 3px 10px;
+  font-size: 12px;
+  color: var(--fg-dim);
+  background: transparent;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  cursor: pointer;
+}
+.search-mode.active {
+  color: var(--fg);
+  background: var(--bg);
+  border-color: var(--accent);
+}
+.search-input {
+  flex: 1;
+  padding: 5px 8px;
+  font-size: 13px;
+  color: var(--fg);
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  outline: none;
+}
+.search-input:focus {
+  border-color: var(--accent);
+}
+.search-count {
+  font-size: 11px;
+  color: var(--fg-dim);
+  white-space: nowrap;
+  min-width: 56px;
+  text-align: right;
+}
+.search-x {
+  cursor: pointer;
+  color: var(--fg-dim);
+  font-size: 16px;
+  padding: 0 4px;
+}
+.search-x:hover {
+  color: var(--fg);
+}
+.search-results {
+  overflow-y: auto;
+  flex: 1;
+}
+.search-row {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  padding: 4px 12px;
+  font-size: 12px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.search-row.sel {
+  background: var(--bg-hover);
+}
+.search-row-icon {
+  flex: 0 0 auto;
+}
+.search-row-path {
+  color: var(--fg);
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.search-row.is-dir .search-row-path {
+  color: var(--fg-dim);
+}
+.search-row-loc {
+  flex: 0 0 auto;
+  color: var(--accent);
+  font-family: var(--mono, monospace);
+}
+.search-row-text {
+  color: var(--fg-dim);
+  font-family: var(--mono, monospace);
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.search-empty,
+.search-foot {
+  padding: 8px 12px;
+  font-size: 11px;
+  color: var(--fg-dim);
+}
+.search-foot {
+  border-top: 1px solid var(--border);
+  background: var(--bg-alt);
+}
