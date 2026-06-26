@@ -935,9 +935,12 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
                 className="claudeterm-viewer-x"
                 title="닫기"
                 onClick={() => {
+                  // Esc 닫기와 동작 일치: selectedTurn을 유지해 TimelineView가
+                  // 직전 항목으로 scrollIntoView하도록 두고, 타임라인 리스트로 포커스 복귀.
+                  // (setSelectedTurn(null)을 하면 스크롤 복원 대상이 사라져 맨 위로 튐.)
                   setSelectedId(null);
                   setTextView(null);
-                  setSelectedTurn(null);
+                  (timelineRef.current?.querySelector(".timeline-list") as HTMLElement | null)?.focus();
                 }}
               >
                 ×
