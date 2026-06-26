@@ -14,6 +14,7 @@ import { FilePeekViewer } from "./components/FilePeekViewer";
 import { CommitFilesSidebar } from "./components/CommitFilesSidebar";
 import { CommitFileView } from "./components/CommitFileView";
 import { TerminalSettings } from "./components/TerminalSettings";
+import { SearchPanel } from "./components/SearchPanel";
 import { StudyView } from "./components/StudyView";
 import { PopoutWorkbench } from "./components/PopoutWorkbench";
 import { WebviewWindow } from "@tauri-apps/api/webviewWindow";
@@ -33,7 +34,9 @@ function AppMain() {
   const initProjectSync = useAppStore((s) => s.initProjectSync);
   const activeProject = useAppStore((s) => s.activeProject);
   const peekFile = useAppStore((s) => s.peekFile);
+  const peekLine = useAppStore((s) => s.peekLine);
   const setPeekFile = useAppStore((s) => s.setPeekFile);
+  const [searchOpen, setSearchOpen] = useState(false);
   const gitHistory = useAppStore((s) => s.gitHistory);
   const gitHistoryFile = useAppStore((s) => s.gitHistoryFile);
   const closeGitHistoryFile = useAppStore((s) => s.closeGitHistoryFile);
@@ -143,6 +146,18 @@ function AppMain() {
       } else {
         tree?.focus();
       }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, []);
+
+  // Ctrl+F opens the project-wide search overlay (file name / content). Needs an
+  // active project to search under.
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (!(e.ctrlKey && (e.key === "f" || e.key === "F")) || e.shiftKey) return;
+      e.preventDefault();
+      if (useAppStore.getState().activeProject) setSearchOpen(true);
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
@@ -275,7 +290,11 @@ function AppMain() {
         <Panel id="main" order={3} defaultSize={60} minSize={30} className="pane-main">
           <MainArea />
           {peekFile && (
-            <FilePeekViewer path={peekFile} onClose={() => setPeekFile(null)} />
+            <FilePeekViewer
+              path={peekFile}
+              line={peekLine ?? undefined}
+              onClose={() => setPeekFile(null)}
+            />
           )}
           {gitHistoryFile && (
             <CommitFileView
@@ -289,6 +308,16 @@ function AppMain() {
         </PanelGroup>
       )}
       {termSettingsOpen && <TerminalSettings onClose={() => setTermSettingsOpen(false)} />}
+      {searchOpen && activeProject && (
+        <SearchPanel
+          root={activeProject}
+          onClose={() => setSearchOpen(false)}
+          onOpen={(path, line) => {
+            setPeekFile(path, line);
+            setSearchOpen(false);
+          }}
+        />
+      )}
     </div>
   );
 }

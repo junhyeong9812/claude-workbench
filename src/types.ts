@@ -18,6 +18,24 @@ export interface DirEntry {
   project_types: ProjectType[];
 }
 
+/** A file that matched a file-name search (`search_files` command). */
+export interface FileHit {
+  /** Absolute path, used to open the file. */
+  path: string;
+  /** Path relative to the search root, for display. */
+  rel: string;
+}
+
+/** One matching line from a content search (`search_content` command). */
+export interface ContentHit {
+  path: string;
+  rel: string;
+  /** 1-based line number of the match. */
+  line: number;
+  /** The matching line, trimmed and length-capped. */
+  text: string;
+}
+
 /** Per-project folder-tree UI state that survives restarts. */
 export interface TreeState {
   /** Absolute paths of expanded directories, scoped to one project. */
