@@ -3113,3 +3113,24 @@ body {
   border-top: 1px solid var(--border);
   background: var(--bg-alt);
 }
+
+/* 커밋 리뷰 버튼 (CommitFilesSidebar — Claude 리뷰 세션 시작) */
+.commit-review-btn {
+  font-size: 11px;
+  padding: 2px 7px;
+  margin-right: 4px;
+  color: var(--fg);
+  background: var(--bg);
+  border: 1px solid var(--accent);
+  border-radius: 4px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.commit-review-btn:hover {
+  background: var(--bg-hover);
+}
+.commit-review-btn:disabled {
+  opacity: 0.45;
+  cursor: default;
+  border-color: var(--border);
+}

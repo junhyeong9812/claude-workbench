@@ -252,8 +252,15 @@ interface AppState {
   diffRequest: DiffSpec | null;
   /** A request to open a new Claude session bound to `project` (consumed by
    * MainArea, which owns the dockview api), or null. Transient — used by the
-   * worktree panel's one-click "Claude 열기". */
-  claudeOpenRequest: { project: string } | null;
+   * worktree panel's one-click "Claude 열기" and review mode (`seed`/`title`:
+   * a fresh review session pre-seeded with "이 커밋 리뷰하자"). */
+  claudeOpenRequest: {
+    project: string;
+    seed?: string;
+    title?: string;
+    /** Open this panel to the right of an existing panel (review: beside the diff). */
+    referencePanelId?: string;
+  } | null;
   /** Bumped to ask MainArea to focus the active dockview panel (Ctrl+B from the
    * already-focused tree toggles focus back to the open tab). A counter so every
    * press re-fires even when the value would otherwise be unchanged. */
@@ -360,8 +367,11 @@ interface AppState {
   requestEditorOpen: (path: string | null) => void;
   /** Request opening a diff panel (MainArea consumes + clears with null). */
   requestDiff: (spec: DiffSpec | null) => void;
-  /** Request opening a new Claude session in `project` (MainArea consumes + clears). */
-  requestClaudeOpen: (req: { project: string } | null) => void;
+  /** Request opening a new Claude session in `project` (MainArea consumes + clears).
+   * Optional `seed`/`title` pre-seed a review session. */
+  requestClaudeOpen: (
+    req: { project: string; seed?: string; title?: string; referencePanelId?: string } | null,
+  ) => void;
   /** Ask MainArea to focus the active dockview panel (Ctrl+B tree→tab toggle). */
   requestFocusMain: () => void;
   /** Switch the color theme. */
