@@ -39,13 +39,15 @@ export function SearchPanel({
   const runId = useRef(0);
   useEffect(() => {
     const q = query.trim();
+    // Bump the run id first thing, so any request still in flight from a prior
+    // query is invalidated — its late result can't repopulate a cleared list.
+    const id = ++runId.current;
     if (!q) {
       setFiles([]);
       setContent([]);
       setLoading(false);
       return;
     }
-    const id = ++runId.current;
     setLoading(true);
     const t = setTimeout(async () => {
       try {
@@ -78,7 +80,7 @@ export function SearchPanel({
   const openAt = (i: number) => {
     if (mode === "files") {
       const hit = files[i];
-      if (hit && !hit.is_dir) onOpen(hit.path);
+      if (hit) onOpen(hit.path);
     } else {
       const hit = content[i];
       if (hit) onOpen(hit.path, hit.line);
@@ -149,11 +151,11 @@ export function SearchPanel({
             ? files.map((h, i) => (
                 <div
                   key={h.path}
-                  className={`search-row ${i === sel ? "sel" : ""} ${h.is_dir ? "is-dir" : ""}`}
+                  className={`search-row ${i === sel ? "sel" : ""}`}
                   onMouseEnter={() => setSel(i)}
                   onClick={() => openAt(i)}
                 >
-                  <span className="search-row-icon">{h.is_dir ? "📁" : "📄"}</span>
+                  <span className="search-row-icon">📄</span>
                   <span className="search-row-path">{h.rel}</span>
                 </div>
               ))
