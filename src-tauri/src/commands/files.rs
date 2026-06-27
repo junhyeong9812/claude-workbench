@@ -163,3 +163,51 @@ pub fn write_file(path: String, content: String) -> Result<(), AppError> {
         AppError::new(io_message("Cannot save file", &e))
     })
 }
+
+/// Create an empty file at `path` (tree "새 파일"). Parent directories are
+/// created as needed (so a typed `sub/Foo.java` works). Errors if the path
+/// already exists, so an existing file is never clobbered.
+#[tauri::command]
+pub fn create_file(path: String) -> Result<(), AppError> {
+    reject_unsafe_path(&path)?;
+    let p = std::path::Path::new(&path);
+    if p.exists() {
+        return Err(AppError::new("이미 존재하는 경로입니다"));
+    }
+    if let Some(parent) = p.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| AppError::new(io_message("Cannot create file", &e)))?;
+    }
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(p)
+        .map(|_| ())
+        .map_err(|e| AppError::new(io_message("Cannot create file", &e)))
+}
+
+/// Create a directory at `path` (tree "새 폴더"), including intermediate dirs —
+/// so a typed `com/example/foo` (or `.`-separated, mapped to `/` by the UI)
+/// makes the whole chain. Idempotent: an existing dir is not an error.
+#[tauri::command]
+pub fn create_dir(path: String) -> Result<(), AppError> {
+    reject_unsafe_path(&path)?;
+    std::fs::create_dir_all(&path).map_err(|e| AppError::new(io_message("Cannot create folder", &e)))
+}
+
+/// Rename/move `from` to `to` (tree "이름 변경"). Errors if `to` already exists
+/// (no overwrite). Parent dirs of `to` are created as needed.
+#[tauri::command]
+pub fn rename_path(from: String, to: String) -> Result<(), AppError> {
+    reject_unsafe_path(&from)?;
+    reject_unsafe_path(&to)?;
+    let to_p = std::path::Path::new(&to);
+    if to_p.exists() {
+        return Err(AppError::new("대상 경로가 이미 존재합니다"));
+    }
+    if let Some(parent) = to_p.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| AppError::new(io_message("Cannot rename", &e)))?;
+    }
+    std::fs::rename(&from, to_p).map_err(|e| AppError::new(io_message("Cannot rename", &e)))
+}
