@@ -78,6 +78,37 @@ export function EditorPanel(props: IDockviewPanelProps<EditorParams>) {
   const saveRef = useRef(save);
   saveRef.current = save;
 
+  // Dev mode 확인: save the file, then ask the project's dev Claude session to
+  // review it (typos, missing imports, indentation/format, context) — review
+  // only, no edits (the user is the writer). Save is awaited so Claude reads the
+  // flushed file, not stale bytes.
+  const [reviewing, setReviewing] = useState(false);
+  const confirmReview = async () => {
+    const view = viewRef.current;
+    if (!view || !path) return;
+    const content = view.state.doc.toString();
+    const savedVersion = versionRef.current;
+    setReviewing(true);
+    try {
+      await invoke("write_file", { path, content });
+      if (versionRef.current === savedVersion) setDirty(false);
+      setStatus("저장됨 — Claude 검토 요청");
+    } catch (e) {
+      setStatus(`저장 실패: ${errText(e)}`);
+      setReviewing(false);
+      return;
+    }
+    const project = useAppStore.getState().activeProject;
+    if (project) {
+      const prompt =
+        `방금 \`${path}\` 를 편집·저장했어. 그 파일을 읽고 검토해줘 — ` +
+        `오타·빠진 import·들여쓰기/포맷·맥락 적합성 위주로. ` +
+        `직접 수정하지 말고 무엇을 어떻게 고치면 되는지 지적·설명만 해줘.`;
+      useAppStore.getState().requestDevReview({ project, prompt, editorPanelId: props.api.id });
+    }
+    setReviewing(false);
+  };
+
   useEffect(() => {
     if (!path) {
       setErr("열 파일이 없습니다");
@@ -136,6 +167,14 @@ export function EditorPanel(props: IDockviewPanelProps<EditorParams>) {
         <span className="editor-status">{status}</span>
         <button className="editor-save" onClick={() => save()} disabled={!path}>
           저장 (Ctrl+S)
+        </button>
+        <button
+          className="editor-review"
+          title="저장하고 Claude에게 검토 요청 (오타·import·들여쓰기·맥락 — 지적만)"
+          onClick={() => void confirmReview()}
+          disabled={!path || reviewing}
+        >
+          {reviewing ? "검토 요청 중…" : "✓ 확인 (Claude 검토)"}
         </button>
       </div>
       {err ? <div className="editor-err">{err}</div> : <div className="editor-body" ref={hostRef} />}

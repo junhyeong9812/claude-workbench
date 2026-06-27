@@ -242,6 +242,22 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
     }).catch(() => {});
   };
 
+  // Dev mode 확인: inject a review prompt into THIS session if it's the target
+  // (matched by uuid) and we're its driver and live. The first "open + seed" goes
+  // through the seed mechanism; this handles subsequent injects into the already-
+  // live per-project dev session.
+  const claudeInjectRequest = useAppStore((s) => s.claudeInjectRequest);
+  const requestClaudeInject = useAppStore((s) => s.requestClaudeInject);
+  useEffect(() => {
+    if (!claudeInjectRequest) return;
+    const myUuid = props.params.sessionUuid ?? props.params.loadSessionId;
+    if (!myUuid || claudeInjectRequest.uuid !== myUuid) return;
+    if (!isDriverRef.current || sessionIdRef.current == null) return;
+    injectSeed(claudeInjectRequest.text);
+    requestClaudeInject(null);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [claudeInjectRequest]);
+
   // Step 1 of "task 시작": summarize the current task and open it for review. Only
   // generates — the restart happens on confirm, so a failure here never tears
   // down the live session (codex P3 D1).
