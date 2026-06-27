@@ -39,6 +39,10 @@ export interface ClaudeTermParams {
    * panel uses that task's project; falls back to the active project for
    * freshly-created panels. */
   project?: string;
+  /** One-shot prompt injected once when this session first starts (review/dev
+   * modes seed it with "이 커밋 리뷰하자" / "이 파일 검토해줘"). Cleared from the
+   * persisted params after injection so a tab-switch remount won't re-send it. */
+  seed?: string;
 }
 
 /** Result of `claude_open_or_attach`: attached to a live PTY (mirror) or started
@@ -662,10 +666,20 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
         const driving = opened.driver === myLabel;
         isDriverRef.current = driving;
         setIsDriver(driving);
+        // Fresh review/dev session: queue the one-shot seed prompt (only if no
+        // handoff seed is already pending — that one wins). It's injected by the
+        // pendingSeed block below once the session settles.
+        if (driving && props.params.seed && pendingSeedRef.current == null) {
+          pendingSeedRef.current = props.params.seed;
+          setLastSeed(props.params.seed);
+        }
         props.api.updateParameters({
           ...props.params,
           sessionId: opened.id,
           sessionUuid: opened.session_uuid,
+          // A seed is one-shot — drop it from the persisted params so a remount
+          // (tab switch / reopen) doesn't re-inject it.
+          seed: undefined,
         });
       } catch {
         sessionId = null; // open failed (no project, etc.)

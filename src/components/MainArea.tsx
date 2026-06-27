@@ -287,7 +287,14 @@ export function MainArea() {
 
   const addPanel = (
     kind: PanelKind,
-    opts?: { loadSessionId?: string; title?: string; project?: string; path?: string },
+    opts?: {
+      loadSessionId?: string;
+      title?: string;
+      project?: string;
+      path?: string;
+      seed?: string;
+      position?: { referencePanel: string; direction: "right" | "left" | "above" | "below" };
+    },
   ) => {
     const api = apiRef.current;
     if (!api) return;
@@ -307,12 +314,18 @@ export function MainArea() {
       id: `${kind}-${Date.now()}`,
       component,
       title,
+      // Position beside a reference panel (review: claude to the right of the
+      // diff) only if that panel actually exists, else default placement.
+      ...(opts?.position && api.getPanel(opts.position.referencePanel)
+        ? { position: opts.position }
+        : {}),
       params: {
         kind,
         title,
         ...(opts?.loadSessionId ? { loadSessionId: opts.loadSessionId } : {}),
         ...(opts?.project ? { project: opts.project } : {}),
         ...(opts?.path ? { path: opts.path } : {}),
+        ...(opts?.seed ? { seed: opts.seed } : {}),
       },
     });
   };
@@ -530,7 +543,7 @@ export function MainArea() {
   // tab is active afterwards.
   useEffect(() => {
     if (!claudeOpenRequest) return;
-    const { project } = claudeOpenRequest;
+    const { project, seed, title: reqTitle, referencePanelId } = claudeOpenRequest;
     // Only THIS project's mount may consume the request (MainArea is keyed by
     // activeProject): otherwise a not-yet-switched old mount would add the Claude
     // panel to the wrong project's dock (codex P1). Keep the request until the
@@ -539,8 +552,16 @@ export function MainArea() {
     const api = apiRef.current;
     if (!api) return; // dock not ready (project-switch remount) — keep the request; apiReady re-runs this
     requestClaudeOpen(null); // consume only once we can actually act
-    const title = `Claude ${counterRef.current + 1}`;
-    addPanel("claudeterm", { project, loadSessionId: crypto.randomUUID(), title });
+    const title = reqTitle ?? `Claude ${counterRef.current + 1}`;
+    addPanel("claudeterm", {
+      project,
+      loadSessionId: crypto.randomUUID(),
+      title,
+      seed,
+      ...(referencePanelId
+        ? { position: { referencePanel: referencePanelId, direction: "right" as const } }
+        : {}),
+    });
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [claudeOpenRequest, apiReady, activeProject]);
 

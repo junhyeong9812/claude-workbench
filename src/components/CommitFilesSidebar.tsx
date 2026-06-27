@@ -28,6 +28,8 @@ export function CommitFilesSidebar() {
   const gitHistoryFile = useAppStore((s) => s.gitHistoryFile);
   const openGitHistoryFile = useAppStore((s) => s.openGitHistoryFile);
   const closeGitHistory = useAppStore((s) => s.closeGitHistory);
+  const requestClaudeOpen = useAppStore((s) => s.requestClaudeOpen);
+  const requestDiff = useAppStore((s) => s.requestDiff);
 
   const [files, setFiles] = useState<CommitFile[]>([]);
   const [note, setNote] = useState("");
@@ -93,6 +95,31 @@ export function CommitFilesSidebar() {
     openGitHistoryFile(root, commit, files[next].path);
   };
 
+  // Open a fresh review-dedicated Claude session seeded with this commit's
+  // context. Claude reads the diff itself (`git show`) — we only point it at the
+  // commit + the changed-file list, so the seed stays small.
+  const startReview = () => {
+    if (!gitHistory || files.length === 0) return;
+    const fileList = files.map((f) => `- ${f.path} (${STATUS_LABEL[f.status] ?? f.status})`).join("\n");
+    const seed =
+      `이 커밋을 함께 코드리뷰하자. 커밋: ${commit}\n` +
+      `변경 파일 ${files.length}개:\n${fileList}\n\n` +
+      `먼저 \`git show ${commit}\` 로 변경을 확인하고, 버그·경계조건·설계 관점에서 리뷰해줘. ` +
+      `내가 특정 파일/라인을 물으면 그 부분을 깊이 보자. (파일은 수정하지 말고 리뷰·설명만)`;
+    // Open the commit diff as a dockview panel (left) and the review-dedicated
+    // Claude session to its right — genuine side-by-side. The diff panel id
+    // mirrors MainArea's dedupe key (`diff:<cwd>:<hash>`). Close the history
+    // overlay so the dockview panels are visible.
+    requestDiff({ title: `diff ${commit.slice(0, 8)}`, cwd: root, hash: commit });
+    requestClaudeOpen({
+      project: root,
+      seed,
+      title: `리뷰 ${commit.slice(0, 8)}`,
+      referencePanelId: `diff:${root}:${commit}`,
+    });
+    closeGitHistory();
+  };
+
   if (!gitHistory) return null;
   const short = commit.slice(0, 8);
 
@@ -103,6 +130,14 @@ export function CommitFilesSidebar() {
           ⎇ {short}
         </span>
         <span className="commit-files-count">{files.length}개 파일</span>
+        <button
+          className="commit-review-btn"
+          title="이 커밋을 Claude와 코드리뷰 (리뷰 전용 세션)"
+          disabled={files.length === 0}
+          onClick={startReview}
+        >
+          🤖 리뷰
+        </button>
         <span className="commit-files-x" title="닫기 (Esc)" onClick={closeGitHistory}>
           ✕
         </span>
