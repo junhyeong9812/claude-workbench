@@ -1,9 +1,37 @@
-import { useEffect } from "react";
+import { useEffect, useState } from "react";
+import { invoke } from "@tauri-apps/api/core";
+import { errText } from "../utils/error";
 import { useAppStore } from "../state/store";
 import type { DirEntry } from "../types";
 import { TypeBadges } from "./TypeBadges";
 
-function TreeNode({ entry, depth }: { entry: DirEntry; depth: number }) {
+/** Quick file-type picks for "새 파일" (fills the extension; the user can also
+ * just type a full name like `Foo.java`). Our supported languages + markdown. */
+const FILE_EXTS: [string, string][] = [
+  ["Rust", "rs"],
+  ["Java", "java"],
+  ["Kotlin", "kt"],
+  ["Python", "py"],
+  ["TS", "ts"],
+  ["TSX", "tsx"],
+  ["JS", "js"],
+  ["HTML", "html"],
+  ["CSS", "css"],
+  ["MD", "md"],
+];
+
+/** A right-click action on a tree node (or the empty background → `entry=null`). */
+type ContextHandler = (entry: DirEntry | null, x: number, y: number) => void;
+
+function TreeNode({
+  entry,
+  depth,
+  onContext,
+}: {
+  entry: DirEntry;
+  depth: number;
+  onContext: ContextHandler;
+}) {
   const expanded = useAppStore((s) => {
     const active = s.projects.find((p) => p.path === s.activeProject);
     return active?.tree_state.expanded.includes(entry.path) ?? false;
@@ -39,6 +67,11 @@ function TreeNode({ entry, depth }: { entry: DirEntry; depth: number }) {
         data-tree-path={entry.path}
         style={{ paddingLeft: depth * 14 + 8 }}
         onClick={onClick}
+        onContextMenu={(e) => {
+          e.preventDefault();
+          e.stopPropagation();
+          onContext(entry, e.clientX, e.clientY);
+        }}
       >
         <span className="tree-icon">{icon}</span>
         <span className="tree-label">{entry.name}</span>
@@ -57,7 +90,7 @@ function TreeNode({ entry, depth }: { entry: DirEntry; depth: number }) {
             </div>
           ) : (
             children.map((child) => (
-              <TreeNode key={child.path} entry={child} depth={depth + 1} />
+              <TreeNode key={child.path} entry={child} depth={depth + 1} onContext={onContext} />
             ))
           )}
         </div>
@@ -95,6 +128,110 @@ export function FolderTree() {
   const setPeekFile = useAppStore((s) => s.setPeekFile);
   const requestEditorOpen = useAppStore((s) => s.requestEditorOpen);
   const reloadActiveTree = useAppStore((s) => s.reloadActiveTree);
+  const reloadDir = useAppStore((s) => s.reloadDir);
+
+  // Right-click context menu (at cursor) + the create/rename/delete dialog.
+  const [menu, setMenu] = useState<{ dir: string; node: DirEntry | null; x: number; y: number } | null>(
+    null,
+  );
+  const [dialog, setDialog] = useState<
+    | { kind: "newfile" | "newfolder"; dir: string }
+    | { kind: "rename"; node: DirEntry }
+    | { kind: "delete"; node: DirEntry }
+    | null
+  >(null);
+  const [name, setName] = useState("");
+  const [opErr, setOpErr] = useState<string | null>(null);
+
+  // Parent dir of an absolute path; "/" for a root-level entry (so reloadDir
+  // never gets "" → the process cwd).
+  const dirname = (p: string): string => {
+    const i = p.lastIndexOf("/");
+    return i <= 0 ? "/" : p.slice(0, i);
+  };
+
+  // Clean a typed relative path: drop empty/`.`/`..` segments. "" if invalid, so
+  // `.` / `/` / `...` don't slip through as a no-op create.
+  const normalizeRel = (s: string): string => {
+    const segs = s.split("/").map((x) => x.trim()).filter(Boolean);
+    if (segs.length === 0 || segs.some((x) => x === "." || x === "..")) return "";
+    return segs.join("/");
+  };
+
+  // dir to create *into*: a folder uses itself; a file uses its parent dir; the
+  // empty background uses the project root.
+  const dirOf = (node: DirEntry | null): string => {
+    if (!node) return activeProject ?? "";
+    return node.is_dir ? node.path : dirname(node.path);
+  };
+
+  const onContext: ContextHandler = (node, x, y) => {
+    setMenu({ dir: dirOf(node), node, x, y });
+  };
+
+  const ensureExpanded = (dir: string) => {
+    if (dir !== activeProject && !isExpanded(dir)) toggleExpanded(dir);
+  };
+
+  // Run a filesystem op, refresh the affected dir, surface errors in the dialog.
+  // Returns true only on success, so callers can chain (e.g. open the new file)
+  // without firing on failure.
+  const runOp = async (
+    fn: () => Promise<void>,
+    reloadTarget: string,
+    afterExpand?: string,
+  ): Promise<boolean> => {
+    setOpErr(null);
+    try {
+      await fn();
+      await reloadDir(reloadTarget);
+      if (afterExpand) ensureExpanded(afterExpand);
+      setDialog(null);
+      setName("");
+      return true;
+    } catch (e) {
+      setOpErr(errText(e, "작업 실패"));
+      return false;
+    }
+  };
+
+  const submitDialog = () => {
+    if (!dialog || !activeProject) return;
+    const root = activeProject;
+    const trimmed = name.trim();
+    if (dialog.kind === "newfile") {
+      // `sub/Foo.java` makes the subdir too. Reject empty path segments.
+      const rel = normalizeRel(trimmed);
+      if (!rel) {
+        setOpErr("올바른 파일명을 입력하세요");
+        return;
+      }
+      const path = `${dialog.dir}/${rel}`;
+      void runOp(() => invoke("create_file", { path, root }), dialog.dir, dialog.dir).then((ok) => {
+        if (ok) requestEditorOpen(path); // open the fresh file in the editor
+      });
+    } else if (dialog.kind === "newfolder") {
+      // `.` (Java package style) or `/` → nested dirs. Reject empty segments so
+      // `.` / `/` / `...` don't silently no-op on an existing dir.
+      const rel = normalizeRel(trimmed.replace(/\./g, "/"));
+      if (!rel) {
+        setOpErr("올바른 폴더명을 입력하세요");
+        return;
+      }
+      void runOp(() => invoke("create_dir", { path: `${dialog.dir}/${rel}`, root }), dialog.dir, dialog.dir);
+    } else if (dialog.kind === "rename") {
+      const rel = normalizeRel(trimmed);
+      if (!rel) {
+        setOpErr("올바른 이름을 입력하세요");
+        return;
+      }
+      const parent = dirname(dialog.node.path);
+      void runOp(
+        () => invoke("rename_path", { from: dialog.node.path, to: `${parent}/${rel}`, root }),
+        parent,
+      );
+    }
+  };
 
   useEffect(() => {
     if (activeProject) void loadChildren(activeProject);
@@ -216,11 +353,134 @@ export function FolderTree() {
     }
   };
 
+  const openDialog = (d: NonNullable<typeof dialog>, initial = "") => {
+    setMenu(null);
+    setOpErr(null);
+    setName(initial);
+    setDialog(d);
+  };
+
   return (
-    <div className="tree" id="folder-tree" tabIndex={0} onKeyDown={onKeyDown} onFocus={onFocus}>
+    <div
+      className="tree"
+      id="folder-tree"
+      tabIndex={0}
+      onKeyDown={onKeyDown}
+      onFocus={onFocus}
+      onContextMenu={(e) => {
+        // Right-click on empty space → operate on the project root.
+        e.preventDefault();
+        onContext(null, e.clientX, e.clientY);
+      }}
+    >
       {rootChildren.map((entry) => (
-        <TreeNode key={entry.path} entry={entry} depth={0} />
+        <TreeNode key={entry.path} entry={entry} depth={0} onContext={onContext} />
       ))}
+
+      {menu && (
+        <>
+          <div className="tree-menu-backdrop" onClick={() => setMenu(null)} onContextMenu={(e) => { e.preventDefault(); setMenu(null); }} />
+          <div className="tree-menu" style={{ left: menu.x, top: menu.y }}>
+            <button className="tree-menu-item" onClick={() => openDialog({ kind: "newfile", dir: menu.dir })}>
+              새 파일
+            </button>
+            <button className="tree-menu-item" onClick={() => openDialog({ kind: "newfolder", dir: menu.dir })}>
+              새 폴더
+            </button>
+            {menu.node && (
+              <>
+                <div className="tree-menu-sep" />
+                <button
+                  className="tree-menu-item"
+                  onClick={() => openDialog({ kind: "rename", node: menu.node! }, menu.node!.name)}
+                >
+                  이름 변경
+                </button>
+                <button
+                  className="tree-menu-item tree-menu-danger"
+                  onClick={() => { setDialog({ kind: "delete", node: menu.node! }); setMenu(null); setOpErr(null); }}
+                >
+                  삭제
+                </button>
+              </>
+            )}
+          </div>
+        </>
+      )}
+
+      {dialog && (
+        <div className="tree-dialog-backdrop" onClick={() => setDialog(null)}>
+          <div className="tree-dialog" onClick={(e) => e.stopPropagation()}>
+            {dialog.kind === "delete" ? (
+              <>
+                <div className="tree-dialog-head">삭제 확인</div>
+                <div className="tree-dialog-msg">
+                  <code>{dialog.node.name}</code> 을(를) 삭제할까요?
+                  {dialog.node.is_dir && " (폴더 내용 전부)"}
+                </div>
+                {opErr && <div className="tree-dialog-err">{opErr}</div>}
+                <div className="tree-dialog-foot">
+                  <button onClick={() => setDialog(null)}>취소</button>
+                  <button
+                    className="tree-menu-danger"
+                    onClick={() =>
+                      void runOp(
+                        () => invoke("delete_path", { path: dialog.node.path, root: activeProject }),
+                        dirname(dialog.node.path),
+                      )
+                    }
+                  >
+                    삭제
+                  </button>
+                </div>
+              </>
+            ) : (
+              <>
+                <div className="tree-dialog-head">
+                  {dialog.kind === "newfile" ? "새 파일" : dialog.kind === "newfolder" ? "새 폴더" : "이름 변경"}
+                </div>
+                {dialog.kind === "newfolder" && (
+                  <div className="tree-dialog-hint">. 또는 / 로 중첩 폴더 (예: com.example.foo)</div>
+                )}
+                <input
+                  className="tree-dialog-input"
+                  autoFocus
+                  value={name}
+                  placeholder={dialog.kind === "newfile" ? "파일명 (예: Foo.java)" : "이름"}
+                  onChange={(e) => setName(e.target.value)}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter") { e.preventDefault(); submitDialog(); }
+                    if (e.key === "Escape") { e.preventDefault(); setDialog(null); }
+                  }}
+                />
+                {dialog.kind === "newfile" && (
+                  <div className="tree-dialog-exts">
+                    {FILE_EXTS.map(([label, ext]) => (
+                      <button
+                        key={ext}
+                        className="tree-ext-btn"
+                        onClick={() =>
+                          setName((n) => {
+                            const base = n.includes(".") ? n.slice(0, n.lastIndexOf(".")) : n;
+                            return `${base || "Untitled"}.${ext}`;
+                          })
+                        }
+                      >
+                        {label}
+                      </button>
+                    ))}
+                  </div>
+                )}
+                {opErr && <div className="tree-dialog-err">{opErr}</div>}
+                <div className="tree-dialog-foot">
+                  <button onClick={() => setDialog(null)}>취소</button>
+                  <button onClick={submitDialog}>확인</button>
+                </div>
+              </>
+            )}
+          </div>
+        </div>
+      )}
     </div>
   );
 }

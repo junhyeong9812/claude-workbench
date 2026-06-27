@@ -3207,3 +3207,66 @@ body {
   color: var(--fg-dim);
   cursor: default;
 }
+
+/* 파일트리 우클릭 메뉴 + 생성/이름변경/삭제 다이얼로그 */
+.tree-menu-backdrop { position: fixed; inset: 0; z-index: 140; }
+.tree-menu {
+  position: fixed;
+  z-index: 141;
+  min-width: 140px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.4);
+  padding: 4px;
+}
+.tree-menu-item {
+  display: block;
+  width: 100%;
+  text-align: left;
+  font-size: 12px;
+  padding: 5px 10px;
+  color: var(--fg);
+  background: transparent;
+  border: none;
+  border-radius: 4px;
+  cursor: pointer;
+}
+.tree-menu-item:hover { background: var(--bg-hover); }
+.tree-menu-danger { color: #e06c5e; }
+.tree-menu-sep { height: 1px; background: var(--border); margin: 4px 0; }
+
+.tree-dialog-backdrop {
+  position: fixed; inset: 0; z-index: 142;
+  background: rgba(0, 0, 0, 0.35);
+  display: flex; justify-content: center; align-items: flex-start; padding-top: 14vh;
+}
+.tree-dialog {
+  width: 380px; max-width: 90vw;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.45);
+  padding: 14px;
+}
+.tree-dialog-head { font-size: 13px; font-weight: 600; color: var(--fg); margin-bottom: 8px; }
+.tree-dialog-hint, .tree-dialog-msg { font-size: 11px; color: var(--fg-dim); margin-bottom: 8px; }
+.tree-dialog-input {
+  width: 100%; box-sizing: border-box;
+  padding: 6px 8px; font-size: 13px;
+  color: var(--fg); background: var(--bg); border: 1px solid var(--border); border-radius: 4px; outline: none;
+}
+.tree-dialog-input:focus { border-color: var(--accent); }
+.tree-dialog-exts { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 8px; }
+.tree-ext-btn {
+  font-size: 11px; padding: 2px 8px;
+  color: var(--fg-dim); background: var(--bg-alt); border: 1px solid var(--border); border-radius: 4px; cursor: pointer;
+}
+.tree-ext-btn:hover { color: var(--fg); border-color: var(--accent); }
+.tree-dialog-err { color: #e06c5e; font-size: 11px; margin-top: 8px; }
+.tree-dialog-foot { display: flex; justify-content: flex-end; gap: 8px; margin-top: 12px; }
+.tree-dialog-foot button {
+  font-size: 12px; padding: 4px 12px;
+  color: var(--fg); background: var(--bg-alt); border: 1px solid var(--border); border-radius: 4px; cursor: pointer;
+}
+.tree-dialog-foot button:hover { background: var(--bg-hover); }

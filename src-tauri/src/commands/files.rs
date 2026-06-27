@@ -117,9 +117,40 @@ fn reject_unsafe_path(path: &str) -> Result<(), AppError> {
     Ok(())
 }
 
+/// Ensure `path` resolves **inside** `root` (the active project) — a stronger
+/// guard than `reject_unsafe_path` so a buggy/compromised renderer can't
+/// create/rename/delete outside the project (e.g. `delete_path("/")`). Both are
+/// canonicalized (resolving symlinks); for a not-yet-created `path` we check its
+/// deepest existing ancestor, so a new nested file still gets validated against
+/// its real on-disk location.
+fn ensure_within(path: &str, root: &str) -> Result<(), AppError> {
+    let root_c = std::fs::canonicalize(root)
+        .map_err(|_| AppError::new("프로젝트 경로를 확인할 수 없습니다"))?;
+    let mut probe = std::path::PathBuf::from(path);
+    let resolved = loop {
+        match std::fs::canonicalize(&probe) {
+            Ok(c) => break c,
+            Err(_) => match probe.parent() {
+                Some(parent) if parent != probe => probe = parent.to_path_buf(),
+                _ => return Err(AppError::new("경로를 확인할 수 없습니다")),
+            },
+        }
+    };
+    if resolved.starts_with(&root_c) {
+        Ok(())
+    } else {
+        Err(AppError::new("프로젝트 밖 경로는 허용되지 않습니다"))
+    }
+}
+
 #[tauri::command]
-pub fn delete_path(path: String) -> Result<(), AppError> {
+pub fn delete_path(path: String, root: Option<String>) -> Result<(), AppError> {
     reject_unsafe_path(&path)?;
+    // The file-tree caller pins deletes to the project root; legacy callers
+    // (study tree) omit it and keep the prior behavior.
+    if let Some(r) = root.as_deref() {
+        ensure_within(&path, r)?;
+    }
     let p = std::path::Path::new(&path);
     let md = std::fs::symlink_metadata(p).map_err(|e| AppError::new(io_message("Cannot delete", &e)))?;
     if md.is_dir() {
@@ -162,4 +193,90 @@ pub fn write_file(path: String, content: String) -> Result<(), AppError> {
         let _ = std::fs::remove_file(&tmp); // best-effort cleanup on rename failure
         AppError::new(io_message("Cannot save file", &e))
     })
+}
+
+/// Create an empty file at `path` (tree "새 파일"). Parent directories are
+/// created as needed (so a typed `sub/Foo.java` works). Errors if the path
+/// already exists, so an existing file is never clobbered.
+#[tauri::command]
+pub fn create_file(path: String, root: String) -> Result<(), AppError> {
+    reject_unsafe_path(&path)?;
+    ensure_within(&path, &root)?;
+    let p = std::path::Path::new(&path);
+    if std::fs::symlink_metadata(p).is_ok() {
+        return Err(AppError::new("이미 존재하는 경로입니다"));
+    }
+    if let Some(parent) = p.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| AppError::new(io_message("Cannot create file", &e)))?;
+    }
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(p)
+        .map(|_| ())
+        .map_err(|e| AppError::new(io_message("Cannot create file", &e)))
+}
+
+/// Create a directory at `path` (tree "새 폴더"), including intermediate dirs —
+/// so a typed `com/example/foo` (or `.`-separated, mapped to `/` by the UI)
+/// makes the whole chain. Idempotent: an existing dir is not an error.
+#[tauri::command]
+pub fn create_dir(path: String, root: String) -> Result<(), AppError> {
+    reject_unsafe_path(&path)?;
+    ensure_within(&path, &root)?;
+    std::fs::create_dir_all(&path).map_err(|e| AppError::new(io_message("Cannot create folder", &e)))
+}
+
+/// Rename/move `from` to `to` (tree "이름 변경"). Errors if `to` already exists
+/// (no overwrite). Parent dirs of `to` are created as needed.
+#[tauri::command]
+pub fn rename_path(from: String, to: String, root: String) -> Result<(), AppError> {
+    reject_unsafe_path(&from)?;
+    reject_unsafe_path(&to)?;
+    ensure_within(&from, &root)?;
+    ensure_within(&to, &root)?;
+    let to_p = std::path::Path::new(&to);
+    // `symlink_metadata` (not `exists`) so a dangling symlink at `to` is also
+    // treated as occupied — `exists()` reports false for it and would clobber.
+    if std::fs::symlink_metadata(to_p).is_ok() {
+        return Err(AppError::new("대상 경로가 이미 존재합니다"));
+    }
+    if let Some(parent) = to_p.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| AppError::new(io_message("Cannot rename", &e)))?;
+    }
+    std::fs::rename(&from, to_p).map_err(|e| AppError::new(io_message("Cannot rename", &e)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ensure_within_blocks_outside_root() {
+        let root = std::env::temp_dir().join(format!("mt_within_{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let root_s = root.to_string_lossy().to_string();
+
+        // Nested create inside the project root succeeds.
+        let inside = format!("{root_s}/a/b/c");
+        assert!(create_dir(inside.clone(), root_s.clone()).is_ok());
+        assert!(std::path::Path::new(&inside).is_dir());
+
+        // An absolute path outside the root is rejected (renderer can't escape).
+        assert!(create_dir("/etc/mt_should_not_exist".into(), root_s.clone()).is_err());
+        assert!(create_file("/etc/mt_should_not_exist_file".into(), root_s).is_err());
+    }
+
+    #[test]
+    fn create_file_no_clobber_and_within() {
+        let root = std::env::temp_dir().join(format!("mt_cf_{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let root_s = root.to_string_lossy().to_string();
+        let f = format!("{root_s}/x.txt");
+        assert!(create_file(f.clone(), root_s.clone()).is_ok());
+        // Second create on the same path fails (no clobber).
+        assert!(create_file(f, root_s).is_err());
+    }
 }
