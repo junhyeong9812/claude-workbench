@@ -118,10 +118,16 @@ export function MainArea() {
   const requestDiff = useAppStore((s) => s.requestDiff);
   const claudeOpenRequest = useAppStore((s) => s.claudeOpenRequest);
   const requestClaudeOpen = useAppStore((s) => s.requestClaudeOpen);
+  const devReviewRequest = useAppStore((s) => s.devReviewRequest);
+  const requestDevReview = useAppStore((s) => s.requestDevReview);
+  const requestClaudeInject = useAppStore((s) => s.requestClaudeInject);
   const focusMainRequest = useAppStore((s) => s.focusMainRequest);
   const setLayout = useAppStore((s) => s.setLayout);
 
   const apiRef = useRef<DockviewApi | null>(null);
+  // Per-project dev-mode Claude session uuid (in-memory: continuity within an app
+  // run; persistence across restarts is a follow-up). Lets 확인 reuse one session.
+  const devUuidRef = useRef<Record<string, string>>({});
   // Drop-out gesture (P3): one AbortController per in-progress tab drag bounds
   // the dragover/dragend listeners, and the onWillDragPanel subscription is
   // disposed on unmount — no stale listener can fire a late popout (review P3 #1).
@@ -564,6 +570,39 @@ export function MainArea() {
     });
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [claudeOpenRequest, apiReady, activeProject]);
+
+  // Dev mode 확인: review the saved file in the project's dev Claude session.
+  // First time → open a fresh dev session (stable uuid) seeded with the prompt,
+  // beside the editor. Subsequent → inject the prompt into that live session.
+  useEffect(() => {
+    if (!devReviewRequest) return;
+    const { project, prompt, editorPanelId } = devReviewRequest;
+    if (project !== activeProject) return;
+    const api = apiRef.current;
+    if (!api) return; // dock not ready — keep the request; apiReady re-runs
+    requestDevReview(null);
+    const existingUuid = devUuidRef.current[project];
+    const panelOpen =
+      !!existingUuid &&
+      api.panels.some((p) => {
+        const prm = p.params as { loadSessionId?: string; sessionUuid?: string };
+        return prm.loadSessionId === existingUuid || prm.sessionUuid === existingUuid;
+      });
+    if (panelOpen) {
+      requestClaudeInject({ uuid: existingUuid, text: prompt });
+      return;
+    }
+    const uuid = crypto.randomUUID();
+    devUuidRef.current[project] = uuid;
+    addPanel("claudeterm", {
+      project,
+      loadSessionId: uuid,
+      title: "개발 세션",
+      seed: prompt,
+      position: { referencePanel: editorPanelId, direction: "right" as const },
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [devReviewRequest, apiReady, activeProject]);
 
   // Resolve a close request from a Claude tab's × (B3-1): 닫기 keeps the saved
   // history, 삭제 also removes it; both close the panel.

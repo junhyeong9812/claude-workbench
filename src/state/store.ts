@@ -261,6 +261,12 @@ interface AppState {
     /** Open this panel to the right of an existing panel (review: beside the diff). */
     referencePanelId?: string;
   } | null;
+  /** Inject a prompt into an already-live Claude session (dev mode's 확인 button
+   * re-uses the project's dev session). Matched by session uuid in ClaudeTermPanel. */
+  claudeInjectRequest: { uuid: string; text: string } | null;
+  /** Dev mode 확인: review the just-saved file. MainArea opens (first time) or
+   * injects into (subsequent) the per-project dev Claude session. */
+  devReviewRequest: { project: string; prompt: string; editorPanelId: string } | null;
   /** Bumped to ask MainArea to focus the active dockview panel (Ctrl+B from the
    * already-focused tree toggles focus back to the open tab). A counter so every
    * press re-fires even when the value would otherwise be unchanged. */
@@ -372,6 +378,12 @@ interface AppState {
   requestClaudeOpen: (
     req: { project: string; seed?: string; title?: string; referencePanelId?: string } | null,
   ) => void;
+  /** Inject a prompt into a live Claude session (consumed by the matching panel). */
+  requestClaudeInject: (req: { uuid: string; text: string } | null) => void;
+  /** Request a dev-mode review of a saved file (MainArea consumes + clears). */
+  requestDevReview: (
+    req: { project: string; prompt: string; editorPanelId: string } | null,
+  ) => void;
   /** Ask MainArea to focus the active dockview panel (Ctrl+B tree→tab toggle). */
   requestFocusMain: () => void;
   /** Switch the color theme. */
@@ -433,6 +445,8 @@ export const useAppStore = create<AppState>((set, get) => ({
   editorOpenRequest: null,
   diffRequest: null,
   claudeOpenRequest: null,
+  claudeInjectRequest: null,
+  devReviewRequest: null,
   focusMainRequest: 0,
   theme: (localStorage.getItem("theme") as "dark" | "light") || "dark",
   fontSize: clampFontSize(Number(localStorage.getItem("fontSize")) || 13),
@@ -588,6 +602,8 @@ export const useAppStore = create<AppState>((set, get) => ({
   requestEditorOpen: (path) => set({ editorOpenRequest: path }),
   requestDiff: (spec) => set({ diffRequest: spec }),
   requestClaudeOpen: (req) => set({ claudeOpenRequest: req }),
+  requestClaudeInject: (req) => set({ claudeInjectRequest: req }),
+  requestDevReview: (req) => set({ devReviewRequest: req }),
   requestFocusMain: () => set((s) => ({ focusMainRequest: s.focusMainRequest + 1 })),
   setTheme: (theme) => set({ theme }),
   setFontSize: (n) => set({ fontSize: clampFontSize(n) }),
