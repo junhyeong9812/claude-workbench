@@ -109,6 +109,27 @@ export function EditorPanel(props: IDockviewPanelProps<EditorParams>) {
     setReviewing(false);
   };
 
+  // Generate a unit test mirroring this source file: compute the conventional
+  // test path (backend), then ask the dev Claude session to create it there.
+  // An explicit generation action (Claude writes the test), unlike 확인 (review).
+  const genTest = async () => {
+    if (!path) return;
+    const project = useAppStore.getState().activeProject;
+    if (!project) return;
+    let testPath: string | null = null;
+    try {
+      testPath = await invoke<string | null>("mirror_test_path", { src: path });
+    } catch {
+      /* unsupported language → let Claude pick the path */
+    }
+    const where = testPath ? `\`${testPath}\` 에` : "프로젝트 컨벤션에 맞는 위치에";
+    const prompt =
+      `\`${path}\` 의 단위 테스트를 ${where} 생성해줘. ` +
+      `프로젝트의 기존 테스트 컨벤션·프레임워크를 따르고, 파일을 실제로 만들어줘(필요하면 디렉토리도). ` +
+      `핵심 동작·경계조건 위주로.`;
+    useAppStore.getState().requestDevReview({ project, prompt, editorPanelId: props.api.id });
+  };
+
   useEffect(() => {
     if (!path) {
       setErr("열 파일이 없습니다");
@@ -175,6 +196,14 @@ export function EditorPanel(props: IDockviewPanelProps<EditorParams>) {
           disabled={!path || reviewing}
         >
           {reviewing ? "검토 요청 중…" : "✓ 확인 (Claude 검토)"}
+        </button>
+        <button
+          className="editor-review"
+          title="이 파일의 단위 테스트를 미러 경로에 Claude가 생성"
+          onClick={() => void genTest()}
+          disabled={!path}
+        >
+          🧪 테스트 생성
         </button>
       </div>
       {err ? <div className="editor-err">{err}</div> : <div className="editor-body" ref={hostRef} />}

@@ -30,6 +30,6 @@ pub use fs::{list_dir, DirEntry};
 pub use label::nearest_project_marker;
 pub use persist::{load_state, save_state, Project, SshConnection, TreeState, WorkspaceState};
 pub use project_type::{detect_project_types, ProjectType};
-pub use runner::{detect_run_targets, RunTarget};
+pub use runner::{detect_run_targets, mirror_test_path, RunTarget};
 pub use search::{search_content, search_files, ContentHit, FileHit};
 pub use session::{OutputChunk, SessionId, SessionManager};

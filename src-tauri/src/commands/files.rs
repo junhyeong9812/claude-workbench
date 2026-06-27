@@ -29,6 +29,13 @@ pub fn detect_run_targets(dir: String) -> Vec<core_lib::RunTarget> {
     core_lib::detect_run_targets(&dir)
 }
 
+/// The conventional mirror test-file path for a source file (None if the
+/// language isn't supported). Path only — Claude generates the content there.
+#[tauri::command]
+pub fn mirror_test_path(src: String) -> Option<String> {
+    core_lib::mirror_test_path(&src)
+}
+
 /// Hard cap on search results sent to the UI, to bound payload + walk time.
 const SEARCH_LIMIT: usize = 500;
 

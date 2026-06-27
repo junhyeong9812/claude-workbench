@@ -102,6 +102,55 @@ fn npm_scripts(pkg: &Path) -> (Option<String>, Option<String>) {
     (build, test)
 }
 
+/// The conventional test-file path that *mirrors* a source file, by language.
+/// Returns `None` for unsupported extensions. This computes the path only — the
+/// UI asks Claude to actually generate the test content there.
+///
+/// Conventions:
+/// - TS/JS → sibling `foo.test.ts` (Jest/Vitest)
+/// - Python → sibling `test_foo.py` (pytest-discoverable)
+/// - Go → sibling `foo_test.go`
+/// - Rust → crate `tests/foo.rs` (swap a `src/` segment), else sibling `foo_test.rs`
+/// - Java → `src/test/java/.../FooTest.java` (swap `main/java`→`test/java`)
+/// - Kotlin → `src/test/kotlin/.../FooTest.kt` (swap `main/kotlin`→`test/kotlin`)
+pub fn mirror_test_path(src: &str) -> Option<String> {
+    let p = Path::new(src);
+    let ext = p.extension()?.to_str()?.to_lowercase();
+    let stem = p.file_stem()?.to_str()?.to_string();
+    let dir = p.parent()?.to_string_lossy().to_string();
+    match ext.as_str() {
+        "ts" | "tsx" | "js" | "jsx" | "mjs" | "cjs" => Some(format!("{dir}/{stem}.test.{ext}")),
+        "py" => Some(format!("{dir}/test_{stem}.py")),
+        "go" => Some(format!("{dir}/{stem}_test.go")),
+        "rs" => Some(
+            swap_path_seg(src, "src", "tests").unwrap_or_else(|| format!("{dir}/{stem}_test.rs")),
+        ),
+        "java" => {
+            let test_dir = swap_path_seg(&dir, "main/java", "test/java")
+                .or_else(|| swap_path_seg(&dir, "main", "test"))
+                .unwrap_or(dir);
+            Some(format!("{test_dir}/{stem}Test.java"))
+        }
+        "kt" | "kts" => {
+            let test_dir = swap_path_seg(&dir, "main/kotlin", "test/kotlin")
+                .or_else(|| swap_path_seg(&dir, "main", "test"))
+                .unwrap_or(dir);
+            Some(format!("{test_dir}/{stem}Test.kt"))
+        }
+        _ => None,
+    }
+}
+
+/// Replace the first `/<from>/` path segment with `/<to>/` (None if absent).
+fn swap_path_seg(path: &str, from: &str, to: &str) -> Option<String> {
+    let needle = format!("/{from}/");
+    if path.contains(&needle) {
+        Some(path.replacen(&needle, &format!("/{to}/"), 1))
+    } else {
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -181,5 +230,34 @@ mod tests {
     #[test]
     fn empty_dir_no_targets() {
         assert!(detect_run_targets(&temp_dir()).is_empty());
+    }
+
+    #[test]
+    fn mirror_paths_by_language() {
+        assert_eq!(
+            mirror_test_path("/p/src/components/Foo.ts").as_deref(),
+            Some("/p/src/components/Foo.test.ts")
+        );
+        assert_eq!(
+            mirror_test_path("/p/pkg/foo.py").as_deref(),
+            Some("/p/pkg/test_foo.py")
+        );
+        assert_eq!(
+            mirror_test_path("/p/foo.go").as_deref(),
+            Some("/p/foo_test.go")
+        );
+        assert_eq!(
+            mirror_test_path("/p/src/foo.rs").as_deref(),
+            Some("/p/tests/foo.rs")
+        );
+        assert_eq!(
+            mirror_test_path("/p/src/main/java/com/x/Foo.java").as_deref(),
+            Some("/p/src/test/java/com/x/FooTest.java")
+        );
+        assert_eq!(
+            mirror_test_path("/p/src/main/kotlin/com/x/Foo.kt").as_deref(),
+            Some("/p/src/test/kotlin/com/x/FooTest.kt")
+        );
+        assert_eq!(mirror_test_path("/p/README.md"), None);
     }
 }
