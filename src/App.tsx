@@ -15,6 +15,7 @@ import { CommitFilesSidebar } from "./components/CommitFilesSidebar";
 import { CommitFileView } from "./components/CommitFileView";
 import { TerminalSettings } from "./components/TerminalSettings";
 import { SearchPanel } from "./components/SearchPanel";
+import { RunMenu } from "./components/RunMenu";
 import { StudyView } from "./components/StudyView";
 import { PopoutWorkbench } from "./components/PopoutWorkbench";
 import { WebviewWindow } from "@tauri-apps/api/webviewWindow";
@@ -210,6 +211,7 @@ function AppMain() {
         >
           {mode === "study" ? "워크스페이스" : "스터디"}
         </button>
+        <RunMenu />
         <span className="toolbar-title">
           {activeProject ?? "multi-terminal"}
         </span>

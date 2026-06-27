@@ -3154,3 +3154,56 @@ body {
   opacity: 0.5;
   cursor: default;
 }
+
+/* 빌드/테스트 실행 메뉴 (툴바) */
+.run-menu {
+  position: relative;
+  display: inline-block;
+}
+.run-dropdown {
+  position: absolute;
+  top: 100%;
+  left: 0;
+  z-index: 130;
+  margin-top: 4px;
+  min-width: 260px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.4);
+  padding: 4px;
+}
+.run-group + .run-group {
+  border-top: 1px solid var(--border);
+  margin-top: 4px;
+  padding-top: 4px;
+}
+.run-group-head {
+  font-size: 10px;
+  text-transform: uppercase;
+  color: var(--fg-dim);
+  padding: 2px 8px;
+}
+.run-item {
+  display: block;
+  width: 100%;
+  text-align: left;
+  font-size: 12px;
+  padding: 5px 8px;
+  color: var(--fg);
+  background: transparent;
+  border: none;
+  border-radius: 4px;
+  cursor: pointer;
+}
+.run-item:hover {
+  background: var(--bg-hover);
+}
+.run-item code {
+  color: var(--fg-dim);
+  font-size: 11px;
+}
+.run-empty {
+  color: var(--fg-dim);
+  cursor: default;
+}

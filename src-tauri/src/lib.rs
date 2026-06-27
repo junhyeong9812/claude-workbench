@@ -98,6 +98,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             commands::read_dir,
             commands::detect_project_types,
+            commands::detect_run_targets,
             commands::search_files,
             commands::search_content,
             commands::save_state,
