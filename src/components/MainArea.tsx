@@ -121,6 +121,8 @@ export function MainArea() {
   const devReviewRequest = useAppStore((s) => s.devReviewRequest);
   const requestDevReview = useAppStore((s) => s.requestDevReview);
   const requestClaudeInject = useAppStore((s) => s.requestClaudeInject);
+  const runRequest = useAppStore((s) => s.runRequest);
+  const requestRun = useAppStore((s) => s.requestRun);
   const focusMainRequest = useAppStore((s) => s.focusMainRequest);
   const setLayout = useAppStore((s) => s.setLayout);
 
@@ -299,6 +301,8 @@ export function MainArea() {
       project?: string;
       path?: string;
       seed?: string;
+      runCmd?: string;
+      cwd?: string;
       position?: { referencePanel: string; direction: "right" | "left" | "above" | "below" };
     },
   ) => {
@@ -332,6 +336,8 @@ export function MainArea() {
         ...(opts?.project ? { project: opts.project } : {}),
         ...(opts?.path ? { path: opts.path } : {}),
         ...(opts?.seed ? { seed: opts.seed } : {}),
+        ...(opts?.runCmd ? { runCmd: opts.runCmd } : {}),
+        ...(opts?.cwd ? { cwd: opts.cwd } : {}),
       },
     });
   };
@@ -603,6 +609,21 @@ export function MainArea() {
     });
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [devReviewRequest, apiReady, activeProject]);
+
+  // Build/test runner: open a terminal panel that runs the command.
+  useEffect(() => {
+    if (!runRequest) return;
+    if (runRequest.project !== activeProject) return;
+    const api = apiRef.current;
+    if (!api) return; // dock not ready — keep the request; apiReady re-runs
+    requestRun(null);
+    addPanel("terminal", {
+      title: runRequest.title,
+      runCmd: runRequest.cmd,
+      cwd: runRequest.project,
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [runRequest, apiReady, activeProject]);
 
   // Resolve a close request from a Claude tab's × (B3-1): 닫기 keeps the saved
   // history, 삭제 also removes it; both close the panel.

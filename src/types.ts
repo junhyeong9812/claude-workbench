@@ -36,6 +36,14 @@ export interface ContentHit {
   text: string;
 }
 
+/** A detected build/test toolchain (`detect_run_targets` command). */
+export interface RunTarget {
+  /** Tool id for the label ("cargo", "npm", "gradle", "maven", "python", "go"). */
+  kind: string;
+  build: string | null;
+  test: string | null;
+}
+
 /** Per-project folder-tree UI state that survives restarts. */
 export interface TreeState {
   /** Absolute paths of expanded directories, scoped to one project. */

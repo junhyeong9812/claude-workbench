@@ -22,6 +22,20 @@ pub fn detect_project_types(path: String) -> Vec<ProjectType> {
     core_lib::detect_project_types(path)
 }
 
+/// Detect per-tool build/test commands in a project dir (Cargo/npm/Gradle/...),
+/// so the UI can offer one-click 빌드/테스트. Infallible.
+#[tauri::command]
+pub fn detect_run_targets(dir: String) -> Vec<core_lib::RunTarget> {
+    core_lib::detect_run_targets(&dir)
+}
+
+/// The conventional mirror test-file path for a source file (None if the
+/// language isn't supported). Path only — Claude generates the content there.
+#[tauri::command]
+pub fn mirror_test_path(src: String) -> Option<String> {
+    core_lib::mirror_test_path(&src)
+}
+
 /// Hard cap on search results sent to the UI, to bound payload + walk time.
 const SEARCH_LIMIT: usize = 500;
 

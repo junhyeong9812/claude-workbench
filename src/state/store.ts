@@ -267,6 +267,8 @@ interface AppState {
   /** Dev mode 확인: review the just-saved file. MainArea opens (first time) or
    * injects into (subsequent) the per-project dev Claude session. */
   devReviewRequest: { project: string; prompt: string; editorPanelId: string } | null;
+  /** Build/test runner: open a terminal panel that runs `cmd` (consumed by MainArea). */
+  runRequest: { project: string; cmd: string; title: string } | null;
   /** Bumped to ask MainArea to focus the active dockview panel (Ctrl+B from the
    * already-focused tree toggles focus back to the open tab). A counter so every
    * press re-fires even when the value would otherwise be unchanged. */
@@ -384,6 +386,8 @@ interface AppState {
   requestDevReview: (
     req: { project: string; prompt: string; editorPanelId: string } | null,
   ) => void;
+  /** Request running a build/test command in a terminal (MainArea consumes). */
+  requestRun: (req: { project: string; cmd: string; title: string } | null) => void;
   /** Ask MainArea to focus the active dockview panel (Ctrl+B tree→tab toggle). */
   requestFocusMain: () => void;
   /** Switch the color theme. */
@@ -447,6 +451,7 @@ export const useAppStore = create<AppState>((set, get) => ({
   claudeOpenRequest: null,
   claudeInjectRequest: null,
   devReviewRequest: null,
+  runRequest: null,
   focusMainRequest: 0,
   theme: (localStorage.getItem("theme") as "dark" | "light") || "dark",
   fontSize: clampFontSize(Number(localStorage.getItem("fontSize")) || 13),
@@ -604,6 +609,7 @@ export const useAppStore = create<AppState>((set, get) => ({
   requestClaudeOpen: (req) => set({ claudeOpenRequest: req }),
   requestClaudeInject: (req) => set({ claudeInjectRequest: req }),
   requestDevReview: (req) => set({ devReviewRequest: req }),
+  requestRun: (req) => set({ runRequest: req }),
   requestFocusMain: () => set((s) => ({ focusMainRequest: s.focusMainRequest + 1 })),
   setTheme: (theme) => set({ theme }),
   setFontSize: (n) => set({ fontSize: clampFontSize(n) }),
