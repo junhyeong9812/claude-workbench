@@ -141,14 +141,19 @@ pub fn mirror_test_path(src: &str) -> Option<String> {
     }
 }
 
-/// Replace the first `/<from>/` path segment with `/<to>/` (None if absent).
+/// Replace the first `<from>` path segment with `<to>` — matching it mid-path
+/// (`/src/`) *or* as the leading segment (`src/...`, e.g. a relative path).
+/// `None` if the segment isn't present.
 fn swap_path_seg(path: &str, from: &str, to: &str) -> Option<String> {
-    let needle = format!("/{from}/");
-    if path.contains(&needle) {
-        Some(path.replacen(&needle, &format!("/{to}/"), 1))
-    } else {
-        None
+    let mid = format!("/{from}/");
+    if let Some(idx) = path.find(&mid) {
+        return Some(format!("{}/{}/{}", &path[..idx], to, &path[idx + mid.len()..]));
     }
+    let lead = format!("{from}/");
+    if let Some(rest) = path.strip_prefix(&lead) {
+        return Some(format!("{to}/{rest}"));
+    }
+    None
 }
 
 #[cfg(test)]
@@ -249,6 +254,11 @@ mod tests {
         assert_eq!(
             mirror_test_path("/p/src/foo.rs").as_deref(),
             Some("/p/tests/foo.rs")
+        );
+        // Relative path with a *leading* src/ segment (codex finding).
+        assert_eq!(
+            mirror_test_path("src/foo.rs").as_deref(),
+            Some("tests/foo.rs")
         );
         assert_eq!(
             mirror_test_path("/p/src/main/java/com/x/Foo.java").as_deref(),

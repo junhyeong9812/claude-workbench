@@ -302,6 +302,7 @@ export function MainArea() {
       path?: string;
       seed?: string;
       runCmd?: string;
+      cwd?: string;
       position?: { referencePanel: string; direction: "right" | "left" | "above" | "below" };
     },
   ) => {
@@ -336,6 +337,7 @@ export function MainArea() {
         ...(opts?.path ? { path: opts.path } : {}),
         ...(opts?.seed ? { seed: opts.seed } : {}),
         ...(opts?.runCmd ? { runCmd: opts.runCmd } : {}),
+        ...(opts?.cwd ? { cwd: opts.cwd } : {}),
       },
     });
   };
@@ -615,7 +617,11 @@ export function MainArea() {
     const api = apiRef.current;
     if (!api) return; // dock not ready — keep the request; apiReady re-runs
     requestRun(null);
-    addPanel("terminal", { title: runRequest.title, runCmd: runRequest.cmd });
+    addPanel("terminal", {
+      title: runRequest.title,
+      runCmd: runRequest.cmd,
+      cwd: runRequest.project,
+    });
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [runRequest, apiReady, activeProject]);
 

@@ -25,6 +25,9 @@ export interface TerminalParams {
   /** One-shot command run once when a fresh terminal starts (build/test runner).
    * Cleared from params after running so a remount won't re-run it. */
   runCmd?: string;
+  /** Working directory for a fresh terminal (build/test runner pins it to the
+   * target project); falls back to the active project when absent. */
+  cwd?: string;
   // SSH-only (non-secret):
   host?: string;
   port?: number;
@@ -202,7 +205,10 @@ export function TerminalPanel(props: IDockviewPanelProps<TerminalParams>) {
             rows: term.rows,
           });
         } else {
-          const cwd = useAppStore.getState().activeProject ?? null;
+          // Pin to the requested cwd (build/test runner) over the live active
+          // project, so a project switch between request and create can't run in
+          // the wrong directory (codex finding).
+          const cwd = props.params.cwd ?? useAppStore.getState().activeProject ?? null;
           sessionId = await invoke<number>("terminal_create", {
             cmd: null,
             cwd,

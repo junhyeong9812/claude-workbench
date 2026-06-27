@@ -16,12 +16,13 @@ export function RunMenu() {
   const [open, setOpen] = useState(false);
   const ref = useRef<HTMLDivElement>(null);
 
-  // Re-detect whenever the active project changes.
+  // Re-detect whenever the active project changes. Clear the old targets + close
+  // the menu *first*, so a click during detection can't run the previous
+  // project's command against the new project (codex finding).
   useEffect(() => {
-    if (!activeProject) {
-      setTargets([]);
-      return;
-    }
+    setTargets([]);
+    setOpen(false);
+    if (!activeProject) return;
     let alive = true;
     invoke<RunTarget[]>("detect_run_targets", { dir: activeProject })
       .then((t) => {
