@@ -143,11 +143,26 @@ export function FolderTree() {
   const [name, setName] = useState("");
   const [opErr, setOpErr] = useState<string | null>(null);
 
+  // Parent dir of an absolute path; "/" for a root-level entry (so reloadDir
+  // never gets "" → the process cwd).
+  const dirname = (p: string): string => {
+    const i = p.lastIndexOf("/");
+    return i <= 0 ? "/" : p.slice(0, i);
+  };
+
+  // Clean a typed relative path: drop empty/`.`/`..` segments. "" if invalid, so
+  // `.` / `/` / `...` don't slip through as a no-op create.
+  const normalizeRel = (s: string): string => {
+    const segs = s.split("/").map((x) => x.trim()).filter(Boolean);
+    if (segs.length === 0 || segs.some((x) => x === "." || x === "..")) return "";
+    return segs.join("/");
+  };
+
   // dir to create *into*: a folder uses itself; a file uses its parent dir; the
   // empty background uses the project root.
   const dirOf = (node: DirEntry | null): string => {
     if (!node) return activeProject ?? "";
-    return node.is_dir ? node.path : node.path.slice(0, node.path.lastIndexOf("/"));
+    return node.is_dir ? node.path : dirname(node.path);
   };
 
   const onContext: ContextHandler = (node, x, y) => {
@@ -181,25 +196,38 @@ export function FolderTree() {
   };
 
   const submitDialog = () => {
-    if (!dialog) return;
+    if (!dialog || !activeProject) return;
+    const root = activeProject;
     const trimmed = name.trim();
     if (dialog.kind === "newfile") {
-      if (!trimmed) return;
-      // `sub/Foo.java` makes the subdir too; reload the right-clicked dir.
-      const path = `${dialog.dir}/${trimmed}`;
-      void runOp(() => invoke("create_file", { path }), dialog.dir, dialog.dir).then((ok) => {
+      // `sub/Foo.java` makes the subdir too. Reject empty path segments.
+      const rel = normalizeRel(trimmed);
+      if (!rel) {
+        setOpErr("올바른 파일명을 입력하세요");
+        return;
+      }
+      const path = `${dialog.dir}/${rel}`;
+      void runOp(() => invoke("create_file", { path, root }), dialog.dir, dialog.dir).then((ok) => {
         if (ok) requestEditorOpen(path); // open the fresh file in the editor
       });
     } else if (dialog.kind === "newfolder") {
-      if (!trimmed) return;
-      // `.` (Java package style) or `/` → nested dirs.
-      const rel = trimmed.replace(/\./g, "/");
-      void runOp(() => invoke("create_dir", { path: `${dialog.dir}/${rel}` }), dialog.dir, dialog.dir);
+      // `.` (Java package style) or `/` → nested dirs. Reject empty segments so
+      // `.` / `/` / `...` don't silently no-op on an existing dir.
+      const rel = normalizeRel(trimmed.replace(/\./g, "/"));
+      if (!rel) {
+        setOpErr("올바른 폴더명을 입력하세요");
+        return;
+      }
+      void runOp(() => invoke("create_dir", { path: `${dialog.dir}/${rel}`, root }), dialog.dir, dialog.dir);
     } else if (dialog.kind === "rename") {
-      if (!trimmed) return;
-      const parent = dialog.node.path.slice(0, dialog.node.path.lastIndexOf("/"));
+      const rel = normalizeRel(trimmed);
+      if (!rel) {
+        setOpErr("올바른 이름을 입력하세요");
+        return;
+      }
+      const parent = dirname(dialog.node.path);
       void runOp(
-        () => invoke("rename_path", { from: dialog.node.path, to: `${parent}/${trimmed}` }),
+        () => invoke("rename_path", { from: dialog.node.path, to: `${parent}/${rel}`, root }),
         parent,
       );
     }
@@ -397,8 +425,8 @@ export function FolderTree() {
                     className="tree-menu-danger"
                     onClick={() =>
                       void runOp(
-                        () => invoke("delete_path", { path: dialog.node.path }),
-                        dialog.node.path.slice(0, dialog.node.path.lastIndexOf("/")),
+                        () => invoke("delete_path", { path: dialog.node.path, root: activeProject }),
+                        dirname(dialog.node.path),
                       )
                     }
                   >
