@@ -101,15 +101,17 @@ interface ClaudeTimelineEvent {
 }
 
 /** Context-window size (tokens) for a Claude model id. The `[1m]` variants carry
- * a 1M window; all other Claude models default to 200k. Unknown → 0 (gauge hidden). */
+ * a 1M window; other Claude models default to 200k. Unknown / non-Claude → 0, so
+ * the gauge is hidden rather than showing a made-up window. */
 function ctxWindow(model?: string | null): number {
-  if (!model) return 0;
+  if (!model || !model.includes("claude")) return 0;
   if (model.includes("[1m]") || model.includes("-1m")) return 1_000_000;
   return 200_000;
 }
 
 /** Compact token count: 1234 → "1.2k". */
-const kfmt = (n: number): string => (n >= 1000 ? `${(n / 1000).toFixed(1)}k` : String(n));
+const kfmt = (n: number): string =>
+  n >= 1_000_000 ? `${(n / 1_000_000).toFixed(1)}M` : n >= 1000 ? `${(n / 1000).toFixed(1)}k` : String(n);
 
 /** A short error string from an invoke rejection (AppError `{message}` or text). */
 

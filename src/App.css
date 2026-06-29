@@ -869,8 +869,8 @@ body {
   padding: 5px 8px;
   margin: 4px;
   border-radius: 4px;
-  background: rgba(243, 139, 168, 0.15);
-  border: 1px solid rgba(243, 139, 168, 0.4);
+  background: color-mix(in srgb, var(--st-danger) 15%, transparent);
+  border: 1px solid color-mix(in srgb, var(--st-danger) 40%, transparent);
   color: var(--st-danger);
   font-size: 0.95em;
 }
@@ -1046,7 +1046,7 @@ body {
   color: #a6e3a1;
 }
 .diff-del {
-  background: rgba(243, 139, 168, 0.12);
+  background: color-mix(in srgb, var(--st-danger) 12%, transparent);
   color: var(--st-danger);
 }
 .diff-hunk {
@@ -2263,7 +2263,7 @@ body {
   padding: 6px 8px;
   font-size: 12px;
   color: var(--st-fail);
-  background: rgba(248, 81, 73, 0.1);
+  background: color-mix(in srgb, var(--st-fail) 10%, transparent);
   border-bottom: 1px solid var(--border);
 }
 
@@ -2347,7 +2347,7 @@ body {
   gap: 6px;
   padding: 6px 8px;
   border-top: 1px solid var(--border);
-  background: rgba(210, 153, 34, 0.08);
+  background: color-mix(in srgb, var(--st-warn) 8%, transparent);
   max-height: 40%;
   overflow-y: auto;
 }

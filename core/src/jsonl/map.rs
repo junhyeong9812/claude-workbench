@@ -742,6 +742,30 @@ mod tests {
         assert_eq!(t.cache_creation, 300);
     }
 
+    #[test]
+    fn last_usage_overwrites_and_model_is_last_wins() {
+        let mut m = JsonlMapper::new(ROOT, SID);
+        m.apply_line(&line(json!({
+            "type": "assistant", "sessionId": SID,
+            "message": { "role": "assistant", "model": "claude-sonnet-4-6",
+                "usage": { "input_tokens": 100, "cache_read_input_tokens": 2000,
+                           "cache_creation_input_tokens": 300 }, "content": [] }
+        })));
+        m.apply_line(&line(json!({
+            "type": "assistant", "sessionId": SID,
+            "message": { "role": "assistant", "model": "claude-opus-4-8",
+                "usage": { "input_tokens": 10, "cache_read_input_tokens": 5,
+                           "cache_creation_input_tokens": 1 }, "content": [] }
+        })));
+        // last_usage is the *latest* message's usage (overwrite), not the per-turn sum.
+        let lu = m.last_usage().expect("last_usage");
+        assert_eq!(lu.input, 10);
+        assert_eq!(lu.cache_read, 5);
+        assert_eq!(lu.cache_creation, 1);
+        // model takes the most recent assistant message.
+        assert_eq!(m.model(), Some("claude-opus-4-8"));
+    }
+
     // B1: an extended-thinking block becomes a Think item (reasoning flow).
     #[test]
     fn thinking_becomes_a_think_item() {
