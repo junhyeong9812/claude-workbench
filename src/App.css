@@ -2047,6 +2047,16 @@ body {
 .timeline-kind-del {
   color: var(--st-fail);
 }
+/* Thinking rows (P4) are reasoning, not actions — de-emphasized (muted + italic)
+   so they don't compete with file/command work. Content still opens in the detail
+   pane on click (no inline expand — keeps the auto-scroll behavior intact). */
+.timeline-item-think .timeline-title {
+  font-style: italic;
+  color: var(--fg-dim);
+}
+.timeline-item-think .timeline-kind {
+  opacity: 0.75;
+}
 .timeline-title {
   flex: 1;
   overflow: hidden;

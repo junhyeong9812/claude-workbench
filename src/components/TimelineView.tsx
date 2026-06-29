@@ -188,9 +188,9 @@ export function TimelineView({
     <Fragment key={it.tool_call_id}>
       <div
         data-tcid={it.tool_call_id}
-        className={`timeline-item ${sub ? "timeline-item-sub" : ""} ts-${it.agent_status} ${
-          selectedId === it.tool_call_id ? "timeline-item-sel" : ""
-        }`}
+        className={`timeline-item ${sub ? "timeline-item-sub" : ""} ${
+          it.kind === "think" ? "timeline-item-think" : ""
+        } ts-${it.agent_status} ${selectedId === it.tool_call_id ? "timeline-item-sel" : ""}`}
         title={it.locations.join("\n")}
         onClick={() => {
           onSelect(it);
