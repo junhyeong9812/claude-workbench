@@ -223,8 +223,16 @@ export function TimelineView({
     if (renderSeenAgent.has(aid)) return null;
     renderSeenAgent.add(aid);
     const collapsed = collapsedAgents.has(aid);
+    // Progress over this group's *direct* items only (not nested agents) — keeps
+    // the count free of the cycle/dup concerns the recursive render guards against.
+    const total = its.length;
+    const done = its.filter((it) => it.agent_status === "completed").length;
+    const pct = total > 0 ? Math.round((done / total) * 100) : 0;
     return (
       <div key={aid} className="timeline-agent">
+        <div className="timeline-agent-rail" title={`${done}/${total} 완료`}>
+          <div className="timeline-agent-rail-fill" style={{ width: `${pct}%` }} />
+        </div>
         <div
           className="timeline-agent-head"
           onClick={() => toggleAgent(aid)}
@@ -232,7 +240,9 @@ export function TimelineView({
         >
           <span className="timeline-date-caret">{collapsed ? "▸" : "▾"}</span>
           서브에이전트 {aid.slice(0, 8)}
-          <span className="timeline-agent-count">{its.length}</span>
+          <span className="timeline-agent-count">
+            {done}/{total}
+          </span>
         </div>
         {!collapsed && its.map((it) => renderItem(it, true))}
       </div>

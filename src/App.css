@@ -1592,6 +1592,18 @@ body {
   margin-left: 14px;
   border-left: 2px solid rgba(137, 180, 250, 0.4);
 }
+/* Progress rail across the top of a subagent group (P6) — fill = completed/total
+   of the group's direct items, so a glance shows how far the agent has gotten. */
+.timeline-agent-rail {
+  height: 2px;
+  background: var(--bg-hover);
+  overflow: hidden;
+}
+.timeline-agent-rail-fill {
+  height: 100%;
+  background: var(--st-ok);
+  transition: width 0.3s ease;
+}
 .timeline-agent-head {
   display: flex;
   align-items: center;
