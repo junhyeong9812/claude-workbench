@@ -117,6 +117,31 @@ export function TimelineView({
       return next;
     });
 
+  // Collapsed turns: fold a whole Q&A (question + answer + its tool items) to its
+  // head. The head stays as a ↑/↓ stop (unlike a collapsed *date*, which hides its
+  // turns entirely). Keyed by turn number.
+  const [collapsedTurns, setCollapsedTurns] = useState<Set<number>>(new Set());
+  // The turn a tool item belongs to (searches top-level items and every subagent
+  // group). Used to keep keyboard selection valid when a turn is collapsed.
+  const itemTurn = (id: string): number | null => {
+    for (const it of items) if (it.tool_call_id === id) return it.turn;
+    for (const [, , turn, its] of subagents ?? [])
+      for (const it of its) if (it.tool_call_id === id) return turn;
+    return null;
+  };
+  const toggleTurn = (turn: number) => {
+    const collapsing = !collapsedTurns.has(turn);
+    // If the selected item is about to be hidden, promote selection to the turn
+    // head so ↑/↓ keeps a valid anchor (else findIndex→-1 jumps to the list end).
+    if (collapsing && selectedId && itemTurn(selectedId) === turn) onSelectTurn?.(turn);
+    setCollapsedTurns((prev) => {
+      const next = new Set(prev);
+      if (next.has(turn)) next.delete(turn);
+      else next.add(turn);
+      return next;
+    });
+  };
+
   // Subagents indexed by parent tool-call id (for nesting) and, for those with
   // no known parent, by turn (fallback).
   const agentsByParent = new Map<string, [string, TimelineItem[]][]>();
@@ -241,6 +266,7 @@ export function TimelineView({
   for (const turn of turnNos) {
     if (collapsedDates.has(dates.get(turn) ?? "")) continue;
     navEntries.push({ kind: "turn", turn });
+    if (collapsedTurns.has(turn)) continue; // folded turn: head is the only stop
     for (const it of items.filter((x) => x.turn === turn).sort((a, b) => a.seq - b.seq)) {
       pushItemTree(it);
     }
@@ -320,6 +346,14 @@ export function TimelineView({
   }, [followBottom]);
 
   const onKeyDown = (e: React.KeyboardEvent<HTMLDivElement>) => {
+    // Enter/Space folds the selected turn head (keyboard reach for the caret).
+    if (e.key === "Enter" || e.key === " ") {
+      if (selectedTurn != null && selectedScope === scope) {
+        e.preventDefault();
+        toggleTurn(selectedTurn);
+      }
+      return;
+    }
     if (e.key !== "ArrowDown" && e.key !== "ArrowUp") return;
     if (navEntries.length === 0) return;
     e.preventDefault();
@@ -367,7 +401,10 @@ export function TimelineView({
                 {date}
               </div>
             )}
-            {!collapsed && (
+            {!collapsed && (() => {
+              const tCollapsed = collapsedTurns.has(turn);
+              const diffCount = turnItems.reduce((a, it) => a + it.diffs.length, 0);
+              return (
           <div className="timeline-turn">
             <div
               data-turn={turn}
@@ -381,10 +418,28 @@ export function TimelineView({
               }}
               style={{ cursor: onSelectTurn ? "pointer" : undefined }}
             >
+              <span
+                className="timeline-turn-caret"
+                role="button"
+                aria-expanded={!tCollapsed}
+                title={tCollapsed ? "펼치기" : "접기"}
+                onClick={(e) => {
+                  e.stopPropagation();
+                  toggleTurn(turn);
+                }}
+              >
+                {tCollapsed ? "▸" : "▾"}
+              </span>
               <span className="timeline-turn-q">Q{turn}</span>
-              {prompt ?? "(질문)"}
+              <span className="timeline-turn-prompt">{prompt ?? "(질문)"}</span>
+              {tCollapsed && (turnItems.length > 0 || diffCount > 0) && (
+                <span className="timeline-turn-sum">
+                  {diffCount > 0 ? `±${diffCount} · ` : ""}
+                  {turnItems.length} tools
+                </span>
+              )}
             </div>
-            {answer && (
+            {!tCollapsed && answer && (
               <div
                 className="timeline-answer"
                 title="클릭하면 전체 답변 보기"
@@ -394,10 +449,12 @@ export function TimelineView({
                 {answer.length > 140 ? `${answer.slice(0, 140)}…` : answer}
               </div>
             )}
-            {turnItems.map((it) => renderItem(it, false))}
-            {(orphanAgentsByTurn.get(turn) ?? []).map(([aid, its]) => renderAgent(aid, its))}
+            {!tCollapsed && turnItems.map((it) => renderItem(it, false))}
+            {!tCollapsed &&
+              (orphanAgentsByTurn.get(turn) ?? []).map(([aid, its]) => renderAgent(aid, its))}
           </div>
-            )}
+              );
+            })()}
           </Fragment>
         );
       })}

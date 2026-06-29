@@ -1837,6 +1837,37 @@ body {
   color: var(--accent);
   flex-shrink: 0;
 }
+/* Turn fold caret (P2) — a separate hit area so a head click still selects the
+   turn while the caret toggles its fold. */
+.timeline-turn-caret {
+  font-size: 8px;
+  width: 8px;
+  flex-shrink: 0;
+  color: var(--fg-dim);
+  cursor: pointer;
+}
+.timeline-turn-caret:hover {
+  color: var(--fg);
+}
+/* The prompt text is the only flexible part of the head — it ellipsizes while the
+   caret/Q badge/summary keep their size. */
+.timeline-turn-prompt {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+/* Summary shown on a folded turn: tool/diff counts so a collapsed Q&A still
+   signals how much work it holds. */
+.timeline-turn-sum {
+  flex-shrink: 0;
+  font-size: 10px;
+  color: var(--fg-dim);
+  background: var(--bg-alt);
+  border-radius: 8px;
+  padding: 0 6px;
+}
 .timeline-label {
   font-size: 10px;
   color: var(--fg-dim);
