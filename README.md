@@ -91,3 +91,9 @@ Categories=Development;Utility;
 ## 아키텍처 노트 (A)
 
 앱이 UUID를 생성해 `claude --session-id <uuid>`로 세션을 시작(또는 `--resume <uuid>`로 이어붙임)하고, claude가 쓰는 **네이티브 세션 JSONL**을 tail 한다. 즉 앱이 이벤트를 따로 저장하지 않고 **claude의 파일을 단일 출처로** 읽어 타임라인을 구성한다. (구버전 B = ACP 커스텀 프로토콜은 제거됨.)
+
+---
+
+## 크레딧 / 참고
+
+타임라인의 일부 UI는 **[tessera](https://github.com/horang-labs/tessera)** (Apache-2.0)를 참고했습니다 — CSS 색 토큰 규율과 타임라인 "보는 경험" 패턴(턴 접기·KIND 라벨·thinking 디엠퍼시스·서브에이전트 레일·컨텍스트 게이지)의 *아이디어*만 차용했고, 코드를 복사하거나 Tailwind를 도입하지는 않았습니다(기존 순수 CSS 위에 자체 구현).
