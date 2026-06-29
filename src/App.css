@@ -1442,6 +1442,30 @@ body {
   opacity: 0.85;
   font-size: 0.95em;
 }
+/* Context-window usage gauge (P5): a small bar + percent next to the token totals.
+   Occupancy = latest message's input+cache tokens over the model's window. */
+.claudeterm-ctx {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-variant-numeric: tabular-nums;
+  opacity: 0.85;
+  font-size: 0.9em;
+}
+.claudeterm-ctx-bar {
+  width: 36px;
+  height: 4px;
+  border-radius: 2px;
+  background: var(--bg-hover);
+  overflow: hidden;
+}
+.claudeterm-ctx-fill {
+  display: block;
+  height: 100%;
+  background: var(--accent-bright);
+  transition: width 0.3s ease;
+}
 /* Right-aligned cluster in the Claude pane head: tokens + handoff buttons. */
 .claudeterm-head-controls {
   flex: 0 0 auto;

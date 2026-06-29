@@ -175,6 +175,8 @@ fn generate_task_summary_blocking(
         answers: tail.answers().iter().map(|(k, v)| (*k, v.clone())).collect(),
         dates: tail.dates().iter().map(|(k, v)| (*k, v.clone())).collect(),
         tokens: tail.tokens().iter().map(|(k, v)| (*k, *v)).collect(),
+        model: tail.model().map(str::to_string),
+        last_usage: tail.last_usage(),
         prev_uuid: None,
         summary_path: None,
         title: None,

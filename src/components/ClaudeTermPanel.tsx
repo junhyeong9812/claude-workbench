@@ -90,9 +90,22 @@ interface ClaudeTimelineEvent {
   answers: [number, string][];
   dates: [number, string][];
   tokens: [number, TokenUsage][];
+  /** Current assistant model id (sizes the context-window gauge), or null. */
+  model?: string | null;
+  /** Most recent assistant message's usage = current context occupancy (gauge
+   * numerator), distinct from `tokens` which sums a turn's tool round-trips. */
+  last_usage?: TokenUsage | null;
   /** [agentId, parentToolCallId|null, turn, items] per subagent — nested under
    * its spawning Agent item (parent), or its turn when there's no known parent. */
   subagents: [string, string | null, number, TimelineItem[]][];
+}
+
+/** Context-window size (tokens) for a Claude model id. The `[1m]` variants carry
+ * a 1M window; all other Claude models default to 200k. Unknown → 0 (gauge hidden). */
+function ctxWindow(model?: string | null): number {
+  if (!model) return 0;
+  if (model.includes("[1m]") || model.includes("-1m")) return 1_000_000;
+  return 200_000;
 }
 
 /** Compact token count: 1234 → "1.2k". */
@@ -181,6 +194,10 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
     input: 0,
     output: 0,
   });
+  // Context-window gauge (P5): current occupancy = the latest assistant message's
+  // input+cache tokens (last_usage), sized by the session model's window.
+  const [ctxModel, setCtxModel] = useState<string | null>(null);
+  const [ctxTokens, setCtxTokens] = useState<number>(0);
   // Width (px) of the detail viewer + timeline panes; drag splitters to resize.
   const [viewerWidth, setViewerWidth] = useState(480);
   const [timelineWidth, setTimelineWidth] = useState(360);
@@ -334,6 +351,8 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
       setSubagents([]);
       setChainPrev([]);
       setTokenTotal({ input: 0, output: 0 });
+      setCtxModel(null);
+      setCtxTokens(0);
       setSelectedId(null);
       setTextView(null);
       setSummaryDraft(null);
@@ -601,6 +620,8 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
       answers: [number, string][];
       dates: [number, string][];
       tokens?: [number, TokenUsage][];
+      model?: string | null;
+      last_usage?: TokenUsage | null;
     }) => {
       setItems([...s.items].sort((a, b) => a.seq - b.seq));
       setTurns(new Map(s.turns));
@@ -614,6 +635,9 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
         { input: 0, output: 0 },
       );
       setTokenTotal(total);
+      setCtxModel(s.model ?? null);
+      const lu = s.last_usage;
+      setCtxTokens(lu ? lu.input + lu.cache_read + lu.cache_creation : 0);
     };
 
     const write = (bytes: number[]) => {
@@ -848,6 +872,22 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
                 ↑{kfmt(tokenTotal.input)} ↓{kfmt(tokenTotal.output)}
               </span>
             )}
+            {(() => {
+              const win = ctxWindow(ctxModel);
+              if (ctxTokens <= 0 || win <= 0) return null;
+              const pct = Math.min(100, Math.round((ctxTokens / win) * 100));
+              return (
+                <span
+                  className="claudeterm-ctx"
+                  title={`컨텍스트 ${kfmt(ctxTokens)} / ${kfmt(win)} (${ctxModel ?? "?"})`}
+                >
+                  <span className="claudeterm-ctx-bar">
+                    <span className="claudeterm-ctx-fill" style={{ width: `${pct}%` }} />
+                  </span>
+                  {pct}%
+                </span>
+              );
+            })()}
             {lastSeed && (
               <button
                 className="claudeterm-head-btn"
