@@ -49,6 +49,23 @@ export const KIND_ICON: Record<string, string> = {
   other: "•",
 };
 
+/** Short uppercase work-type label shown in the timeline row's fixed-width first
+ * column (P3) — replaces the emoji so rows read like an aligned activity log. The
+ * detail pane keeps the emoji (KIND_ICON). */
+export const KIND_LABEL: Record<string, string> = {
+  read: "READ",
+  edit: "EDIT",
+  delete: "DEL",
+  move: "MOVE",
+  search: "FIND",
+  execute: "RUN",
+  think: "THINK",
+  fetch: "WEB",
+  question: "ASK",
+  plan: "PLAN",
+  other: "·",
+};
+
 export const AGENT_BADGE: Record<string, string> = {
   pending: "…",
   in_progress: "▶",
@@ -180,7 +197,9 @@ export function TimelineView({
           listRef.current?.focus();
         }}
       >
-        <span className="timeline-icon">{KIND_ICON[it.kind] ?? "•"}</span>
+        <span className={`timeline-kind${it.kind === "delete" ? " timeline-kind-del" : ""}`}>
+          {KIND_LABEL[it.kind] ?? "·"}
+        </span>
         <span className="timeline-title">{it.title || it.kind}</span>
         {it.project_label && <span className="timeline-label">{it.project_label}</span>}
         {it.cwd && sessionCwd && normPath(it.cwd) !== normPath(sessionCwd) && (

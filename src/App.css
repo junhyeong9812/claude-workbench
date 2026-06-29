@@ -2032,6 +2032,21 @@ body {
   width: 14px;
   text-align: center;
 }
+/* Fixed-width work-type label (P3) — left-aligned in a constant box so the title
+   column starts at the same x on every row (aligned activity-log look). */
+.timeline-kind {
+  width: 2.8rem;
+  flex-shrink: 0;
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  color: var(--fg-dim);
+  text-transform: uppercase;
+}
+/* Destructive op stands out from the neutral labels. */
+.timeline-kind-del {
+  color: var(--st-fail);
+}
 .timeline-title {
   flex: 1;
   overflow: hidden;
