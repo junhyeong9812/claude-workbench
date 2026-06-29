@@ -20,6 +20,14 @@
   --diff-add-fg: #a8d8a8;
   --diff-del-bg: rgba(248, 81, 73, 0.12);
   --diff-del-fg: #f0a0a0;
+  /* timeline/status semantic colors (st = status), recovered from literals.
+     Kept separate from --git-* so status and git semantics can diverge.
+     Dark values equal the former literals → dark stays pixel-identical. */
+  --st-ok: #3fb950;
+  --st-warn: #d29922;
+  --st-fail: #f85149;
+  --st-danger: #f38ba8;
+  --accent-bright: #89b4fa;
 }
 
 /* Light theme — toggled via document.documentElement[data-theme="light"]. */
@@ -45,6 +53,13 @@
   --diff-add-fg: #0a5d2a;
   --diff-del-bg: rgba(207, 34, 46, 0.10);
   --diff-del-fg: #a01722;
+  /* light status variants — darker/saturated so they read on white, aligned
+     with the --git-* light system (D1: light theme status colors improved). */
+  --st-ok: #1a7f37;
+  --st-warn: #9a6700;
+  --st-fail: #cf222e;
+  --st-danger: #cf222e;
+  --accent-bright: #0969da;
 }
 
 * {
@@ -203,7 +218,7 @@ body {
 }
 .sidebar-tab.active {
   color: var(--fg, #cdd6f4);
-  border-bottom-color: #89b4fa;
+  border-bottom-color: var(--accent-bright);
 }
 .sidebar-content {
   flex: 1 1 0;
@@ -583,7 +598,7 @@ body {
 }
 .peek-err {
   padding: 12px;
-  color: #f38ba8;
+  color: var(--st-danger);
 }
 
 /* ---- Editor panel (P2 — editable CodeMirror in a dockview panel) ---- */
@@ -645,7 +660,7 @@ body {
 }
 .editor-err {
   padding: 12px;
-  color: #f38ba8;
+  color: var(--st-danger);
 }
 
 /* ---- Git panel (G1) ---- */
@@ -856,17 +871,17 @@ body {
   border-radius: 4px;
   background: rgba(243, 139, 168, 0.15);
   border: 1px solid rgba(243, 139, 168, 0.4);
-  color: #f38ba8;
+  color: var(--st-danger);
   font-size: 0.95em;
 }
 .git-merge-banner span {
   flex: 1 1 auto;
 }
 .git-conflict-head {
-  color: #f38ba8;
+  color: var(--st-danger);
 }
 .git-code.git-conflict {
-  color: #f38ba8;
+  color: var(--st-danger);
   font-weight: 600;
 }
 .git-commit {
@@ -920,7 +935,7 @@ body {
 }
 .git-node {
   flex: 0 0 auto;
-  color: #89b4fa;
+  color: var(--accent-bright);
 }
 .git-node-merge {
   color: #f5c2e7;
@@ -1032,7 +1047,7 @@ body {
 }
 .diff-del {
   background: rgba(243, 139, 168, 0.12);
-  color: #f38ba8;
+  color: var(--st-danger);
 }
 .diff-hunk {
   color: #94e2d5;
@@ -1123,7 +1138,7 @@ body {
   background: var(--bg-hover);
 }
 .claude-tab-del:hover {
-  color: #f85149;
+  color: var(--st-fail);
 }
 .claude-tab-hint {
   font-size: 10px;
@@ -1173,7 +1188,7 @@ body {
   background: var(--bg-hover);
 }
 .claude-modal-del:hover {
-  color: #f85149;
+  color: var(--st-fail);
 }
 .claude-modal-cancel {
   color: var(--fg-dim);
@@ -1470,7 +1485,7 @@ body {
   width: 11px;
   height: 11px;
   border: 2px solid rgba(137, 180, 250, 0.3);
-  border-top-color: #89b4fa;
+  border-top-color: var(--accent-bright);
   border-radius: 50%;
   animation: claudeterm-spin 0.7s linear infinite;
 }
@@ -1994,20 +2009,20 @@ body {
 }
 .timeline-diff {
   font-size: 10px;
-  color: #3fb950;
+  color: var(--st-ok);
 }
 .timeline-write-fail {
   filter: none;
 }
 .timeline-status.ts-completed {
-  color: #3fb950;
+  color: var(--st-ok);
 }
 .timeline-status.ts-failed {
-  color: #f85149;
+  color: var(--st-fail);
 }
 .timeline-status.ts-in_progress,
 .timeline-status.ts-pending {
-  color: #d29922;
+  color: var(--st-warn);
 }
 
 /* ---- Claude (ACP) panel ---- */
@@ -2106,8 +2121,8 @@ body {
   border-color: var(--accent);
 }
 .claude-del:hover {
-  color: #f85149;
-  border-color: #f85149;
+  color: var(--st-fail);
+  border-color: var(--st-fail);
 }
 
 .claude-status {
@@ -2127,16 +2142,16 @@ body {
   background: var(--fg-dim);
 }
 .claude-dot-ready {
-  background: #3fb950;
+  background: var(--st-ok);
 }
 .claude-dot-starting {
-  background: #d29922;
+  background: var(--st-warn);
 }
 .claude-dot-auth {
-  background: #d29922;
+  background: var(--st-warn);
 }
 .claude-dot-error {
-  background: #f85149;
+  background: var(--st-fail);
 }
 .claude-dot-closed {
   background: var(--fg-dim);
@@ -2155,7 +2170,7 @@ body {
 .claude-error {
   padding: 6px 8px;
   font-size: 12px;
-  color: #f85149;
+  color: var(--st-fail);
   background: rgba(248, 81, 73, 0.1);
   border-bottom: 1px solid var(--border);
 }
@@ -2249,7 +2264,7 @@ body {
   display: flex;
   flex-direction: column;
   gap: 4px;
-  border: 1px solid #d29922;
+  border: 1px solid var(--st-warn);
   border-radius: 4px;
   padding: 6px;
 }
@@ -2259,7 +2274,7 @@ body {
   color: var(--fg);
 }
 .claude-approval-head code {
-  color: #d29922;
+  color: var(--st-warn);
   word-break: break-all;
 }
 
@@ -2283,8 +2298,8 @@ body {
   flex-wrap: wrap;
 }
 .claude-approval-actions .btn-reject {
-  border-color: #f85149;
-  color: #f85149;
+  border-color: var(--st-fail);
+  color: var(--st-fail);
 }
 
 .claude-input {
@@ -2355,7 +2370,7 @@ body {
   background: rgba(137, 180, 250, 0.32);
 }
 .tree-row-peeked {
-  box-shadow: inset 2px 0 0 #89b4fa;
+  box-shadow: inset 2px 0 0 var(--accent-bright);
 }
 .tree-row:hover {
   background: var(--bg-hover);
@@ -2700,7 +2715,7 @@ body {
 }
 .study-view-err {
   padding: 12px;
-  color: #f38ba8;
+  color: var(--st-danger);
 }
 
 .study-session-dock { height: 100%; }
