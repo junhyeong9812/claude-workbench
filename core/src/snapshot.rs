@@ -60,6 +60,14 @@ pub struct SessionSnapshot {
     pub dates: Vec<(u64, String)>,
     #[serde(default)]
     pub tokens: Vec<(u64, TokenUsage)>,
+    /// Current assistant model id (e.g. `claude-opus-4-8`) for the context-window
+    /// gauge. `None` for snapshots written before the model was tracked.
+    #[serde(default)]
+    pub model: Option<String>,
+    /// The most recent assistant message's usage (current context occupancy) — the
+    /// gauge numerator. `None` for snapshots written before this was tracked.
+    #[serde(default)]
+    pub last_usage: Option<TokenUsage>,
     /// The session this task continues from (handoff chain). `None` = chain root.
     /// Sourced from the decoupled `<uuid>.task` sidecar on [`load`] (see
     /// [`read_task_meta`]) so the poll thread's body overwrite never clobbers it —
@@ -481,6 +489,8 @@ mod tests {
             answers: vec![(1, "an answer".into())],
             dates: vec![(1, date.to_string())],
             tokens: vec![],
+            model: None,
+            last_usage: None,
             prev_uuid: None,
             summary_path: None,
             title: None,

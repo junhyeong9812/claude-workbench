@@ -49,6 +49,23 @@ export const KIND_ICON: Record<string, string> = {
   other: "•",
 };
 
+/** Short uppercase work-type label shown in the timeline row's fixed-width first
+ * column (P3) — replaces the emoji so rows read like an aligned activity log. The
+ * detail pane keeps the emoji (KIND_ICON). */
+export const KIND_LABEL: Record<string, string> = {
+  read: "READ",
+  edit: "EDIT",
+  delete: "DEL",
+  move: "MOVE",
+  search: "FIND",
+  execute: "RUN",
+  think: "THINK",
+  fetch: "WEB",
+  question: "ASK",
+  plan: "PLAN",
+  other: "·",
+};
+
 export const AGENT_BADGE: Record<string, string> = {
   pending: "…",
   in_progress: "▶",
@@ -117,6 +134,31 @@ export function TimelineView({
       return next;
     });
 
+  // Collapsed turns: fold a whole Q&A (question + answer + its tool items) to its
+  // head. The head stays as a ↑/↓ stop (unlike a collapsed *date*, which hides its
+  // turns entirely). Keyed by turn number.
+  const [collapsedTurns, setCollapsedTurns] = useState<Set<number>>(new Set());
+  // The turn a tool item belongs to (searches top-level items and every subagent
+  // group). Used to keep keyboard selection valid when a turn is collapsed.
+  const itemTurn = (id: string): number | null => {
+    for (const it of items) if (it.tool_call_id === id) return it.turn;
+    for (const [, , turn, its] of subagents ?? [])
+      for (const it of its) if (it.tool_call_id === id) return turn;
+    return null;
+  };
+  const toggleTurn = (turn: number) => {
+    const collapsing = !collapsedTurns.has(turn);
+    // If the selected item is about to be hidden, promote selection to the turn
+    // head so ↑/↓ keeps a valid anchor (else findIndex→-1 jumps to the list end).
+    if (collapsing && selectedId && itemTurn(selectedId) === turn) onSelectTurn?.(turn);
+    setCollapsedTurns((prev) => {
+      const next = new Set(prev);
+      if (next.has(turn)) next.delete(turn);
+      else next.add(turn);
+      return next;
+    });
+  };
+
   // Subagents indexed by parent tool-call id (for nesting) and, for those with
   // no known parent, by turn (fallback).
   const agentsByParent = new Map<string, [string, TimelineItem[]][]>();
@@ -146,16 +188,18 @@ export function TimelineView({
     <Fragment key={it.tool_call_id}>
       <div
         data-tcid={it.tool_call_id}
-        className={`timeline-item ${sub ? "timeline-item-sub" : ""} ts-${it.agent_status} ${
-          selectedId === it.tool_call_id ? "timeline-item-sel" : ""
-        }`}
+        className={`timeline-item ${sub ? "timeline-item-sub" : ""} ${
+          it.kind === "think" ? "timeline-item-think" : ""
+        } ts-${it.agent_status} ${selectedId === it.tool_call_id ? "timeline-item-sel" : ""}`}
         title={it.locations.join("\n")}
         onClick={() => {
           onSelect(it);
           listRef.current?.focus();
         }}
       >
-        <span className="timeline-icon">{KIND_ICON[it.kind] ?? "•"}</span>
+        <span className={`timeline-kind${it.kind === "delete" ? " timeline-kind-del" : ""}`}>
+          {KIND_LABEL[it.kind] ?? "·"}
+        </span>
         <span className="timeline-title">{it.title || it.kind}</span>
         {it.project_label && <span className="timeline-label">{it.project_label}</span>}
         {it.cwd && sessionCwd && normPath(it.cwd) !== normPath(sessionCwd) && (
@@ -179,8 +223,16 @@ export function TimelineView({
     if (renderSeenAgent.has(aid)) return null;
     renderSeenAgent.add(aid);
     const collapsed = collapsedAgents.has(aid);
+    // Progress over this group's *direct* items only (not nested agents) — keeps
+    // the count free of the cycle/dup concerns the recursive render guards against.
+    const total = its.length;
+    const done = its.filter((it) => it.agent_status === "completed").length;
+    const pct = total > 0 ? Math.round((done / total) * 100) : 0;
     return (
       <div key={aid} className="timeline-agent">
+        <div className="timeline-agent-rail" title={`${done}/${total} 완료`}>
+          <div className="timeline-agent-rail-fill" style={{ width: `${pct}%` }} />
+        </div>
         <div
           className="timeline-agent-head"
           onClick={() => toggleAgent(aid)}
@@ -188,7 +240,9 @@ export function TimelineView({
         >
           <span className="timeline-date-caret">{collapsed ? "▸" : "▾"}</span>
           서브에이전트 {aid.slice(0, 8)}
-          <span className="timeline-agent-count">{its.length}</span>
+          <span className="timeline-agent-count">
+            {done}/{total}
+          </span>
         </div>
         {!collapsed && its.map((it) => renderItem(it, true))}
       </div>
@@ -241,6 +295,7 @@ export function TimelineView({
   for (const turn of turnNos) {
     if (collapsedDates.has(dates.get(turn) ?? "")) continue;
     navEntries.push({ kind: "turn", turn });
+    if (collapsedTurns.has(turn)) continue; // folded turn: head is the only stop
     for (const it of items.filter((x) => x.turn === turn).sort((a, b) => a.seq - b.seq)) {
       pushItemTree(it);
     }
@@ -320,6 +375,14 @@ export function TimelineView({
   }, [followBottom]);
 
   const onKeyDown = (e: React.KeyboardEvent<HTMLDivElement>) => {
+    // Enter/Space folds the selected turn head (keyboard reach for the caret).
+    if (e.key === "Enter" || e.key === " ") {
+      if (selectedTurn != null && selectedScope === scope) {
+        e.preventDefault();
+        toggleTurn(selectedTurn);
+      }
+      return;
+    }
     if (e.key !== "ArrowDown" && e.key !== "ArrowUp") return;
     if (navEntries.length === 0) return;
     e.preventDefault();
@@ -367,7 +430,10 @@ export function TimelineView({
                 {date}
               </div>
             )}
-            {!collapsed && (
+            {!collapsed && (() => {
+              const tCollapsed = collapsedTurns.has(turn);
+              const diffCount = turnItems.reduce((a, it) => a + it.diffs.length, 0);
+              return (
           <div className="timeline-turn">
             <div
               data-turn={turn}
@@ -381,10 +447,28 @@ export function TimelineView({
               }}
               style={{ cursor: onSelectTurn ? "pointer" : undefined }}
             >
+              <span
+                className="timeline-turn-caret"
+                role="button"
+                aria-expanded={!tCollapsed}
+                title={tCollapsed ? "펼치기" : "접기"}
+                onClick={(e) => {
+                  e.stopPropagation();
+                  toggleTurn(turn);
+                }}
+              >
+                {tCollapsed ? "▸" : "▾"}
+              </span>
               <span className="timeline-turn-q">Q{turn}</span>
-              {prompt ?? "(질문)"}
+              <span className="timeline-turn-prompt">{prompt ?? "(질문)"}</span>
+              {tCollapsed && (turnItems.length > 0 || diffCount > 0) && (
+                <span className="timeline-turn-sum">
+                  {diffCount > 0 ? `±${diffCount} · ` : ""}
+                  {turnItems.length} tools
+                </span>
+              )}
             </div>
-            {answer && (
+            {!tCollapsed && answer && (
               <div
                 className="timeline-answer"
                 title="클릭하면 전체 답변 보기"
@@ -394,10 +478,12 @@ export function TimelineView({
                 {answer.length > 140 ? `${answer.slice(0, 140)}…` : answer}
               </div>
             )}
-            {turnItems.map((it) => renderItem(it, false))}
-            {(orphanAgentsByTurn.get(turn) ?? []).map(([aid, its]) => renderAgent(aid, its))}
+            {!tCollapsed && turnItems.map((it) => renderItem(it, false))}
+            {!tCollapsed &&
+              (orphanAgentsByTurn.get(turn) ?? []).map(([aid, its]) => renderAgent(aid, its))}
           </div>
-            )}
+              );
+            })()}
           </Fragment>
         );
       })}

@@ -150,6 +150,16 @@ impl SessionTail {
         self.mapper.tokens()
     }
 
+    /// The current assistant model id (delegated to the mapper).
+    pub fn model(&self) -> Option<&str> {
+        self.mapper.model()
+    }
+
+    /// The most recent assistant message's usage — current context occupancy.
+    pub fn last_usage(&self) -> Option<crate::timeline::TokenUsage> {
+        self.mapper.last_usage()
+    }
+
     /// The current conversation turn (for attributing a subagent to the turn it
     /// was spawned in — B1).
     pub fn current_turn(&self) -> u64 {

@@ -95,6 +95,12 @@ struct ClaudeTimelinePayload {
     answers: Vec<(u64, String)>,
     dates: Vec<(u64, String)>,
     tokens: Vec<(u64, TokenUsage)>,
+    /// Current assistant model id (e.g. `claude-opus-4-8`), or `None` if not yet
+    /// seen — the frontend maps it to a context-window size for the usage gauge.
+    model: Option<String>,
+    /// Most recent assistant message's usage = current context occupancy (the gauge
+    /// numerator). Distinct from `tokens`, which sums a turn's tool round-trips.
+    last_usage: Option<TokenUsage>,
     /// Per-subagent (`Agent`/`Task`) change lists:
     /// `(agent_id, parent_tool_call_id, turn, items)`. `parent_tool_call_id` is
     /// the timeline item (the spawning `Agent` tool call) the agent nests under —
@@ -483,7 +489,8 @@ fn run_timeline_poll(
     // Cheap fingerprint of the last emitted state (incl. subagent item count). A
     // prompt- or answer-only record advances turns/answers without touching any
     // tool item, so we can't key off `poll`'s touched indices alone.
-    let mut last_fp: (usize, u32, usize, usize, usize, usize) = (0, 0, 0, 0, 0, 0);
+    let mut last_fp: (usize, u32, usize, usize, usize, usize, u64, u64, u64) =
+        (0, 0, 0, 0, 0, 0, 0, 0, 0);
 
     while !stop.load(Ordering::Relaxed) {
         thread::sleep(Duration::from_millis(150));
@@ -545,6 +552,19 @@ fn run_timeline_poll(
         let sub_count: usize = subagents.values().map(|st| st.timeline().items().len()).sum();
 
         let items = t.timeline().items();
+        // Token/model/usage changes can land without any item/answer change (a
+        // usage-only assistant record), so fold them into the fingerprint — else the
+        // gauge and persisted snapshot would skip those ticks (codex).
+        let token_fp: u64 = t
+            .tokens()
+            .values()
+            .map(|u| u.input + u.output + u.cache_read + u.cache_creation)
+            .sum();
+        let ctx_fp: u64 = t
+            .last_usage()
+            .map(|u| u.input + u.cache_read + u.cache_creation)
+            .unwrap_or(0);
+        let model_fp: u64 = t.model().map(|m| m.bytes().map(u64::from).sum()).unwrap_or(0);
         let fp = (
             items.len(),
             items.iter().map(|i| i.revision).sum::<u32>() + sub_rev,
@@ -552,6 +572,9 @@ fn run_timeline_poll(
             t.answers().values().map(|s| s.len()).sum(),
             t.dates().len(),
             sub_count,
+            token_fp,
+            ctx_fp,
+            model_fp,
         );
         if fp == last_fp {
             continue; // nothing changed this tick
@@ -564,6 +587,8 @@ fn run_timeline_poll(
             t.answers().iter().map(|(k, v)| (*k, v.clone())).collect();
         let dates_v: Vec<(u64, String)> = t.dates().iter().map(|(k, v)| (*k, v.clone())).collect();
         let tokens_v: Vec<(u64, TokenUsage)> = t.tokens().iter().map(|(k, v)| (*k, *v)).collect();
+        let model_v: Option<String> = t.model().map(str::to_string);
+        let last_usage_v: Option<TokenUsage> = t.last_usage();
         let sub_raw: Vec<(String, u64, Vec<TimelineItem>)> = subagents
             .iter()
             .filter(|(_, st)| !st.timeline().items().is_empty())
@@ -612,6 +637,8 @@ fn run_timeline_poll(
                 answers: answers_v.clone(),
                 dates: dates_v.clone(),
                 tokens: tokens_v.clone(),
+                model: model_v.clone(),
+                last_usage: last_usage_v,
                 subagents: subagents_v,
             },
         );
@@ -638,6 +665,8 @@ fn run_timeline_poll(
                 answers: answers_v,
                 dates: dates_v,
                 tokens: tokens_v,
+                model: model_v,
+                last_usage: last_usage_v,
                 // Task-chain meta lives in the decoupled `.task` sidecar (set at
                 // handoff), not the body — the body is overwritten every tick, so
                 // these stay `None` here and `load` sources them from the sidecar.

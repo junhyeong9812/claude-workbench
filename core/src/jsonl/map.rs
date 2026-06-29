@@ -44,6 +44,13 @@ pub struct JsonlMapper {
     answers: BTreeMap<u64, String>,
     dates: BTreeMap<u64, String>,
     tokens: BTreeMap<u64, TokenUsage>,
+    /// Most recent assistant `message.model` seen — the current session model,
+    /// used to size the context-window gauge.
+    model: Option<String>,
+    /// The single most recent assistant message's usage (overwritten, not summed)
+    /// — its input+cache tokens ≈ the *current* context occupancy, unlike the
+    /// per-turn `tokens` sum which double-counts a turn's tool round-trips.
+    last_usage: Option<TokenUsage>,
 }
 
 impl JsonlMapper {
@@ -56,6 +63,8 @@ impl JsonlMapper {
             answers: BTreeMap::new(),
             dates: BTreeMap::new(),
             tokens: BTreeMap::new(),
+            model: None,
+            last_usage: None,
         }
     }
 
@@ -82,13 +91,18 @@ impl JsonlMapper {
         let is_user = role == Some("user");
         let is_assistant = role == Some("assistant");
 
-        // Accumulate this turn's token usage from assistant `usage` (B1).
+        // Accumulate this turn's token usage from assistant `usage` (B1), and track
+        // the latest model id (last assistant wins) for the context-window gauge.
         if is_assistant {
             if let Some(u) = rec.message.as_ref().and_then(|m| m.usage.as_ref()) {
-                self.tokens
-                    .entry(self.current_turn)
-                    .or_default()
-                    .add(&parse_usage(u));
+                let usage = parse_usage(u);
+                self.tokens.entry(self.current_turn).or_default().add(&usage);
+                // Overwrite (not add): the latest message's prompt size is the
+                // current context occupancy for the gauge.
+                self.last_usage = Some(usage);
+            }
+            if let Some(m) = rec.message.as_ref().and_then(|m| m.model.as_ref()) {
+                self.model = Some(m.clone());
             }
         }
 
@@ -180,6 +194,16 @@ impl JsonlMapper {
     /// turn → accumulated token usage (B1).
     pub fn tokens(&self) -> &BTreeMap<u64, TokenUsage> {
         &self.tokens
+    }
+
+    /// The current (most recent) assistant model id, if any has been seen.
+    pub fn model(&self) -> Option<&str> {
+        self.model.as_deref()
+    }
+
+    /// The most recent assistant message's usage (current context occupancy).
+    pub fn last_usage(&self) -> Option<TokenUsage> {
+        self.last_usage
     }
 
     pub fn current_turn(&self) -> u64 {
@@ -716,6 +740,30 @@ mod tests {
         assert_eq!(t.output, 70);
         assert_eq!(t.cache_read, 2000);
         assert_eq!(t.cache_creation, 300);
+    }
+
+    #[test]
+    fn last_usage_overwrites_and_model_is_last_wins() {
+        let mut m = JsonlMapper::new(ROOT, SID);
+        m.apply_line(&line(json!({
+            "type": "assistant", "sessionId": SID,
+            "message": { "role": "assistant", "model": "claude-sonnet-4-6",
+                "usage": { "input_tokens": 100, "cache_read_input_tokens": 2000,
+                           "cache_creation_input_tokens": 300 }, "content": [] }
+        })));
+        m.apply_line(&line(json!({
+            "type": "assistant", "sessionId": SID,
+            "message": { "role": "assistant", "model": "claude-opus-4-8",
+                "usage": { "input_tokens": 10, "cache_read_input_tokens": 5,
+                           "cache_creation_input_tokens": 1 }, "content": [] }
+        })));
+        // last_usage is the *latest* message's usage (overwrite), not the per-turn sum.
+        let lu = m.last_usage().expect("last_usage");
+        assert_eq!(lu.input, 10);
+        assert_eq!(lu.cache_read, 5);
+        assert_eq!(lu.cache_creation, 1);
+        // model takes the most recent assistant message.
+        assert_eq!(m.model(), Some("claude-opus-4-8"));
     }
 
     // B1: an extended-thinking block becomes a Think item (reasoning flow).

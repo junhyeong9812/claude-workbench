@@ -60,6 +60,9 @@ pub struct Message {
     pub content: Option<Content>,
     /// Token accounting (input/output/cache) — parsed, surfaced in Phase E.
     pub usage: Option<serde_json::Value>,
+    /// Model id on assistant messages (e.g. `claude-opus-4-8`). Used to derive the
+    /// context-window size for the usage gauge; absent on user/system records.
+    pub model: Option<String>,
 }
 
 /// A message's content is either a bare string (a user's typed prompt), an array
