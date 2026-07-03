@@ -1,7 +1,15 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { useAppStore } from "../state/store";
 import { TERM_PRESETS, TERM_EDITABLE, xtermTheme } from "./xtermTheme";
-import { readNotifPrefs, setNotifEnabled, setSoundEnabled } from "../state/notify";
+import {
+  readNotifPrefs,
+  setNotifEnabled,
+  setSoundEnabled,
+  ensureNotifyPermission,
+  refreshNotifyPermission,
+  notifyPermissionState,
+  primeAudio,
+} from "../state/notify";
 
 /**
  * Terminal color customization dialog: pick a named preset, or set individual
@@ -29,6 +37,21 @@ export function TerminalSettings({ onClose }: { onClose: () => void }) {
     setSoundEnabled(on);
     setNotif((p) => ({ ...p, soundEnabled: on }));
   };
+
+  // OS-notification permission status (S13). The fire path never re-prompts once
+  // denied, so surface the state here and offer an explicit request — a user
+  // gesture, the reliable moment to both request permission and resume the
+  // AudioContext (autoplay policy) so later tones aren't blocked.
+  const [perm, setPerm] = useState<"granted" | "denied" | "unknown">(notifyPermissionState());
+  useEffect(() => {
+    void refreshNotifyPermission().then(setPerm);
+  }, []);
+  const requestPerm = () => {
+    primeAudio(); // user gesture — unblock tones
+    void ensureNotifyPermission(true).then((ok) => setPerm(ok ? "granted" : "denied"));
+  };
+  const permLabel =
+    perm === "granted" ? "허용됨" : perm === "denied" ? "거부됨 (OS 설정에서 변경)" : "미확인";
 
   return (
     <div className="modal-backdrop" onClick={onClose}>
@@ -100,6 +123,17 @@ export function TerminalSettings({ onClose }: { onClose: () => void }) {
             />
             <span>소리 — 알림 톤 재생</span>
           </label>
+          <div className="ts-row ts-perm-row">
+            <span className="ts-key">OS 알림 권한: {permLabel}</span>
+            <button
+              className="git-btn"
+              disabled={perm === "granted"}
+              title="OS 알림 권한을 요청하고 알림 소리를 활성화합니다"
+              onClick={requestPerm}
+            >
+              권한 요청
+            </button>
+          </div>
         </div>
 
         <div className="ts-foot">

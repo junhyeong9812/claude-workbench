@@ -41,20 +41,19 @@ import "./App.css";
  */
 function ToolbarRollup() {
   const entries = useClaudeStatus((s) => s.entries);
+  // The dock-active Claude panel is the cycle cursor (S12): clicking a group
+  // steps to the session *after* whatever you're currently on, so the cycle
+  // advances relative to the real active tab (not a private "last click" ref that
+  // drifts when you navigate by other means). Not in the group → restart at its
+  // first member (nextCycleTarget handles an absent/foreign current).
+  const activeClaudeUuid = useClaudeStatus((s) => s.activeClaudeUuid);
   const requestFocusSession = useAppStore((s) => s.requestFocusSession);
-  // Last uuid we cycled to — the "current" fed to nextCycleTarget so repeated
-  // clicks step forward through the group (a session that left the set restarts
-  // the cycle at its first member).
-  const lastCycledRef = useRef<string | null>(null);
   const { blocked, doneUnseen } = attentionUuids(entries);
   const counts = { blocked: blocked.length, doneUnseen: doneUnseen.length };
   if (!shouldShowRollup(counts)) return null;
   const cycle = (uuids: string[]) => {
-    const next = nextCycleTarget(uuids, lastCycledRef.current);
-    if (next) {
-      lastCycledRef.current = next;
-      requestFocusSession(next);
-    }
+    const next = nextCycleTarget(uuids, activeClaudeUuid);
+    if (next) requestFocusSession(next);
   };
   return (
     <div className="toolbar-rollup" role="group" aria-label="주의가 필요한 세션">

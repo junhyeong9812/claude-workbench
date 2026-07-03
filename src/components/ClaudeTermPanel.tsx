@@ -477,6 +477,11 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
       const uuid = statusUuidRef.current;
       if (!uuid) return;
       const st = useClaudeStatus.getState();
+      // activeClaudeUuid tracks the dock-active tab regardless of focus — the
+      // roll-up's cycle cursor (S12). Distinct from watchedUuid (active AND
+      // focused) which drives alert suppression.
+      if (props.api.isActive) st.setActiveClaudeUuid(uuid);
+      else if (st.activeClaudeUuid === uuid) st.setActiveClaudeUuid(null);
       if (props.api.isActive && document.hasFocus()) {
         st.markSeen(uuid);
         // This panel is what the user is actively watching now — suppress its
@@ -510,6 +515,15 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
       d.dispose();
       window.removeEventListener("focus", markSeenIfLooking);
       window.removeEventListener("blur", onBlur);
+      // This panel is unmounting (tab switch / close) — if it was the watched or
+      // active-cycle session, release those live signals so a stale uuid doesn't
+      // keep suppressing alerts or anchoring the roll-up cycle (S8/S12).
+      const uuid = statusUuidRef.current;
+      if (uuid) {
+        const st = useClaudeStatus.getState();
+        if (st.watchedUuid === uuid) st.setWatched(null);
+        if (st.activeClaudeUuid === uuid) st.setActiveClaudeUuid(null);
+      }
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [props.api]);
@@ -697,15 +711,18 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
     let attachedUuid: string | null = null;
     const pending: TerminalOutputEvent[] = [];
 
-    const applySnapshot = (s: {
-      items: TimelineItem[];
-      turns: [number, string][];
-      answers: [number, string][];
-      dates: [number, string][];
-      tokens?: [number, TokenUsage][];
-      model?: string | null;
-      last_usage?: TokenUsage | null;
-    }) => {
+    const applySnapshot = (
+      s: {
+        items: TimelineItem[];
+        turns: [number, string][];
+        answers: [number, string][];
+        dates: [number, string][];
+        tokens?: [number, TokenUsage][];
+        model?: string | null;
+        last_usage?: TokenUsage | null;
+      },
+      origin: "snapshot" | "live",
+    ) => {
       setItems([...s.items].sort((a, b) => a.seq - b.seq));
       setTurns(new Map(s.turns));
       setAnswers(new Map(s.answers));
@@ -721,6 +738,19 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
       setCtxModel(s.model ?? null);
       const lu = s.last_usage;
       setCtxTokens(lu ? lu.input + lu.cache_read + lu.cache_creation : 0);
+      // Derive the attention status from the same snapshot so a restart / reopen
+      // restores the badge (invariant ⑥) — not just live events (S5). A
+      // `snapshot` origin seeds the notifier silently (no restore re-alert);
+      // `live` (the timeline-event caller) edges normally.
+      const statusUuid = statusUuidRef.current;
+      if (statusUuid) {
+        useClaudeStatus.getState().updateFromTimeline(statusUuid, {
+          activity: deriveSessionActivity(s.turns, s.answers, s.items),
+          questionBlocked: hasOpenQuestion(s.items),
+          seenNow: props.api.isActive && document.hasFocus(),
+          origin,
+        });
+      }
     };
 
     // P2: after PTY output settles, scan the live screen bottom for an
@@ -741,6 +771,17 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
         if (s.trim() === "") continue;
         lines.push(s);
       }
+      // An empty live screen (nothing restored yet, or a transient blank frame)
+      // must NOT clear a blocked signal — clearing on an empty buffer would false-
+      // negative a session reopened while sitting at a prompt, before its
+      // scrollback repaints (S1). Only a non-empty screen produces a verdict.
+      if (lines.length === 0) return;
+      // NOTE: a permission/menu prompt that Claude drew while this session was a
+      // *backgrounded* (unmounted) tab isn't scanned until the panel remounts and
+      // repaints — the scan reads this window's live xterm buffer only. Remount +
+      // the scheduled open scan (below) recover it; a still-backgrounded prompt is
+      // a known limitation (its blocked badge still comes from the timeline
+      // question path when applicable).
       useClaudeStatus.getState().setScreenBlocked(uuid, scanBottomForPrompt(lines));
     };
     const blockedScanner = makeDebouncedScanner(runBlockedScan, 300);
@@ -768,19 +809,11 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
       unlistenTl = await listen<ClaudeTimelineEvent>("claude-timeline", (e) => {
         if (sessionId == null || e.payload.id !== sessionId) return;
         gotLive = true;
-        applySnapshot(e.payload);
+        // applySnapshot("live") also derives this session's attention status
+        // (badge) from the same payload — "seen" = this panel is the active tab
+        // AND its window is focused right now (S5 unified the derive path).
+        applySnapshot(e.payload, "live");
         setSubagents(e.payload.subagents ?? []);
-        // Derive this session's attention status (badge) from the same snapshot.
-        // "seen" = this panel is the active tab AND its window is focused right now
-        // (so a completion the user is watching never flags done-unseen).
-        const statusUuid = statusUuidRef.current;
-        if (statusUuid) {
-          useClaudeStatus.getState().updateFromTimeline(statusUuid, {
-            activity: deriveSessionActivity(e.payload.turns, e.payload.answers, e.payload.items),
-            questionBlocked: hasOpenQuestion(e.payload.items),
-            seenNow: props.api.isActive && document.hasFocus(),
-          });
-        }
       });
       // Driver changes (P6): lock/unlock input by whether we hold the driver role.
       // `rev` is monotonic — drop stale events (review R7-4).
@@ -834,6 +867,21 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
         attachedUuid = opened.session_uuid;
         useClaudeStatus.getState().registerSession(opened.session_uuid, opened.id);
         useClaudeStatus.getState().attachPanel(opened.session_uuid);
+        // Audit gap: the mount-time markSeenIfLooking ran before statusUuidRef was
+        // set (uuid null → no-op), so an initially active+focused panel would set
+        // neither watchedUuid (alert suppression) nor activeClaudeUuid (roll-up
+        // cursor) until its next activate event. Establish them now the uuid is
+        // known (S8/S12). markSeen is a no-op until the first timeline tick creates
+        // the entry — the entry's seen flag is captured there via seenNow — so
+        // watched/active are the load-bearing part here.
+        {
+          const st = useClaudeStatus.getState();
+          if (props.api.isActive) st.setActiveClaudeUuid(opened.session_uuid);
+          if (props.api.isActive && document.hasFocus()) {
+            st.markSeen(opened.session_uuid);
+            st.setWatched(opened.session_uuid);
+          }
+        }
         driverRevRef.current = opened.rev;
         const driving = opened.driver === myLabel;
         isDriverRef.current = driving;
@@ -876,6 +924,14 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
       for (const ev of pending) applyLive(ev);
       pending.length = 0;
 
+      // Mount rescan (S1): the scrollback `write()` above already triggers the
+      // debounced scanner, but a fresh reopen with no new scrollback wouldn't —
+      // so schedule one scan now that the session uuid is set and the screen is
+      // restored, recovering a blocked badge for a session reopened while sitting
+      // at a permission/menu prompt. The empty-buffer guard in runBlockedScan
+      // keeps this from clearing a signal before the repaint lands.
+      if (sessionId != null) blockedScanner.trigger();
+
       // Handoff: seed the freshly-restarted session once it should be at a prompt.
       // Ready detection is best-effort (codex P3 D3) — a fixed settle delay, with a
       // manual "요약 주입" button if it missed. The seed is idempotent (it points at
@@ -903,7 +959,7 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
           tokens?: [number, TokenUsage][];
         } | null>("claude_session_snapshot", { project, uuid: seedUuid })
           .then((snap) => {
-            if (snap && !gotLive && !disposed) applySnapshot(snap);
+            if (snap && !gotLive && !disposed) applySnapshot(snap, "snapshot");
           })
           .catch(() => {});
 

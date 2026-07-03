@@ -4,6 +4,7 @@ import { emit, listen } from "@tauri-apps/api/event";
 import type { DockviewApi, IDockviewPanel } from "dockview-react";
 import { useAppStore } from "./store";
 import { beginTransfer, endTransfer } from "./panelTransfer";
+import { useClaudeStatus } from "./claudeStatus";
 
 const KNOWN_COMPONENTS = new Set([
   "placeholder",
@@ -83,7 +84,20 @@ async function handOff(
     acked = true;
     un();
     clearTimeout(ackTimer);
-    if (!re.payload.ok) reinsert();
+    if (!re.payload.ok) {
+      reinsert();
+    } else {
+      // Transfer committed (target accepted, latest safe point): the target
+      // window now owns this session's badge in its own status store, so drop the
+      // now-stale entry from THIS (source) window's store (S9). Only on `ok` — a
+      // reject/timeout reinserts the panel here, so its badge must stay. A
+      // non-Claude panel has no uuid → no-op.
+      const uuid =
+        (spec.params.sessionUuid as string | undefined) ??
+        (spec.params.loadSessionId as string | undefined) ??
+        null;
+      if (uuid) useClaudeStatus.getState().remove(uuid);
+    }
     inFlight.delete(panelId);
   });
   ackTimer = setTimeout(() => {

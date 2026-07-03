@@ -3,46 +3,47 @@ import {
   requestPermission,
   sendNotification,
 } from "@tauri-apps/plugin-notification";
-import { useClaudeStatus, attentionOf, type SessionStatus } from "./claudeStatus";
+import {
+  useClaudeStatus,
+  onAttentionEvent,
+  type AttentionEvent,
+  type AttentionSignals,
+} from "./claudeStatus";
 
 /**
  * Attention notifications + tones (agent-status-badges P4).
  *
- * Best-effort side channel layered on top of the P1 store: it subscribes to the
- * status store and, on the **rising edge** of a session into an attention state
- * (→ blocked or → done-unseen), fires an OS notification and a Web Audio tone.
+ * Best-effort side channel layered on top of the P1 store. It subscribes to the
+ * store's **attention event bus** (S11 — the store pushes only a changed uuid's
+ * prev/next signals, so this never re-scans all sessions) and, on a rising edge
+ * into an attention state, fires an OS notification and a Web Audio tone.
  * Everything here is fire-and-forget: a denied permission, a rejected
  * `sendNotification`, or an unavailable `AudioContext` degrades to silence with a
  * single `console.warn` and never throws (invariant ⑥) — the badge, which lives
  * in the store, keeps working regardless.
  *
- * Edge semantics (invariant ③, N8/N9): notifications fire only on a transition
- * *into* an attention level, once per transition. Because `markSeen` drops the
- * badge (unseen→false) and a resolved block clears `blocked`, a later re-entry is
- * a fresh rising edge and alerts again — the "once" is per edge, not per session.
+ * Edge model (S10): `blockedActive` and `unseen` are treated as **independent
+ * signals**, not a single scalar. The combination rules (see {@link edgeKind})
+ * make blocked strictly dominate done, so e.g. a done→blocked→done bounce alerts
+ * blocked once and never re-fires done (the old scalar 2→3→2 double-alert bug).
  *
  * Suppression (N4): a session the user is actively watching — its panel active
  * AND the window focused (`watchedUuid` === uuid && document.hasFocus()) — is
- * silenced. done-unseen already can't arise while watching (the store only sets
- * unseen when the panel wasn't seen at completion); this also silences a `blocked`
- * that pops up on the panel you're looking at.
+ * silenced.
  */
 
 export type NotifKind = "blocked" | "done";
-
-/** Attention level = the store's `attentionOf` result (3 blocked, 2 done-unseen,
- * 1 working, 0 idle). Aliased for readability in the pure edge logic. */
-type Attention = 0 | 1 | 2 | 3;
 
 export interface NotifPrefs {
   notifEnabled: boolean;
   soundEnabled: boolean;
 }
 
+// --- prefs (cached — S2: no localStorage read on the fire path) --------------
+
 /** Read the user's alert/sound toggles from localStorage (TerminalSettings writes
  * them). Both default ON — the key is absent until the user opts out, so only an
- * explicit "0" disables. Independent axes (N5/N6): alerts and sound gate
- * separately. */
+ * explicit "0" disables. Independent axes (N5/N6). */
 export function readNotifPrefs(): NotifPrefs {
   return {
     notifEnabled: localStorage.getItem("notifyEnabled") !== "0",
@@ -50,11 +51,41 @@ export function readNotifPrefs(): NotifPrefs {
   };
 }
 
+/** Module cache so the hot fire path never hits localStorage (S2). Seeded on
+ * first use; kept in sync by the setters below. */
+let prefsCache: NotifPrefs | null = null;
+function cachedPrefs(): NotifPrefs {
+  if (!prefsCache) prefsCache = readNotifPrefs();
+  return prefsCache;
+}
+
 export function setNotifEnabled(on: boolean): void {
   localStorage.setItem("notifyEnabled", on ? "1" : "0");
+  prefsCache = { ...cachedPrefs(), notifEnabled: on };
 }
 export function setSoundEnabled(on: boolean): void {
   localStorage.setItem("soundEnabled", on ? "1" : "0");
+  prefsCache = { ...cachedPrefs(), soundEnabled: on };
+}
+
+// --- pure edge decision (S10) ----------------------------------------------
+
+/**
+ * Which alert (if any) a prev→next signal change fires. Blocked and done-unseen
+ * are independent rising edges combined by these rules:
+ *  ① both rise at once           → blocked only  (blocked dominates)
+ *  ② blocked held, unseen rises   → nothing        (`!next.blockedActive` guard)
+ *  ③ blocked clears, unseen already true → nothing (unseen not *rising*)
+ *  ④ blocked clears AND unseen rises same update → done
+ *  ⑤ done, blocked rises          → blocked        (any blocked rising edge)
+ * So done fires exactly on `!next.blockedActive && unseen rising`.
+ */
+export function edgeKind(prev: AttentionSignals, next: AttentionSignals): NotifKind | null {
+  const blockedRising = next.blockedActive && !prev.blockedActive;
+  const unseenRising = next.unseen && !prev.unseen;
+  if (blockedRising) return "blocked";
+  if (unseenRising && !next.blockedActive) return "done";
+  return null;
 }
 
 export interface NotifDecision {
@@ -67,20 +98,16 @@ export interface NotifDecision {
 }
 
 /**
- * Pure decision for one attention transition. `notify`/`sound` are true only on a
- * rising edge into an attention level, when not watching, and when the respective
- * toggle is on. The three axes — badge (store, not here), OS alert, sound — are
- * independent: `notifEnabled`/`soundEnabled` gate their own output only (N5/N6).
+ * Pure decision for one signal transition: the {@link edgeKind}, then gated by
+ * watching (both outputs off) and the independent notif/sound toggles (N5/N6).
  */
-export function shouldNotify(
-  prev: Attention,
-  next: Attention,
+export function decideNotify(
+  prev: AttentionSignals,
+  next: AttentionSignals,
   opts: { watching: boolean; notifEnabled: boolean; soundEnabled: boolean },
 ): NotifDecision {
-  const roseToBlocked = next === 3 && prev !== 3;
-  const roseToDone = next === 2 && prev !== 2;
-  if (!roseToBlocked && !roseToDone) return { notify: false, sound: false, kind: null };
-  const kind: NotifKind = roseToBlocked ? "blocked" : "done";
+  const kind = edgeKind(prev, next);
+  if (!kind) return { notify: false, sound: false, kind: null };
   if (opts.watching) return { notify: false, sound: false, kind };
   return { notify: opts.notifEnabled, sound: opts.soundEnabled, kind };
 }
@@ -92,7 +119,7 @@ export interface NotifySinks {
   sound: (kind: NotifKind) => void;
 }
 
-/** Everything the detector needs about "now" beyond the entries themselves. */
+/** Everything the detector needs about "now" beyond the event itself. */
 export interface NotifyContext {
   watchedUuid: string | null;
   focused: boolean;
@@ -100,49 +127,51 @@ export interface NotifyContext {
   soundEnabled: boolean;
 }
 
-type EntryView = { status: SessionStatus; unseen: boolean };
+const IDLE_SIGNALS: AttentionSignals = { blockedActive: false, unseen: false };
 
 /**
- * Rising-edge detector over successive `entries` snapshots. Holds the previous
- * attention level per uuid and, on each `process`, fires the sinks for any
- * session that crossed into an attention state. `prime` seeds the baseline
- * without firing (so pre-existing states at startup don't alert). Extracted from
- * the store subscription so the once-per-edge / re-entry / suppression rules are
- * unit-testable with plain snapshots.
+ * Incremental rising-edge detector (S11). It holds each uuid's last signals and,
+ * on each {@link AttentionEvent}, fires the sinks for a rising edge. `prime`
+ * seeds baselines without firing (so pre-existing states at startup don't alert).
+ * A uuid's **first** observation seeds silently when it comes from a `snapshot`
+ * (restore must not re-alert — S4); a `live` first sighting edges from idle so a
+ * genuinely-new blocked/done still fires.
  */
 export function createTransitionDetector(sinks: NotifySinks) {
-  const prevAttention = new Map<string, Attention>();
-
-  const attOf = (uuid: string): Attention => prevAttention.get(uuid) ?? 0;
+  const prev = new Map<string, AttentionSignals>();
 
   return {
-    /** Record current attention for every entry without firing (startup seed). */
-    prime(entries: Record<string, EntryView>) {
-      for (const [uuid, e] of Object.entries(entries)) {
-        prevAttention.set(uuid, attentionOf(e.status, e.unseen));
-      }
+    /** Record current signals for every entry without firing (startup seed). */
+    prime(signals: Record<string, AttentionSignals>) {
+      for (const [uuid, s] of Object.entries(signals)) prev.set(uuid, s);
     },
-    /** Diff `entries` against the last snapshot and fire sinks on rising edges. */
-    process(entries: Record<string, EntryView>, ctx: NotifyContext) {
-      for (const [uuid, e] of Object.entries(entries)) {
-        const next = attentionOf(e.status, e.unseen);
-        const prev = attOf(uuid);
-        prevAttention.set(uuid, next);
-        if (next === prev) continue;
-        const watching = ctx.watchedUuid === uuid && ctx.focused;
-        const d = shouldNotify(prev, next, {
-          watching,
-          notifEnabled: ctx.notifEnabled,
-          soundEnabled: ctx.soundEnabled,
-        });
-        if (d.kind == null) continue;
-        if (d.notify) sinks.notify(uuid, d.kind);
-        if (d.sound) sinks.sound(d.kind);
+    /** Handle one attention event and fire sinks on a qualifying rising edge. */
+    processEvent(ev: AttentionEvent, ctx: NotifyContext) {
+      if (ev.next === null) {
+        // Session gone — forget it so a reused uuid starts fresh.
+        prev.delete(ev.uuid);
+        return;
       }
-      // Forget sessions that are gone so a reused uuid starts fresh.
-      for (const uuid of [...prevAttention.keys()]) {
-        if (!(uuid in entries)) prevAttention.delete(uuid);
+      const next = ev.next;
+      const hadPrev = prev.has(ev.uuid);
+      let base = prev.get(ev.uuid);
+      if (!hadPrev) {
+        if (ev.origin === "snapshot") {
+          prev.set(ev.uuid, next); // silent restore baseline
+          return;
+        }
+        base = IDLE_SIGNALS; // live first sighting edges from idle
       }
+      prev.set(ev.uuid, next);
+      const watching = ctx.watchedUuid === ev.uuid && ctx.focused;
+      const d = decideNotify(base!, next, {
+        watching,
+        notifEnabled: ctx.notifEnabled,
+        soundEnabled: ctx.soundEnabled,
+      });
+      if (d.kind == null) return;
+      if (d.notify) sinks.notify(ev.uuid, d.kind);
+      if (d.sound) sinks.sound(d.kind);
     },
   };
 }
@@ -151,6 +180,47 @@ export function createTransitionDetector(sinks: NotifySinks) {
 
 let warnedPermission = false;
 let warnedSend = false;
+/** Cached permission verdict so the fire path doesn't re-prompt a user who
+ * already declined (S13). "unknown" until first checked. */
+let permissionState: "granted" | "denied" | "unknown" = "unknown";
+
+/**
+ * Ensure OS-notification permission, caching the result. `interactive:false`
+ * (the fire path) requests at most once and, once denied, never re-prompts —
+ * best-effort silence, no per-alert nagging. `interactive:true` (the settings
+ * button — a user gesture) always attempts a request. Never throws.
+ */
+export async function ensureNotifyPermission(interactive: boolean): Promise<boolean> {
+  try {
+    if (permissionState === "granted") return true;
+    if (await isPermissionGranted()) {
+      permissionState = "granted";
+      return true;
+    }
+    if (permissionState === "denied" && !interactive) return false;
+    const res = await requestPermission();
+    permissionState = res === "granted" ? "granted" : "denied";
+    return permissionState === "granted";
+  } catch {
+    return false;
+  }
+}
+
+/** Current cached permission verdict (for the settings display). */
+export function notifyPermissionState(): "granted" | "denied" | "unknown" {
+  return permissionState;
+}
+
+/** Re-query the OS permission (settings panel open) and update the cache. */
+export async function refreshNotifyPermission(): Promise<"granted" | "denied" | "unknown"> {
+  try {
+    if (await isPermissionGranted()) permissionState = "granted";
+    else if (permissionState === "granted") permissionState = "unknown";
+  } catch {
+    /* leave cache as-is */
+  }
+  return permissionState;
+}
 
 /** Copy for each transition (Korean, matching the app's hardcoded UI language). */
 function bodyFor(uuid: string, kind: NotifKind): { title: string; body: string } {
@@ -161,17 +231,14 @@ function bodyFor(uuid: string, kind: NotifKind): { title: string; body: string }
 }
 
 /**
- * Send an OS notification, requesting permission on first use. Never throws:
- * denied permission or a rejected `sendNotification` degrades to silence with a
- * single `console.warn` (invariant ⑥, N7). Awaitable for tests.
+ * Send an OS notification (best-effort). Uses the cached permission (requests at
+ * most once, never re-prompts once denied — S13). Never throws: a denied
+ * permission or a rejected `sendNotification` degrades to silence with a single
+ * `console.warn` (invariant ⑥, N7). Awaitable for tests.
  */
 export async function fireOsNotification(uuid: string, kind: NotifKind): Promise<void> {
   try {
-    let granted = await isPermissionGranted();
-    if (!granted) {
-      granted = (await requestPermission()) === "granted";
-    }
-    if (!granted) {
+    if (!(await ensureNotifyPermission(false))) {
       if (!warnedPermission) {
         console.warn("[notify] OS notification permission not granted — alerts silenced");
         warnedPermission = true;
@@ -206,6 +273,13 @@ function getAudioCtx(): AudioContext | null {
   } catch {
     return null;
   }
+}
+
+/** Resume the AudioContext from a user gesture (settings button) so later
+ * fire-time tones aren't blocked by the autoplay policy (S13). Best-effort. */
+export function primeAudio(): void {
+  const ac = getAudioCtx();
+  if (ac && ac.state === "suspended") void ac.resume().catch(() => {});
 }
 
 /** Schedule one sine beep with a short attack/release so it doesn't click. */
@@ -267,15 +341,26 @@ export function playTone(kind: NotifKind): void {
   }
 }
 
+/** Reset all module-level notifier state — test-only (permission/warn caches and
+ * prefs leak across cases otherwise). */
+export function __resetNotifyForTest(): void {
+  permissionState = "unknown";
+  warnedPermission = false;
+  warnedSend = false;
+  warnedAudio = false;
+  prefsCache = null;
+}
+
 // --- wiring ----------------------------------------------------------------
 
 let started = false;
 
 /**
  * Start the notifier for this window (idempotent). Seeds the current attention
- * baseline (no startup alerts), then subscribes to the store and fires OS
- * notifications + tones on attention rising edges. Returns a disposer (mainly for
- * symmetry/tests — normally left running for the window's lifetime).
+ * baseline (no startup alerts), then subscribes to the store's attention event
+ * bus and fires OS notifications + tones on rising edges (S11). Returns a
+ * disposer (mainly for symmetry/tests — normally left running for the window's
+ * lifetime).
  */
 export function initNotify(): () => void {
   if (started) return () => {};
@@ -285,13 +370,19 @@ export function initNotify(): () => void {
     notify: (uuid, kind) => void fireOsNotification(uuid, kind),
     sound: (kind) => playTone(kind),
   });
-  detector.prime(useClaudeStatus.getState().entries);
 
-  const unsub = useClaudeStatus.subscribe((state) => {
-    detector.process(state.entries, {
-      watchedUuid: state.watchedUuid,
+  // Seed baselines from the current entries so pre-existing states don't alert.
+  const seed: Record<string, AttentionSignals> = {};
+  for (const [uuid, e] of Object.entries(useClaudeStatus.getState().entries)) {
+    seed[uuid] = { blockedActive: e.status === "blocked", unseen: e.unseen };
+  }
+  detector.prime(seed);
+
+  const unsub = onAttentionEvent((ev) => {
+    detector.processEvent(ev, {
+      watchedUuid: useClaudeStatus.getState().watchedUuid,
       focused: typeof document !== "undefined" ? document.hasFocus() : false,
-      ...readNotifPrefs(),
+      ...cachedPrefs(),
     });
   });
 

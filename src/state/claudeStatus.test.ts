@@ -8,12 +8,14 @@ import {
   lookupSessionUuid,
   makeDebouncedScanner,
   nextCycleTarget,
+  onAttentionEvent,
   PROMPT_SCAN_MAX_LINES,
   rollup,
   scanBottomForPrompt,
   shouldShowRollup,
   useClaudeStatus,
   type ActivityItem,
+  type AttentionEvent,
   type SessionEntry,
   type SessionStatus,
 } from "./claudeStatus";
@@ -478,5 +480,172 @@ describe("store: session registry + attach/detach", () => {
     expect(lookupSessionUuid(42)).toBeUndefined();
     expect(S.getState().attached["uuid-a"]).toBeUndefined();
     expect(S.getState().entries["uuid-a"]).toBeUndefined();
+  });
+
+  // S6: bidirectional registry hygiene ---------------------------------------
+
+  it("S6: re-registering a uuid under a new numeric id drops the stale reverse", () => {
+    S.getState().registerSession("uuid-a", 42);
+    S.getState().registerSession("uuid-a", 43); // same session, new PTY id
+    expect(lookupSessionUuid(43)).toBe("uuid-a");
+    expect(lookupSessionUuid(42)).toBeUndefined(); // stale reverse evicted
+  });
+
+  it("S6: reusing a numeric id for a new uuid unbinds the old uuid's forward map", () => {
+    S.getState().registerSession("uuid-a", 42);
+    S.getState().registerSession("uuid-b", 42); // id 42 reused by a new session
+    expect(lookupSessionUuid(42)).toBe("uuid-b");
+    // uuid-a's forward mapping is gone, so removing it can't touch 42 (below).
+    S.getState().remove("uuid-a");
+    expect(lookupSessionUuid(42)).toBe("uuid-b"); // still the new session
+  });
+
+  it("S6: a stale close for a reused numeric id does NOT unmap the new session", () => {
+    S.getState().registerSession("uuid-a", 42);
+    S.getState().registerSession("uuid-b", 42); // 42 now → uuid-b
+    // An old close event for uuid-a arrives late; it must not delete 42→uuid-b.
+    S.getState().remove("uuid-a");
+    expect(lookupSessionUuid(42)).toBe("uuid-b");
+  });
+});
+
+// --- S7: seenDuringHold latch ------------------------------------------------
+
+describe("store: seenDuringHold latch (S7)", () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+    for (const uuid of Object.keys(S.getState().entries)) S.getState().remove(uuid);
+  });
+  afterEach(() => {
+    vi.clearAllTimers();
+    vi.useRealTimers();
+  });
+
+  it("a markSeen during the hold survives a later seenNow:false quiet tick", () => {
+    const u = "a";
+    S.getState().updateFromTimeline(u, { activity: "working", questionBlocked: false, seenNow: false });
+    S.getState().updateFromTimeline(u, { activity: "quiet", questionBlocked: false, seenNow: false });
+    S.getState().markSeen(u); // user looked mid-hold → latch
+    // A subsequent quiet tick still reports not-looking; without the latch this
+    // would reset seen and the hold would confirm unseen=true.
+    S.getState().updateFromTimeline(u, { activity: "quiet", questionBlocked: false, seenNow: false });
+    vi.advanceTimersByTime(HOLD_MS);
+    expect(entry(u)?.unseen).toBe(false);
+  });
+
+  it("the latch resets when real work resumes (a genuinely-unseen next completion)", () => {
+    const u = "a";
+    S.getState().updateFromTimeline(u, { activity: "working", questionBlocked: false, seenNow: false });
+    S.getState().updateFromTimeline(u, { activity: "quiet", questionBlocked: false, seenNow: false });
+    S.getState().markSeen(u); // latch
+    vi.advanceTimersByTime(HOLD_MS); // confirms seen (unseen false)
+    expect(entry(u)?.unseen).toBe(false);
+    // New work, then it finishes unseen — the latch must have reset.
+    S.getState().updateFromTimeline(u, { activity: "working", questionBlocked: false, seenNow: false });
+    expect(entry(u)?.seenDuringHold).toBe(false);
+    S.getState().updateFromTimeline(u, { activity: "quiet", questionBlocked: false, seenNow: false });
+    vi.advanceTimersByTime(HOLD_MS);
+    expect(entry(u)?.unseen).toBe(true);
+  });
+});
+
+// --- S8 / S12: watchedUuid + activeClaudeUuid lifecycle ----------------------
+
+describe("store: watchedUuid + activeClaudeUuid (S8/S12)", () => {
+  beforeEach(() => {
+    for (const uuid of Object.keys(S.getState().entries)) S.getState().remove(uuid);
+    S.getState().setWatched(null);
+    S.getState().setActiveClaudeUuid(null);
+  });
+
+  it("S12: setActiveClaudeUuid tracks the dock-active session", () => {
+    S.getState().setActiveClaudeUuid("a");
+    expect(S.getState().activeClaudeUuid).toBe("a");
+    S.getState().setActiveClaudeUuid(null);
+    expect(S.getState().activeClaudeUuid).toBeNull();
+  });
+
+  it("S8: remove clears watchedUuid + activeClaudeUuid when they point at it", () => {
+    S.getState().updateFromTimeline("a", { activity: "working", questionBlocked: false, seenNow: false });
+    S.getState().setWatched("a");
+    S.getState().setActiveClaudeUuid("a");
+    S.getState().remove("a");
+    expect(S.getState().watchedUuid).toBeNull();
+    expect(S.getState().activeClaudeUuid).toBeNull();
+  });
+
+  it("S8: remove leaves a DIFFERENT watched/active session alone", () => {
+    S.getState().updateFromTimeline("a", { activity: "working", questionBlocked: false, seenNow: false });
+    S.getState().setWatched("b");
+    S.getState().setActiveClaudeUuid("b");
+    S.getState().remove("a");
+    expect(S.getState().watchedUuid).toBe("b");
+    expect(S.getState().activeClaudeUuid).toBe("b");
+  });
+});
+
+// --- minor: no ghost entry from setScreenBlocked(false) ----------------------
+
+describe("store: setScreenBlocked ghost-entry guard (minor)", () => {
+  beforeEach(() => {
+    for (const uuid of Object.keys(S.getState().entries)) S.getState().remove(uuid);
+  });
+
+  it("clearing screen-blocked on an unknown uuid does not create an entry", () => {
+    S.getState().setScreenBlocked("never-seen", false);
+    expect(S.getState().entries["never-seen"]).toBeUndefined();
+  });
+
+  it("setting screen-blocked true DOES create the entry", () => {
+    S.getState().setScreenBlocked("fresh", true);
+    expect(S.getState().entries["fresh"]?.status).toBe("blocked");
+  });
+});
+
+// --- S11: attention event bus ------------------------------------------------
+
+describe("store: onAttentionEvent bus (S11)", () => {
+  beforeEach(() => {
+    for (const uuid of Object.keys(S.getState().entries)) S.getState().remove(uuid);
+  });
+
+  it("emits prev/next signals + origin for a changed session", () => {
+    const seen: AttentionEvent[] = [];
+    const unsub = onAttentionEvent((e) => seen.push(e));
+    S.getState().updateFromTimeline("a", {
+      activity: "working",
+      questionBlocked: true,
+      seenNow: false,
+    });
+    unsub();
+    expect(seen).toHaveLength(1);
+    expect(seen[0]).toMatchObject({
+      uuid: "a",
+      prev: null, // newly created
+      next: { blockedActive: true, unseen: false },
+      origin: "live",
+    });
+  });
+
+  it("carries the snapshot origin through for a restore seed", () => {
+    const seen: AttentionEvent[] = [];
+    const unsub = onAttentionEvent((e) => seen.push(e));
+    S.getState().updateFromTimeline("a", {
+      activity: "quiet",
+      questionBlocked: false,
+      seenNow: false,
+      origin: "snapshot",
+    });
+    unsub();
+    expect(seen[0]?.origin).toBe("snapshot");
+  });
+
+  it("emits a removal event (next === null) on remove", () => {
+    S.getState().updateFromTimeline("a", { activity: "working", questionBlocked: false, seenNow: false });
+    const seen: AttentionEvent[] = [];
+    const unsub = onAttentionEvent((e) => seen.push(e));
+    S.getState().remove("a");
+    unsub();
+    expect(seen[seen.length - 1]).toMatchObject({ uuid: "a", next: null });
   });
 });

@@ -22,6 +22,13 @@ export type SessionStatus = "blocked" | "working" | "idle";
 /** Timeline-derived activity, before the working→quiet hold is applied. */
 export type SessionActivity = "working" | "quiet";
 
+/** Where a status update came from. A `snapshot` seeds a restored/re-attached
+ * state (restart, reopen) — the notifier treats a uuid's first `snapshot`
+ * observation as a silent baseline (invariant ⑥: restore must not re-alert). A
+ * `live` update (a real timeline event or a screen scan) is a genuine edge and
+ * alerts normally. Defaults to `live` when unspecified. */
+export type TimelineOrigin = "snapshot" | "live";
+
 /** Minimal shape the pure derivations read off a `TimelineItem` — kept local so
  * this module has no dependency on the React timeline component (vitest-friendly).
  * `TimelineItem` structurally satisfies it. */
@@ -244,6 +251,11 @@ export interface SessionEntry {
   screenBlocked: boolean;
   /** Last known "user is looking at this panel" (active + window focused). */
   seen: boolean;
+  /** Latched true if the user looked (markSeen) at any point during the current
+   * working→quiet hold epoch. Once latched, a later quiet tick reporting
+   * `seenNow:false` can't un-see the completion — the hold confirms as *seen*
+   * (unseen:false). Reset when real work resumes (S7). */
+  seenDuringHold: boolean;
 }
 
 /** Payload the panel feeds updateFromTimeline on each `claude-timeline` tick. */
@@ -253,6 +265,9 @@ export interface DerivedTimeline {
   questionBlocked: boolean;
   /** Panel active AND window focused right now. */
   seenNow: boolean;
+  /** Snapshot seed (restore) vs a live edge — see {@link TimelineOrigin}.
+   * Defaults to `live`. */
+  origin?: TimelineOrigin;
 }
 
 function emptyEntry(): SessionEntry {
@@ -263,7 +278,48 @@ function emptyEntry(): SessionEntry {
     questionBlocked: false,
     screenBlocked: false,
     seen: false,
+    seenDuringHold: false,
   };
+}
+
+// --- attention event bus (S11: incremental notification) ---------------------
+
+/** The two independent attention signals the notifier edges on (S10). Kept as a
+ * flat pair (not the scalar `attentionOf`) so blocked and done-unseen are
+ * separate rising edges the combination rules can reason about individually. */
+export interface AttentionSignals {
+  /** Display status is currently "blocked". */
+  blockedActive: boolean;
+  /** done-unseen flag (meaningful only when not blocked). */
+  unseen: boolean;
+}
+
+/** One session's attention change. `prev === null` = the entry was just created;
+ * `next === null` = it was removed. `origin` is the triggering update's origin
+ * (a snapshot seed suppresses the first-observation alert — S4). */
+export interface AttentionEvent {
+  uuid: string;
+  prev: AttentionSignals | null;
+  next: AttentionSignals | null;
+  origin: TimelineOrigin;
+}
+
+function attentionSignals(e: SessionEntry): AttentionSignals {
+  return { blockedActive: e.status === "blocked", unseen: e.unseen };
+}
+
+const attentionListeners = new Set<(ev: AttentionEvent) => void>();
+
+/** Subscribe to per-session attention changes (the notifier's feed — S11). The
+ * store actions push only the changed uuid's prev/next signals here, so the
+ * notifier never re-scans all entries. Returns an unsubscribe. */
+export function onAttentionEvent(cb: (ev: AttentionEvent) => void): () => void {
+  attentionListeners.add(cb);
+  return () => attentionListeners.delete(cb);
+}
+
+function emitAttention(ev: AttentionEvent): void {
+  for (const cb of attentionListeners) cb(ev);
 }
 
 /** Recompute the display status from the internal fields. Blocked (question or
@@ -310,8 +366,17 @@ interface StatusStore {
    * "watching" signal distinct from `SessionEntry.seen` (which is a snapshot from
    * the last timeline tick and isn't cleared on blur). */
   watchedUuid: string | null;
+  /** The Claude panel that is the **active dock tab** in this window right now —
+   * regardless of window focus (distinct from `watchedUuid`, which additionally
+   * requires focus and drives alert suppression). This is the roll-up's cycle
+   * cursor: clicking a group steps to the session *after* the active one, so the
+   * cycle advances relative to what you're actually on. `null` when no Claude
+   * panel is the active tab. Maintained by ClaudeTermPanel's activate/deactivate. */
+  activeClaudeUuid: string | null;
   /** Set the actively-watched session (null when the user looks away/blurs). */
   setWatched: (uuid: string | null) => void;
+  /** Set the dock-active Claude panel's uuid (S12 — roll-up cycle cursor). */
+  setActiveClaudeUuid: (uuid: string | null) => void;
   /** Record a timeline tick for `uuid`, applying the working→quiet hold and the
    * unseen rule at hold-confirm. Blocked (question) is applied immediately. */
   updateFromTimeline: (uuid: string, d: DerivedTimeline) => void;
@@ -331,7 +396,7 @@ interface StatusStore {
   detachPanel: (uuid: string) => void;
 }
 
-export const useClaudeStatus = create<StatusStore>((set) => {
+export const useClaudeStatus = create<StatusStore>((set, get) => {
   const clearHold = (uuid: string) => {
     const t = holdTimers.get(uuid);
     if (t !== undefined) {
@@ -340,20 +405,42 @@ export const useClaudeStatus = create<StatusStore>((set) => {
     }
   };
 
+  /** Commit a new entry for `uuid` and push its attention delta to the notifier
+   * bus (S11). `prevEntry` is the pre-update entry (undefined = newly created). */
+  const commit = (
+    uuid: string,
+    e: SessionEntry,
+    prevEntry: SessionEntry | undefined,
+    origin: TimelineOrigin,
+  ) => {
+    set((s) => ({ entries: { ...s.entries, [uuid]: e } }));
+    emitAttention({
+      uuid,
+      prev: prevEntry ? attentionSignals(prevEntry) : null,
+      next: attentionSignals(e),
+      origin,
+    });
+  };
+
   const scheduleHold = (uuid: string) => {
     clearHold(uuid);
     const t = setTimeout(() => {
       holdTimers.delete(uuid);
-      set((s) => {
-        const prev = s.entries[uuid];
-        if (!prev) return {};
-        // Confirm quiet. done-unseen iff the panel wasn't seen at completion
-        // (seen was last set from the completion tick's seenNow, or by markSeen
-        // if the user looked during the hold).
-        const e: SessionEntry = { ...prev, activity: "quiet", unseen: !prev.seen };
-        e.status = statusOf(e);
-        return { entries: { ...s.entries, [uuid]: e } };
-      });
+      const prev = get().entries[uuid];
+      if (!prev) return;
+      // Confirm quiet. done-unseen iff the panel wasn't seen at completion —
+      // where "seen" latches: either the last completion tick's seenNow, OR a
+      // markSeen at any point during this hold epoch (seenDuringHold, S7). A
+      // quiet tick reporting seenNow:false after the user already looked must
+      // NOT resurrect unseen, so the latch wins. Epoch ends here.
+      const e: SessionEntry = {
+        ...prev,
+        activity: "quiet",
+        unseen: !(prev.seen || prev.seenDuringHold),
+        seenDuringHold: false,
+      };
+      e.status = statusOf(e);
+      commit(uuid, e, prev, "live");
     }, HOLD_MS);
     holdTimers.set(uuid, t);
   };
@@ -362,70 +449,96 @@ export const useClaudeStatus = create<StatusStore>((set) => {
     entries: {},
     attached: {},
     watchedUuid: null,
+    activeClaudeUuid: null,
 
     setWatched: (uuid) => {
       set((s) => (s.watchedUuid === uuid ? {} : { watchedUuid: uuid }));
     },
 
+    setActiveClaudeUuid: (uuid) => {
+      set((s) => (s.activeClaudeUuid === uuid ? {} : { activeClaudeUuid: uuid }));
+    },
+
     updateFromTimeline: (uuid, d) => {
-      set((s) => {
-        const prev = s.entries[uuid] ?? emptyEntry();
-        const e: SessionEntry = { ...prev, questionBlocked: d.questionBlocked, seen: d.seenNow };
-        if (d.activity === "working") {
-          // Real work (again) — cancel any pending hold, drop stale done-unseen.
-          clearHold(uuid);
-          e.activity = "working";
-          e.unseen = false;
-        } else if (prev.activity === "working") {
-          // working→quiet: don't confirm yet. Keep showing "working" through the
-          // hold; if the hold is already running, let it keep ticking.
-          if (!holdTimers.has(uuid)) scheduleHold(uuid);
-          e.activity = "working";
-        } else {
-          // Already quiet (or never worked) — nothing to hold.
-          e.activity = "quiet";
-        }
-        e.status = statusOf(e);
-        return { entries: { ...s.entries, [uuid]: e } };
-      });
+      const prevEntry = get().entries[uuid];
+      const prev = prevEntry ?? emptyEntry();
+      const e: SessionEntry = { ...prev, questionBlocked: d.questionBlocked, seen: d.seenNow };
+      if (d.activity === "working") {
+        // Real work (again) — cancel any pending hold, drop stale done-unseen,
+        // and reset the seen latch so this fresh epoch starts clean (S7).
+        clearHold(uuid);
+        e.activity = "working";
+        e.unseen = false;
+        e.seenDuringHold = false;
+      } else if (prev.activity === "working") {
+        // working→quiet: don't confirm yet. Keep showing "working" through the
+        // hold; if the hold is already running, let it keep ticking.
+        if (!holdTimers.has(uuid)) scheduleHold(uuid);
+        e.activity = "working";
+      } else {
+        // Already quiet (or never worked) — nothing to hold.
+        e.activity = "quiet";
+      }
+      e.status = statusOf(e);
+      commit(uuid, e, prevEntry, d.origin ?? "live");
     },
 
     setScreenBlocked: (uuid, blocked) => {
-      set((s) => {
-        const prev = s.entries[uuid] ?? emptyEntry();
-        if (prev.screenBlocked === blocked && uuid in s.entries) return {};
-        const e: SessionEntry = { ...prev, screenBlocked: blocked };
-        e.status = statusOf(e);
-        return { entries: { ...s.entries, [uuid]: e } };
-      });
+      const prevEntry = get().entries[uuid];
+      // Don't materialize a ghost idle entry for a never-seen uuid when clearing
+      // (blocked:false) — only a real blocked signal creates an entry (minor).
+      if (!prevEntry && !blocked) return;
+      const prev = prevEntry ?? emptyEntry();
+      if (prev.screenBlocked === blocked && prevEntry) return;
+      const e: SessionEntry = { ...prev, screenBlocked: blocked };
+      e.status = statusOf(e);
+      commit(uuid, e, prevEntry, "live");
     },
 
     markSeen: (uuid) => {
-      set((s) => {
-        const prev = s.entries[uuid];
-        if (!prev) return {};
-        const e: SessionEntry = { ...prev, seen: true, unseen: false };
-        e.status = statusOf(e);
-        return { entries: { ...s.entries, [uuid]: e } };
-      });
+      const prevEntry = get().entries[uuid];
+      if (!prevEntry) return;
+      // Latch seenDuringHold so a later seenNow:false quiet tick can't un-see
+      // this completion (S7); clear unseen and remember seen.
+      const e: SessionEntry = { ...prevEntry, seen: true, unseen: false, seenDuringHold: true };
+      e.status = statusOf(e);
+      commit(uuid, e, prevEntry, "live");
     },
 
     remove: (uuid) => {
       clearHold(uuid);
       const numericId = uuidToNumeric.get(uuid);
-      if (numericId !== undefined) numericToUuid.delete(numericId);
-      uuidToNumeric.delete(uuid);
+      // Only drop the reverse (numeric→uuid) mapping if it still points at THIS
+      // uuid — a stale close for a reused numeric id must not unmap the session
+      // that now owns it (S6).
+      if (numericId !== undefined) {
+        if (numericToUuid.get(numericId) === uuid) numericToUuid.delete(numericId);
+        uuidToNumeric.delete(uuid);
+      }
+      const prevEntry = get().entries[uuid];
       set((s) => {
-        if (!(uuid in s.entries) && !(uuid in s.attached)) return {};
+        const clearWatched = s.watchedUuid === uuid ? { watchedUuid: null } : {};
+        const clearActive = s.activeClaudeUuid === uuid ? { activeClaudeUuid: null } : {};
+        if (!(uuid in s.entries) && !(uuid in s.attached)) {
+          return { ...clearWatched, ...clearActive };
+        }
         const rest = { ...s.entries };
         delete rest[uuid];
         const att = { ...s.attached };
         delete att[uuid];
-        return { entries: rest, attached: att };
+        return { entries: rest, attached: att, ...clearWatched, ...clearActive };
       });
+      if (prevEntry) emitAttention({ uuid, prev: attentionSignals(prevEntry), next: null, origin: "live" });
     },
 
     registerSession: (uuid, numericId) => {
+      // Evict stale mappings on either side before (re)binding, so a reused
+      // numeric id or a uuid re-registered under a new id can't leave a dangling
+      // reverse entry that resolves the wrong session (S6).
+      const staleUuid = numericToUuid.get(numericId);
+      if (staleUuid !== undefined && staleUuid !== uuid) uuidToNumeric.delete(staleUuid);
+      const staleNumeric = uuidToNumeric.get(uuid);
+      if (staleNumeric !== undefined && staleNumeric !== numericId) numericToUuid.delete(staleNumeric);
       numericToUuid.set(numericId, uuid);
       uuidToNumeric.set(uuid, numericId);
     },

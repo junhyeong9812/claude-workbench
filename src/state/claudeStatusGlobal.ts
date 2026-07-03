@@ -38,7 +38,23 @@ interface TimelinePayload {
 }
 
 let started = false;
+/** Set by the disposer so a `listen()` promise that resolves *after* teardown
+ * immediately unlistens instead of leaking (S3 async race). */
+let disposed = false;
 let unlisteners: UnlistenFn[] = [];
+
+/** Track a pending `listen()` registration: push its unlistener when it lands,
+ * or unlisten at once if we were already disposed. A rejected registration
+ * warns and reopens `started` so a later init can retry (S3). */
+function track(p: Promise<UnlistenFn>): void {
+  p.then((un) => {
+    if (disposed) un();
+    else unlisteners.push(un);
+  }).catch((err) => {
+    console.warn("[claudeStatusGlobal] listener registration failed — will retry on next init", err);
+    started = false;
+  });
+}
 
 /** Start the window-global attention listener (idempotent). Returns a disposer
  * that tears it down (mainly for symmetry / tests — normally left running for
@@ -46,29 +62,37 @@ let unlisteners: UnlistenFn[] = [];
 export function initClaudeStatusGlobal(): () => void {
   if (started) return disposeClaudeStatusGlobal;
   started = true;
+  disposed = false;
 
-  void listen<TimelinePayload>("claude-timeline", (e) => {
-    const uuid = lookupSessionUuid(e.payload.id);
-    if (!uuid) return; // an id we never registered (another window's session)
-    // A mounted panel owns its own (accurate-seenNow) update — don't clobber it.
-    if (useClaudeStatus.getState().attached[uuid]) return;
-    useClaudeStatus.getState().updateFromTimeline(uuid, {
-      activity: deriveSessionActivity(e.payload.turns, e.payload.answers, e.payload.items),
-      questionBlocked: hasOpenQuestion(e.payload.items),
-      // The panel is unmounted, so by definition the user isn't looking at it.
-      seenNow: false,
-    });
-  }).then((un) => unlisteners.push(un));
+  track(
+    listen<TimelinePayload>("claude-timeline", (e) => {
+      const uuid = lookupSessionUuid(e.payload.id);
+      if (!uuid) return; // an id we never registered (another window's session)
+      // A mounted panel owns its own (accurate-seenNow) update — don't clobber it.
+      if (useClaudeStatus.getState().attached[uuid]) return;
+      useClaudeStatus.getState().updateFromTimeline(uuid, {
+        activity: deriveSessionActivity(e.payload.turns, e.payload.answers, e.payload.items),
+        questionBlocked: hasOpenQuestion(e.payload.items),
+        // The panel is unmounted, so by definition the user isn't looking at it.
+        seenNow: false,
+        // A backgrounded session's live JSONL edge — alert normally.
+        origin: "live",
+      });
+    }),
+  );
 
-  void listen<number>("claude-session-closed", (e) => {
-    const uuid = lookupSessionUuid(e.payload);
-    if (uuid) useClaudeStatus.getState().remove(uuid);
-  }).then((un) => unlisteners.push(un));
+  track(
+    listen<number>("claude-session-closed", (e) => {
+      const uuid = lookupSessionUuid(e.payload);
+      if (uuid) useClaudeStatus.getState().remove(uuid);
+    }),
+  );
 
   return disposeClaudeStatusGlobal;
 }
 
 function disposeClaudeStatusGlobal() {
+  disposed = true;
   for (const un of unlisteners) un();
   unlisteners = [];
   started = false;
