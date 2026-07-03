@@ -7,6 +7,7 @@ import { EditorState, Compartment } from "@codemirror/state";
 import { keymap } from "@codemirror/view";
 import { langFor, fileName } from "./cmLang";
 import { completionExts } from "./cmComplete";
+import { lintExts } from "./cmLint";
 import { cmThemeExt } from "./cmTheme";
 import { useAppStore } from "../state/store";
 
@@ -152,6 +153,7 @@ export function EditorPanel(props: IDockviewPanelProps<EditorParams>) {
               themeComp.current.of(cmThemeExt(useAppStore.getState().theme)),
               ...langFor(path),
               ...completionExts(path, useAppStore.getState().activeProject),
+              ...lintExts(path, useAppStore.getState().activeProject),
               keymap.of([{ key: "Mod-s", preventDefault: true, run: () => saveRef.current() }]),
               EditorView.updateListener.of((u) => {
                 if (u.docChanged) {

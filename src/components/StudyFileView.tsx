@@ -12,6 +12,7 @@ import { useAppStore } from "../state/store";
 import { langFor } from "./cmLang";
 import { cmThemeExt } from "./cmTheme";
 import { completionExts } from "./cmComplete";
+import { lintExts } from "./cmLint";
 import { isMarkdownPath, Markdown } from "./markdown";
 import { useFileText } from "../hooks/useFileText";
 
@@ -72,6 +73,7 @@ export function StudyFileView({
         const exts = [basicSetup, cmThemeExt(theme), ...langFor(path)];
         if (editable) {
           exts.push(...completionExts(path, project));
+          exts.push(...lintExts(path, project));
           exts.push(
             keymap.of([
               {

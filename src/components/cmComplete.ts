@@ -60,7 +60,7 @@ export function fqcnFromPath(rel: string): { name: string; fqcn: string } | null
   return { name, fqcn: parts.join(".") };
 }
 
-interface ClassIndex {
+export interface ClassIndex {
   at: number;
   classes: { name: string; fqcn: string }[];
   truncated: boolean;
@@ -70,8 +70,9 @@ const INDEX_TTL_MS = 30_000;
 const SEARCH_CAP = 500; // backend SEARCH_LIMIT — a bigger project's index is partial
 
 /** List the project's Java/Kotlin classes via the gitignore-aware file finder
- * (backend `search_files`), cached briefly per project. */
-async function classIndex(project: string): Promise<ClassIndex> {
+ * (backend `search_files`), cached briefly per project. Shared with the import
+ * linter (cmLint.ts). */
+export async function classIndex(project: string): Promise<ClassIndex> {
   const hit = indexCache.get(project);
   if (hit && Date.now() - hit.at < INDEX_TTL_MS) return hit;
   const [java, kt] = await Promise.all([
