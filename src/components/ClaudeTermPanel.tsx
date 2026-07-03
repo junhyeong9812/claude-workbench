@@ -762,13 +762,17 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
     // backfill write + the scheduled open scan) are a *snapshot* of pre-existing
     // screen state — they must seed the notifier silently, not re-alert a prompt
     // the user already saw before the restart. The first genuinely NEW output
-    // (a live terminal-output event) or a keystroke flips this to "live".
+    // (a live terminal-output event) or a keystroke flips this to "live". Each
+    // trigger passes the origin AT TRIGGER TIME — the debounced scanner resolves
+    // a coalesced batch to snapshot only when every trigger was snapshot, so live
+    // output landing inside the debounce window can't retroactively promote a
+    // pure restore scan.
     let scanOrigin: "snapshot" | "live" = "snapshot";
     // S1: gate empty-screen scans — blank before the restore paints is "no data"
-    // (don't clear a blocked signal), blank after a non-empty screen is a real
-    // clear-screen (do clear, else blocked goes sticky).
+    // (don't clear a blocked signal); after the post-restore scan is armed (or a
+    // non-empty screen was seen) a blank screen is a real verdict and may clear.
     const scanGate = makeScanGate();
-    const runBlockedScan = () => {
+    const runBlockedScan = (origin: "snapshot" | "live") => {
       const t = termRef.current;
       const uuid = statusUuidRef.current;
       if (!t || !uuid) return;
@@ -790,14 +794,14 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
       // the scheduled open scan (below) recover it; a still-backgrounded prompt is
       // a known limitation (its blocked badge still comes from the timeline
       // question path when applicable).
-      useClaudeStatus.getState().setScreenBlocked(uuid, scanBottomForPrompt(lines), scanOrigin);
+      useClaudeStatus.getState().setScreenBlocked(uuid, scanBottomForPrompt(lines), origin);
     };
     const blockedScanner = makeDebouncedScanner(runBlockedScan, 300);
 
     const write = (bytes: number[]) => {
       if (!disposed) {
         term.write(new Uint8Array(bytes));
-        blockedScanner.trigger();
+        blockedScanner.trigger(scanOrigin);
       }
     };
     const applyLive = (ev: TerminalOutputEvent) => {
@@ -939,10 +943,14 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
       // so schedule one scan now that the session uuid is set and the screen is
       // restored, recovering a blocked badge for a session reopened while sitting
       // at a permission/menu prompt. This restore scan reports origin "snapshot"
-      // (silent notifier seed — S4a) unless live output already arrived; the
-      // scanGate keeps a still-blank screen from clearing a signal before the
-      // repaint lands.
-      if (sessionId != null) blockedScanner.trigger();
+      // (silent notifier seed — S4a) unless live output already arrived. Arming
+      // the gate here (S1): the restore is over, so from this scan onward even a
+      // genuinely-empty screen is a valid verdict and may clear a stale blocked
+      // signal (before arming, blank = "not painted yet" and is ignored).
+      if (sessionId != null) {
+        scanGate.arm();
+        blockedScanner.trigger(scanOrigin);
+      }
 
       // Handoff: seed the freshly-restarted session once it should be at a prompt.
       // Ready detection is best-effort (codex P3 D3) — a fixed settle delay, with a
@@ -991,7 +999,7 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
       // clears quickly (the PTY redraw also triggers a scan; this just leads it).
       // User interaction ends the restore phase — subsequent scans are live (S4a).
       scanOrigin = "live";
-      blockedScanner.trigger();
+      blockedScanner.trigger("live");
       // Mirrors are read-only; only the driver writes (backend also enforces — P6).
       if (sessionId == null || inputLockedRef.current || !isDriverRef.current) return;
       // Drop IME composition output (multi-byte / non-ASCII) — Hangul only

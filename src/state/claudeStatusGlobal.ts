@@ -69,9 +69,15 @@ function track(p: Promise<UnlistenFn>, gen: number): void {
 
 /** Start the window-global attention listener (idempotent). Returns a disposer
  * that tears it down (mainly for symmetry / tests — normally left running for
- * the window's lifetime). */
+ * the window's lifetime). The disposer is bound to ITS init's generation: a
+ * stale handle from an already-disposed init is a no-op, so calling it again
+ * can't tear down a newer generation's live listeners (S3). */
 export function initClaudeStatusGlobal(): () => void {
-  if (started) return disposeClaudeStatusGlobal;
+  if (started) {
+    // Already running — hand out a disposer bound to the RUNNING generation.
+    const cur = generation;
+    return () => disposeGeneration(cur);
+  }
   started = true;
   generation++;
   const gen = generation;
@@ -104,10 +110,14 @@ export function initClaudeStatusGlobal(): () => void {
     gen,
   );
 
-  return disposeClaudeStatusGlobal;
+  return () => disposeGeneration(gen);
 }
 
-function disposeClaudeStatusGlobal() {
+/** Tear down generation `gen` — no-op unless it is still the current one (a
+ * stale disposer, re-invoked after its generation already ended, must not kill
+ * a newer init's listeners — S3). */
+function disposeGeneration(gen: number) {
+  if (gen !== generation) return;
   generation++; // invalidate any in-flight registrations of the old generation
   for (const un of unlisteners) un();
   unlisteners = [];

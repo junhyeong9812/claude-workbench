@@ -151,23 +151,37 @@ export function scanBottomForPrompt(lines: readonly string[]): boolean {
  * final screen (intermediate frames ignored — invariant ②/F4). `cancel()` clears
  * a pending fire (call on unmount). Extracted from the component so the debounce
  * is unit-testable with fake timers.
+ *
+ * Origin (S4a): each trigger records its origin *at trigger time* — reading a
+ * shared variable at execution time would let live output arriving within the
+ * debounce window promote a pure restore-replay scan to "live" (re-alerting a
+ * restored prompt). A coalesced batch resolves to `snapshot` only when EVERY
+ * trigger in it was snapshot; any live trigger makes the batch live (live output
+ * is new information — that scan's verdict genuinely is live). Batch resets
+ * after each run.
  */
 export function makeDebouncedScanner(
-  run: () => void,
+  run: (origin: TimelineOrigin) => void,
   delay: number,
-): { trigger: () => void; cancel: () => void } {
+): { trigger: (origin?: TimelineOrigin) => void; cancel: () => void } {
   let timer: ReturnType<typeof setTimeout> | undefined;
+  let batchOrigin: TimelineOrigin | null = null; // null = no batch pending
   const cancel = () => {
     if (timer !== undefined) {
       clearTimeout(timer);
       timer = undefined;
     }
+    batchOrigin = null;
   };
-  const trigger = () => {
-    cancel();
+  const trigger = (origin: TimelineOrigin = "live") => {
+    // Batch rule: all-snapshot → snapshot; any live → live.
+    batchOrigin = batchOrigin === null ? origin : origin === "live" ? "live" : batchOrigin;
+    if (timer !== undefined) clearTimeout(timer);
     timer = setTimeout(() => {
       timer = undefined;
-      run();
+      const o = batchOrigin ?? "live";
+      batchOrigin = null;
+      run(o);
     }, delay);
   };
   return { trigger, cancel };
@@ -176,21 +190,27 @@ export function makeDebouncedScanner(
 /**
  * Empty-screen scan gate (S1). A blank live screen right after a panel mounts is
  * just "restore hasn't painted yet" — clearing screen-blocked on it would false-
- * negative a session reopened while sitting at a prompt. But once the screen has
- * been seen non-empty, a later blank screen is a REAL clear-screen and must be
- * allowed to clear the signal (otherwise blocked goes sticky). `admit(nonEmpty)`
- * returns whether the scan result may be applied, latching on the first
- * non-empty screen. One gate per panel mount.
+ * negative a session reopened while sitting at a prompt. `admit(nonEmpty)` says
+ * whether the scan result may be applied: admitted when the screen is non-empty
+ * (latching — a later blank is a REAL clear-screen and may clear the signal) OR
+ * once the gate is `arm()`ed. Arm when the post-restore scheduled scan is issued:
+ * from then on the restore is over, so even a genuinely-empty screen is a valid
+ * verdict (otherwise a blocked badge would stick on a session whose restored
+ * screen really is blank). One gate per panel mount.
  */
-export function makeScanGate(): { admit: (nonEmpty: boolean) => boolean } {
+export function makeScanGate(): { admit: (nonEmpty: boolean) => boolean; arm: () => void } {
   let sawNonEmpty = false;
+  let armed = false;
   return {
+    arm() {
+      armed = true;
+    },
     admit(nonEmpty: boolean): boolean {
       if (nonEmpty) {
         sawNonEmpty = true;
         return true;
       }
-      return sawNonEmpty;
+      return sawNonEmpty || armed;
     },
   };
 }

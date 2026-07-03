@@ -82,12 +82,13 @@ async function handOff(
   const un = await listen<{ transferId: string; ok: boolean }>("transfer-result", (re) => {
     if (acked || re.payload.transferId !== transferId) return;
     acked = true;
-    un();
-    clearTimeout(ackTimer);
-    // try/finally: whatever the post-ack bookkeeping throws (reinsert's addPanel,
-    // the badge remove — S11), the in-flight lock MUST release, or this panel
-    // could never be transferred again.
+    // try/finally on the WHOLE settle path (S11): whatever the post-ack
+    // bookkeeping throws (reinsert's addPanel, the badge remove), the listener
+    // release and the in-flight lock MUST both happen — a leaked `inFlight`
+    // entry would make this panel untransferable forever, a leaked listener
+    // would double-settle a future transfer.
     try {
+      clearTimeout(ackTimer);
       if (!re.payload.ok) {
         reinsert();
       } else {
@@ -103,15 +104,21 @@ async function handOff(
         if (uuid) useClaudeStatus.getState().remove(uuid);
       }
     } finally {
+      un();
       inFlight.delete(panelId);
     }
   });
   ackTimer = setTimeout(() => {
     if (acked) return;
     acked = true;
-    un();
-    reinsert();
-    inFlight.delete(panelId);
+    // Same discipline as the ack path: reinsert may throw (dockview state), but
+    // the listener + in-flight lock must still release (S11).
+    try {
+      reinsert();
+    } finally {
+      un();
+      inFlight.delete(panelId);
+    }
   }, ACCEPT_TIMEOUT_MS);
 
   // Detach the source panel (session survives via the guard), then VERIFY it

@@ -423,6 +423,44 @@ describe("makeDebouncedScanner — trailing debounce (E4)", () => {
     vi.advanceTimersByTime(300);
     expect(run).toHaveBeenCalledTimes(2);
   });
+
+  // S4a: the batch origin is captured per trigger, not read at execution time.
+  it("S4a: an all-snapshot batch runs with origin snapshot (even if 'now' is live)", () => {
+    const run = vi.fn();
+    const { trigger } = makeDebouncedScanner(run, 300);
+    trigger("snapshot"); // restore replay — nothing else happens
+    // (a shared-variable design would read "live" here if the phase advanced)
+    vi.advanceTimersByTime(300);
+    expect(run).toHaveBeenCalledWith("snapshot");
+  });
+
+  it("S4a: a live trigger inside the batch promotes the whole batch to live", () => {
+    const run = vi.fn();
+    const { trigger } = makeDebouncedScanner(run, 300);
+    trigger("snapshot"); // restore replay …
+    trigger("live"); // … then real new output within the debounce window
+    vi.advanceTimersByTime(300);
+    expect(run).toHaveBeenCalledWith("live");
+  });
+
+  it("S4a: the batch origin resets after each run (live batch doesn't taint the next)", () => {
+    const run = vi.fn();
+    const { trigger } = makeDebouncedScanner(run, 300);
+    trigger("live");
+    vi.advanceTimersByTime(300);
+    trigger("snapshot");
+    vi.advanceTimersByTime(300);
+    expect(run).toHaveBeenNthCalledWith(1, "live");
+    expect(run).toHaveBeenNthCalledWith(2, "snapshot");
+  });
+
+  it("S4a: trigger() without an origin defaults to live", () => {
+    const run = vi.fn();
+    const { trigger } = makeDebouncedScanner(run, 300);
+    trigger();
+    vi.advanceTimersByTime(300);
+    expect(run).toHaveBeenCalledWith("live");
+  });
 });
 
 // --- registry: numeric↔uuid mapping + attach/detach (P3 global listener) ------
@@ -743,5 +781,14 @@ describe("makeScanGate (S1)", () => {
     const g = makeScanGate();
     expect(g.admit(true)).toBe(true); // restore painted (maybe a prompt)
     expect(g.admit(false)).toBe(true); // later blank = actual clear → may clear blocked
+  });
+
+  it("S1: arm() admits empty scans even when the screen was never non-empty", () => {
+    const g = makeScanGate();
+    expect(g.admit(false)).toBe(false); // pre-arm blank — restore not painted, ignore
+    g.arm(); // the post-restore scheduled scan is issued — restore is over
+    // A genuinely-empty restored screen is now a valid verdict (clears a stale
+    // blocked signal instead of leaving it sticky).
+    expect(g.admit(false)).toBe(true);
   });
 });

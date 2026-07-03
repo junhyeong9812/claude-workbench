@@ -135,4 +135,27 @@ describe("initClaudeStatusGlobal — async race + retry (S3)", () => {
     // The late failure still unlistens the already-registered sibling.
     expect(survivor).toHaveBeenCalledTimes(1);
   });
+
+  it("S3: a stale disposer re-invoked after its generation ended is a no-op (doesn't kill B)", async () => {
+    // init A → dispose A → init B (listeners live) → call A's disposer again:
+    // B's listeners must survive; only B's own disposer tears them down.
+    const disposeA = initClaudeStatusGlobal();
+    resolvers.splice(0).forEach((r) => r(vi.fn()));
+    await flush();
+    disposeA(); // A ends
+
+    const disposeB = initClaudeStatusGlobal();
+    const bSpies = resolvers.splice(0).map((r) => {
+      const s = vi.fn();
+      r(s);
+      return s;
+    });
+    await flush();
+
+    disposeA(); // stale handle re-invoked — must NOT touch B's generation
+    for (const s of bSpies) expect(s).not.toHaveBeenCalled();
+
+    disposeB();
+    for (const s of bSpies) expect(s).toHaveBeenCalledTimes(1);
+  });
 });
