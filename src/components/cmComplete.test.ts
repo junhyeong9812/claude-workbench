@@ -51,4 +51,16 @@ describe("importInsertion", () => {
     const ins = importInsertion(doc, "com.acme.Foo", true);
     expect(ins!.insert).toBe("import com.acme.Foo\n");
   });
+
+  it("returns null for a default-package class (not importable)", () => {
+    expect(importInsertion(doc, "Foo", false)).toBeNull();
+  });
+
+  it("ignores commented-out headers (inserts outside; commented import ≠ imported)", () => {
+    const commented = `package com.app;\n/*\nimport com.acme.Foo;\n*/\nclass A {}\n`;
+    const ins = importInsertion(commented, "com.acme.Foo", false);
+    expect(ins).not.toBeNull(); // commented import ≠ already imported
+    // lands right after the package line, NOT after the commented import
+    expect(commented.slice(0, ins!.from).endsWith("package com.app;\n")).toBe(true);
+  });
 });

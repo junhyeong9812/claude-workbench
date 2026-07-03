@@ -93,6 +93,13 @@ export async function classIndex(project: string): Promise<ClassIndex> {
   return idx;
 }
 
+/** Blank out `/* … *​/` block contents (newlines kept) so header regexes don't
+ * read commented-out `package`/`import` lines as real ones — offsets computed on
+ * the masked text stay valid for the original document. */
+export function maskBlockComments(doc: string): string {
+  return doc.replace(/\/\*[\s\S]*?(?:\*\/|$)/g, (m) => m.replace(/[^\n]/g, " "));
+}
+
 /** Insert `import` for `fqcn` if the document doesn't already have it and the
  * class isn't in the file's own package. Returns the changes (or none). */
 export function importInsertion(
@@ -100,6 +107,8 @@ export function importInsertion(
   fqcn: string,
   kotlin: boolean,
 ): { from: number; insert: string } | null {
+  if (!fqcn.includes(".")) return null; // default package — not importable
+  doc = maskBlockComments(doc); // a commented-out header line is not a header
   const pkg = fqcn.slice(0, fqcn.lastIndexOf("."));
   const filePkg = /^\s*package\s+([\w.]+)/m.exec(doc)?.[1] ?? null;
   if (filePkg === pkg) return null; // same package — no import needed
@@ -135,9 +144,12 @@ function classSource(project: string, kotlin: boolean) {
       type: "class",
       apply: (view, _completion, from, to) => {
         const ins = importInsertion(view.state.doc.toString(), c.fqcn, kotlin);
+        // The cursor shifts by the import's length only when the import lands
+        // BEFORE the completion point (the normal header-above-body case).
+        const shift = ins && ins.from <= from ? ins.insert.length : 0;
         view.dispatch({
           changes: [{ from, to, insert: c.name }, ...(ins ? [ins] : [])],
-          selection: { anchor: from + c.name.length + (ins ? ins.insert.length : 0) },
+          selection: { anchor: from + c.name.length + shift },
         });
       },
     }));
