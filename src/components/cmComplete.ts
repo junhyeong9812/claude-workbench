@@ -95,9 +95,54 @@ export async function classIndex(project: string): Promise<ClassIndex> {
 
 /** Blank out `/* … *​/` block contents (newlines kept) so header regexes don't
  * read commented-out `package`/`import` lines as real ones — offsets computed on
- * the masked text stay valid for the original document. */
+ * the masked text stay valid for the original document (length preserved).
+ * A small state scanner, not a regex: a `/*` inside a `//` line comment or a
+ * string literal must NOT open a block (a naive regex masks the rest of the
+ * file on such input). Strings resync at end-of-line, bounding any
+ * misclassification to one line. */
 export function maskBlockComments(doc: string): string {
-  return doc.replace(/\/\*[\s\S]*?(?:\*\/|$)/g, (m) => m.replace(/[^\n]/g, " "));
+  const out = doc.split("");
+  let state: "code" | "line" | "block" | "str" | "chr" = "code";
+  let i = 0;
+  while (i < doc.length) {
+    const c = doc[i];
+    const n = doc[i + 1];
+    if (state === "code") {
+      if (c === "/" && n === "/") {
+        state = "line";
+        i += 2;
+      } else if (c === "/" && n === "*") {
+        state = "block";
+        out[i] = out[i + 1] = " ";
+        i += 2;
+      } else {
+        if (c === '"') state = "str";
+        else if (c === "'") state = "chr";
+        i++;
+      }
+    } else if (state === "line") {
+      if (c === "\n") state = "code";
+      i++;
+    } else if (state === "block") {
+      if (c === "*" && n === "/") {
+        out[i] = out[i + 1] = " ";
+        state = "code";
+        i += 2;
+      } else {
+        if (c !== "\n") out[i] = " ";
+        i++;
+      }
+    } else {
+      // str/chr: skip escapes; close on the matching quote or resync at EOL.
+      if (c === "\\") i += 2;
+      else {
+        if ((state === "str" && c === '"') || (state === "chr" && c === "'") || c === "\n")
+          state = "code";
+        i++;
+      }
+    }
+  }
+  return out.join("");
 }
 
 /** Insert `import` for `fqcn` if the document doesn't already have it and the

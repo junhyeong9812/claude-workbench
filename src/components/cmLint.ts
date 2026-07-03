@@ -48,13 +48,17 @@ export function unresolvedImports(
   const known = new Set(idx.classes.map((c) => c.fqcn));
   const pkgs = new Set(idx.classes.map((c) => c.fqcn.slice(0, c.fqcn.lastIndexOf("."))));
   const out: { from: number; to: number; fqcn: string }[] = [];
-  for (const m of doc.matchAll(/^[ \t]*import\s+(?:static\s+)?([\w.]+(?:\.\*)?)\s*;?[ \t]*$/gm)) {
-    const spec = m[1];
+  for (const m of doc.matchAll(/^[ \t]*import\s+(static\s+)?([\w.]+(?:\.\*)?)\s*;?[ \t]*$/gm)) {
+    const spec = m[2];
     if (spec.endsWith(".*")) continue; // wildcard — package contents unknowable enough; no claim
-    // static member import (`import static com.x.Foo.bar`): the class is the parent.
-    const cls = /^[A-Z]/.test(spec.split(".").pop() ?? "")
-      ? spec
-      : spec.slice(0, spec.lastIndexOf("."));
+    // The class is the spec itself, or the member's parent for a static import
+    // (`import static com.x.Foo.bar` → com.x.Foo) — decided by the keyword, not
+    // by identifier casing (a constant is uppercase too).
+    const cls = m[1] ? spec.slice(0, spec.lastIndexOf(".")) : spec;
+    if (!cls.includes(".")) continue;
+    // The index only holds convention-named (uppercase) classes — a lowercase
+    // class can't be judged, so stay silent rather than risk a false red line.
+    if (!/^[A-Z]/.test(cls.split(".").pop() ?? "")) continue;
     const pkg = cls.slice(0, cls.lastIndexOf("."));
     if (!pkg || !pkgs.has(pkg)) continue; // package not in the index — external, silent
     if (!known.has(cls)) {

@@ -45,6 +45,21 @@ describe("unresolvedImports", () => {
     expect(unresolvedImports(doc, IDX)).toHaveLength(0);
   });
 
+  it("a /* inside a line comment does not swallow the rest of the file", () => {
+    const doc = `// note /*\nimport com.acme.Missing;\nclass A {}`;
+    expect(unresolvedImports(doc, IDX)).toHaveLength(1); // still judged
+  });
+
+  it("flags a static import whose parent class is missing", () => {
+    const out = unresolvedImports("import static com.acme.Missing.CONSTANT;", IDX);
+    expect(out).toHaveLength(1);
+    expect(out[0].fqcn).toBe("com.acme.Missing.CONSTANT");
+  });
+
+  it("stays silent on lowercase class names (not in the convention index)", () => {
+    expect(unresolvedImports("import com.acme.lowercaseclass;", IDX)).toHaveLength(0);
+  });
+
   it("stays silent on an empty or truncated index (no false claims)", () => {
     const doc = "import com.acme.Missing;";
     expect(unresolvedImports(doc, idx([]))).toHaveLength(0);
