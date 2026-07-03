@@ -33,9 +33,16 @@ describe("unresolvedImports", () => {
     expect(unresolvedImports(doc, IDX)).toHaveLength(0);
   });
 
-  it("flags a wildcard on a nonexistent project package", () => {
-    const out = unresolvedImports("import com.acme.nothere.*;", IDX);
-    expect(out).toHaveLength(1);
+  it("stays silent on wildcards and unknown subpackages (classpath unknowable)", () => {
+    // wildcard — never judged
+    expect(unresolvedImports("import com.acme.nothere.*;", IDX)).toHaveLength(0);
+    // same-org external artifact: package not in the index → no claim
+    expect(unresolvedImports("import com.acme.sdk.External;", IDX)).toHaveLength(0);
+  });
+
+  it("ignores imports inside block comments", () => {
+    const doc = `package com.app;\n/*\nimport com.acme.Missing;\n*/\nclass A {}`;
+    expect(unresolvedImports(doc, IDX)).toHaveLength(0);
   });
 
   it("stays silent on an empty or truncated index (no false claims)", () => {
