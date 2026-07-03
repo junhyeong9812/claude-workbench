@@ -67,6 +67,105 @@ export function hasOpenQuestion(items: readonly ActivityItem[]): boolean {
   return items.some((it) => it.kind === "question" && isOpenTool(it.agent_status));
 }
 
+// --- P2: bottom-of-screen scan for a permission/menu prompt (blocked) --------
+
+/** Max non-empty lines from the bottom of the screen we consider. Blank lines
+ * don't count toward this cap. A live prompt renders in the last few rows, so a
+ * tight window keeps stale scrollback (already answered prompts scrolled up out
+ * of the live screen) from producing a false blocked (invariant ②). */
+export const PROMPT_SCAN_MAX_LINES = 20;
+
+/** The highlighted menu choice cursor + a number: `❯ 1. Yes`. U+276F (❯) is the
+ * selection cursor Claude Code renders on the *active* option of a live picker —
+ * it is chrome, not something assistant prose emits, so it is the load-bearing
+ * discriminator against a coincidental numbered list. */
+const SELECT_CURSOR = /❯\s*\d+\.\s/;
+/** A numbered menu option line: `1. Yes`, `  2. No, and tell Claude…`. */
+const NUMBERED_OPTION = /(?:^|\s)\d+\.\s+\S/;
+/** The permission-dialog header. Claude phrases every tool-permission prompt as
+ * "Do you want to make this edit?" / "…proceed?" / "…create …?". */
+const PERMISSION_Q = /do you want to/i;
+/** An affirmative numbered option, e.g. `1. Yes` / `❯ 1. Yes, and don't ask…`. */
+const YES_OPTION = /\d+\.\s+Yes\b/;
+
+interface PromptRule {
+  /** Which live screen this catches — recorded for review, not used at runtime. */
+  screen: string;
+  /** True only when *every* required signal is present in the scanned lines. */
+  test: (lines: readonly string[]) => boolean;
+}
+
+/**
+ * Conservative rules: each ANDs ≥2 signals so a single stray string can't flip
+ * blocked (oversensitivity is worse than a miss — invariant ②). Rules are OR'd.
+ * Deliberately NOT keyed on "esc to interrupt": that footer is the *working*
+ * spinner, so matching it would false-positive on every streaming response.
+ * (ANSI escapes are already stripped — callers pass `translateToString(true)`.)
+ */
+const PROMPT_RULES: readonly PromptRule[] = [
+  {
+    // Tool-permission dialog: "Do you want to make this edit?" + a "1. Yes"
+    // option. Text-based (no ❯), so it still fires if the cursor glyph is
+    // normalized away. A scrollback quote of the question alone lacks the
+    // numbered Yes option, so both together are needed.
+    screen: "permission-prompt (edit / bash / create / proceed)",
+    test: (ls) => ls.some((l) => PERMISSION_Q.test(l)) && ls.some((l) => YES_OPTION.test(l)),
+  },
+  {
+    // Any live numbered picker (AskUserQuestion, trust-folder, theme select):
+    // the ❯ selection cursor on a numbered choice AND ≥2 numbered options — a
+    // real menu, not a lone "❯ 1." coincidence in prose.
+    screen: "numbered select menu (AskUserQuestion / trust / theme)",
+    test: (ls) =>
+      ls.some((l) => SELECT_CURSOR.test(l)) &&
+      ls.filter((l) => NUMBERED_OPTION.test(l)).length >= 2,
+  },
+];
+
+/**
+ * Does the bottom of the screen show an input-waiting prompt (permission dialog
+ * or numbered menu)? `lines` are collected bottom-first by the caller from the
+ * live screen rows; we keep only the first `PROMPT_SCAN_MAX_LINES` non-empty
+ * ones (blanks skipped, not counted) and OR the conservative rules over them.
+ */
+export function scanBottomForPrompt(lines: readonly string[]): boolean {
+  const nonEmpty: string[] = [];
+  for (const l of lines) {
+    if (l.trim() === "") continue; // blank rows don't consume the window
+    nonEmpty.push(l);
+    if (nonEmpty.length >= PROMPT_SCAN_MAX_LINES) break;
+  }
+  return PROMPT_RULES.some((r) => r.test(nonEmpty));
+}
+
+/**
+ * Trailing debounce: `trigger()` (re)arms a timer; `run` fires once `delay` ms
+ * after the *last* trigger, so a burst of PTY writes yields a single scan of the
+ * final screen (intermediate frames ignored — invariant ②/F4). `cancel()` clears
+ * a pending fire (call on unmount). Extracted from the component so the debounce
+ * is unit-testable with fake timers.
+ */
+export function makeDebouncedScanner(
+  run: () => void,
+  delay: number,
+): { trigger: () => void; cancel: () => void } {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const cancel = () => {
+    if (timer !== undefined) {
+      clearTimeout(timer);
+      timer = undefined;
+    }
+  };
+  const trigger = () => {
+    cancel();
+    timer = setTimeout(() => {
+      timer = undefined;
+      run();
+    }, delay);
+  };
+  return { trigger, cancel };
+}
+
 /**
  * Attention level for sorting/roll-up and notification edges (higher = louder):
  * 3 blocked, 2 done-unseen, 1 working, 0 idle. `unseen` only elevates a

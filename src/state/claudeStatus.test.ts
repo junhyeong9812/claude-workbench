@@ -4,7 +4,10 @@ import {
   deriveSessionActivity,
   hasOpenQuestion,
   HOLD_MS,
+  makeDebouncedScanner,
+  PROMPT_SCAN_MAX_LINES,
   rollup,
+  scanBottomForPrompt,
   useClaudeStatus,
   type ActivityItem,
   type SessionEntry,
@@ -227,5 +230,140 @@ describe("store: blocked priority + re-transition (invariant ③)", () => {
     // the hold timer must not resurrect the entry
     vi.advanceTimersByTime(HOLD_MS * 2);
     expect(entry(u)).toBeUndefined();
+  });
+});
+
+// --- P2: bottom-of-screen prompt scan (E group) ------------------------------
+
+// Bottom-first fixtures (index 0 = bottommost live row), as the panel collects
+// them. Real Claude Code chrome shapes, self-authored (no herdr copy).
+const PERMISSION_PROMPT = [
+  "  3. No, and tell Claude what to do differently (esc)",
+  "  2. Yes, and don't ask again this session",
+  "❯ 1. Yes",
+  "",
+  "Do you want to make this edit to claudeStatus.ts?",
+];
+const SELECT_MENU = [
+  "  3. Use a different approach",
+  "  2. Refactor the store",
+  "❯ 1. Add the scan function",
+  "",
+  "How should I structure P2?",
+];
+
+describe("scanBottomForPrompt — rule positives", () => {
+  it("E-pos1: permission dialog (Do you want to… + numbered Yes) → blocked", () => {
+    expect(scanBottomForPrompt(PERMISSION_PROMPT)).toBe(true);
+  });
+
+  it("E-pos2: numbered select menu (❯ cursor + ≥2 options) → blocked", () => {
+    expect(scanBottomForPrompt(SELECT_MENU)).toBe(true);
+  });
+
+  it("E1: a prompt within the bottom ≤20 non-empty lines is detected", () => {
+    // 12 innocuous lines below the prompt, still inside the 20-line window
+    const lines = [...Array(12).fill("some earlier streamed output"), ...PERMISSION_PROMPT];
+    expect(scanBottomForPrompt(lines)).toBe(true);
+  });
+});
+
+describe("scanBottomForPrompt — rule negatives (no false positives, invariant ②)", () => {
+  it("N1: assistant merely quoting the question, no numbered option → not blocked", () => {
+    const lines = [
+      "so it prints the confirmation.",
+      'Earlier the CLI showed "Do you want to proceed?" but that is answered now.',
+      "Here is the next step:",
+    ];
+    expect(scanBottomForPrompt(lines)).toBe(false);
+  });
+
+  it("N2: a plain enumerated list (no ❯ cursor) → not blocked", () => {
+    const lines = ["3. Ship it", "2. Add tests", "1. Write the function", "The plan is:"];
+    expect(scanBottomForPrompt(lines)).toBe(false);
+  });
+
+  it("N3: the working spinner footer 'esc to interrupt' → not blocked", () => {
+    const lines = ["  (esc to interrupt)", "✻ Thinking… (12s · ↑ 1.2k tokens)"];
+    expect(scanBottomForPrompt(lines)).toBe(false);
+  });
+
+  it("N4: a lone ❯ cursor with only one option → not blocked", () => {
+    const lines = ["❯ 1. Yes", "Continue?"];
+    expect(scanBottomForPrompt(lines)).toBe(false);
+  });
+});
+
+describe("scanBottomForPrompt — window + blank handling", () => {
+  it("E2: a prompt pushed past 20 non-empty lines (scrollback residue) is NOT detected", () => {
+    // 21 non-empty filler lines are nearer the bottom; the prompt sits beyond
+    // the window and must be ignored (no stale-scrollback false positive).
+    const filler = Array.from({ length: 21 }, (_, i) => `output line ${i}`);
+    const lines = [...filler, ...PERMISSION_PROMPT];
+    expect(scanBottomForPrompt(lines)).toBe(false);
+  });
+
+  it("E2b: exactly at the boundary — prompt within the last 20 non-empty lines IS detected", () => {
+    // PERMISSION_PROMPT has 4 non-empty lines → 16 filler keeps it inside 20.
+    const filler = Array.from({ length: 15 }, (_, i) => `output line ${i}`);
+    const lines = [...filler, ...PERMISSION_PROMPT];
+    expect(scanBottomForPrompt(lines)).toBe(true);
+  });
+
+  it("E3: blank lines are skipped and do NOT consume the ≤20 window", () => {
+    const blanks = Array.from({ length: 40 }, () => "   ");
+    const lines = [...blanks.slice(0, 20), ...PERMISSION_PROMPT, ...blanks];
+    // 20 blanks before the prompt would exhaust a naive window, but blanks are
+    // not counted, so the prompt is still reached.
+    expect(scanBottomForPrompt(lines)).toBe(true);
+  });
+
+  it("counts non-empty only up to the cap constant", () => {
+    expect(PROMPT_SCAN_MAX_LINES).toBe(20);
+  });
+});
+
+describe("makeDebouncedScanner — trailing debounce (E4)", () => {
+  beforeEach(() => vi.useFakeTimers());
+  afterEach(() => {
+    vi.clearAllTimers();
+    vi.useRealTimers();
+  });
+
+  it("E4: a burst of triggers scans once, seeing only the final snapshot", () => {
+    const seen: string[] = [];
+    let screen = "frame-a";
+    const { trigger } = makeDebouncedScanner(() => seen.push(screen), 300);
+
+    trigger();
+    screen = "frame-b";
+    trigger();
+    screen = "frame-c";
+    trigger();
+    // nothing fired mid-burst
+    vi.advanceTimersByTime(299);
+    expect(seen).toEqual([]);
+    // fires once, 300ms after the LAST trigger, with the final state
+    vi.advanceTimersByTime(1);
+    expect(seen).toEqual(["frame-c"]);
+  });
+
+  it("E4b: cancel() prevents a pending scan (unmount safety)", () => {
+    const run = vi.fn();
+    const { trigger, cancel } = makeDebouncedScanner(run, 300);
+    trigger();
+    cancel();
+    vi.advanceTimersByTime(1000);
+    expect(run).not.toHaveBeenCalled();
+  });
+
+  it("separated triggers each fire (not merged when the gap exceeds delay)", () => {
+    const run = vi.fn();
+    const { trigger } = makeDebouncedScanner(run, 300);
+    trigger();
+    vi.advanceTimersByTime(300);
+    trigger();
+    vi.advanceTimersByTime(300);
+    expect(run).toHaveBeenCalledTimes(2);
   });
 });

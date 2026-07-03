@@ -14,7 +14,14 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 import { TimelineView, ItemDetail, MarkdownText, type TimelineItem } from "./TimelineView";
 import { SubagentsPane } from "./SubagentsPane";
 import { handleScrollKey } from "./scrollKeys";
-import { useClaudeStatus, deriveSessionActivity, hasOpenQuestion } from "../state/claudeStatus";
+import {
+  useClaudeStatus,
+  deriveSessionActivity,
+  hasOpenQuestion,
+  scanBottomForPrompt,
+  makeDebouncedScanner,
+  PROMPT_SCAN_MAX_LINES,
+} from "../state/claudeStatus";
 
 /**
  * Architecture A Claude panel: the **real** `claude` CLI in an xterm PTY (left)
@@ -694,8 +701,33 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
       setCtxTokens(lu ? lu.input + lu.cache_read + lu.cache_creation : 0);
     };
 
+    // P2: after PTY output settles, scan the live screen bottom for an
+    // input-waiting prompt (permission dialog / numbered menu) and set the
+    // screen-blocked signal. No-op until a session is open (statusUuidRef).
+    const runBlockedScan = () => {
+      const t = termRef.current;
+      const uuid = statusUuidRef.current;
+      if (!t || !uuid) return;
+      const buf = t.buffer.active;
+      // Read the *live screen* rows [baseY … baseY+rows-1] bottom-first — not the
+      // scrolled viewport — so scrolling up to an old, already-answered prompt
+      // can't drag it into range. translateToString has already stripped ANSI.
+      const lines: string[] = [];
+      const bottom = buf.baseY + t.rows - 1;
+      for (let i = bottom; i >= buf.baseY && lines.length < PROMPT_SCAN_MAX_LINES; i--) {
+        const s = buf.getLine(i)?.translateToString(true) ?? "";
+        if (s.trim() === "") continue;
+        lines.push(s);
+      }
+      useClaudeStatus.getState().setScreenBlocked(uuid, scanBottomForPrompt(lines));
+    };
+    const blockedScanner = makeDebouncedScanner(runBlockedScan, 300);
+
     const write = (bytes: number[]) => {
-      if (!disposed) term.write(new Uint8Array(bytes));
+      if (!disposed) {
+        term.write(new Uint8Array(bytes));
+        blockedScanner.trigger();
+      }
     };
     const applyLive = (ev: TerminalOutputEvent) => {
       if (ev.session_id === sessionId && ev.seq > lastApplied) {
@@ -858,6 +890,9 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
     })();
 
     const onData = term.onData((d) => {
+      // A keystroke is a response too — rescan so a prompt that the key dismisses
+      // clears quickly (the PTY redraw also triggers a scan; this just leads it).
+      blockedScanner.trigger();
       // Mirrors are read-only; only the driver writes (backend also enforces — P6).
       if (sessionId == null || inputLockedRef.current || !isDriverRef.current) return;
       // Drop IME composition output (multi-byte / non-ASCII) — Hangul only
@@ -894,6 +929,7 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
       // Detach only — the PTY + poll thread live on (closed by claude_close on
       // real panel removal in MainArea).
       disposed = true;
+      blockedScanner.cancel();
       ro.disconnect();
       onData.dispose();
       onResize.dispose();
