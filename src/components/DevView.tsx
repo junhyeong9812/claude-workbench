@@ -6,7 +6,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { ClaudeTermPanel } from "./ClaudeTermPanel";
 import { StudyFileView } from "./StudyFileView";
 import { useAppStore } from "../state/store";
-import { resolveLayerMode, devConsumesEditorOpen } from "../state/layerRouting";
+import { resolveLayerMode, devConsumesEditorOpen, routeDevReview } from "../state/layerRouting";
 
 const components = { claudeterm: ClaudeTermPanel };
 const basename = (p: string) => p.split("/").pop() ?? p;
@@ -33,6 +33,10 @@ export function DevView({ project }: { project: string }) {
   const layerMode = resolveLayerMode(projectModes, project);
   const editorOpenRequest = useAppStore((s) => s.editorOpenRequest);
   const requestEditorOpen = useAppStore((s) => s.requestEditorOpen);
+  // ✓확인/🧪 (EditorPanel or the DevView button) hands a review/test prompt to
+  // this project's dev session — this view (not MainArea) owns delivery now.
+  const devReviewRequest = useAppStore((s) => s.devReviewRequest);
+  const requestDevReview = useAppStore((s) => s.requestDevReview);
 
   // Open tabs, MRU-first; in-memory per mount (the durable continuity is the
   // dev session itself, whose uuid persists).
@@ -74,20 +78,60 @@ export function DevView({ project }: { project: string }) {
     useAppStore.getState().requestClaudeInject({ uuid, text: prompt });
   };
 
+  // Open the embedded dev session panel with the project's persisted uuid (so it
+  // resumes across restarts), optionally carrying a review/test prompt as the
+  // session's one-shot seed. Shared by onReady (fresh/empty dock) and the
+  // devReview effect (pane emptied by a user close).
+  const seedDevSession = (api: DockviewApi, prompt?: string) => {
+    const uuid = useAppStore.getState().ensureDevUuid(project);
+    api.addPanel({
+      id: "dev-claude",
+      component: "claudeterm",
+      title: "개발 세션",
+      params: {
+        kind: "claudeterm",
+        title: "개발 세션",
+        project,
+        loadSessionId: uuid,
+        ...(prompt ? { seed: prompt } : {}),
+      },
+    });
+  };
+
+  // Deliver a devReview (✓확인/🧪) prompt to this project's dev session. Only this
+  // project's request is ours; the route (pending/inject/seed) is decided from the
+  // dock's state so the prompt reaches the session by exactly one channel and is
+  // never lost (③·#6·F4). "pending" (dock not ready — the ✓확인 flip freshly
+  // mounted us) is left for onReady to seed with.
+  useEffect(() => {
+    if (!devReviewRequest || devReviewRequest.project !== project) return; // not ours
+    const api = apiRef.current;
+    const route = routeDevReview(api != null, api != null && api.getPanel("dev-claude") != null);
+    if (route === "pending") return; // onReady will seed the new session with this prompt
+    const prompt = devReviewRequest.prompt;
+    if (route === "inject") {
+      const uuid = useAppStore.getState().ensureDevUuid(project);
+      useAppStore.getState().requestClaudeInject({ uuid, text: prompt });
+    } else {
+      seedDevSession(api!, prompt); // "seed": pane was emptied — re-open it seeded
+    }
+    requestDevReview(null);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [devReviewRequest]);
+
   // Embedded dev session dock (StudySession 선례): seed once with the project's
   // persisted dev-session uuid so it resumes across restarts; a re-entry within
-  // a run re-attaches to the still-live PTY.
+  // a run re-attaches to the still-live PTY. If a devReview is already pending
+  // (the ✓확인 flip mounted us this same tick), carry its prompt as the seed so
+  // the very first prompt isn't lost to a not-yet-live inject (F4).
   const onReady = (event: DockviewReadyEvent) => {
     const api = event.api;
     apiRef.current = api;
     if (api.panels.length === 0) {
-      const uuid = useAppStore.getState().ensureDevUuid(project);
-      api.addPanel({
-        id: "dev-claude",
-        component: "claudeterm",
-        title: "개발 세션",
-        params: { kind: "claudeterm", title: "개발 세션", project, loadSessionId: uuid },
-      });
+      const pending = useAppStore.getState().devReviewRequest;
+      const prompt = pending && pending.project === project ? pending.prompt : undefined;
+      seedDevSession(api, prompt);
+      if (prompt) useAppStore.getState().requestDevReview(null);
     }
     // Explicit close of the dev session → stop its PTY (the pane stays empty
     // until the dev mode is re-entered, which re-seeds the same uuid).

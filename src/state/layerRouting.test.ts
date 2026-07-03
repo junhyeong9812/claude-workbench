@@ -4,6 +4,7 @@ import {
   integratedConsumesEditorOpen,
   devConsumesEditorOpen,
   devLayerMounted,
+  routeDevReview,
   type MainLayerMode,
 } from "./layerRouting";
 import { useAppStore } from "./store";
@@ -105,5 +106,60 @@ describe("store-driven routing (T1/T4/T5)", () => {
     useAppStore.getState().setProjectMode(P, "integrated");
     expect(useAppStore.getState().projectModes[P]).toBeUndefined();
     expect(resolveLayerMode(useAppStore.getState().projectModes, P)).toBe("integrated");
+  });
+});
+
+describe("routeDevReview channel (③·#6·F4 — ✓확인/🧪 delivery)", () => {
+  it("T6: a live dev-session panel → inject", () => {
+    // Dock ready and the dev-claude panel present (subsequent ✓확인): inject the
+    // prompt into the already-live session (uuid-matched in ClaudeTermPanel).
+    expect(routeDevReview(true, true)).toBe("inject");
+  });
+
+  it("T7: fresh mount (dock not ready) → pending, not a lost inject", () => {
+    // The ✓확인 flip just mounted DevView; onReady will seed the new session with
+    // the prompt. Never inject into a not-yet-live panel (F4 seed race).
+    expect(routeDevReview(false, false)).toBe("pending");
+    expect(routeDevReview(false, true)).toBe("pending"); // dock-not-ready dominates
+  });
+
+  it("dock ready but panel gone (user closed the session) → seed (re-open)", () => {
+    expect(routeDevReview(true, false)).toBe("seed");
+  });
+
+  it("exactly one channel per state — never both inject and seed", () => {
+    for (const dockReady of [false, true]) {
+      for (const panelPresent of [false, true]) {
+        const r = routeDevReview(dockReady, panelPresent);
+        expect(["pending", "inject", "seed"]).toContain(r);
+      }
+    }
+  });
+});
+
+describe("ensureDevUuid (⑥ — persisted dev-session id)", () => {
+  const DP = "/repo/devproj";
+  beforeEach(() => {
+    localStorage.clear();
+    useAppStore.setState({ devUuids: {} });
+  });
+
+  it("T9: idempotent — repeated calls return the same uuid (no regeneration)", () => {
+    const first = useAppStore.getState().ensureDevUuid(DP);
+    const second = useAppStore.getState().ensureDevUuid(DP);
+    expect(second).toBe(first);
+    // A different project gets its own distinct uuid.
+    expect(useAppStore.getState().ensureDevUuid("/repo/other")).not.toBe(first);
+  });
+
+  it("T10: persisted to localStorage → survives a re-hydrate with the same value", () => {
+    const uuid = useAppStore.getState().ensureDevUuid(DP);
+    // Written through to storage under the project key…
+    const persisted = JSON.parse(localStorage.getItem("devUuids") || "{}");
+    expect(persisted[DP]).toBe(uuid);
+    // …and a fresh store hydrated from that storage resumes the same uuid (the
+    // dev session resumes across restarts — no new session spawned).
+    useAppStore.setState({ devUuids: persisted });
+    expect(useAppStore.getState().ensureDevUuid(DP)).toBe(uuid);
   });
 });

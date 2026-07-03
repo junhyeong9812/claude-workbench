@@ -38,3 +38,18 @@ export function devConsumesEditorOpen(mode: MainLayerMode): boolean {
 export function devLayerMounted(mode: MainLayerMode, visited: boolean): boolean {
   return mode === "dev" || visited;
 }
+
+/** How the dev layer delivers a devReview (✓확인/🧪) prompt, from the dev dock's
+ * state alone:
+ *   - "pending": the dock isn't ready yet (fresh mount from the ✓확인 flip) — leave
+ *     the request in the store; onReady seeds the new session with it (no loss, #6).
+ *   - "inject": the dev session panel is live — inject the prompt (uuid-matched).
+ *   - "seed": the dock is ready but the panel is gone (user closed the session) —
+ *     re-open it carrying the prompt as its one-shot seed.
+ * A prompt reaches the session by exactly one channel — never injected into a
+ * not-yet-live panel (F4 seed race) and never dropped. */
+export type DevReviewRoute = "pending" | "inject" | "seed";
+export function routeDevReview(dockReady: boolean, panelPresent: boolean): DevReviewRoute {
+  if (!dockReady) return "pending";
+  return panelPresent ? "inject" : "seed";
+}

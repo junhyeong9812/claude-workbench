@@ -290,9 +290,11 @@ interface AppState {
   /** Inject a prompt into an already-live Claude session (dev mode's 확인 button
    * re-uses the project's dev session). Matched by session uuid in ClaudeTermPanel. */
   claudeInjectRequest: { uuid: string; text: string } | null;
-  /** Dev mode 확인: review the just-saved file. MainArea opens (first time) or
-   * injects into (subsequent) the per-project dev Claude session. */
-  devReviewRequest: { project: string; prompt: string; editorPanelId: string } | null;
+  /** Dev mode 확인/🧪: review (or generate a test for) the just-saved file. The
+   * project's own DevView consumes it — injecting into its live dev Claude
+   * session, or seeding a fresh one. No panel-positioning field: the dev session
+   * lives in DevView's own dock, not beside an editor panel. */
+  devReviewRequest: { project: string; prompt: string } | null;
   /** Build/test runner: open a terminal panel that runs `cmd` (consumed by MainArea). */
   runRequest: { project: string; cmd: string; title: string } | null;
   /** Bumped to ask MainArea to focus the active dockview panel (Ctrl+B from the
@@ -416,9 +418,9 @@ interface AppState {
   ) => void;
   /** Inject a prompt into a live Claude session (consumed by the matching panel). */
   requestClaudeInject: (req: { uuid: string; text: string } | null) => void;
-  /** Request a dev-mode review of a saved file (MainArea consumes + clears). */
+  /** Request a dev-mode review of a saved file (the project's DevView consumes + clears). */
   requestDevReview: (
-    req: { project: string; prompt: string; editorPanelId: string } | null,
+    req: { project: string; prompt: string } | null,
   ) => void;
   /** Request running a build/test command in a terminal (MainArea consumes). */
   requestRun: (req: { project: string; cmd: string; title: string } | null) => void;

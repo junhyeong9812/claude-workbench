@@ -123,14 +123,10 @@ export function MainArea() {
   const requestDiff = useAppStore((s) => s.requestDiff);
   const claudeOpenRequest = useAppStore((s) => s.claudeOpenRequest);
   const requestClaudeOpen = useAppStore((s) => s.requestClaudeOpen);
-  const devReviewRequest = useAppStore((s) => s.devReviewRequest);
-  const requestDevReview = useAppStore((s) => s.requestDevReview);
-  const requestClaudeInject = useAppStore((s) => s.requestClaudeInject);
   const runRequest = useAppStore((s) => s.runRequest);
   const requestRun = useAppStore((s) => s.requestRun);
   const focusMainRequest = useAppStore((s) => s.focusMainRequest);
   const setLayout = useAppStore((s) => s.setLayout);
-  const ensureDevUuid = useAppStore((s) => s.ensureDevUuid);
 
   const apiRef = useRef<DockviewApi | null>(null);
   // Drop-out gesture (P3): one AbortController per in-progress tab drag bounds
@@ -599,35 +595,9 @@ export function MainArea() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [claudeOpenRequest, apiReady, activeProject, layerMode]);
 
-  // Dev mode 확인: review the saved file in the project's dev Claude session.
-  // The uuid is the project's persisted dev-session id (survives restarts —
-  // resumed by the backend when its transcript exists). Panel open → inject the
-  // prompt into the live session; closed → open it seeded with the prompt.
-  useEffect(() => {
-    if (!devReviewRequest) return;
-    const { project, prompt, editorPanelId } = devReviewRequest;
-    if (project !== activeProject) return;
-    const api = apiRef.current;
-    if (!api) return; // dock not ready — keep the request; apiReady re-runs
-    requestDevReview(null);
-    const uuid = ensureDevUuid(project);
-    const panelOpen = api.panels.some((p) => {
-      const prm = p.params as { loadSessionId?: string; sessionUuid?: string };
-      return prm.loadSessionId === uuid || prm.sessionUuid === uuid;
-    });
-    if (panelOpen) {
-      requestClaudeInject({ uuid, text: prompt });
-      return;
-    }
-    addPanel("claudeterm", {
-      project,
-      loadSessionId: uuid,
-      title: "개발 세션",
-      seed: prompt,
-      position: { referencePanel: editorPanelId, direction: "right" as const },
-    });
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [devReviewRequest, apiReady, activeProject]);
+  // (개발 세션 ✓확인/🧪 소비는 DevView로 이관됨 — 통합 dock 안에 "개발 세션"
+  // 부분 패널을 끼워 넣던 옛 경로는 제거. 이제 EditorPanel이 dev 레이어를 전면
+  // 전환하고 DevView가 자기 dock의 개발 세션에 프롬프트를 전달한다.)
 
   // Build/test runner: open a terminal panel that runs the command.
   // (통합·개발 두 레이어가 동시 마운트되므로 앞 레이어인 통합 모드일 때만 소비한다 —

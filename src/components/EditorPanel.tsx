@@ -106,7 +106,13 @@ export function EditorPanel(props: IDockviewPanelProps<EditorParams>) {
         `방금 \`${path}\` 를 편집·저장했어. 그 파일을 읽고 검토해줘 — ` +
         `오타·빠진 import·들여쓰기/포맷·맥락 적합성 위주로. ` +
         `직접 수정하지 말고 무엇을 어떻게 고치면 되는지 지적·설명만 해줘.`;
-      useAppStore.getState().requestDevReview({ project, prompt, editorPanelId: props.api.id });
+      // Bring the dev layer to the front and open this file as a DevView tab, then
+      // hand the review to the dev session — no split panel in the integrated dock
+      // (the whole main area swaps to dev). requestEditorOpen routes to the dev
+      // layer because setProjectMode(dev) has already flipped the front layer.
+      useAppStore.getState().setProjectMode(project, "dev");
+      useAppStore.getState().requestEditorOpen(path);
+      useAppStore.getState().requestDevReview({ project, prompt });
     }
     setReviewing(false);
   };
@@ -129,7 +135,11 @@ export function EditorPanel(props: IDockviewPanelProps<EditorParams>) {
       `\`${path}\` 의 단위 테스트를 ${where} 생성해줘. ` +
       `프로젝트의 기존 테스트 컨벤션·프레임워크를 따르고, 파일을 실제로 만들어줘(필요하면 디렉토리도). ` +
       `핵심 동작·경계조건 위주로.`;
-    useAppStore.getState().requestDevReview({ project, prompt, editorPanelId: props.api.id });
+    // Same 전면 전환 as ✓확인: dev layer to the front + open the file as a DevView
+    // tab, then hand the test-gen prompt to the dev session (no split panel).
+    useAppStore.getState().setProjectMode(project, "dev");
+    useAppStore.getState().requestEditorOpen(path);
+    useAppStore.getState().requestDevReview({ project, prompt });
   };
 
   useEffect(() => {
