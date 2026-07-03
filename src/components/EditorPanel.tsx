@@ -82,11 +82,13 @@ export function EditorPanel(props: IDockviewPanelProps<EditorParams>) {
   saveRef.current = save;
 
   // Whether the ✓확인/🧪 dev-layer transition (setProjectMode + editorOpen +
-  // devReview) can run from here. It only works in the MAIN window, where DevView
-  // is mounted to consume the editorOpen/devReview requests and show the flipped
-  // layer, and for the active project (whose DevView is the one that would
-  // consume). A popout has no DevView, so the flip would strand those requests and
-  // persist a mode nobody renders — so we gate it (cross-project / popout guard).
+  // devReview) can run from here for the project CAPTURED at click time. Two
+  // conditions: (1) the MAIN window — a popout has no DevView, so the flip would
+  // strand those requests and persist a mode nobody renders; (2) the captured
+  // project is STILL the active project — the awaits before dispatch (write_file/
+  // mirror_test_path) leave a window where the user can switch projects, and
+  // dispatching then would flip/target the wrong project (TOCTOU re-check;
+  // `project` must be captured BEFORE the first await, not re-read here).
   const canDevTransition = (project: string): boolean =>
     getCurrentWindow().label === "main" && project === useAppStore.getState().activeProject;
 
@@ -98,6 +100,10 @@ export function EditorPanel(props: IDockviewPanelProps<EditorParams>) {
   const confirmReview = async () => {
     const view = viewRef.current;
     if (!view || !path) return;
+    // Capture the project at click time — BEFORE the save await — so the dev
+    // transition targets the project the user acted in, not whatever became
+    // active while the save was in flight (TOCTOU).
+    const project = useAppStore.getState().activeProject;
     const content = view.state.doc.toString();
     const savedVersion = versionRef.current;
     setReviewing(true);
@@ -110,7 +116,8 @@ export function EditorPanel(props: IDockviewPanelProps<EditorParams>) {
       setReviewing(false);
       return;
     }
-    const project = useAppStore.getState().activeProject;
+    // Re-validate after the await: main window AND the captured project is still
+    // active (canDevTransition re-reads activeProject).
     if (project && canDevTransition(project)) {
       const prompt =
         `방금 \`${path}\` 를 편집·저장했어. 그 파일을 읽고 검토해줘 — ` +
@@ -124,10 +131,15 @@ export function EditorPanel(props: IDockviewPanelProps<EditorParams>) {
       useAppStore.getState().requestEditorOpen(path);
       useAppStore.getState().requestDevReview({ project, prompt });
     } else if (project) {
-      // Saved, but the dev-layer transition can't run here (popout / non-active
-      // project — no DevView to consume). Don't strand editorOpen/devReview
-      // requests or persist a dev mode nobody shows.
-      setStatus("저장됨 — 개발 세션 검토는 메인 창에서 사용 가능합니다");
+      // Saved, but the dev-layer transition can't run: either not the main window
+      // (popout — no DevView to consume) or the project switched during the save
+      // await. Don't strand editorOpen/devReview requests or persist a dev mode
+      // nobody shows.
+      setStatus(
+        useAppStore.getState().activeProject === project
+          ? "저장됨 — 개발 세션 검토는 메인 창에서 사용 가능합니다"
+          : "저장됨 — 프로젝트가 전환되어 검토 요청을 보내지 않았습니다",
+      );
     }
     setReviewing(false);
   };
@@ -137,6 +149,8 @@ export function EditorPanel(props: IDockviewPanelProps<EditorParams>) {
   // An explicit generation action (Claude writes the test), unlike 확인 (review).
   const genTest = async () => {
     if (!path) return;
+    // Capture at click time (before any await) — the dispatch below must target
+    // the project the user acted in (TOCTOU, same discipline as ✓확인).
     const project = useAppStore.getState().activeProject;
     if (!project) return;
     if (!canDevTransition(project)) {
@@ -148,6 +162,12 @@ export function EditorPanel(props: IDockviewPanelProps<EditorParams>) {
       testPath = await invoke<string | null>("mirror_test_path", { src: path });
     } catch {
       /* unsupported language → let Claude pick the path */
+    }
+    // Re-validate after the await: the user may have switched projects while
+    // mirror_test_path was in flight — don't flip/dispatch to the wrong project.
+    if (!canDevTransition(project)) {
+      setStatus("프로젝트가 전환되어 테스트 생성 요청을 보내지 않았습니다");
+      return;
     }
     const where = testPath ? `\`${testPath}\` 에` : "프로젝트 컨벤션에 맞는 위치에";
     const prompt =

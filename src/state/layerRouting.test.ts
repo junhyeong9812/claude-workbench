@@ -6,6 +6,7 @@ import {
   devLayerMounted,
   routeDevReview,
   shouldFlipToIntegrated,
+  nextDevReviewAction,
   type MainLayerMode,
 } from "./layerRouting";
 import { useAppStore } from "./store";
@@ -227,5 +228,80 @@ describe("devReview FIFO queue (B1/B2 — ③ single-consumer, no clobber)", () 
     expect(q.map((r) => r.prompt)).toEqual(["b1", "a2"]);
     expect(q.find((r) => r.project === A)?.prompt).toBe("a2");
     expect(q.find((r) => r.project === B)?.prompt).toBe("b1"); // never blocked/removed
+  });
+});
+
+describe("nextDevReviewAction (B2 — inject pacing over the single claudeInject slot)", () => {
+  const A = "/repo/a";
+  const q = [
+    { id: "1", project: A, prompt: "one" },
+    { id: "2", project: A, prompt: "two" },
+  ];
+
+  it("delivers the head when the slot is free", () => {
+    expect(nextDevReviewAction(q, A, "inject", false)).toEqual({
+      kind: "inject",
+      id: "1",
+      prompt: "one",
+    });
+  });
+
+  it("waits while the slot is occupied — the entry stays queued (no overwrite)", () => {
+    expect(nextDevReviewAction(q, A, "inject", true)).toEqual({ kind: "wait" });
+  });
+
+  it("pending (dock not ready) waits regardless of the slot", () => {
+    expect(nextDevReviewAction(q, A, "pending", false)).toEqual({ kind: "wait" });
+    expect(nextDevReviewAction(q, A, "pending", true)).toEqual({ kind: "wait" });
+  });
+
+  it("seed does not use the inject slot (ignores occupancy)", () => {
+    expect(nextDevReviewAction(q, A, "seed", true)).toEqual({
+      kind: "seed",
+      id: "1",
+      prompt: "one",
+    });
+  });
+
+  it("none when the project has no entries", () => {
+    expect(nextDevReviewAction(q, "/repo/other", "inject", false)).toEqual({ kind: "none" });
+    expect(nextDevReviewAction([], A, "inject", false)).toEqual({ kind: "none" });
+  });
+
+  it("store scenario: two rapid ✓확인 flow one per slot vacancy (no clobber)", () => {
+    // Mirrors DevView's drain loop against the real store: 2 entries queued, a
+    // live panel (route "inject"), single inject slot.
+    useAppStore.setState({ devReviewQueue: [], claudeInjectRequest: null });
+    useAppStore.getState().requestDevReview({ project: A, prompt: "one" });
+    useAppStore.getState().requestDevReview({ project: A, prompt: "two" });
+
+    const step = () => {
+      const s = useAppStore.getState();
+      const action = nextDevReviewAction(
+        s.devReviewQueue,
+        A,
+        "inject",
+        s.claudeInjectRequest !== null,
+      );
+      if (action.kind === "inject") {
+        useAppStore.getState().requestClaudeInject({ uuid: "u", text: action.prompt });
+        useAppStore.getState().consumeDevReview(action.id);
+      }
+      return action;
+    };
+
+    // Pass 1: slot free → "one" injected + consumed; next step sees the slot
+    // occupied → wait, so "two" SURVIVES in the queue (not overwritten).
+    expect(step().kind).toBe("inject");
+    expect(useAppStore.getState().claudeInjectRequest?.text).toBe("one");
+    expect(step().kind).toBe("wait");
+    expect(useAppStore.getState().devReviewQueue.map((r) => r.prompt)).toEqual(["two"]);
+
+    // ClaudeTermPanel consumes the inject (slot → null) → next pass delivers "two".
+    useAppStore.getState().requestClaudeInject(null);
+    expect(step().kind).toBe("inject");
+    expect(useAppStore.getState().claudeInjectRequest?.text).toBe("two");
+    expect(useAppStore.getState().devReviewQueue).toEqual([]);
+    useAppStore.setState({ claudeInjectRequest: null });
   });
 });

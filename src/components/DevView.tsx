@@ -6,7 +6,12 @@ import { invoke } from "@tauri-apps/api/core";
 import { ClaudeTermPanel } from "./ClaudeTermPanel";
 import { StudyFileView } from "./StudyFileView";
 import { useAppStore } from "../state/store";
-import { resolveLayerMode, devIsFront, routeDevReview } from "../state/layerRouting";
+import {
+  resolveLayerMode,
+  devIsFront,
+  routeDevReview,
+  nextDevReviewAction,
+} from "../state/layerRouting";
 
 const components = { claudeterm: ClaudeTermPanel };
 const basename = (p: string) => p.split("/").pop() ?? p;
@@ -37,6 +42,10 @@ export function DevView({ project }: { project: string }) {
   // this project's dev session — this view (not MainArea) owns delivery now. A
   // FIFO queue: this DevView drains only its own project's entries, in order.
   const devReviewQueue = useAppStore((s) => s.devReviewQueue);
+  // The single inject slot's occupancy paces the drain (B2): the queue flows one
+  // entry per slot vacancy — when ClaudeTermPanel consumes an inject (slot →
+  // null), this subscription re-fires the deliver effect for the next entry.
+  const claudeInjectRequest = useAppStore((s) => s.claudeInjectRequest);
   // Ctrl+B focus request: when the dev layer is in front, DevView (not MainArea)
   // owns the focus target (its editor or its dev dock).
   const focusMainRequest = useAppStore((s) => s.focusMainRequest);
@@ -104,36 +113,43 @@ export function DevView({ project }: { project: string }) {
   };
 
   // Drain this project's devReview (✓확인/🧪) entries from the FIFO queue. Delivery
-  // follows a CAS discipline: re-read the LATEST queue from the store each step
-  // (never a captured snapshot), take our project's head entry, deliver it by
-  // exactly one route (pending/inject/seed — ③·#6·F4), then consume it BY ID. So
-  // the two delivery paths (this effect and onReady's child effect, which runs
-  // first) can't double-deliver: whichever consumes an id first, the other
-  // re-reads and no longer finds it. "pending" (dock not ready — the ✓확인 flip
-  // just mounted us) is left for onReady to seed with. Remaining same-project
-  // entries are delivered in order via inject (downstream claudeInject is a single
-  // slot — an extreme same-tick burst can overwrite; pre-existing semantics).
+  // follows a CAS discipline: re-read the LATEST store each step (never a
+  // captured snapshot), decide via nextDevReviewAction (pending/inject/seed/wait
+  // — ③·#6·F4·B2), deliver, then consume BY ID. So the two delivery paths (this
+  // effect and onReady's child effect, which runs first) can't double-deliver:
+  // whichever consumes an id first, the other re-reads and no longer finds it.
+  // "wait" covers both blockers: dock not ready (onReady will seed the head) and
+  // the single inject slot still occupied — at most ONE inject per pass; the
+  // queue flows one entry per slot vacancy (the claudeInjectRequest subscription
+  // re-runs this when ClaudeTermPanel consumes the slot → null). If the panel
+  // never goes live the slot never clears and the queue waits (no loss) — same
+  // root as the pre-existing live-race.
   const deliverDevReviews = () => {
     const api = apiRef.current;
     for (;;) {
-      const head = useAppStore.getState().devReviewQueue.find((r) => r.project === project);
-      if (!head) return; // nothing (more) for us — other projects' entries never block us
+      const s = useAppStore.getState();
       const route = routeDevReview(api != null, api != null && api.getPanel("dev-claude") != null);
-      if (route === "pending") return; // onReady will seed the new session with the head
-      if (route === "inject") {
+      const action = nextDevReviewAction(
+        s.devReviewQueue,
+        project,
+        route,
+        s.claudeInjectRequest !== null,
+      );
+      if (action.kind === "none" || action.kind === "wait") return; // done / blocked — queue keeps the rest
+      if (action.kind === "inject") {
         const uuid = useAppStore.getState().ensureDevUuid(project);
-        useAppStore.getState().requestClaudeInject({ uuid, text: head.prompt });
+        useAppStore.getState().requestClaudeInject({ uuid, text: action.prompt });
       } else {
-        seedDevSession(api!, head.prompt); // "seed": pane was emptied — re-open it seeded
+        seedDevSession(api!, action.prompt); // "seed": pane was emptied — re-open it seeded
       }
-      useAppStore.getState().consumeDevReview(head.id); // consume by id (idempotent)
+      useAppStore.getState().consumeDevReview(action.id); // consume by id (idempotent)
     }
   };
 
   useEffect(() => {
     deliverDevReviews();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [devReviewQueue]);
+  }, [devReviewQueue, claudeInjectRequest]);
 
   // Embedded dev session dock (StudySession 선례): seed once with the project's
   // persisted dev-session uuid so it resumes across restarts; a re-entry within

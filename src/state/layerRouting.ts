@@ -76,6 +76,39 @@ export function routeDevReview(dockReady: boolean, panelPresent: boolean): DevRe
   return panelPresent ? "inject" : "seed";
 }
 
+/** One delivery decision over the devReview queue for `project` (B2 pacing).
+ * Returns what the DevView's drain loop should do next:
+ *   - "none": no entry for this project — stop.
+ *   - "wait": an entry exists but can't be delivered NOW — dock not ready
+ *     ("pending" route), or the inject slot (`claudeInjectRequest`, a single
+ *     slot) is still occupied. The queue keeps the entry; delivery resumes when
+ *     the blocker clears (onReady seeds, or the panel consumes the slot → null
+ *     re-fires the effect). This paces the queue to ONE inject per slot
+ *     vacancy — a burst of ✓확인 can't overwrite an unconsumed inject.
+ *   - "inject"/"seed": deliver this entry (then consume it by id).
+ * Seed doesn't use the inject slot (it rides the new panel's one-shot seed
+ * param), so it ignores `injectSlotOccupied`. */
+export type DevReviewAction =
+  | { kind: "none" }
+  | { kind: "wait" }
+  | { kind: "inject"; id: string; prompt: string }
+  | { kind: "seed"; id: string; prompt: string };
+export function nextDevReviewAction(
+  queue: ReadonlyArray<{ id: string; project: string; prompt: string }>,
+  project: string,
+  route: DevReviewRoute,
+  injectSlotOccupied: boolean,
+): DevReviewAction {
+  const head = queue.find((r) => r.project === project);
+  if (!head) return { kind: "none" };
+  if (route === "pending") return { kind: "wait" };
+  if (route === "inject") {
+    if (injectSlotOccupied) return { kind: "wait" }; // slot busy — deliver on vacancy
+    return { kind: "inject", id: head.id, prompt: head.prompt };
+  }
+  return { kind: "seed", id: head.id, prompt: head.prompt };
+}
+
 /** Symmetric auto-flip (B4): when the dev layer is in FRONT and a VIEW-ROW request
  * (diff·claudeOpen·run) arrives for the active project, flip that project back to
  * integrated so the front-gated integrated consumer can immediately render it —
