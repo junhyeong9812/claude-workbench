@@ -125,11 +125,10 @@ export function MainArea() {
   const requestRun = useAppStore((s) => s.requestRun);
   const focusMainRequest = useAppStore((s) => s.focusMainRequest);
   const setLayout = useAppStore((s) => s.setLayout);
+  const projectModes = useAppStore((s) => s.projectModes);
+  const ensureDevUuid = useAppStore((s) => s.ensureDevUuid);
 
   const apiRef = useRef<DockviewApi | null>(null);
-  // Per-project dev-mode Claude session uuid (in-memory: continuity within an app
-  // run; persistence across restarts is a follow-up). Lets 확인 reuse one session.
-  const devUuidRef = useRef<Record<string, string>>({});
   // Drop-out gesture (P3): one AbortController per in-progress tab drag bounds
   // the dragover/dragend listeners, and the onWillDragPanel subscription is
   // disposed on unmount — no stale listener can fire a late popout (review P3 #1).
@@ -307,7 +306,7 @@ export function MainArea() {
     },
   ) => {
     const api = apiRef.current;
-    if (!api) return;
+    if (!api) return null;
     const n = ++counterRef.current;
     const title = opts?.title ?? `${kind[0].toUpperCase()}${kind.slice(1)} ${n}`;
     // Terminals get the real PTY panel, claudeterm the real claude CLI + timeline,
@@ -320,8 +319,9 @@ export function MainArea() {
           : kind === "editor"
             ? "editor"
             : "placeholder";
+    const id = `${kind}-${Date.now()}`;
     api.addPanel({
-      id: `${kind}-${Date.now()}`,
+      id,
       component,
       title,
       // Position beside a reference panel (review: claude to the right of the
@@ -340,6 +340,7 @@ export function MainArea() {
         ...(opts?.cwd ? { cwd: opts.cwd } : {}),
       },
     });
+    return id;
   };
 
   // Create an SSH session (backend connects async) and open a panel attached to
@@ -503,25 +504,56 @@ export function MainArea() {
     invoke("ssh_hostkey_decision", { id: p.id, accept }).catch(() => {});
   };
 
+  // Dev-mode layout helper: make sure the project's dev Claude session (stable
+  // persisted uuid) is open, docked beside `refPanelId`. A stale uuid is safe —
+  // the backend resumes only when the transcript exists, else it starts fresh
+  // under the same id. Returns the uuid so callers can inject into the session.
+  const ensureDevSession = (project: string, refPanelId?: string | null, seed?: string) => {
+    const uuid = ensureDevUuid(project);
+    const api = apiRef.current;
+    if (!api) return uuid;
+    const open = api.panels.some((p) => {
+      const prm = p.params as { loadSessionId?: string; sessionUuid?: string };
+      return prm.loadSessionId === uuid || prm.sessionUuid === uuid;
+    });
+    if (!open) {
+      addPanel("claudeterm", {
+        project,
+        loadSessionId: uuid,
+        title: "개발 세션",
+        ...(seed ? { seed } : {}),
+        ...(refPanelId
+          ? { position: { referencePanel: refPanelId, direction: "right" as const } }
+          : {}),
+      });
+    }
+    return uuid;
+  };
+
   // Open a file in the editor when requested (from the peek viewer or tree). Focus
-  // an already-open editor for the same file instead of opening a duplicate.
+  // an already-open editor for the same file instead of opening a duplicate. In a
+  // dev-flavored project (개발 모드) the editor comes with the project's dev
+  // Claude session docked to its right — the ✓확인 loop's built-in layout.
   useEffect(() => {
     if (!editorOpenRequest) return;
     const api = apiRef.current;
     if (!api) return; // dock not ready (mount/project switch) — keep the request
     const path = editorOpenRequest;
     requestEditorOpen(null); // consume only once we can actually act (codex P2 E4)
+    const dev = !!activeProject && projectModes[activeProject] === "dev";
     const existing = api.panels.find((p) => {
       const prm = p.params as { kind?: string; path?: string } | undefined;
       return prm?.kind === "editor" && prm.path === path;
     });
     if (existing) {
       existing.api.setActive();
+      if (dev) ensureDevSession(activeProject!, existing.id);
       return;
     }
-    addPanel("editor", { path, title: fileName(path) });
+    const panelId = addPanel("editor", { path, title: fileName(path) });
+    if (dev) ensureDevSession(activeProject!, panelId);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [editorOpenRequest, activeProject]);
+  }, [editorOpenRequest, activeProject, projectModes]);
 
   // Open a diff panel (changed file or commit) when requested from the Git panel.
   useEffect(() => {
@@ -578,8 +610,9 @@ export function MainArea() {
   }, [claudeOpenRequest, apiReady, activeProject]);
 
   // Dev mode 확인: review the saved file in the project's dev Claude session.
-  // First time → open a fresh dev session (stable uuid) seeded with the prompt,
-  // beside the editor. Subsequent → inject the prompt into that live session.
+  // The uuid is the project's persisted dev-session id (survives restarts —
+  // resumed by the backend when its transcript exists). Panel open → inject the
+  // prompt into the live session; closed → open it seeded with the prompt.
   useEffect(() => {
     if (!devReviewRequest) return;
     const { project, prompt, editorPanelId } = devReviewRequest;
@@ -587,26 +620,16 @@ export function MainArea() {
     const api = apiRef.current;
     if (!api) return; // dock not ready — keep the request; apiReady re-runs
     requestDevReview(null);
-    const existingUuid = devUuidRef.current[project];
-    const panelOpen =
-      !!existingUuid &&
-      api.panels.some((p) => {
-        const prm = p.params as { loadSessionId?: string; sessionUuid?: string };
-        return prm.loadSessionId === existingUuid || prm.sessionUuid === existingUuid;
-      });
+    const uuid = ensureDevUuid(project);
+    const panelOpen = api.panels.some((p) => {
+      const prm = p.params as { loadSessionId?: string; sessionUuid?: string };
+      return prm.loadSessionId === uuid || prm.sessionUuid === uuid;
+    });
     if (panelOpen) {
-      requestClaudeInject({ uuid: existingUuid, text: prompt });
+      requestClaudeInject({ uuid, text: prompt });
       return;
     }
-    const uuid = crypto.randomUUID();
-    devUuidRef.current[project] = uuid;
-    addPanel("claudeterm", {
-      project,
-      loadSessionId: uuid,
-      title: "개발 세션",
-      seed: prompt,
-      position: { referencePanel: editorPanelId, direction: "right" as const },
-    });
+    ensureDevSession(project, editorPanelId, prompt);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [devReviewRequest, apiReady, activeProject]);
 

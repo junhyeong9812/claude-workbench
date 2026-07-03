@@ -52,6 +52,8 @@ function AppMain() {
   const setFontSize = useAppStore((s) => s.setFontSize);
   const mode = useAppStore((s) => s.mode);
   const setMode = useAppStore((s) => s.setMode);
+  const projectModes = useAppStore((s) => s.projectModes);
+  const setProjectMode = useAppStore((s) => s.setProjectMode);
 
   useEffect(() => {
     void init();
@@ -211,6 +213,20 @@ function AppMain() {
         >
           {mode === "study" ? "워크스페이스" : "스터디"}
         </button>
+        {mode === "workspace" && activeProject && (
+          <button
+            className={`toolbar-btn${projectModes[activeProject] === "dev" ? " toolbar-btn-on" : ""}`}
+            title="현재 프로젝트의 통합 ↔ 개발 모드 전환 — 개발 모드에서는 트리 파일이 에디터 탭+개발 세션(우측) 레이아웃으로 열립니다"
+            onClick={() =>
+              setProjectMode(
+                activeProject,
+                projectModes[activeProject] === "dev" ? "integrated" : "dev",
+              )
+            }
+          >
+            {projectModes[activeProject] === "dev" ? "개발" : "통합"}
+          </button>
+        )}
         <RunMenu />
         <span className="toolbar-title">
           {activeProject ?? "multi-terminal"}
