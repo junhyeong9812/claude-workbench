@@ -17,14 +17,11 @@ export function SubagentsPane({
   selectedId: string | null;
   onSelect: (item: TimelineItem) => void;
 }) {
-  const [collapsed, setCollapsed] = useState<Set<string>>(new Set());
-  const toggle = (aid: string) =>
-    setCollapsed((prev) => {
-      const next = new Set(prev);
-      if (next.has(aid)) next.delete(aid);
-      else next.add(aid);
-      return next;
-    });
+  // User fold overrides; without one, a finished agent starts collapsed (the
+  // column is about live progress) — bounding the DOM on agent-heavy sessions.
+  const [folds, setFolds] = useState<Map<string, boolean>>(new Map());
+  const toggle = (aid: string, current: boolean) =>
+    setFolds((prev) => new Map(prev).set(aid, !current));
 
   // Newest spawn first — the agents being watched are almost always the latest.
   const agents = [...subagents].sort((a, b) => b[2] - a[2]);
@@ -42,7 +39,10 @@ export function SubagentsPane({
         const last = its[its.length - 1];
         const running =
           last?.agent_status === "in_progress" || last?.agent_status === "pending";
-        const fold = collapsed.has(aid);
+        const fold = folds.get(aid) ?? !running; // finished agents start folded
+        // Bound each card's DOM — a runaway agent can log thousands of items.
+        const MAX_ROWS = 200;
+        const rows = its.length > MAX_ROWS ? its.slice(-MAX_ROWS) : its;
         return (
           <div key={aid} className="claudeterm-agent-card">
             <div className="timeline-agent-rail" title={`${done}/${total} 완료`}>
@@ -50,7 +50,7 @@ export function SubagentsPane({
             </div>
             <div
               className="claudeterm-agent-card-head"
-              onClick={() => toggle(aid)}
+              onClick={() => toggle(aid, fold)}
               title={fold ? "펼치기" : "접기"}
             >
               <span className="timeline-date-caret">{fold ? "▸" : "▾"}</span>
@@ -60,8 +60,11 @@ export function SubagentsPane({
                 {done}/{total}
               </span>
             </div>
+            {!fold && its.length > MAX_ROWS && (
+              <div className="claudeterm-agents-empty">…앞 {its.length - MAX_ROWS}개 생략</div>
+            )}
             {!fold &&
-              its.map((it) => (
+              rows.map((it) => (
                 <div
                   key={it.tool_call_id}
                   className={`timeline-item ${

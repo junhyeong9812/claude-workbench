@@ -487,10 +487,17 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
   const startDragAgents = (e: React.MouseEvent) => {
     e.preventDefault();
     const pane = agentsPaneRef.current;
-    if (!pane) return;
+    const container = containerRef.current;
+    if (!pane || !container) return;
     const right = pane.getBoundingClientRect().right;
+    // Container-aware max (like the timeline splitter): leave the other fixed
+    // panes + a 240px terminal minimum, so the fixed widths can't overflow.
+    // Viewer visibility approximated from state (selectedItem derives later in
+    // render) — over-reserving when a selection has no item is harmless.
+    const others = timelineWidth + (selectedId != null || textView != null ? viewerWidth : 0);
+    const max = Math.max(220, container.getBoundingClientRect().width - others - 240);
     const onMove = (ev: MouseEvent) => {
-      setAgentsWidth(Math.max(220, Math.min(600, right - ev.clientX)));
+      setAgentsWidth(Math.max(220, Math.min(max, right - ev.clientX)));
     };
     const onUp = () => {
       window.removeEventListener("mousemove", onMove);
