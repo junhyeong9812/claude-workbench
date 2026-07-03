@@ -14,6 +14,7 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 import { TimelineView, ItemDetail, MarkdownText, type TimelineItem } from "./TimelineView";
 import { SubagentsPane } from "./SubagentsPane";
 import { handleScrollKey } from "./scrollKeys";
+import { useClaudeStatus, deriveSessionActivity, hasOpenQuestion } from "../state/claudeStatus";
 
 /**
  * Architecture A Claude panel: the **real** `claude` CLI in an xterm PTY (left)
@@ -216,6 +217,10 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
   // Current live PTY session id, mirrored out of the effect so handoff (component
   // scope) can read/close it. The effect remains the sole writer.
   const sessionIdRef = useRef<number | null>(null);
+  // This session's stable uuid, used to key the attention-status store (badges).
+  // Set alongside the numeric session id once the session opens; the timeline
+  // payload carries only the numeric id, so status derivation reads it here.
+  const statusUuidRef = useRef<string | null>(null);
   // Seed to inject into a freshly-started session once it looks ready (handoff).
   const pendingSeedRef = useRef<string | null>(null);
   // On a handoff remount, the exact session to attach to — so the effect doesn't
@@ -459,10 +464,28 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
   // another group is clicked) doesn't re-run the mount effect, so restore focus
   // here too. The mount path calls restoreFocus() directly once xterm is ready.
   useEffect(() => {
+    // The user "sees" this session when it's the active tab and its window is
+    // focused — clear its done-unseen badge then (invariant ①).
+    const markSeenIfLooking = () => {
+      const uuid = statusUuidRef.current;
+      if (uuid && props.api.isActive && document.hasFocus()) {
+        useClaudeStatus.getState().markSeen(uuid);
+      }
+    };
     const d = props.api.onDidActiveChange(() => {
-      if (props.api.isActive) restoreFocus();
+      if (props.api.isActive) {
+        restoreFocus();
+        markSeenIfLooking();
+      }
     });
-    return () => d.dispose();
+    // Also flip seen when this window regains focus while the panel is active.
+    window.addEventListener("focus", markSeenIfLooking);
+    // Seed: if we mount already active+focused, count it as seen immediately.
+    markSeenIfLooking();
+    return () => {
+      d.dispose();
+      window.removeEventListener("focus", markSeenIfLooking);
+    };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [props.api]);
   // Drag the terminal|viewer splitter to resize the viewer (timeline stays 360px).
@@ -693,6 +716,17 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
         gotLive = true;
         applySnapshot(e.payload);
         setSubagents(e.payload.subagents ?? []);
+        // Derive this session's attention status (badge) from the same snapshot.
+        // "seen" = this panel is the active tab AND its window is focused right now
+        // (so a completion the user is watching never flags done-unseen).
+        const statusUuid = statusUuidRef.current;
+        if (statusUuid) {
+          useClaudeStatus.getState().updateFromTimeline(statusUuid, {
+            activity: deriveSessionActivity(e.payload.turns, e.payload.answers, e.payload.items),
+            questionBlocked: hasOpenQuestion(e.payload.items),
+            seenNow: props.api.isActive && document.hasFocus(),
+          });
+        }
       });
       // Driver changes (P6): lock/unlock input by whether we hold the driver role.
       // `rev` is monotonic — drop stale events (review R7-4).
@@ -711,6 +745,11 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
         inputLockedRef.current = true;
         isDriverRef.current = false;
         setIsDriver(false);
+        // Session is truly dead now — drop its attention badge. (Not done in the
+        // detach cleanup below, which is a mere tab-switch remount; a done-unseen
+        // badge must survive that so it stays visible until the user looks.)
+        const closedUuid = statusUuidRef.current;
+        if (closedUuid) useClaudeStatus.getState().remove(closedUuid);
         if (!disposed) term.write("\r\n\x1b[2m[세션이 다른 창에서 종료되었습니다]\x1b[0m\r\n");
       });
       if (disposed) return;
@@ -733,6 +772,7 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
           rows: term.rows,
         });
         sessionId = opened.id;
+        statusUuidRef.current = opened.session_uuid;
         driverRevRef.current = opened.rev;
         const driving = opened.driver === myLabel;
         isDriverRef.current = driving;
