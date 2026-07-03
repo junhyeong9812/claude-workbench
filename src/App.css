@@ -28,6 +28,28 @@
   --st-fail: #f85149;
   --st-danger: #f38ba8;
   --accent-bright: #89b4fa;
+  /* ---- z-index layer scale — the single stacking authority. Raw z-index
+     numbers are forbidden outside this block (enforced by `npm run css-audit`).
+     Values preserve the pre-token stacking order exactly. Bands:
+       sticky(1) < in-panel overlays(10..31) < local menus(40..42)
+       < app modals(100) < global overlays(120..142) < context menu(200)
+       < cross-window DnD(9999, always topmost). */
+  --z-sticky: 1;
+  --z-lock: 10;
+  --z-pane-modal: 20;
+  --z-peek: 30;
+  --z-peek-above: 31;
+  --z-local-menu: 40;
+  --z-local-menu-fg: 41;
+  --z-local-modal: 42;
+  --z-modal: 100;
+  --z-search: 120;
+  --z-dropdown: 130;
+  --z-tree-menu: 140;
+  --z-tree-menu-fg: 141;
+  --z-tree-dialog: 142;
+  --z-ctx-menu: 200;
+  --z-dnd: 9999;
 }
 
 /* Light theme — toggled via document.documentElement[data-theme="light"]. */
@@ -208,6 +230,7 @@ body {
 }
 .sidebar-tab {
   flex: 1 1 0;
+  min-width: 0;
   padding: 4px 8px;
   background: transparent;
   border: none;
@@ -248,7 +271,7 @@ body {
 .peek-viewer {
   position: absolute;
   inset: 0;
-  z-index: 30;
+  z-index: var(--z-peek);
   display: flex;
   flex-direction: column;
   background: var(--bg);
@@ -290,6 +313,7 @@ body {
 }
 .commit-files-count {
   flex: 1 1 auto;
+  min-width: 0;
   opacity: 0.6;
 }
 .commit-files-x {
@@ -345,7 +369,7 @@ body {
 .commit-file-view {
   position: absolute;
   inset: 0;
-  z-index: 31;
+  z-index: var(--z-peek-above);
   display: flex;
   flex-direction: column;
   background: var(--bg);
@@ -381,6 +405,7 @@ body {
 }
 .commit-file-view-spacer {
   flex: 1 1 auto;
+  min-width: 0;
 }
 .commit-file-view-x {
   flex: 0 0 auto;
@@ -419,11 +444,11 @@ body {
 .git-ctx-backdrop {
   position: fixed;
   inset: 0;
-  z-index: 40;
+  z-index: var(--z-local-menu);
 }
 .git-ctx-menu {
   position: fixed;
-  z-index: 41;
+  z-index: var(--z-local-menu-fg);
   min-width: 180px;
   max-width: 280px;
   display: flex;
@@ -433,6 +458,8 @@ body {
   border-radius: 6px;
   box-shadow: 0 6px 20px rgba(0, 0, 0, 0.4);
   overflow: hidden;
+  max-height: 70vh;
+  overflow-y: auto;
   font-size: 0.85em;
 }
 .git-ctx-title {
@@ -477,7 +504,7 @@ body {
 .git-modal-backdrop {
   position: fixed;
   inset: 0;
-  z-index: 42;
+  z-index: var(--z-local-modal);
   display: flex;
   align-items: center;
   justify-content: center;
@@ -485,6 +512,8 @@ body {
 }
 .git-modal {
   width: min(560px, 90vw);
+  max-height: 85vh;
+  overflow-y: auto;
   display: flex;
   flex-direction: column;
   gap: 8px;
@@ -876,6 +905,7 @@ body {
 }
 .git-merge-banner span {
   flex: 1 1 auto;
+  min-width: 0;
 }
 .git-conflict-head {
   color: var(--st-danger);
@@ -1106,17 +1136,19 @@ body {
 .claude-tab-backdrop {
   position: fixed;
   inset: 0;
-  z-index: 30;
+  z-index: var(--z-peek);
 }
 .claude-tab-menu {
   position: absolute;
   top: 100%;
   right: 0;
-  z-index: 31;
+  z-index: var(--z-peek-above);
   margin-top: 2px;
   display: flex;
   flex-direction: column;
   min-width: 160px;
+  max-height: 60vh;
+  overflow-y: auto;
   background: var(--bg-alt);
   border: 1px solid var(--border);
   border-radius: 4px;
@@ -1149,7 +1181,7 @@ body {
 .claude-modal-backdrop {
   position: fixed;
   inset: 0;
-  z-index: 100;
+  z-index: var(--z-modal);
   background: rgba(0, 0, 0, 0.45);
   display: flex;
   align-items: center;
@@ -1159,6 +1191,8 @@ body {
   display: flex;
   flex-direction: column;
   min-width: 300px;
+  max-width: 92vw;
+  max-height: 85vh;
   background: var(--bg-alt);
   border: 1px solid var(--border);
   border-radius: 6px;
@@ -1255,7 +1289,7 @@ body {
   position: absolute;
   top: 100%;
   left: 8px;
-  z-index: 20;
+  z-index: var(--z-pane-modal);
   margin-top: 2px;
   display: flex;
   flex-direction: column;
@@ -1371,6 +1405,8 @@ body {
 }
 .claudeterm-term-pane {
   flex: 1 1 0;
+  min-width: 0;
+  min-height: 0;
 }
 .claudeterm-timeline-pane {
   flex: 0 0 360px;
@@ -1526,7 +1562,7 @@ body {
 .claudeterm-term-lock {
   position: absolute;
   inset: 0;
-  z-index: 10;
+  z-index: var(--z-lock);
   display: flex;
   align-items: center;
   justify-content: center;
@@ -1540,7 +1576,7 @@ body {
 .claudeterm-modal-overlay {
   position: absolute;
   inset: 0;
-  z-index: 20;
+  z-index: var(--z-pane-modal);
   display: flex;
   align-items: center;
   justify-content: center;
@@ -1578,6 +1614,7 @@ body {
 }
 .claudeterm-modal-body {
   flex: 1 1 auto;
+  min-height: 0;
   margin: 0;
   padding: 10px 12px;
   resize: none;
@@ -1693,7 +1730,7 @@ body {
 .claudeterm-prevtask-head {
   position: sticky;
   top: 0;
-  z-index: 1;
+  z-index: var(--z-sticky);
   padding: 4px 8px;
   font-size: 0.8em;
   font-weight: 600;
@@ -1792,7 +1829,7 @@ body {
 .timeline-date {
   position: sticky;
   top: 0;
-  z-index: 1;
+  z-index: var(--z-sticky);
   display: flex;
   align-items: center;
   gap: 5px;
@@ -1844,7 +1881,7 @@ body {
   background: var(--bg);
   padding: 3px 4px;
   border-bottom: 1px solid var(--border);
-  z-index: 1;
+  z-index: var(--z-sticky);
 }
 .timeline-turn {
   margin: 4px 0 4px 2px;
@@ -2404,6 +2441,7 @@ body {
 
 .claude-input textarea {
   flex: 1;
+  min-width: 0;
   resize: none;
   min-height: 38px;
   max-height: 120px;
@@ -2507,7 +2545,7 @@ body {
 .modal-backdrop {
   position: fixed;
   inset: 0;
-  z-index: 100;
+  z-index: var(--z-modal);
   display: flex;
   align-items: center;
   justify-content: center;
@@ -2567,6 +2605,7 @@ body {
 }
 .ts-hex {
   flex: 1 1 auto;
+  min-width: 0;
   background: var(--bg-alt);
   color: var(--fg);
   border: 1px solid var(--border);
@@ -2774,7 +2813,7 @@ body {
   position: absolute;
   top: 100%;
   right: 0;
-  z-index: 40;
+  z-index: var(--z-local-menu);
   min-width: 180px;
   max-height: 320px;
   overflow: auto;
@@ -2813,15 +2852,18 @@ body {
 .study-session-dock { height: 100%; }
 
 .study-view-root { flex: 1; min-height: 0; display: flex; }
-.study-view-root .study-view { flex: 1; }
+.study-view-root .study-view { flex: 1; min-width: 0; min-height: 0; }
 .study-viewer:focus, .study-viewer-empty:focus { outline: 1px solid var(--accent); outline-offset: -1px; }
 .study-tabs-menu-item.hl { background: var(--bg-hover); }
 
 /* ---- Context menu (right-click) ---- */
 .ctx-menu {
   position: fixed;
-  z-index: 200;
+  z-index: var(--z-ctx-menu);
   min-width: 140px;
+  max-width: min(320px, 90vw);
+  max-height: 70vh;
+  overflow-y: auto;
   background: var(--bg);
   border: 1px solid var(--border);
   border-radius: 6px;
@@ -3031,6 +3073,7 @@ body {
 }
 .ssh-grow {
   flex: 1;
+  min-width: 0;
 }
 .ssh-port {
   width: 84px;
@@ -3049,6 +3092,7 @@ body {
 }
 .ssh-dialog-actions .claude-modal-opt {
   flex: 1;
+  min-width: 0;
   align-items: center;
   border-bottom: none;
 }
@@ -3076,7 +3120,7 @@ body {
 .drop-target-overlay {
   position: fixed;
   inset: 0;
-  z-index: 9999;
+  z-index: var(--z-dnd);
   pointer-events: none;
   border: 3px solid var(--accent);
   background: color-mix(in srgb, var(--accent) 12%, transparent);
@@ -3098,7 +3142,7 @@ body {
 .search-backdrop {
   position: fixed;
   inset: 0;
-  z-index: 120;
+  z-index: var(--z-search);
   background: rgba(0, 0, 0, 0.35);
   display: flex;
   justify-content: center;
@@ -3145,6 +3189,7 @@ body {
 }
 .search-input {
   flex: 1;
+  min-width: 0;
   padding: 5px 8px;
   font-size: 13px;
   color: var(--fg);
@@ -3271,9 +3316,12 @@ body {
   position: absolute;
   top: 100%;
   left: 0;
-  z-index: 130;
+  z-index: var(--z-dropdown);
   margin-top: 4px;
   min-width: 260px;
+  max-width: min(420px, 90vw);
+  max-height: 60vh;
+  overflow-y: auto;
   background: var(--bg);
   border: 1px solid var(--border);
   border-radius: 6px;
@@ -3316,11 +3364,14 @@ body {
 }
 
 /* 파일트리 우클릭 메뉴 + 생성/이름변경/삭제 다이얼로그 */
-.tree-menu-backdrop { position: fixed; inset: 0; z-index: 140; }
+.tree-menu-backdrop { position: fixed; inset: 0; z-index: var(--z-tree-menu); }
 .tree-menu {
   position: fixed;
-  z-index: 141;
+  z-index: var(--z-tree-menu-fg);
   min-width: 140px;
+  max-width: min(320px, 90vw);
+  max-height: 70vh;
+  overflow-y: auto;
   background: var(--bg);
   border: 1px solid var(--border);
   border-radius: 6px;
@@ -3344,12 +3395,14 @@ body {
 .tree-menu-sep { height: 1px; background: var(--border); margin: 4px 0; }
 
 .tree-dialog-backdrop {
-  position: fixed; inset: 0; z-index: 142;
+  position: fixed; inset: 0; z-index: var(--z-tree-dialog);
   background: rgba(0, 0, 0, 0.35);
   display: flex; justify-content: center; align-items: flex-start; padding-top: 14vh;
 }
 .tree-dialog {
   width: 380px; max-width: 90vw;
+  max-height: 85vh;
+  overflow-y: auto;
   background: var(--bg);
   border: 1px solid var(--border);
   border-radius: 8px;
