@@ -1,10 +1,11 @@
 import { beforeEach, describe, expect, it } from "vitest";
 import {
   resolveLayerMode,
-  integratedConsumesEditorOpen,
-  devConsumesEditorOpen,
+  integratedIsFront,
+  devIsFront,
   devLayerMounted,
   routeDevReview,
+  shouldFlipToIntegrated,
   type MainLayerMode,
 } from "./layerRouting";
 import { useAppStore } from "./store";
@@ -27,21 +28,40 @@ describe("resolveLayerMode", () => {
   });
 });
 
-describe("editorOpen consume gates (XOR — 불변식 ③)", () => {
-  // T3: for ANY mode, exactly one layer consumes — never both, never neither.
+describe("front-layer gates (XOR — 불변식 ③)", () => {
+  // T3: for ANY mode, exactly one layer is front — never both, never neither.
   const modes: MainLayerMode[] = ["integrated", "dev"];
-  it("integrated consumes iff integrated mode", () => {
-    expect(integratedConsumesEditorOpen("integrated")).toBe(true);
-    expect(integratedConsumesEditorOpen("dev")).toBe(false);
+  it("integrated is front iff integrated mode", () => {
+    expect(integratedIsFront("integrated")).toBe(true);
+    expect(integratedIsFront("dev")).toBe(false);
   });
-  it("dev consumes iff dev mode", () => {
-    expect(devConsumesEditorOpen("dev")).toBe(true);
-    expect(devConsumesEditorOpen("integrated")).toBe(false);
+  it("dev is front iff dev mode", () => {
+    expect(devIsFront("dev")).toBe(true);
+    expect(devIsFront("integrated")).toBe(false);
   });
   it("exactly one gate is true for every mode (XOR)", () => {
     for (const m of modes) {
-      expect(integratedConsumesEditorOpen(m) !== devConsumesEditorOpen(m)).toBe(true);
+      expect(integratedIsFront(m) !== devIsFront(m)).toBe(true);
     }
+  });
+});
+
+describe("shouldFlipToIntegrated (B4 — symmetric auto-flip for view-row requests)", () => {
+  const A = "/repo/a";
+  const B = "/repo/b";
+  it("flips when dev is front and the request targets the active project", () => {
+    expect(shouldFlipToIntegrated("dev", A, A)).toBe(true);
+  });
+  it("does not flip when the request is for a DIFFERENT project (stays pending)", () => {
+    expect(shouldFlipToIntegrated("dev", B, A)).toBe(false);
+  });
+  it("does not flip in integrated mode (nothing to flip)", () => {
+    expect(shouldFlipToIntegrated("integrated", A, A)).toBe(false);
+  });
+  it("does not flip with no request project or no active project", () => {
+    expect(shouldFlipToIntegrated("dev", null, A)).toBe(false);
+    expect(shouldFlipToIntegrated("dev", undefined, A)).toBe(false);
+    expect(shouldFlipToIntegrated("dev", A, null)).toBe(false);
   });
 });
 
@@ -74,8 +94,8 @@ describe("store-driven routing (T1/T4/T5)", () => {
     const s = useAppStore.getState();
     const mode = resolveLayerMode(s.projectModes, s.activeProject);
     expect(mode).toBe("integrated");
-    expect(integratedConsumesEditorOpen(mode)).toBe(true);
-    expect(devConsumesEditorOpen(mode)).toBe(false);
+    expect(integratedIsFront(mode)).toBe(true);
+    expect(devIsFront(mode)).toBe(false);
     expect(s.editorOpenRequest).toBe("/repo/proj/a.ts");
   });
 
@@ -86,8 +106,8 @@ describe("store-driven routing (T1/T4/T5)", () => {
     const mode = resolveLayerMode(s.projectModes, s.activeProject);
     // The integrated consumer returns early (gate false) BEFORE requestEditorOpen(null),
     // so the request survives for the dev layer to consume.
-    expect(integratedConsumesEditorOpen(mode)).toBe(false);
-    expect(devConsumesEditorOpen(mode)).toBe(true);
+    expect(integratedIsFront(mode)).toBe(false);
+    expect(devIsFront(mode)).toBe(true);
     expect(s.editorOpenRequest).toBe("/repo/proj/b.ts");
   });
 
@@ -98,7 +118,7 @@ describe("store-driven routing (T1/T4/T5)", () => {
     const s = useAppStore.getState();
     const mode = resolveLayerMode(s.projectModes, s.activeProject);
     expect(mode).toBe("dev");
-    expect(devConsumesEditorOpen(mode)).toBe(true);
+    expect(devIsFront(mode)).toBe(true);
   });
 
   it("setProjectMode('integrated') deletes the key (sparse map) → resolves integrated", () => {
@@ -161,5 +181,51 @@ describe("ensureDevUuid (⑥ — persisted dev-session id)", () => {
     // dev session resumes across restarts — no new session spawned).
     useAppStore.setState({ devUuids: persisted });
     expect(useAppStore.getState().ensureDevUuid(DP)).toBe(uuid);
+  });
+});
+
+describe("devReview FIFO queue (B1/B2 — ③ single-consumer, no clobber)", () => {
+  const A = "/repo/a";
+  const B = "/repo/b";
+  beforeEach(() => {
+    useAppStore.setState({ devReviewQueue: [] });
+  });
+
+  it("enqueues in order with stable unique ids (no clobber of rapid clicks)", () => {
+    useAppStore.getState().requestDevReview({ project: A, prompt: "one" });
+    useAppStore.getState().requestDevReview({ project: A, prompt: "two" });
+    const q = useAppStore.getState().devReviewQueue;
+    expect(q.map((r) => r.prompt)).toEqual(["one", "two"]); // FIFO order preserved
+    expect(q[0].id).not.toBe(q[1].id); // distinct ids
+    expect(typeof q[0].id).toBe("string");
+  });
+
+  it("consumeDevReview removes only the matching id, and is idempotent", () => {
+    useAppStore.getState().requestDevReview({ project: A, prompt: "one" });
+    useAppStore.getState().requestDevReview({ project: A, prompt: "two" });
+    const [first] = useAppStore.getState().devReviewQueue;
+    useAppStore.getState().consumeDevReview(first.id);
+    expect(useAppStore.getState().devReviewQueue.map((r) => r.prompt)).toEqual(["two"]);
+    // Double-consume the same id is a harmless no-op (onReady + effect both fire).
+    useAppStore.getState().consumeDevReview(first.id);
+    expect(useAppStore.getState().devReviewQueue.map((r) => r.prompt)).toEqual(["two"]);
+    // An unknown id is also a no-op.
+    useAppStore.getState().consumeDevReview("does-not-exist");
+    expect(useAppStore.getState().devReviewQueue.map((r) => r.prompt)).toEqual(["two"]);
+  });
+
+  it("a project drains only its own head — other projects' entries never block it", () => {
+    useAppStore.getState().requestDevReview({ project: A, prompt: "a1" });
+    useAppStore.getState().requestDevReview({ project: B, prompt: "b1" });
+    useAppStore.getState().requestDevReview({ project: A, prompt: "a2" });
+    // A's DevView takes its head (first entry whose project === A), leaving B's.
+    const headA = useAppStore.getState().devReviewQueue.find((r) => r.project === A);
+    expect(headA?.prompt).toBe("a1");
+    useAppStore.getState().consumeDevReview(headA!.id);
+    // B's entry is untouched; A's next is now the head for A.
+    const q = useAppStore.getState().devReviewQueue;
+    expect(q.map((r) => r.prompt)).toEqual(["b1", "a2"]);
+    expect(q.find((r) => r.project === A)?.prompt).toBe("a2");
+    expect(q.find((r) => r.project === B)?.prompt).toBe("b1"); // never blocked/removed
   });
 });

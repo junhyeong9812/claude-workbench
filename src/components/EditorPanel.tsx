@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { errText } from "../utils/error";
 import type { IDockviewPanelProps } from "dockview-react";
 import { invoke } from "@tauri-apps/api/core";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import { EditorView, basicSetup } from "codemirror";
 import { EditorState, Compartment } from "@codemirror/state";
 import { keymap } from "@codemirror/view";
@@ -80,6 +81,15 @@ export function EditorPanel(props: IDockviewPanelProps<EditorParams>) {
   const saveRef = useRef(save);
   saveRef.current = save;
 
+  // Whether the ✓확인/🧪 dev-layer transition (setProjectMode + editorOpen +
+  // devReview) can run from here. It only works in the MAIN window, where DevView
+  // is mounted to consume the editorOpen/devReview requests and show the flipped
+  // layer, and for the active project (whose DevView is the one that would
+  // consume). A popout has no DevView, so the flip would strand those requests and
+  // persist a mode nobody renders — so we gate it (cross-project / popout guard).
+  const canDevTransition = (project: string): boolean =>
+    getCurrentWindow().label === "main" && project === useAppStore.getState().activeProject;
+
   // Dev mode 확인: save the file, then ask the project's dev Claude session to
   // review it (typos, missing imports, indentation/format, context) — review
   // only, no edits (the user is the writer). Save is awaited so Claude reads the
@@ -101,7 +111,7 @@ export function EditorPanel(props: IDockviewPanelProps<EditorParams>) {
       return;
     }
     const project = useAppStore.getState().activeProject;
-    if (project) {
+    if (project && canDevTransition(project)) {
       const prompt =
         `방금 \`${path}\` 를 편집·저장했어. 그 파일을 읽고 검토해줘 — ` +
         `오타·빠진 import·들여쓰기/포맷·맥락 적합성 위주로. ` +
@@ -113,6 +123,11 @@ export function EditorPanel(props: IDockviewPanelProps<EditorParams>) {
       useAppStore.getState().setProjectMode(project, "dev");
       useAppStore.getState().requestEditorOpen(path);
       useAppStore.getState().requestDevReview({ project, prompt });
+    } else if (project) {
+      // Saved, but the dev-layer transition can't run here (popout / non-active
+      // project — no DevView to consume). Don't strand editorOpen/devReview
+      // requests or persist a dev mode nobody shows.
+      setStatus("저장됨 — 개발 세션 검토는 메인 창에서 사용 가능합니다");
     }
     setReviewing(false);
   };
@@ -124,6 +139,10 @@ export function EditorPanel(props: IDockviewPanelProps<EditorParams>) {
     if (!path) return;
     const project = useAppStore.getState().activeProject;
     if (!project) return;
+    if (!canDevTransition(project)) {
+      setStatus("테스트 생성(개발 세션)은 메인 창에서 사용 가능합니다");
+      return;
+    }
     let testPath: string | null = null;
     try {
       testPath = await invoke<string | null>("mirror_test_path", { src: path });

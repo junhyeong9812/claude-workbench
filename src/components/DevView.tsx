@@ -6,7 +6,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { ClaudeTermPanel } from "./ClaudeTermPanel";
 import { StudyFileView } from "./StudyFileView";
 import { useAppStore } from "../state/store";
-import { resolveLayerMode, devConsumesEditorOpen, routeDevReview } from "../state/layerRouting";
+import { resolveLayerMode, devIsFront, routeDevReview } from "../state/layerRouting";
 
 const components = { claudeterm: ClaudeTermPanel };
 const basename = (p: string) => p.split("/").pop() ?? p;
@@ -34,9 +34,12 @@ export function DevView({ project }: { project: string }) {
   const editorOpenRequest = useAppStore((s) => s.editorOpenRequest);
   const requestEditorOpen = useAppStore((s) => s.requestEditorOpen);
   // ✓확인/🧪 (EditorPanel or the DevView button) hands a review/test prompt to
-  // this project's dev session — this view (not MainArea) owns delivery now.
-  const devReviewRequest = useAppStore((s) => s.devReviewRequest);
-  const requestDevReview = useAppStore((s) => s.requestDevReview);
+  // this project's dev session — this view (not MainArea) owns delivery now. A
+  // FIFO queue: this DevView drains only its own project's entries, in order.
+  const devReviewQueue = useAppStore((s) => s.devReviewQueue);
+  // Ctrl+B focus request: when the dev layer is in front, DevView (not MainArea)
+  // owns the focus target (its editor or its dev dock).
+  const focusMainRequest = useAppStore((s) => s.focusMainRequest);
 
   // Open tabs, MRU-first; in-memory per mount (the durable continuity is the
   // dev session itself, whose uuid persists).
@@ -48,12 +51,14 @@ export function DevView({ project }: { project: string }) {
   // In integrated mode this view is still mounted (latch) but behind MainArea,
   // so it must leave the request untouched for MainArea (유실≠소비).
   useEffect(() => {
-    if (!devConsumesEditorOpen(layerMode)) return; // integrated layer's request — leave it
+    if (!devIsFront(layerMode)) return; // integrated layer's request — leave it
     if (!editorOpenRequest) return;
     const path = editorOpenRequest;
-    requestEditorOpen(null);
+    // Clear only AFTER the tab actually opens (side effect before clear, T1) so a
+    // dropped request can't read as "consumed".
     setTabs((prev) => (prev.includes(path) ? prev : [path, ...prev]));
     setActive(path);
+    requestEditorOpen(null);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [editorOpenRequest, layerMode]);
 
@@ -98,26 +103,37 @@ export function DevView({ project }: { project: string }) {
     });
   };
 
-  // Deliver a devReview (✓확인/🧪) prompt to this project's dev session. Only this
-  // project's request is ours; the route (pending/inject/seed) is decided from the
-  // dock's state so the prompt reaches the session by exactly one channel and is
-  // never lost (③·#6·F4). "pending" (dock not ready — the ✓확인 flip freshly
-  // mounted us) is left for onReady to seed with.
-  useEffect(() => {
-    if (!devReviewRequest || devReviewRequest.project !== project) return; // not ours
+  // Drain this project's devReview (✓확인/🧪) entries from the FIFO queue. Delivery
+  // follows a CAS discipline: re-read the LATEST queue from the store each step
+  // (never a captured snapshot), take our project's head entry, deliver it by
+  // exactly one route (pending/inject/seed — ③·#6·F4), then consume it BY ID. So
+  // the two delivery paths (this effect and onReady's child effect, which runs
+  // first) can't double-deliver: whichever consumes an id first, the other
+  // re-reads and no longer finds it. "pending" (dock not ready — the ✓확인 flip
+  // just mounted us) is left for onReady to seed with. Remaining same-project
+  // entries are delivered in order via inject (downstream claudeInject is a single
+  // slot — an extreme same-tick burst can overwrite; pre-existing semantics).
+  const deliverDevReviews = () => {
     const api = apiRef.current;
-    const route = routeDevReview(api != null, api != null && api.getPanel("dev-claude") != null);
-    if (route === "pending") return; // onReady will seed the new session with this prompt
-    const prompt = devReviewRequest.prompt;
-    if (route === "inject") {
-      const uuid = useAppStore.getState().ensureDevUuid(project);
-      useAppStore.getState().requestClaudeInject({ uuid, text: prompt });
-    } else {
-      seedDevSession(api!, prompt); // "seed": pane was emptied — re-open it seeded
+    for (;;) {
+      const head = useAppStore.getState().devReviewQueue.find((r) => r.project === project);
+      if (!head) return; // nothing (more) for us — other projects' entries never block us
+      const route = routeDevReview(api != null, api != null && api.getPanel("dev-claude") != null);
+      if (route === "pending") return; // onReady will seed the new session with the head
+      if (route === "inject") {
+        const uuid = useAppStore.getState().ensureDevUuid(project);
+        useAppStore.getState().requestClaudeInject({ uuid, text: head.prompt });
+      } else {
+        seedDevSession(api!, head.prompt); // "seed": pane was emptied — re-open it seeded
+      }
+      useAppStore.getState().consumeDevReview(head.id); // consume by id (idempotent)
     }
-    requestDevReview(null);
+  };
+
+  useEffect(() => {
+    deliverDevReviews();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [devReviewRequest]);
+  }, [devReviewQueue]);
 
   // Embedded dev session dock (StudySession 선례): seed once with the project's
   // persisted dev-session uuid so it resumes across restarts; a re-entry within
@@ -128,10 +144,12 @@ export function DevView({ project }: { project: string }) {
     const api = event.api;
     apiRef.current = api;
     if (api.panels.length === 0) {
-      const pending = useAppStore.getState().devReviewRequest;
-      const prompt = pending && pending.project === project ? pending.prompt : undefined;
-      seedDevSession(api, prompt);
-      if (prompt) useAppStore.getState().requestDevReview(null);
+      // CAS: grab our project's head devReview (if any) to seed the fresh session
+      // with, and consume it by id — so the devReview effect (parent, runs after
+      // this child effect) re-reads and won't re-deliver it.
+      const head = useAppStore.getState().devReviewQueue.find((r) => r.project === project);
+      seedDevSession(api, head?.prompt);
+      if (head) useAppStore.getState().consumeDevReview(head.id);
     }
     // Explicit close of the dev session → stop its PTY (the pane stays empty
     // until the dev mode is re-entered, which re-seeds the same uuid).
@@ -141,7 +159,45 @@ export function DevView({ project }: { project: string }) {
         invoke("claude_close", { id: p.sessionId }).catch(() => {});
       }
     });
+    // Deliver any remaining same-project entries now that the dock is live (a
+    // rapid double ✓확인 before mount leaves >1 queued).
+    deliverDevReviews();
   };
+
+  // Ctrl+B focus: when the dev layer is in front, focus this view's active area —
+  // the open editor tab's CodeMirror if one is active, else the dev dock's active
+  // panel content (xterm/timeline). Symmetric with MainArea's focusMainRequest
+  // consumer, which stays gated to the integrated (front) layer. Retries across a
+  // few frames in case content is still laying out. Skip the initial 0.
+  const lastFocusHandledRef = useRef(0);
+  useEffect(() => {
+    if (focusMainRequest === 0 || focusMainRequest === lastFocusHandledRef.current) return;
+    lastFocusHandledRef.current = focusMainRequest;
+    if (!devIsFront(layerMode)) return; // integrated layer in front — MainArea focuses
+    const wantEditor = active != null;
+    let tries = 0;
+    const tick = () => {
+      const root = document.querySelector(".dev-view");
+      if (root) {
+        const editor = root.querySelector(".dev-editor-body .cm-content") as HTMLElement | null;
+        if (wantEditor && editor && editor.offsetParent !== null) {
+          editor.focus();
+          return;
+        }
+        const group = root.querySelector(".dev-session-dock .dv-active-group");
+        const content = (group ?? root).querySelector(
+          ".xterm-helper-textarea, .cm-content, textarea, input, [tabindex]",
+        ) as HTMLElement | null;
+        if (content && content.offsetParent !== null) {
+          content.focus();
+          return;
+        }
+      }
+      if (tries++ < 10) requestAnimationFrame(tick);
+    };
+    requestAnimationFrame(tick);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [focusMainRequest, layerMode]);
 
   return (
     <PanelGroup direction="horizontal" className="dev-view" autoSaveId="dev-cols">
