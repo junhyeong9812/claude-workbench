@@ -494,7 +494,7 @@ export const useAppStore = create<AppState>((set, get) => ({
   theme: (localStorage.getItem("theme") as "dark" | "light") || "dark",
   fontSize: clampFontSize(Number(localStorage.getItem("fontSize")) || 13),
   termColors: loadTermColors(),
-  mode: (localStorage.getItem("mode") as "workspace" | "study") || "workspace",
+  mode: localStorage.getItem("mode") === "study" ? "study" : "workspace",
   projectModes: loadProjectModes(),
   devUuids: loadStringMap("devUuids"),
   studyFolders: STUDY0.folders,

@@ -319,7 +319,9 @@ export function MainArea() {
           : kind === "editor"
             ? "editor"
             : "placeholder";
-    const id = `${kind}-${Date.now()}`;
+    // Counter suffix: two same-kind panels in one millisecond (rapid dev-mode
+    // opens) must not collide — dockview requires unique ids.
+    const id = `${kind}-${Date.now()}-${n}`;
     api.addPanel({
       id,
       component,
@@ -501,7 +503,11 @@ export function MainArea() {
     const p = hostKeyQueue[0];
     setHostKeyQueue((q) => q.slice(1));
     if (!p) return;
-    invoke("ssh_hostkey_decision", { id: p.id, accept }).catch(() => {});
+    invoke("ssh_hostkey_decision", { id: p.id, accept }).catch((e) => {
+      // Surface the failure: the backend never got the decision, so the SSH
+      // connect will hang — at least make the cause findable in devtools.
+      console.error("ssh_hostkey_decision failed", e);
+    });
   };
 
   // Dev-mode layout helper: make sure the project's dev Claude session (stable
@@ -553,7 +559,7 @@ export function MainArea() {
     const panelId = addPanel("editor", { path, title: fileName(path) });
     if (dev) ensureDevSession(activeProject!, panelId);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [editorOpenRequest, activeProject, projectModes]);
+  }, [editorOpenRequest, apiReady, activeProject, projectModes]);
 
   // Open a diff panel (changed file or commit) when requested from the Git panel.
   useEffect(() => {

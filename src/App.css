@@ -1203,7 +1203,10 @@ body {
   border: 1px solid var(--border);
   border-radius: 6px;
   box-shadow: 0 8px 32px rgba(0, 0, 0, 0.5);
-  overflow: hidden;
+  /* x stays clipped for the border radius; y scrolls so a modal taller than the
+     85vh clamp (e.g. the SSH dialog) keeps its bottom actions reachable. */
+  overflow-x: hidden;
+  overflow-y: auto;
 }
 .claude-modal-title {
   padding: 10px 14px;

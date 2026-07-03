@@ -36,6 +36,12 @@ lines.forEach((line, i) => {
 });
 
 // --- 2. flex:1 without a shrink guard ---
+// Known heuristic limits (kept regex-simple by design — no CSS AST dependency):
+// the guard check is axis-agnostic (a min-width:0 satisfies it even where the
+// parent is a column and min-height:0 is the effective guard), and the naive
+// rule regex reads nested @media blocks flat. Both can under-report axis
+// mismatches, never over-report; the current sheet audits clean under manual
+// axis review (P3 dual review).
 for (const m of css.matchAll(/([^{}]+)\{([^{}]*)\}/g)) {
   const sel = m[1].trim().split("\n").pop().trim();
   const body = m[2];
@@ -51,6 +57,8 @@ for (const m of css.matchAll(/([^{}]+)\{([^{}]*)\}/g)) {
 }
 
 // --- 3. rule-starting class outside the namespace allowlist ---
+// Checks column-0 selectors only — App.css keeps top-level rules unindented;
+// an indented selector (inside @media) inherits its component's namespace.
 lines.forEach((line, i) => {
   const m = /^\.([a-z][a-z0-9]*)/.exec(line);
   if (!m) return;
