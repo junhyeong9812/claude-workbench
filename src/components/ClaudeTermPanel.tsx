@@ -12,6 +12,7 @@ import { xtermTheme } from "./xtermTheme";
 import { recallArea, rememberArea, type PanelArea } from "../state/panelFocus";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { TimelineView, ItemDetail, MarkdownText, type TimelineItem } from "./TimelineView";
+import { SubagentsPane } from "./SubagentsPane";
 import { handleScrollKey } from "./scrollKeys";
 
 /**
@@ -203,6 +204,11 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
   // Width (px) of the detail viewer + timeline panes; drag splitters to resize.
   const [viewerWidth, setViewerWidth] = useState(480);
   const [timelineWidth, setTimelineWidth] = useState(360);
+  // 서브에이전트 칼럼 (opt-in): every agent's live progress stacked beside the
+  // terminal, instead of digging into the timeline's nested groups.
+  const [showAgents, setShowAgents] = useState(false);
+  const [agentsWidth, setAgentsWidth] = useState(300);
+  const agentsPaneRef = useRef<HTMLDivElement | null>(null);
 
   // --- Task handoff state ---
   // Bumped to remount the terminal/timeline effect onto a new session (restart).
@@ -478,6 +484,22 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
     window.addEventListener("mouseup", onUp);
   };
   // Drag the timeline splitter to resize the timeline column.
+  const startDragAgents = (e: React.MouseEvent) => {
+    e.preventDefault();
+    const pane = agentsPaneRef.current;
+    if (!pane) return;
+    const right = pane.getBoundingClientRect().right;
+    const onMove = (ev: MouseEvent) => {
+      setAgentsWidth(Math.max(220, Math.min(600, right - ev.clientX)));
+    };
+    const onUp = () => {
+      window.removeEventListener("mousemove", onMove);
+      window.removeEventListener("mouseup", onUp);
+    };
+    window.addEventListener("mousemove", onMove);
+    window.addEventListener("mouseup", onUp);
+  };
+
   const startDragTimeline = (e: React.MouseEvent) => {
     e.preventDefault();
     const container = containerRef.current;
@@ -890,6 +912,23 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
                 </span>
               );
             })()}
+            {subagents.length > 0 && (
+              <button
+                className={`claudeterm-head-btn${showAgents ? " claudeterm-head-btn-on" : ""}`}
+                title="서브에이전트 진행상황을 별도 칼럼으로 나란히 봅니다"
+                onClick={() => setShowAgents((v) => !v)}
+              >
+                🤖 서브 {(() => {
+                  const running = subagents.filter(([, , , its]) => {
+                    const last = its[its.length - 1];
+                    return (
+                      last?.agent_status === "in_progress" || last?.agent_status === "pending"
+                    );
+                  }).length;
+                  return running > 0 ? `${running}▶` : subagents.length;
+                })()}
+              </button>
+            )}
             {lastSeed && (
               <button
                 className="claudeterm-head-btn"
@@ -1039,6 +1078,36 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
         </>
       )}
 
+      {showAgents && subagents.length > 0 && (
+        <>
+          <div className="claudeterm-splitter" title="드래그로 크기 조절" onMouseDown={startDragAgents} />
+          <div
+            className="claudeterm-pane claudeterm-agents-pane"
+            ref={agentsPaneRef}
+            style={{ flex: `0 0 ${agentsWidth}px` }}
+          >
+            <div className="claudeterm-pane-head">
+              <span className="claudeterm-pane-head-title">서브에이전트</span>
+              <span
+                className="claudeterm-viewer-x"
+                title="닫기"
+                onClick={() => setShowAgents(false)}
+              >
+                ×
+              </span>
+            </div>
+            <SubagentsPane
+              subagents={subagents}
+              selectedId={selectedId}
+              onSelect={(it) => {
+                setSelectedId(it.tool_call_id);
+                setTextView(null);
+                setSelectedTurn(null);
+              }}
+            />
+          </div>
+        </>
+      )}
       <div className="claudeterm-splitter" title="드래그로 크기 조절" onMouseDown={startDragTimeline} />
       <div
         className="claudeterm-pane claudeterm-timeline-pane"
