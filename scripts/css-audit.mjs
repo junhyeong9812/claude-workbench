@@ -19,7 +19,7 @@ const lines = css.split("\n");
 // Extend deliberately when adding a new component family — not ad hoc.
 const PREFIXES = new Set([
   "app", "badge", "cfs", "claude", "claudeterm", "cm", "commit", "ctx",
-  "diff", "dock", "drop", "editor", "git", "main", "modal", "pane", "panes",
+  "dev", "diff", "dock", "drop", "editor", "git", "main", "modal", "pane", "panes",
   "peek", "placeholder", "resize", "run", "search", "sidebar", "ssh",
   "study", "tab", "tabbar", "terminal", "timeline", "tl", "toolbar",
   "tree", "ts",

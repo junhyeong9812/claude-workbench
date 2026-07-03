@@ -125,7 +125,6 @@ export function MainArea() {
   const requestRun = useAppStore((s) => s.requestRun);
   const focusMainRequest = useAppStore((s) => s.focusMainRequest);
   const setLayout = useAppStore((s) => s.setLayout);
-  const projectModes = useAppStore((s) => s.projectModes);
   const ensureDevUuid = useAppStore((s) => s.ensureDevUuid);
 
   const apiRef = useRef<DockviewApi | null>(null);
@@ -510,56 +509,27 @@ export function MainArea() {
     });
   };
 
-  // Dev-mode layout helper: make sure the project's dev Claude session (stable
-  // persisted uuid) is open, docked beside `refPanelId`. A stale uuid is safe —
-  // the backend resumes only when the transcript exists, else it starts fresh
-  // under the same id. Returns the uuid so callers can inject into the session.
-  const ensureDevSession = (project: string, refPanelId?: string | null, seed?: string) => {
-    const uuid = ensureDevUuid(project);
-    const api = apiRef.current;
-    if (!api) return uuid;
-    const open = api.panels.some((p) => {
-      const prm = p.params as { loadSessionId?: string; sessionUuid?: string };
-      return prm.loadSessionId === uuid || prm.sessionUuid === uuid;
-    });
-    if (!open) {
-      addPanel("claudeterm", {
-        project,
-        loadSessionId: uuid,
-        title: "개발 세션",
-        ...(seed ? { seed } : {}),
-        ...(refPanelId
-          ? { position: { referencePanel: refPanelId, direction: "right" as const } }
-          : {}),
-      });
-    }
-    return uuid;
-  };
-
   // Open a file in the editor when requested (from the peek viewer or tree). Focus
-  // an already-open editor for the same file instead of opening a duplicate. In a
-  // dev-flavored project (개발 모드) the editor comes with the project's dev
-  // Claude session docked to its right — the ✓확인 loop's built-in layout.
+  // an already-open editor for the same file instead of opening a duplicate.
+  // (개발 모드는 MainArea 대신 DevView가 마운트되어 이 요청을 소비한다 — the
+  // dev-flavored layout lives there, not here.)
   useEffect(() => {
     if (!editorOpenRequest) return;
     const api = apiRef.current;
     if (!api) return; // dock not ready (mount/project switch) — keep the request
     const path = editorOpenRequest;
     requestEditorOpen(null); // consume only once we can actually act (codex P2 E4)
-    const dev = !!activeProject && projectModes[activeProject] === "dev";
     const existing = api.panels.find((p) => {
       const prm = p.params as { kind?: string; path?: string } | undefined;
       return prm?.kind === "editor" && prm.path === path;
     });
     if (existing) {
       existing.api.setActive();
-      if (dev) ensureDevSession(activeProject!, existing.id);
       return;
     }
-    const panelId = addPanel("editor", { path, title: fileName(path) });
-    if (dev) ensureDevSession(activeProject!, panelId);
+    addPanel("editor", { path, title: fileName(path) });
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [editorOpenRequest, apiReady, activeProject, projectModes]);
+  }, [editorOpenRequest, apiReady, activeProject]);
 
   // Open a diff panel (changed file or commit) when requested from the Git panel.
   useEffect(() => {
@@ -635,7 +605,13 @@ export function MainArea() {
       requestClaudeInject({ uuid, text: prompt });
       return;
     }
-    ensureDevSession(project, editorPanelId, prompt);
+    addPanel("claudeterm", {
+      project,
+      loadSessionId: uuid,
+      title: "개발 세션",
+      seed: prompt,
+      position: { referencePanel: editorPanelId, direction: "right" as const },
+    });
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [devReviewRequest, apiReady, activeProject]);
 
