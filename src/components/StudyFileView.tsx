@@ -11,6 +11,7 @@ import { keymap } from "@codemirror/view";
 import { useAppStore } from "../state/store";
 import { langFor } from "./cmLang";
 import { cmThemeExt } from "./cmTheme";
+import { completionExts } from "./cmComplete";
 import { isMarkdownPath, Markdown } from "./markdown";
 import { useFileText } from "../hooks/useFileText";
 
@@ -34,9 +35,19 @@ function MarkdownView({ path }: { path: string }) {
 
 /**
  * CodeMirror view of one file for a study viewer tab. Read-only in viewer mode;
- * in editor mode it is editable with Ctrl+S save (atomic `write_file`).
+ * in editor mode it is editable with Ctrl+S save (atomic `write_file`) and
+ * Ctrl+Space completion (word/keyword + tree-based auto-import when a
+ * `project` root is given — dev mode passes it).
  */
-export function StudyFileView({ path, editable = false }: { path: string; editable?: boolean }) {
+export function StudyFileView({
+  path,
+  editable = false,
+  project = null,
+}: {
+  path: string;
+  editable?: boolean;
+  project?: string | null;
+}) {
   const theme = useAppStore((s) => s.theme);
   const hostRef = useRef<HTMLDivElement | null>(null);
   const saveTimer = useRef<number | null>(null);
@@ -60,6 +71,7 @@ export function StudyFileView({ path, editable = false }: { path: string; editab
         if (cancelled || !hostRef.current) return;
         const exts = [basicSetup, cmThemeExt(theme), ...langFor(path)];
         if (editable) {
+          exts.push(...completionExts(path, project));
           exts.push(
             keymap.of([
               {
@@ -103,7 +115,7 @@ export function StudyFileView({ path, editable = false }: { path: string; editab
       }
       view?.destroy();
     };
-  }, [path, theme, editable]);
+  }, [path, theme, editable, project]);
 
   if (isImage(path))
     return (

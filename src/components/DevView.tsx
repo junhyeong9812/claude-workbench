@@ -129,7 +129,7 @@ export function DevView({ project }: { project: string }) {
           </div>
           <div className="dev-editor-body">
             {active ? (
-              <StudyFileView key={active} path={active} editable />
+              <StudyFileView key={active} path={active} editable project={project} />
             ) : (
               <div className="dev-empty">
                 좌측 트리에서 파일을 열면 에디터 탭으로 열립니다.
