@@ -3445,3 +3445,96 @@ body {
   color: var(--fg); background: var(--bg-alt); border: 1px solid var(--border); border-radius: 4px; cursor: pointer;
 }
 .tree-dialog-foot button:hover { background: var(--bg-hover); }
+
+/* ---- Dev mode view (개발 모드 전환 레이아웃) ---- */
+/* Editor-first main-area swap: file tabs + editable view (left), the project's
+   pinned dev Claude session (right). Tab styling mirrors .study-tab so the two
+   editor surfaces read the same. */
+.dev-view {
+  height: 100%;
+}
+.dev-col {
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+.dev-editor {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+.dev-tabs {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: stretch;
+  border-bottom: 1px solid var(--border);
+  background: var(--bg-alt);
+  min-height: 26px;
+}
+.dev-tabs-list {
+  flex: 1 1 0;
+  min-width: 0;
+  display: flex;
+  overflow: hidden;
+}
+.dev-tab {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  max-width: 160px;
+  padding: 2px 8px;
+  border-right: 1px solid var(--border);
+  cursor: pointer;
+  font-size: 0.82em;
+  color: var(--fg-dim);
+}
+.dev-tab.active {
+  color: var(--fg);
+  background: var(--bg);
+  border-bottom: 2px solid var(--accent);
+}
+.dev-tab-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.dev-tab-x {
+  flex: 0 0 auto;
+  opacity: 0.6;
+}
+.dev-tab-x:hover {
+  opacity: 1;
+}
+.dev-review-btn {
+  flex: 0 0 auto;
+  margin: 2px 6px;
+  padding: 0 10px;
+  background: var(--bg);
+  color: var(--st-ok);
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  cursor: pointer;
+  font-size: 0.82em;
+}
+.dev-review-btn:hover {
+  background: var(--bg-hover);
+}
+.dev-editor-body {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: auto;
+}
+.dev-empty {
+  padding: 24px 16px;
+  color: var(--fg-dim);
+  font-size: 0.9em;
+  line-height: 1.8;
+}
+.dev-session-dock {
+  height: 100%;
+}

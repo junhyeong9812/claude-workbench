@@ -10,6 +10,7 @@ import { FolderTree } from "./components/FolderTree";
 import { GitPanel } from "./components/GitPanel";
 import { WorktreePanel } from "./components/WorktreePanel";
 import { MainArea } from "./components/MainArea";
+import { DevView } from "./components/DevView";
 import { FilePeekViewer } from "./components/FilePeekViewer";
 import { CommitFilesSidebar } from "./components/CommitFilesSidebar";
 import { CommitFileView } from "./components/CommitFileView";
@@ -306,7 +307,13 @@ function AppMain() {
         )}
         <PanelResizeHandle className="resize-handle" />
         <Panel id="main" order={3} defaultSize={60} minSize={30} className="pane-main">
-          <MainArea />
+          {activeProject && projectModes[activeProject] === "dev" ? (
+            // 개발 모드: the main area swaps to the editor-first layout (원안) —
+            // keyed by project so switching projects resets its tabs.
+            <DevView key={activeProject} project={activeProject} />
+          ) : (
+            <MainArea />
+          )}
           {peekFile && (
             <FilePeekViewer
               path={peekFile}
