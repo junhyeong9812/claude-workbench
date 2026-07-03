@@ -673,6 +673,10 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
     // Set once a live timeline event arrives, so a slower snapshot-seed (reopen /
     // re-attach restore) doesn't overwrite newer live state.
     let gotLive = false;
+    // The uuid this mount attached to the attention store (P3). Tracked locally so
+    // the cleanup detaches exactly what it attached, regardless of a later handoff
+    // reassigning statusUuidRef.
+    let attachedUuid: string | null = null;
     const pending: TerminalOutputEvent[] = [];
 
     const applySnapshot = (s: {
@@ -805,6 +809,13 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
         });
         sessionId = opened.id;
         statusUuidRef.current = opened.session_uuid;
+        // Register this session's numeric↔uuid mapping so the app-level global
+        // listener can resolve its timeline events while this panel is a
+        // backgrounded (unmounted) tab, and mark it attached so the global
+        // listener defers to this panel's own (accurate-seenNow) updates (P3).
+        attachedUuid = opened.session_uuid;
+        useClaudeStatus.getState().registerSession(opened.session_uuid, opened.id);
+        useClaudeStatus.getState().attachPanel(opened.session_uuid);
         driverRevRef.current = opened.rev;
         const driving = opened.driver === myLabel;
         isDriverRef.current = driving;
@@ -929,6 +940,11 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
       // Detach only — the PTY + poll thread live on (closed by claude_close on
       // real panel removal in MainArea).
       disposed = true;
+      // Release this panel's attention-store attachment so the global listener
+      // takes over the (still-live) session's badge. Does NOT remove the entry /
+      // mapping — a done-unseen badge must survive a tab-switch remount (the
+      // session is only truly removed on claude-session-closed).
+      if (attachedUuid) useClaudeStatus.getState().detachPanel(attachedUuid);
       blockedScanner.cancel();
       ro.disconnect();
       onData.dispose();

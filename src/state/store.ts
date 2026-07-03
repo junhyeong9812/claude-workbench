@@ -299,6 +299,11 @@ interface AppState {
    * already-focused tree toggles focus back to the open tab). A counter so every
    * press re-fires even when the value would otherwise be unchanged. */
   focusMainRequest: number;
+  /** Request MainArea activate the Claude panel for a session uuid (the toolbar
+   * attention roll-up's cycle-click). `nonce` re-fires the effect even when the
+   * same uuid is requested twice in a row. Transient. No-op if that session has
+   * no panel in this window's dock (another window's session). */
+  focusSessionRequest: { uuid: string; nonce: number } | null;
   /** Color theme (persisted to localStorage). Drives CSS vars + xterm palette. */
   theme: "dark" | "light";
   /** Code font size in px (terminals + editor/viewer), persisted. */
@@ -424,6 +429,8 @@ interface AppState {
   requestRun: (req: { project: string; cmd: string; title: string } | null) => void;
   /** Ask MainArea to focus the active dockview panel (Ctrl+B tree→tab toggle). */
   requestFocusMain: () => void;
+  /** Ask MainArea to activate the panel for `uuid` (attention roll-up cycle). */
+  requestFocusSession: (uuid: string) => void;
   /** Switch the color theme. */
   setTheme: (theme: "dark" | "light") => void;
   /** Set the code font size (clamped 9–28). */
@@ -491,6 +498,7 @@ export const useAppStore = create<AppState>((set, get) => ({
   devReviewRequest: null,
   runRequest: null,
   focusMainRequest: 0,
+  focusSessionRequest: null,
   theme: (localStorage.getItem("theme") as "dark" | "light") || "dark",
   fontSize: clampFontSize(Number(localStorage.getItem("fontSize")) || 13),
   termColors: loadTermColors(),
@@ -651,6 +659,10 @@ export const useAppStore = create<AppState>((set, get) => ({
   requestDevReview: (req) => set({ devReviewRequest: req }),
   requestRun: (req) => set({ runRequest: req }),
   requestFocusMain: () => set((s) => ({ focusMainRequest: s.focusMainRequest + 1 })),
+  requestFocusSession: (uuid) =>
+    set((s) => ({
+      focusSessionRequest: { uuid, nonce: (s.focusSessionRequest?.nonce ?? 0) + 1 },
+    })),
   setTheme: (theme) => set({ theme }),
   setFontSize: (n) => set({ fontSize: clampFontSize(n) }),
   setTermColors: (c) => {

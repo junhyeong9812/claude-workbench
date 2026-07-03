@@ -22,7 +22,64 @@ import { PopoutWorkbench } from "./components/PopoutWorkbench";
 import { WebviewWindow } from "@tauri-apps/api/webviewWindow";
 import { getAllWindows } from "@tauri-apps/api/window";
 import { useAppStore } from "./state/store";
+import {
+  useClaudeStatus,
+  attentionUuids,
+  nextCycleTarget,
+  shouldShowRollup,
+} from "./state/claudeStatus";
+import { initClaudeStatusGlobal } from "./state/claudeStatusGlobal";
 import "./App.css";
+
+/**
+ * Toolbar attention roll-up (agent-status-badges P3): a compact `●n` for the
+ * sessions currently needing attention — red for blocked, blue for done-unseen.
+ * Nothing renders when both are zero. Clicking a group cycles activation through
+ * that group's session tabs (in this window's dock; another window's session is a
+ * no-op, a documented roll-up limitation). Idle/working never count.
+ */
+function ToolbarRollup() {
+  const entries = useClaudeStatus((s) => s.entries);
+  const requestFocusSession = useAppStore((s) => s.requestFocusSession);
+  // Last uuid we cycled to — the "current" fed to nextCycleTarget so repeated
+  // clicks step forward through the group (a session that left the set restarts
+  // the cycle at its first member).
+  const lastCycledRef = useRef<string | null>(null);
+  const { blocked, doneUnseen } = attentionUuids(entries);
+  const counts = { blocked: blocked.length, doneUnseen: doneUnseen.length };
+  if (!shouldShowRollup(counts)) return null;
+  const cycle = (uuids: string[]) => {
+    const next = nextCycleTarget(uuids, lastCycledRef.current);
+    if (next) {
+      lastCycledRef.current = next;
+      requestFocusSession(next);
+    }
+  };
+  return (
+    <div className="toolbar-rollup" role="group" aria-label="주의가 필요한 세션">
+      {counts.blocked > 0 && (
+        <button
+          className="toolbar-rollup-item is-blocked"
+          title={`입력 대기 중인 세션 ${counts.blocked}개 — 클릭해 차례로 이동`}
+          onClick={() => cycle(blocked)}
+        >
+          <span className="toolbar-rollup-dot" />
+          {counts.blocked}
+        </button>
+      )}
+      {counts.doneUnseen > 0 && (
+        <button
+          className="toolbar-rollup-item is-done"
+          title={`완료(미확인) 세션 ${counts.doneUnseen}개 — 클릭해 차례로 이동`}
+          onClick={() => cycle(doneUnseen)}
+        >
+          <span className="toolbar-rollup-dot" />
+          {counts.doneUnseen}
+        </button>
+      )}
+    </div>
+  );
+}
 
 export default function App() {
   // A popped-out panel window loads the same frontend with the `#popout` hash
@@ -59,6 +116,11 @@ function AppMain() {
   useEffect(() => {
     void init();
   }, [init]);
+
+  // App-level attention listener (P3): keeps every session's badge updating even
+  // while its panel is a backgrounded (unmounted) tab. Module-guarded to once per
+  // window, so this is the single init point for the main window.
+  useEffect(() => initClaudeStatusGlobal(), []);
 
   // Reopen popout windows that were open at the last quit (multiwindow P2). Runs
   // once on main-window startup; each reopened popout self-restores its layout
@@ -228,6 +290,7 @@ function AppMain() {
             {projectModes[activeProject] === "dev" ? "개발" : "통합"}
           </button>
         )}
+        <ToolbarRollup />
         <RunMenu />
         <span className="toolbar-title">
           {activeProject ?? "multi-terminal"}

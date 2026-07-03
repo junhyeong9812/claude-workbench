@@ -124,6 +124,7 @@ export function MainArea() {
   const runRequest = useAppStore((s) => s.runRequest);
   const requestRun = useAppStore((s) => s.requestRun);
   const focusMainRequest = useAppStore((s) => s.focusMainRequest);
+  const focusSessionRequest = useAppStore((s) => s.focusSessionRequest);
   const setLayout = useAppStore((s) => s.setLayout);
   const ensureDevUuid = useAppStore((s) => s.ensureDevUuid);
 
@@ -849,6 +850,23 @@ export function MainArea() {
     // for other panels `area` is undefined → first focusable content.
     focusActivePanelContent(recallArea(api.activePanel?.id ?? ""));
   }, [focusMainRequest]);
+
+  // Attention roll-up cycle: activate the panel for the requested session uuid.
+  // Matched by the panel's live `sessionUuid` or its resume `loadSessionId` (a
+  // fresh session's uuid == its loadSessionId). No-op if no panel here owns it —
+  // it lives in another window's dock (a documented limitation of the roll-up).
+  useEffect(() => {
+    if (!focusSessionRequest) return;
+    const api = apiRef.current;
+    if (!api) return;
+    const { uuid } = focusSessionRequest;
+    const panel = api.panels.find((p) => {
+      const prm = p.params as { sessionUuid?: string; loadSessionId?: string } | undefined;
+      return prm?.sessionUuid === uuid || prm?.loadSessionId === uuid;
+    });
+    panel?.api.setActive();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [focusSessionRequest]);
 
   return (
     <div className="main-area">

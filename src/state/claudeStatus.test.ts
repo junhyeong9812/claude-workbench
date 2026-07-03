@@ -1,13 +1,17 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   attentionOf,
+  attentionUuids,
   deriveSessionActivity,
   hasOpenQuestion,
   HOLD_MS,
+  lookupSessionUuid,
   makeDebouncedScanner,
+  nextCycleTarget,
   PROMPT_SCAN_MAX_LINES,
   rollup,
   scanBottomForPrompt,
+  shouldShowRollup,
   useClaudeStatus,
   type ActivityItem,
   type SessionEntry,
@@ -88,6 +92,56 @@ describe("rollup", () => {
       { status: "idle", unseen: false },
     ];
     expect(rollup(entries)).toEqual({ blocked: 2, doneUnseen: 1 });
+  });
+});
+
+describe("shouldShowRollup (R3)", () => {
+  it("R3: both zero → nothing to render", () => {
+    expect(shouldShowRollup({ blocked: 0, doneUnseen: 0 })).toBe(false);
+  });
+  it("R4: any nonzero group → render", () => {
+    expect(shouldShowRollup({ blocked: 1, doneUnseen: 0 })).toBe(true);
+    expect(shouldShowRollup({ blocked: 0, doneUnseen: 2 })).toBe(true);
+  });
+});
+
+describe("attentionUuids", () => {
+  it("splits blocked / done-unseen by kind and ignores idle+working", () => {
+    const entries: Record<string, { status: SessionStatus; unseen: boolean }> = {
+      a: { status: "blocked", unseen: false },
+      b: { status: "working", unseen: false }, // excluded
+      c: { status: "idle", unseen: true }, // done-unseen
+      d: { status: "idle", unseen: false }, // excluded
+      e: { status: "blocked", unseen: true },
+    };
+    expect(attentionUuids(entries)).toEqual({ blocked: ["a", "e"], doneUnseen: ["c"] });
+  });
+  it("keeps entries' insertion order (the cycle order)", () => {
+    const entries: Record<string, { status: SessionStatus; unseen: boolean }> = {
+      z: { status: "idle", unseen: true },
+      a: { status: "idle", unseen: true },
+    };
+    expect(attentionUuids(entries).doneUnseen).toEqual(["z", "a"]);
+  });
+});
+
+describe("nextCycleTarget", () => {
+  it("empty list → null (no-op)", () => {
+    expect(nextCycleTarget([], null)).toBeNull();
+    expect(nextCycleTarget([], "a")).toBeNull();
+  });
+  it("no current → first", () => {
+    expect(nextCycleTarget(["a", "b", "c"], null)).toBe("a");
+    expect(nextCycleTarget(["a", "b", "c"], undefined)).toBe("a");
+  });
+  it("current in the middle → next", () => {
+    expect(nextCycleTarget(["a", "b", "c"], "b")).toBe("c");
+  });
+  it("current is last → wraps to first", () => {
+    expect(nextCycleTarget(["a", "b", "c"], "c")).toBe("a");
+  });
+  it("current no longer in the list → restarts at first", () => {
+    expect(nextCycleTarget(["a", "b"], "gone")).toBe("a");
   });
 });
 
@@ -365,5 +419,64 @@ describe("makeDebouncedScanner — trailing debounce (E4)", () => {
     trigger();
     vi.advanceTimersByTime(300);
     expect(run).toHaveBeenCalledTimes(2);
+  });
+});
+
+// --- registry: numeric↔uuid mapping + attach/detach (P3 global listener) ------
+
+describe("store: session registry + attach/detach", () => {
+  beforeEach(() => {
+    for (const uuid of Object.keys(S.getState().entries)) S.getState().remove(uuid);
+    for (const uuid of Object.keys(S.getState().attached)) S.getState().remove(uuid);
+  });
+
+  it("registerSession resolves the numeric id to its uuid (global reverse lookup)", () => {
+    S.getState().registerSession("uuid-a", 42);
+    expect(lookupSessionUuid(42)).toBe("uuid-a");
+    expect(lookupSessionUuid(999)).toBeUndefined();
+  });
+
+  it("attachPanel marks a session attached; the global path skips attached sessions", () => {
+    S.getState().registerSession("uuid-a", 42);
+    expect(S.getState().attached["uuid-a"]).toBeUndefined(); // not attached yet
+    S.getState().attachPanel("uuid-a");
+    // The global listener's guard is `attached[uuid]` — truthy here means it defers
+    // to the mounted panel (no double update).
+    expect(S.getState().attached["uuid-a"]).toBe(1);
+    S.getState().detachPanel("uuid-a");
+    expect(S.getState().attached["uuid-a"]).toBeUndefined(); // global takes over
+  });
+
+  it("attach is ref-counted so a double-detach can't go negative", () => {
+    S.getState().attachPanel("uuid-a");
+    S.getState().attachPanel("uuid-a");
+    expect(S.getState().attached["uuid-a"]).toBe(2);
+    S.getState().detachPanel("uuid-a");
+    expect(S.getState().attached["uuid-a"]).toBe(1);
+    S.getState().detachPanel("uuid-a");
+    S.getState().detachPanel("uuid-a"); // extra
+    expect(S.getState().attached["uuid-a"]).toBeUndefined();
+  });
+
+  it("detach keeps the numeric mapping (a backgrounded tab still resolves)", () => {
+    S.getState().registerSession("uuid-a", 42);
+    S.getState().attachPanel("uuid-a");
+    S.getState().detachPanel("uuid-a");
+    // Mapping survives an unmount so the global listener can update the bg tab.
+    expect(lookupSessionUuid(42)).toBe("uuid-a");
+  });
+
+  it("remove clears the numeric mapping + attach count (true session death)", () => {
+    S.getState().registerSession("uuid-a", 42);
+    S.getState().attachPanel("uuid-a");
+    S.getState().updateFromTimeline("uuid-a", {
+      activity: "working",
+      questionBlocked: false,
+      seenNow: false,
+    });
+    S.getState().remove("uuid-a");
+    expect(lookupSessionUuid(42)).toBeUndefined();
+    expect(S.getState().attached["uuid-a"]).toBeUndefined();
+    expect(S.getState().entries["uuid-a"]).toBeUndefined();
   });
 });

@@ -193,6 +193,40 @@ export function rollup(
   return { blocked, doneUnseen };
 }
 
+/** Does the roll-up need rendering at all? Both zero → nothing to show (R3). */
+export function shouldShowRollup(r: { blocked: number; doneUnseen: number }): boolean {
+  return r.blocked > 0 || r.doneUnseen > 0;
+}
+
+/** The uuids currently needing attention, split by kind and kept in the entries'
+ * insertion order — the roll-up cycles through these lists. Idle/working never
+ * appear (they aren't attention states). */
+export function attentionUuids(
+  entries: Record<string, { status: SessionStatus; unseen: boolean }>,
+): { blocked: string[]; doneUnseen: string[] } {
+  const blocked: string[] = [];
+  const doneUnseen: string[] = [];
+  for (const [uuid, e] of Object.entries(entries)) {
+    const a = attentionOf(e.status, e.unseen);
+    if (a === 3) blocked.push(uuid);
+    else if (a === 2) doneUnseen.push(uuid);
+  }
+  return { blocked, doneUnseen };
+}
+
+/** Next uuid to focus when the roll-up is clicked: the one after `current` in
+ * `uuids`, wrapping at the end. `current` absent (or not in the list — e.g. it
+ * left this attention set) restarts at the first. Empty list → null (no-op).
+ * Pure so the cycle order is unit-testable independent of dockview. */
+export function nextCycleTarget(
+  uuids: readonly string[],
+  current: string | null | undefined,
+): string | null {
+  if (uuids.length === 0) return null;
+  const i = current == null ? -1 : uuids.indexOf(current);
+  return uuids[(i + 1) % uuids.length];
+}
+
 /** One session's tracked state. `status`/`unseen` are the display fields; the
  * rest are internal bookkeeping the actions maintain. */
 export interface SessionEntry {
@@ -249,8 +283,26 @@ export const HOLD_MS = 1000;
  * drives it in tests. */
 const holdTimers = new Map<string, ReturnType<typeof setTimeout>>();
 
+/** numeric PTY/session id → stable uuid. The `claude-timeline` payload carries
+ * only the numeric id, so the app-level global listener (claudeStatusGlobal)
+ * reverse-maps it here to a uuid before updating the store. Registered by a
+ * panel when its session opens; survives a panel unmount (tab switch) so a
+ * backgrounded session's events still resolve — cleared only on real removal. */
+const numericToUuid = new Map<number, string>();
+/** Reverse of `numericToUuid`, so `remove(uuid)` can drop both directions. */
+const uuidToNumeric = new Map<string, number>();
+
+/** Resolve a numeric session id to its uuid (global listener reverse lookup). */
+export function lookupSessionUuid(numericId: number): string | undefined {
+  return numericToUuid.get(numericId);
+}
+
 interface StatusStore {
   entries: Record<string, SessionEntry>;
+  /** uuid → number of mounted panels currently showing it (per window). While
+   * >0 a live panel owns this session's timeline/seen updates (it has the
+   * accurate `seenNow`), so the global listener skips it — no double update. */
+  attached: Record<string, number>;
   /** Record a timeline tick for `uuid`, applying the working→quiet hold and the
    * unseen rule at hold-confirm. Blocked (question) is applied immediately. */
   updateFromTimeline: (uuid: string, d: DerivedTimeline) => void;
@@ -260,6 +312,14 @@ interface StatusStore {
   markSeen: (uuid: string) => void;
   /** Panel unmounted / session ended — drop the entry and any hold timer. */
   remove: (uuid: string) => void;
+  /** Map a session's numeric id ↔ uuid so the global listener can resolve its
+   * `claude-timeline` events. Idempotent; the mapping outlives a panel unmount. */
+  registerSession: (uuid: string, numericId: number) => void;
+  /** A panel mounted for `uuid` — it now owns timeline/seen updates (global skips). */
+  attachPanel: (uuid: string) => void;
+  /** A panel for `uuid` unmounted (tab switch). Only decrements the attach count;
+   * the entry + numeric mapping stay so the global listener takes over. */
+  detachPanel: (uuid: string) => void;
 }
 
 export const useClaudeStatus = create<StatusStore>((set) => {
@@ -291,6 +351,7 @@ export const useClaudeStatus = create<StatusStore>((set) => {
 
   return {
     entries: {},
+    attached: {},
 
     updateFromTimeline: (uuid, d) => {
       set((s) => {
@@ -337,11 +398,35 @@ export const useClaudeStatus = create<StatusStore>((set) => {
 
     remove: (uuid) => {
       clearHold(uuid);
+      const numericId = uuidToNumeric.get(uuid);
+      if (numericId !== undefined) numericToUuid.delete(numericId);
+      uuidToNumeric.delete(uuid);
       set((s) => {
-        if (!(uuid in s.entries)) return {};
+        if (!(uuid in s.entries) && !(uuid in s.attached)) return {};
         const rest = { ...s.entries };
         delete rest[uuid];
-        return { entries: rest };
+        const att = { ...s.attached };
+        delete att[uuid];
+        return { entries: rest, attached: att };
+      });
+    },
+
+    registerSession: (uuid, numericId) => {
+      numericToUuid.set(numericId, uuid);
+      uuidToNumeric.set(uuid, numericId);
+    },
+
+    attachPanel: (uuid) => {
+      set((s) => ({ attached: { ...s.attached, [uuid]: (s.attached[uuid] ?? 0) + 1 } }));
+    },
+
+    detachPanel: (uuid) => {
+      set((s) => {
+        const n = (s.attached[uuid] ?? 0) - 1;
+        const att = { ...s.attached };
+        if (n > 0) att[uuid] = n;
+        else delete att[uuid];
+        return { attached: att };
       });
     },
   };
