@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { errText } from "../utils/error";
 import type { IDockviewPanelProps } from "dockview-react";
 import { invoke } from "@tauri-apps/api/core";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import { EditorView, basicSetup } from "codemirror";
 import { EditorState, Compartment } from "@codemirror/state";
 import { keymap } from "@codemirror/view";
@@ -80,6 +81,17 @@ export function EditorPanel(props: IDockviewPanelProps<EditorParams>) {
   const saveRef = useRef(save);
   saveRef.current = save;
 
+  // Whether the ✓확인/🧪 dev-layer transition (setProjectMode + editorOpen +
+  // devReview) can run from here for the project CAPTURED at click time. Two
+  // conditions: (1) the MAIN window — a popout has no DevView, so the flip would
+  // strand those requests and persist a mode nobody renders; (2) the captured
+  // project is STILL the active project — the awaits before dispatch (write_file/
+  // mirror_test_path) leave a window where the user can switch projects, and
+  // dispatching then would flip/target the wrong project (TOCTOU re-check;
+  // `project` must be captured BEFORE the first await, not re-read here).
+  const canDevTransition = (project: string): boolean =>
+    getCurrentWindow().label === "main" && project === useAppStore.getState().activeProject;
+
   // Dev mode 확인: save the file, then ask the project's dev Claude session to
   // review it (typos, missing imports, indentation/format, context) — review
   // only, no edits (the user is the writer). Save is awaited so Claude reads the
@@ -88,6 +100,10 @@ export function EditorPanel(props: IDockviewPanelProps<EditorParams>) {
   const confirmReview = async () => {
     const view = viewRef.current;
     if (!view || !path) return;
+    // Capture the project at click time — BEFORE the save await — so the dev
+    // transition targets the project the user acted in, not whatever became
+    // active while the save was in flight (TOCTOU).
+    const project = useAppStore.getState().activeProject;
     const content = view.state.doc.toString();
     const savedVersion = versionRef.current;
     setReviewing(true);
@@ -100,13 +116,30 @@ export function EditorPanel(props: IDockviewPanelProps<EditorParams>) {
       setReviewing(false);
       return;
     }
-    const project = useAppStore.getState().activeProject;
-    if (project) {
+    // Re-validate after the await: main window AND the captured project is still
+    // active (canDevTransition re-reads activeProject).
+    if (project && canDevTransition(project)) {
       const prompt =
         `방금 \`${path}\` 를 편집·저장했어. 그 파일을 읽고 검토해줘 — ` +
         `오타·빠진 import·들여쓰기/포맷·맥락 적합성 위주로. ` +
         `직접 수정하지 말고 무엇을 어떻게 고치면 되는지 지적·설명만 해줘.`;
-      useAppStore.getState().requestDevReview({ project, prompt, editorPanelId: props.api.id });
+      // Bring the dev layer to the front and open this file as a DevView tab, then
+      // hand the review to the dev session — no split panel in the integrated dock
+      // (the whole main area swaps to dev). requestEditorOpen routes to the dev
+      // layer because setProjectMode(dev) has already flipped the front layer.
+      useAppStore.getState().setProjectMode(project, "dev");
+      useAppStore.getState().requestEditorOpen(path);
+      useAppStore.getState().requestDevReview({ project, prompt });
+    } else if (project) {
+      // Saved, but the dev-layer transition can't run: either not the main window
+      // (popout — no DevView to consume) or the project switched during the save
+      // await. Don't strand editorOpen/devReview requests or persist a dev mode
+      // nobody shows.
+      setStatus(
+        useAppStore.getState().activeProject === project
+          ? "저장됨 — 개발 세션 검토는 메인 창에서 사용 가능합니다"
+          : "저장됨 — 프로젝트가 전환되어 검토 요청을 보내지 않았습니다",
+      );
     }
     setReviewing(false);
   };
@@ -116,20 +149,36 @@ export function EditorPanel(props: IDockviewPanelProps<EditorParams>) {
   // An explicit generation action (Claude writes the test), unlike 확인 (review).
   const genTest = async () => {
     if (!path) return;
+    // Capture at click time (before any await) — the dispatch below must target
+    // the project the user acted in (TOCTOU, same discipline as ✓확인).
     const project = useAppStore.getState().activeProject;
     if (!project) return;
+    if (!canDevTransition(project)) {
+      setStatus("테스트 생성(개발 세션)은 메인 창에서 사용 가능합니다");
+      return;
+    }
     let testPath: string | null = null;
     try {
       testPath = await invoke<string | null>("mirror_test_path", { src: path });
     } catch {
       /* unsupported language → let Claude pick the path */
     }
+    // Re-validate after the await: the user may have switched projects while
+    // mirror_test_path was in flight — don't flip/dispatch to the wrong project.
+    if (!canDevTransition(project)) {
+      setStatus("프로젝트가 전환되어 테스트 생성 요청을 보내지 않았습니다");
+      return;
+    }
     const where = testPath ? `\`${testPath}\` 에` : "프로젝트 컨벤션에 맞는 위치에";
     const prompt =
       `\`${path}\` 의 단위 테스트를 ${where} 생성해줘. ` +
       `프로젝트의 기존 테스트 컨벤션·프레임워크를 따르고, 파일을 실제로 만들어줘(필요하면 디렉토리도). ` +
       `핵심 동작·경계조건 위주로.`;
-    useAppStore.getState().requestDevReview({ project, prompt, editorPanelId: props.api.id });
+    // Same 전면 전환 as ✓확인: dev layer to the front + open the file as a DevView
+    // tab, then hand the test-gen prompt to the dev session (no split panel).
+    useAppStore.getState().setProjectMode(project, "dev");
+    useAppStore.getState().requestEditorOpen(path);
+    useAppStore.getState().requestDevReview({ project, prompt });
   };
 
   useEffect(() => {

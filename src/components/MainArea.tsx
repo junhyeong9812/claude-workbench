@@ -16,6 +16,7 @@ import { installDragOut, movePanelToNewWindow } from "../state/windowTransfer";
 import { DropTargetOverlay } from "./DropTargetOverlay";
 import { installTransferTarget } from "../state/panelTransferTarget";
 import { components, AppTab, type PanelKind } from "./panelRegistry";
+import { resolveLayerMode, integratedIsFront } from "../state/layerRouting";
 import { getAllWindows, getCurrentWindow } from "@tauri-apps/api/window";
 import { fileName } from "./cmLang";
 
@@ -112,20 +113,20 @@ export function MainArea() {
   const activeProject = useAppStore((s) => s.activeProject);
   const theme = useAppStore((s) => s.theme);
   const projects = useAppStore((s) => s.projects);
+  const projectModes = useAppStore((s) => s.projectModes);
+  // MainArea is now always mounted (behind the dev layer when in dev mode), so
+  // it must only consume main-area requests while it is the front layer.
+  const layerMode = resolveLayerMode(projectModes, activeProject);
   const editorOpenRequest = useAppStore((s) => s.editorOpenRequest);
   const requestEditorOpen = useAppStore((s) => s.requestEditorOpen);
   const diffRequest = useAppStore((s) => s.diffRequest);
   const requestDiff = useAppStore((s) => s.requestDiff);
   const claudeOpenRequest = useAppStore((s) => s.claudeOpenRequest);
   const requestClaudeOpen = useAppStore((s) => s.requestClaudeOpen);
-  const devReviewRequest = useAppStore((s) => s.devReviewRequest);
-  const requestDevReview = useAppStore((s) => s.requestDevReview);
-  const requestClaudeInject = useAppStore((s) => s.requestClaudeInject);
   const runRequest = useAppStore((s) => s.runRequest);
   const requestRun = useAppStore((s) => s.requestRun);
   const focusMainRequest = useAppStore((s) => s.focusMainRequest);
   const setLayout = useAppStore((s) => s.setLayout);
-  const ensureDevUuid = useAppStore((s) => s.ensureDevUuid);
 
   const apiRef = useRef<DockviewApi | null>(null);
   // Drop-out gesture (P3): one AbortController per in-progress tab drag bounds
@@ -511,28 +512,37 @@ export function MainArea() {
 
   // Open a file in the editor when requested (from the peek viewer or tree). Focus
   // an already-open editor for the same file instead of opening a duplicate.
-  // (개발 모드는 MainArea 대신 DevView가 마운트되어 이 요청을 소비한다 — the
-  // dev-flavored layout lives there, not here.)
+  // (통합·개발 두 레이어가 동시 마운트되므로 — MainArea가 언마운트된다는 옛 전제
+  // 폐기 — 앞 레이어인 통합 모드일 때만 소비한다. 개발 모드면 요청을 건드리지
+  // 않고 그대로 두어 DevView가 소비하게 한다: 유실≠소비. layerMode를 deps에 넣어
+  // 같은 틱 모드 전환에도 재평가된다.)
   useEffect(() => {
+    if (!integratedIsFront(layerMode)) return; // dev layer's request — leave it
     if (!editorOpenRequest) return;
     const api = apiRef.current;
     if (!api) return; // dock not ready (mount/project switch) — keep the request
     const path = editorOpenRequest;
-    requestEditorOpen(null); // consume only once we can actually act (codex P2 E4)
-    const existing = api.panels.find((p) => {
-      const prm = p.params as { kind?: string; path?: string } | undefined;
-      return prm?.kind === "editor" && prm.path === path;
-    });
-    if (existing) {
-      existing.api.setActive();
-      return;
+    // Clear only AFTER the side effect (activate/open) succeeds, so a throw leaves
+    // the request in place to retry (side effect before clear, T1 / codex P2 E4).
+    try {
+      const existing = api.panels.find((p) => {
+        const prm = p.params as { kind?: string; path?: string } | undefined;
+        return prm?.kind === "editor" && prm.path === path;
+      });
+      if (existing) existing.api.setActive();
+      else addPanel("editor", { path, title: fileName(path) });
+      requestEditorOpen(null);
+    } catch (err) {
+      console.error("editorOpen failed; keeping request", err);
     }
-    addPanel("editor", { path, title: fileName(path) });
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [editorOpenRequest, apiReady, activeProject]);
+  }, [editorOpenRequest, apiReady, activeProject, layerMode]);
 
   // Open a diff panel (changed file or commit) when requested from the Git panel.
+  // (통합·개발 두 레이어가 동시 마운트되므로 앞 레이어인 통합 모드일 때만 소비한다 —
+  // 개발 모드면 요청을 클리어하지 않고 남겨 두어 통합 복귀 시 소비된다: 유실≠소비.)
   useEffect(() => {
+    if (!integratedIsFront(layerMode)) return; // dev layer in front — leave the request
     if (!diffRequest) return;
     const api = apiRef.current;
     if (!api) return;
@@ -555,13 +565,16 @@ export function MainArea() {
       params: { kind: "diff", ...spec },
     });
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [diffRequest, activeProject]);
+  }, [diffRequest, activeProject, layerMode]);
 
   // Open a new Claude session bound to a specific project when requested (the
   // worktree panel's one-click "Claude 열기"). A fresh loadSessionId seeds a new
   // task session; `project` pins it to that worktree's cwd regardless of which
   // tab is active afterwards.
+  // (통합·개발 두 레이어가 동시 마운트되므로 앞 레이어인 통합 모드일 때만 소비한다 —
+  // 개발 모드면 요청을 클리어하지 않고 남겨 두어 통합 복귀 시 소비된다: 유실≠소비.)
   useEffect(() => {
+    if (!integratedIsFront(layerMode)) return; // dev layer in front — leave the request
     if (!claudeOpenRequest) return;
     const { project, seed, title: reqTitle, referencePanelId } = claudeOpenRequest;
     // Only THIS project's mount may consume the request (MainArea is keyed by
@@ -583,40 +596,17 @@ export function MainArea() {
         : {}),
     });
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [claudeOpenRequest, apiReady, activeProject]);
+  }, [claudeOpenRequest, apiReady, activeProject, layerMode]);
 
-  // Dev mode 확인: review the saved file in the project's dev Claude session.
-  // The uuid is the project's persisted dev-session id (survives restarts —
-  // resumed by the backend when its transcript exists). Panel open → inject the
-  // prompt into the live session; closed → open it seeded with the prompt.
-  useEffect(() => {
-    if (!devReviewRequest) return;
-    const { project, prompt, editorPanelId } = devReviewRequest;
-    if (project !== activeProject) return;
-    const api = apiRef.current;
-    if (!api) return; // dock not ready — keep the request; apiReady re-runs
-    requestDevReview(null);
-    const uuid = ensureDevUuid(project);
-    const panelOpen = api.panels.some((p) => {
-      const prm = p.params as { loadSessionId?: string; sessionUuid?: string };
-      return prm.loadSessionId === uuid || prm.sessionUuid === uuid;
-    });
-    if (panelOpen) {
-      requestClaudeInject({ uuid, text: prompt });
-      return;
-    }
-    addPanel("claudeterm", {
-      project,
-      loadSessionId: uuid,
-      title: "개발 세션",
-      seed: prompt,
-      position: { referencePanel: editorPanelId, direction: "right" as const },
-    });
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [devReviewRequest, apiReady, activeProject]);
+  // (개발 세션 ✓확인/🧪 소비는 DevView로 이관됨 — 통합 dock 안에 "개발 세션"
+  // 부분 패널을 끼워 넣던 옛 경로는 제거. 이제 EditorPanel이 dev 레이어를 전면
+  // 전환하고 DevView가 자기 dock의 개발 세션에 프롬프트를 전달한다.)
 
   // Build/test runner: open a terminal panel that runs the command.
+  // (통합·개발 두 레이어가 동시 마운트되므로 앞 레이어인 통합 모드일 때만 소비한다 —
+  // 개발 모드면 요청을 클리어하지 않고 남겨 두어 통합 복귀 시 소비된다: 유실≠소비.)
   useEffect(() => {
+    if (!integratedIsFront(layerMode)) return; // dev layer in front — leave the request
     if (!runRequest) return;
     if (runRequest.project !== activeProject) return;
     const api = apiRef.current;
@@ -628,7 +618,7 @@ export function MainArea() {
       cwd: runRequest.project,
     });
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [runRequest, apiReady, activeProject]);
+  }, [runRequest, apiReady, activeProject, layerMode]);
 
   // Resolve a close request from a Claude tab's × (B3-1): 닫기 keeps the saved
   // history, 삭제 also removes it; both close the panel.
@@ -840,15 +830,23 @@ export function MainArea() {
   // focusMainRequest). dockview's focus() only focuses the active GROUP, so also
   // drop focus into the active panel's content (xterm/CodeMirror/…) so keyboard
   // input lands there. Skip the initial 0 so a fresh mount doesn't steal focus.
+  const lastFocusHandledRef = useRef(0);
   useEffect(() => {
-    if (focusMainRequest === 0) return;
+    // Claim each distinct request once; a layerMode-only re-fire (deps) must not
+    // replay an already-handled focus. Skip the initial 0 (fresh-mount steal).
+    if (focusMainRequest === 0 || focusMainRequest === lastFocusHandledRef.current) return;
+    lastFocusHandledRef.current = focusMainRequest;
+    // Only the FRONT (integrated) layer takes the focus; when the dev layer is in
+    // front, DevView's own consumer handles it instead (symmetric routing).
+    if (!integratedIsFront(layerMode)) return;
     const api = apiRef.current;
     if (!api) return;
     api.focus();
     // Restore the active Claude panel's last sub-area (terminal/viewer/timeline);
     // for other panels `area` is undefined → first focusable content.
     focusActivePanelContent(recallArea(api.activePanel?.id ?? ""));
-  }, [focusMainRequest]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [focusMainRequest, layerMode]);
 
   return (
     <div className="main-area">
