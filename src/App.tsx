@@ -22,6 +22,7 @@ import { PopoutWorkbench } from "./components/PopoutWorkbench";
 import { WebviewWindow } from "@tauri-apps/api/webviewWindow";
 import { getAllWindows } from "@tauri-apps/api/window";
 import { useAppStore } from "./state/store";
+import { resolveLayerMode, devLayerMounted } from "./state/layerRouting";
 import "./App.css";
 
 export default function App() {
@@ -55,6 +56,20 @@ function AppMain() {
   const setMode = useAppStore((s) => s.setMode);
   const projectModes = useAppStore((s) => s.projectModes);
   const setProjectMode = useAppStore((s) => s.setProjectMode);
+
+  // Which main-area layer is in front for the active project.
+  const layerMode = resolveLayerMode(projectModes, activeProject);
+  // Dev-layer mount latch: projects that entered dev mode during THIS run (in
+  // memory only — never persisted, so a restart never spins up a dev PTY before
+  // the user opens dev; a persisted projectModes="dev" still mounts via mode).
+  const [devVisited, setDevVisited] = useState<Set<string>>(new Set());
+  useEffect(() => {
+    if (activeProject && layerMode === "dev" && !devVisited.has(activeProject)) {
+      setDevVisited((prev) => new Set(prev).add(activeProject));
+    }
+  }, [activeProject, layerMode, devVisited]);
+  const devMounted =
+    !!activeProject && devLayerMounted(layerMode, devVisited.has(activeProject));
 
   useEffect(() => {
     void init();
@@ -307,12 +322,20 @@ function AppMain() {
         )}
         <PanelResizeHandle className="resize-handle" />
         <Panel id="main" order={3} defaultSize={60} minSize={30} className="pane-main">
-          {activeProject && projectModes[activeProject] === "dev" ? (
-            // 개발 모드: the main area swaps to the editor-first layout (원안) —
-            // keyed by project so switching projects resets its tabs.
-            <DevView key={activeProject} project={activeProject} />
-          ) : (
+          {/* Both layers stay mounted; the front/back swap is z-index +
+              visibility (not conditional render) so toggling modes preserves
+              each view's terminal scrollback and editor tabs (불변식 ②). The
+              back layer is visibility:hidden — display:none would zero xterm's
+              measured size. DevView only mounts once its project has entered dev
+              (mount latch, 불변식 ④). */}
+          <div className={`main-layer${layerMode === "dev" ? " main-layer-back" : ""}`}>
             <MainArea />
+          </div>
+          {devMounted && activeProject && (
+            <div className={`main-layer${layerMode === "dev" ? "" : " main-layer-back"}`}>
+              {/* keyed by project so switching projects resets its tabs. */}
+              <DevView key={activeProject} project={activeProject} />
+            </div>
           )}
           {peekFile && (
             <FilePeekViewer

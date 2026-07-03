@@ -16,6 +16,7 @@ import { installDragOut, movePanelToNewWindow } from "../state/windowTransfer";
 import { DropTargetOverlay } from "./DropTargetOverlay";
 import { installTransferTarget } from "../state/panelTransferTarget";
 import { components, AppTab, type PanelKind } from "./panelRegistry";
+import { resolveLayerMode, integratedConsumesEditorOpen } from "../state/layerRouting";
 import { getAllWindows, getCurrentWindow } from "@tauri-apps/api/window";
 import { fileName } from "./cmLang";
 
@@ -112,6 +113,10 @@ export function MainArea() {
   const activeProject = useAppStore((s) => s.activeProject);
   const theme = useAppStore((s) => s.theme);
   const projects = useAppStore((s) => s.projects);
+  const projectModes = useAppStore((s) => s.projectModes);
+  // MainArea is now always mounted (behind the dev layer when in dev mode), so
+  // it must only consume main-area requests while it is the front layer.
+  const layerMode = resolveLayerMode(projectModes, activeProject);
   const editorOpenRequest = useAppStore((s) => s.editorOpenRequest);
   const requestEditorOpen = useAppStore((s) => s.requestEditorOpen);
   const diffRequest = useAppStore((s) => s.diffRequest);
@@ -511,9 +516,12 @@ export function MainArea() {
 
   // Open a file in the editor when requested (from the peek viewer or tree). Focus
   // an already-open editor for the same file instead of opening a duplicate.
-  // (개발 모드는 MainArea 대신 DevView가 마운트되어 이 요청을 소비한다 — the
-  // dev-flavored layout lives there, not here.)
+  // (통합·개발 두 레이어가 동시 마운트되므로 — MainArea가 언마운트된다는 옛 전제
+  // 폐기 — 앞 레이어인 통합 모드일 때만 소비한다. 개발 모드면 요청을 건드리지
+  // 않고 그대로 두어 DevView가 소비하게 한다: 유실≠소비. layerMode를 deps에 넣어
+  // 같은 틱 모드 전환에도 재평가된다.)
   useEffect(() => {
+    if (!integratedConsumesEditorOpen(layerMode)) return; // dev layer's request — leave it
     if (!editorOpenRequest) return;
     const api = apiRef.current;
     if (!api) return; // dock not ready (mount/project switch) — keep the request
@@ -529,10 +537,13 @@ export function MainArea() {
     }
     addPanel("editor", { path, title: fileName(path) });
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [editorOpenRequest, apiReady, activeProject]);
+  }, [editorOpenRequest, apiReady, activeProject, layerMode]);
 
   // Open a diff panel (changed file or commit) when requested from the Git panel.
+  // (통합·개발 두 레이어가 동시 마운트되므로 앞 레이어인 통합 모드일 때만 소비한다 —
+  // 개발 모드면 요청을 클리어하지 않고 남겨 두어 통합 복귀 시 소비된다: 유실≠소비.)
   useEffect(() => {
+    if (!integratedConsumesEditorOpen(layerMode)) return; // dev layer in front — leave the request
     if (!diffRequest) return;
     const api = apiRef.current;
     if (!api) return;
@@ -555,13 +566,16 @@ export function MainArea() {
       params: { kind: "diff", ...spec },
     });
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [diffRequest, activeProject]);
+  }, [diffRequest, activeProject, layerMode]);
 
   // Open a new Claude session bound to a specific project when requested (the
   // worktree panel's one-click "Claude 열기"). A fresh loadSessionId seeds a new
   // task session; `project` pins it to that worktree's cwd regardless of which
   // tab is active afterwards.
+  // (통합·개발 두 레이어가 동시 마운트되므로 앞 레이어인 통합 모드일 때만 소비한다 —
+  // 개발 모드면 요청을 클리어하지 않고 남겨 두어 통합 복귀 시 소비된다: 유실≠소비.)
   useEffect(() => {
+    if (!integratedConsumesEditorOpen(layerMode)) return; // dev layer in front — leave the request
     if (!claudeOpenRequest) return;
     const { project, seed, title: reqTitle, referencePanelId } = claudeOpenRequest;
     // Only THIS project's mount may consume the request (MainArea is keyed by
@@ -583,7 +597,7 @@ export function MainArea() {
         : {}),
     });
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [claudeOpenRequest, apiReady, activeProject]);
+  }, [claudeOpenRequest, apiReady, activeProject, layerMode]);
 
   // Dev mode 확인: review the saved file in the project's dev Claude session.
   // The uuid is the project's persisted dev-session id (survives restarts —
@@ -616,7 +630,10 @@ export function MainArea() {
   }, [devReviewRequest, apiReady, activeProject]);
 
   // Build/test runner: open a terminal panel that runs the command.
+  // (통합·개발 두 레이어가 동시 마운트되므로 앞 레이어인 통합 모드일 때만 소비한다 —
+  // 개발 모드면 요청을 클리어하지 않고 남겨 두어 통합 복귀 시 소비된다: 유실≠소비.)
   useEffect(() => {
+    if (!integratedConsumesEditorOpen(layerMode)) return; // dev layer in front — leave the request
     if (!runRequest) return;
     if (runRequest.project !== activeProject) return;
     const api = apiRef.current;
@@ -628,7 +645,7 @@ export function MainArea() {
       cwd: runRequest.project,
     });
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [runRequest, apiReady, activeProject]);
+  }, [runRequest, apiReady, activeProject, layerMode]);
 
   // Resolve a close request from a Claude tab's × (B3-1): 닫기 keeps the saved
   // history, 삭제 also removes it; both close the panel.

@@ -6,6 +6,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { ClaudeTermPanel } from "./ClaudeTermPanel";
 import { StudyFileView } from "./StudyFileView";
 import { useAppStore } from "../state/store";
+import { resolveLayerMode, devConsumesEditorOpen } from "../state/layerRouting";
 
 const components = { claudeterm: ClaudeTermPanel };
 const basename = (p: string) => p.split("/").pop() ?? p;
@@ -25,6 +26,11 @@ const basename = (p: string) => p.split("/").pop() ?? p;
  */
 export function DevView({ project }: { project: string }) {
   const theme = useAppStore((s) => s.theme);
+  const projectModes = useAppStore((s) => s.projectModes);
+  // DevView stays mounted behind MainArea after a toggle back to integrated
+  // (mount latch), so it must only consume editorOpen while it is the front
+  // (dev) layer — symmetric with MainArea's gate.
+  const layerMode = resolveLayerMode(projectModes, project);
   const editorOpenRequest = useAppStore((s) => s.editorOpenRequest);
   const requestEditorOpen = useAppStore((s) => s.requestEditorOpen);
 
@@ -34,15 +40,18 @@ export function DevView({ project }: { project: string }) {
   const [active, setActive] = useState<string | null>(null);
   const apiRef = useRef<DockviewApi | null>(null);
 
-  // Consume tree/peek file-open requests while this view owns the main area.
+  // Consume tree/peek file-open requests only while the dev layer is in front.
+  // In integrated mode this view is still mounted (latch) but behind MainArea,
+  // so it must leave the request untouched for MainArea (유실≠소비).
   useEffect(() => {
+    if (!devConsumesEditorOpen(layerMode)) return; // integrated layer's request — leave it
     if (!editorOpenRequest) return;
     const path = editorOpenRequest;
     requestEditorOpen(null);
     setTabs((prev) => (prev.includes(path) ? prev : [path, ...prev]));
     setActive(path);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [editorOpenRequest]);
+  }, [editorOpenRequest, layerMode]);
 
   const closeTab = (p: string) => {
     setTabs((prev) => {

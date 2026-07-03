@@ -35,9 +35,11 @@
   /* ---- z-index layer scale — the single stacking authority. Raw z-index
      numbers are forbidden outside this block (enforced by `npm run css-audit`).
      Values preserve the pre-token stacking order exactly. Bands:
-       sticky(1) < in-panel overlays(10..31) < local menus(40..42)
+       main-area layers(0..1) <= sticky(1) < in-panel overlays(10..31) < local menus(40..42)
        < app modals(100) < global overlays(120..142) < context menu(200)
        < cross-window DnD(9999, always topmost). */
+  --z-layer-back: 0;
+  --z-layer-front: 1;
   --z-sticky: 1;
   --z-lock: 10;
   --z-pane-modal: 20;
@@ -276,7 +278,21 @@ body {
 .pane-main {
   /* dockview positions its own children; keep the pane a plain sized box. */
   overflow: hidden;
-  position: relative; /* anchor the file peek viewer overlay */
+  position: relative; /* anchor the file peek viewer overlay + the layer swap */
+}
+
+/* ---- Main-area layers: integrated (MainArea) and dev (DevView) are both
+   mounted and stacked; the active one is in front, the other visibility:hidden
+   (display:none would zero xterm's measured size). Both sit below the peek /
+   git-history overlays (z 30) so those still cover them. ---- */
+.main-layer {
+  position: absolute;
+  inset: 0;
+  z-index: var(--z-layer-front);
+}
+.main-layer-back {
+  visibility: hidden;
+  z-index: var(--z-layer-back);
 }
 
 /* ---- File peek viewer (P1 — read-only CodeMirror overlay over the main area) ---- */
