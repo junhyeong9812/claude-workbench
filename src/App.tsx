@@ -30,6 +30,7 @@ import {
 } from "./state/claudeStatus";
 import { initClaudeStatusGlobal } from "./state/claudeStatusGlobal";
 import { initNotify } from "./state/notify";
+import { resolveLayerMode, devLayerMounted, shouldFlipToIntegrated } from "./state/layerRouting";
 import "./App.css";
 
 /**
@@ -112,6 +113,53 @@ function AppMain() {
   const setMode = useAppStore((s) => s.setMode);
   const projectModes = useAppStore((s) => s.projectModes);
   const setProjectMode = useAppStore((s) => s.setProjectMode);
+
+  // Which main-area layer is in front for the active project.
+  const layerMode = resolveLayerMode(projectModes, activeProject);
+  // Dev-layer mount latch for the CURRENT active project: has it entered dev this
+  // active period? Stored as the single project that has (`visitedProject`), and
+  // read as a render-time boolean scoped to the active project — so switching to a
+  // never-dev project reads false immediately (no stale-latch window that could
+  // spuriously mount a dev PTY for it). Non-persistent, and it does NOT govern
+  // restart: a persisted projectModes="dev" still mounts via the mode path in
+  // devLayerMounted, the intentional dev-session resume. DevView is keyed by
+  // project, so nothing is preserved across a switch anyway.
+  const [visitedProject, setVisitedProject] = useState<string | null>(null);
+  // Actually RELEASE the latch when the active project changes away from the
+  // visited one — otherwise returning to it later (in integrated mode) would
+  // remount its DevView and spin the dev PTY back up in the background.
+  // Adjust-state-during-render (no stale frame: React restarts this render
+  // immediately), instead of an effect whose reset lands a frame late.
+  const prevProjectRef = useRef(activeProject);
+  if (prevProjectRef.current !== activeProject) {
+    prevProjectRef.current = activeProject;
+    if (visitedProject !== null && visitedProject !== activeProject) setVisitedProject(null);
+  }
+  const devVisited = !!activeProject && visitedProject === activeProject;
+  useEffect(() => {
+    if (activeProject && layerMode === "dev" && visitedProject !== activeProject) {
+      setVisitedProject(activeProject);
+    }
+  }, [activeProject, layerMode, visitedProject]);
+  const devMounted = !!activeProject && devLayerMounted(layerMode, devVisited);
+
+  // Symmetric auto-flip (B4): while the dev layer is in front, a VIEW-ROW request
+  // (diff·claudeOpen·run) for the ACTIVE project would otherwise open behind the
+  // dev layer (invisible). Flip that project back to integrated so the front
+  // integrated consumer renders it immediately (the consumers re-evaluate on the
+  // layerMode change). A request for a different project stays pending for its own
+  // consumer. devReview is a SESSION-ROW request and is intentionally NOT flipped
+  // (DevView consumes it whether front or hidden — layerRouting docstring).
+  const diffRequest = useAppStore((s) => s.diffRequest);
+  const claudeOpenRequest = useAppStore((s) => s.claudeOpenRequest);
+  const runRequest = useAppStore((s) => s.runRequest);
+  useEffect(() => {
+    if (layerMode !== "dev" || !activeProject) return;
+    const flip = () => useAppStore.getState().setProjectMode(activeProject, "integrated");
+    if (shouldFlipToIntegrated(layerMode, diffRequest?.cwd, activeProject)) return flip();
+    if (shouldFlipToIntegrated(layerMode, claudeOpenRequest?.project, activeProject)) return flip();
+    if (shouldFlipToIntegrated(layerMode, runRequest?.project, activeProject)) return flip();
+  }, [diffRequest, claudeOpenRequest, runRequest, layerMode, activeProject]);
 
   useEffect(() => {
     void init();
@@ -375,12 +423,20 @@ function AppMain() {
         )}
         <PanelResizeHandle className="resize-handle" />
         <Panel id="main" order={3} defaultSize={60} minSize={30} className="pane-main">
-          {activeProject && projectModes[activeProject] === "dev" ? (
-            // 개발 모드: the main area swaps to the editor-first layout (원안) —
-            // keyed by project so switching projects resets its tabs.
-            <DevView key={activeProject} project={activeProject} />
-          ) : (
+          {/* Both layers stay mounted; the front/back swap is z-index +
+              visibility (not conditional render) so toggling modes preserves
+              each view's terminal scrollback and editor tabs (불변식 ②). The
+              back layer is visibility:hidden — display:none would zero xterm's
+              measured size. DevView only mounts once its project has entered dev
+              (mount latch, 불변식 ④). */}
+          <div className={`main-layer${layerMode === "dev" ? " main-layer-back" : ""}`}>
             <MainArea />
+          </div>
+          {devMounted && activeProject && (
+            <div className={`main-layer${layerMode === "dev" ? "" : " main-layer-back"}`}>
+              {/* keyed by project so switching projects resets its tabs. */}
+              <DevView key={activeProject} project={activeProject} />
+            </div>
           )}
           {peekFile && (
             <FilePeekViewer

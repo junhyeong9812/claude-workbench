@@ -16,6 +16,9 @@ export interface DirEntry {
   path: string;
   is_dir: boolean;
   project_types: ProjectType[];
+  /** Ignored by .gitignore/.ignore — shown but dimmed (VS Code style). Absent
+   * for older payloads (serde default false). */
+  is_ignored?: boolean;
 }
 
 /** A file that matched a file-name search (`search_files` command). */

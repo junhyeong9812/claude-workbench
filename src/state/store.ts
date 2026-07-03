@@ -290,9 +290,17 @@ interface AppState {
   /** Inject a prompt into an already-live Claude session (dev mode's 확인 button
    * re-uses the project's dev session). Matched by session uuid in ClaudeTermPanel. */
   claudeInjectRequest: { uuid: string; text: string } | null;
-  /** Dev mode 확인: review the just-saved file. MainArea opens (first time) or
-   * injects into (subsequent) the per-project dev Claude session. */
-  devReviewRequest: { project: string; prompt: string; editorPanelId: string } | null;
+  /** Dev mode 확인/🧪: review (or generate a test for) the just-saved file. The
+   * project's own DevView consumes it — injecting into its live dev Claude
+   * session, or seeding a fresh one. No panel-positioning field: the dev session
+   * lives in DevView's own dock, not beside an editor panel.
+   *
+   * A FIFO QUEUE (not a single slot) with a stable id per entry: rapid ✓확인
+   * clicks (or clicks across projects) must not clobber each other, and delivery
+   * consumes by id so a re-run (or the onReady/effect double path) can't
+   * double-deliver or drop an entry (③). Each DevView consumes only its own
+   * project's entries, in order; other projects' entries never block it. */
+  devReviewQueue: Array<{ id: string; project: string; prompt: string }>;
   /** Build/test runner: open a terminal panel that runs `cmd` (consumed by MainArea). */
   runRequest: { project: string; cmd: string; title: string } | null;
   /** Bumped to ask MainArea to focus the active dockview panel (Ctrl+B from the
@@ -421,10 +429,12 @@ interface AppState {
   ) => void;
   /** Inject a prompt into a live Claude session (consumed by the matching panel). */
   requestClaudeInject: (req: { uuid: string; text: string } | null) => void;
-  /** Request a dev-mode review of a saved file (MainArea consumes + clears). */
-  requestDevReview: (
-    req: { project: string; prompt: string; editorPanelId: string } | null,
-  ) => void;
+  /** Enqueue a dev-mode review of a saved file (the project's DevView consumes by
+   * id). Mints a stable id and appends to the FIFO queue. */
+  requestDevReview: (req: { project: string; prompt: string }) => void;
+  /** Remove a devReview entry by id after delivering it (idempotent — a missing
+   * id is a no-op, so a double consume from the onReady/effect paths is safe). */
+  consumeDevReview: (id: string) => void;
   /** Request running a build/test command in a terminal (MainArea consumes). */
   requestRun: (req: { project: string; cmd: string; title: string } | null) => void;
   /** Ask MainArea to focus the active dockview panel (Ctrl+B tree→tab toggle). */
@@ -495,7 +505,7 @@ export const useAppStore = create<AppState>((set, get) => ({
   diffRequest: null,
   claudeOpenRequest: null,
   claudeInjectRequest: null,
-  devReviewRequest: null,
+  devReviewQueue: [],
   runRequest: null,
   focusMainRequest: 0,
   focusSessionRequest: null,
@@ -656,7 +666,12 @@ export const useAppStore = create<AppState>((set, get) => ({
   requestDiff: (spec) => set({ diffRequest: spec }),
   requestClaudeOpen: (req) => set({ claudeOpenRequest: req }),
   requestClaudeInject: (req) => set({ claudeInjectRequest: req }),
-  requestDevReview: (req) => set({ devReviewRequest: req }),
+  requestDevReview: (req) =>
+    set((s) => ({
+      devReviewQueue: [...s.devReviewQueue, { id: crypto.randomUUID(), ...req }],
+    })),
+  consumeDevReview: (id) =>
+    set((s) => ({ devReviewQueue: s.devReviewQueue.filter((r) => r.id !== id) })),
   requestRun: (req) => set({ runRequest: req }),
   requestFocusMain: () => set((s) => ({ focusMainRequest: s.focusMainRequest + 1 })),
   requestFocusSession: (uuid) =>
