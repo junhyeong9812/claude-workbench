@@ -5,6 +5,7 @@
 
 use ignore::WalkBuilder;
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::ffi::OsStr;
 use std::io;
 use std::path::Path;
@@ -22,6 +23,11 @@ pub struct DirEntry {
     pub is_dir: bool,
     #[serde(default)]
     pub project_types: Vec<ProjectType>,
+    /// `true` when the entry is ignored by `.gitignore`/`.ignore`. The entry is
+    /// still listed (so the tree can dim it rather than hide it); only `.git`
+    /// stays fully hidden. Always `false` outside a git repo.
+    #[serde(default)]
+    pub is_ignored: bool,
 }
 
 /// List the immediate children of `path`.
@@ -31,14 +37,18 @@ pub struct DirEntry {
 /// name (case-insensitive). For each directory entry, `project_types` is filled
 /// by probing its marker files.
 ///
-/// Entries ignored by `.gitignore`/`.ignore` (at this directory *or* any parent
-/// up to the repo root) are filtered out — so `node_modules`, `target`, etc.
-/// don't clutter the tree. The traversal is a single level deep (lazy: only the
-/// directory the user expanded), and the `ignore` crate tracks the gitignore
-/// stack for us. Dotfiles stay visible (they're often useful in a file tree),
-/// with the sole exception of the `.git` directory, which is always hidden.
-/// gitignore rules only apply inside a git repository (the `ignore` default);
-/// a plain folder lists everything except `.git`.
+/// Every child is listed, but entries ignored by `.gitignore`/`.ignore` (at this
+/// directory *or* any parent up to the repo root) are flagged `is_ignored: true`
+/// so the tree can dim them (à la VS Code) rather than hide them — `node_modules`,
+/// `target`, etc. stay visible but muted. The one entry that is always hidden is
+/// the `.git` directory. Dotfiles otherwise stay visible (they're often useful in
+/// a file tree). gitignore rules only apply inside a git repository (the `ignore`
+/// default); in a plain folder every entry comes back `is_ignored: false`.
+///
+/// This is a two-pass listing: the `ignore` crate walks one level deep (lazy: only
+/// the directory the user expanded, gitignore stack tracked for us) to learn which
+/// names are *not* ignored, then a plain `read_dir` enumerates everything and marks
+/// the rest ignored.
 pub fn list_dir<P: AsRef<Path>>(path: P) -> io::Result<Vec<DirEntry>> {
     let root = path.as_ref();
     // Preserve the old contract: surface an io::Error (not a panic) for a
@@ -48,38 +58,56 @@ pub fn list_dir<P: AsRef<Path>>(path: P) -> io::Result<Vec<DirEntry>> {
         return Err(io::Error::new(io::ErrorKind::Other, "not a directory"));
     }
 
+    // Pass 1: the gitignore-aware walk yields exactly the *non-ignored* children.
+    // Collect their names so the full listing below can tell ignored from not.
     let walk = WalkBuilder::new(root)
         .max_depth(Some(1)) // immediate children only — keep listing lazy
         .hidden(false) // show dotfiles (.env, .github, .gitignore) ...
         .filter_entry(|e| e.file_name() != OsStr::new(".git")) // ... except .git
         .build();
-
-    let mut entries: Vec<DirEntry> = Vec::new();
+    let mut not_ignored: HashSet<String> = HashSet::new();
     for result in walk {
         let dent = match result {
             Ok(d) => d,
-            // Skip entries we can't stat (broken symlink, permissions) rather
-            // than failing the whole listing.
+            // Skip entries we can't stat (broken symlink, permissions).
             Err(_) => continue,
         };
         // Depth 0 is `root` itself; we only want its children.
         if dent.depth() == 0 {
             continue;
         }
-        // Resolve type without following symlinks into errors we can't recover.
-        let is_dir = dent.file_type().map(|ft| ft.is_dir()).unwrap_or(false);
+        not_ignored.insert(dent.file_name().to_string_lossy().into_owned());
+    }
+
+    // Pass 2: enumerate every child, marking those absent from `not_ignored`.
+    let mut entries: Vec<DirEntry> = Vec::new();
+    for result in std::fs::read_dir(root)? {
+        // Skip entries we can't read rather than failing the whole listing.
+        let dent = match result {
+            Ok(d) => d,
+            Err(_) => continue,
+        };
         let name = dent.file_name().to_string_lossy().into_owned();
-        let entry_path = dent.path().to_path_buf();
+        // `.git` is always hidden (it's excluded from pass 1 too).
+        if name == ".git" {
+            continue;
+        }
+        // Resolve type without following symlinks (matches the old walk's
+        // `file_type`: a symlink is neither a dir nor probed for project types).
+        let is_dir = dent.file_type().map(|ft| ft.is_dir()).unwrap_or(false);
+        let entry_path = dent.path();
         let project_types = if is_dir {
             detect_project_types(&entry_path)
         } else {
             Vec::new()
         };
+        let is_ignored = !not_ignored.contains(&name);
         entries.push(DirEntry {
             name,
             path: entry_path.to_string_lossy().into_owned(),
             is_dir,
             project_types,
+            is_ignored,
         });
     }
 
@@ -138,7 +166,7 @@ mod tests {
     }
 
     #[test]
-    fn hides_gitignored_and_dotgit_keeps_other_dotfiles() {
+    fn marks_gitignored_hides_dotgit_keeps_other_dotfiles() {
         let root = temp_dir("ignore");
         // Make it look like a git repo so .gitignore is honored (the `ignore`
         // crate only applies gitignore rules inside a repository).
@@ -149,27 +177,44 @@ mod tests {
         fs::create_dir_all(root.join("src")).unwrap();
         fs::write(root.join(".env"), b"SECRET=1").unwrap();
 
-        let names: Vec<String> = list_dir(&root)
-            .unwrap()
-            .into_iter()
-            .map(|e| e.name)
-            .collect();
+        let entries = list_dir(&root).unwrap();
+        let by_name = |n: &str| entries.iter().find(|e| e.name == n);
 
-        assert!(names.contains(&"src".to_string()));
+        // Ignored dirs are now listed, but flagged so the tree can dim them.
         assert!(
-            names.contains(&".env".to_string()),
-            "non-git dotfiles stay visible"
-        );
-        assert!(names.contains(&".gitignore".to_string()));
-        assert!(
-            !names.contains(&"node_modules".to_string()),
-            "gitignored dir hidden"
+            by_name("node_modules").is_some_and(|e| e.is_ignored),
+            "gitignored dir listed with is_ignored=true"
         );
         assert!(
-            !names.contains(&"target".to_string()),
-            "gitignored dir hidden"
+            by_name("target").is_some_and(|e| e.is_ignored),
+            "gitignored dir listed with is_ignored=true"
         );
-        assert!(!names.contains(&".git".to_string()), ".git always hidden");
+        // Tracked entries (incl. non-ignored dotfiles) are listed, not ignored.
+        assert!(by_name("src").is_some_and(|e| !e.is_ignored));
+        assert!(
+            by_name(".env").is_some_and(|e| !e.is_ignored),
+            "non-ignored dotfiles stay visible"
+        );
+        assert!(by_name(".gitignore").is_some_and(|e| !e.is_ignored));
+        // .git is still always hidden.
+        assert!(by_name(".git").is_none(), ".git always hidden");
+    }
+
+    #[test]
+    fn plain_folder_marks_nothing_ignored() {
+        // Outside a git repo, gitignore rules don't apply: every entry lists
+        // with is_ignored=false (even names that look ignorable elsewhere).
+        let root = temp_dir("plain");
+        fs::create_dir_all(root.join("node_modules")).unwrap();
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("README.md"), b"hi").unwrap();
+
+        let entries = list_dir(&root).unwrap();
+        assert_eq!(entries.len(), 3);
+        assert!(
+            entries.iter().all(|e| !e.is_ignored),
+            "no git repo → nothing ignored"
+        );
     }
 
     #[test]

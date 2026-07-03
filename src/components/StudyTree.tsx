@@ -10,6 +10,8 @@ const dirname = (p: string): string => p.split(/[\\/]/).slice(0, -1).join("/") |
 interface VisNode {
   entry: DirEntry;
   depth: number;
+  /** gitignored (inherited down the subtree) — rendered dimmed. */
+  ignored: boolean;
 }
 
 /**
@@ -70,13 +72,14 @@ export function StudyTree({
   // Flattened list of currently-visible nodes (for ↑/↓ traversal).
   const visible = useMemo<VisNode[]>(() => {
     const out: VisNode[] = [];
-    const walk = (dir: string, depth: number) => {
+    const walk = (dir: string, depth: number, parentIgnored: boolean) => {
       for (const e of childrenCache[dir] ?? []) {
-        out.push({ entry: e, depth });
-        if (e.is_dir && expanded.has(e.path)) walk(e.path, depth + 1);
+        const ignored = parentIgnored || !!e.is_ignored;
+        out.push({ entry: e, depth, ignored });
+        if (e.is_dir && expanded.has(e.path)) walk(e.path, depth + 1, ignored);
       }
     };
-    walk(root, 0);
+    walk(root, 0, false);
     return out;
   }, [root, childrenCache, expanded]);
 
@@ -197,12 +200,12 @@ export function StudyTree({
           if (!cursor && visible.length > 0) setCursor(visible[0].entry.path);
         }}
       >
-        {visible.map(({ entry, depth }): ReactNode => (
+        {visible.map(({ entry, depth, ignored }): ReactNode => (
           <div
             key={entry.path}
             className={`study-tree-row${entry.is_dir ? "" : " study-tree-file"}${
               cursor === entry.path ? " cursor" : ""
-            }`}
+            }${ignored ? " study-tree-row-ignored" : ""}`}
             style={{ paddingLeft: 6 + depth * 12 + (entry.is_dir ? 0 : 12) }}
             title={entry.path}
             onClick={() => onRowClick(entry)}
