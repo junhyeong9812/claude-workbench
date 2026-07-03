@@ -20,6 +20,7 @@ import {
   hasOpenQuestion,
   scanBottomForPrompt,
   makeDebouncedScanner,
+  makeScanGate,
   PROMPT_SCAN_MAX_LINES,
 } from "../state/claudeStatus";
 
@@ -756,6 +757,17 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
     // P2: after PTY output settles, scan the live screen bottom for an
     // input-waiting prompt (permission dialog / numbered menu) and set the
     // screen-blocked signal. No-op until a session is open (statusUuidRef).
+    //
+    // Origin (S4a): scans triggered by the restore replay (the scrollback
+    // backfill write + the scheduled open scan) are a *snapshot* of pre-existing
+    // screen state — they must seed the notifier silently, not re-alert a prompt
+    // the user already saw before the restart. The first genuinely NEW output
+    // (a live terminal-output event) or a keystroke flips this to "live".
+    let scanOrigin: "snapshot" | "live" = "snapshot";
+    // S1: gate empty-screen scans — blank before the restore paints is "no data"
+    // (don't clear a blocked signal), blank after a non-empty screen is a real
+    // clear-screen (do clear, else blocked goes sticky).
+    const scanGate = makeScanGate();
     const runBlockedScan = () => {
       const t = termRef.current;
       const uuid = statusUuidRef.current;
@@ -771,18 +783,14 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
         if (s.trim() === "") continue;
         lines.push(s);
       }
-      // An empty live screen (nothing restored yet, or a transient blank frame)
-      // must NOT clear a blocked signal — clearing on an empty buffer would false-
-      // negative a session reopened while sitting at a prompt, before its
-      // scrollback repaints (S1). Only a non-empty screen produces a verdict.
-      if (lines.length === 0) return;
+      if (!scanGate.admit(lines.length > 0)) return;
       // NOTE: a permission/menu prompt that Claude drew while this session was a
       // *backgrounded* (unmounted) tab isn't scanned until the panel remounts and
       // repaints — the scan reads this window's live xterm buffer only. Remount +
       // the scheduled open scan (below) recover it; a still-backgrounded prompt is
       // a known limitation (its blocked badge still comes from the timeline
       // question path when applicable).
-      useClaudeStatus.getState().setScreenBlocked(uuid, scanBottomForPrompt(lines));
+      useClaudeStatus.getState().setScreenBlocked(uuid, scanBottomForPrompt(lines), scanOrigin);
     };
     const blockedScanner = makeDebouncedScanner(runBlockedScan, 300);
 
@@ -794,6 +802,8 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
     };
     const applyLive = (ev: TerminalOutputEvent) => {
       if (ev.session_id === sessionId && ev.seq > lastApplied) {
+        // Genuinely new PTY output — from here on, scans report live edges (S4a).
+        scanOrigin = "live";
         write(ev.data);
         lastApplied = ev.seq;
       }
@@ -928,8 +938,10 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
       // debounced scanner, but a fresh reopen with no new scrollback wouldn't —
       // so schedule one scan now that the session uuid is set and the screen is
       // restored, recovering a blocked badge for a session reopened while sitting
-      // at a permission/menu prompt. The empty-buffer guard in runBlockedScan
-      // keeps this from clearing a signal before the repaint lands.
+      // at a permission/menu prompt. This restore scan reports origin "snapshot"
+      // (silent notifier seed — S4a) unless live output already arrived; the
+      // scanGate keeps a still-blank screen from clearing a signal before the
+      // repaint lands.
       if (sessionId != null) blockedScanner.trigger();
 
       // Handoff: seed the freshly-restarted session once it should be at a prompt.
@@ -977,6 +989,8 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
     const onData = term.onData((d) => {
       // A keystroke is a response too — rescan so a prompt that the key dismisses
       // clears quickly (the PTY redraw also triggers a scan; this just leads it).
+      // User interaction ends the restore phase — subsequent scans are live (S4a).
+      scanOrigin = "live";
       blockedScanner.trigger();
       // Mirrors are read-only; only the driver writes (backend also enforces — P6).
       if (sessionId == null || inputLockedRef.current || !isDriverRef.current) return;

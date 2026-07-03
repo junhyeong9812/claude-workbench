@@ -239,6 +239,33 @@ describe("createTransitionDetector — incremental rising edges", () => {
     expect(notify).toHaveBeenCalledTimes(1);
   });
 
+  it("S4a: a snapshot event for an ALREADY-tracked uuid re-seeds silently (restore scan)", () => {
+    const { det, notify } = makeDetector();
+    // Restore order in the panel: timeline snapshot seed (no open question) …
+    det.processEvent(ev("a", sig(false, false), "snapshot"), CTX);
+    // … then the restore-replay screen scan finds the prompt chrome. The uuid is
+    // known by now — the snapshot origin must still seed, not edge.
+    det.processEvent(ev("a", sig(true, false), "snapshot"), CTX);
+    expect(notify).not.toHaveBeenCalled();
+    // A later *live* clear → re-block is a genuine new prompt and alerts.
+    det.processEvent(ev("a", sig(false, false), "live"), CTX);
+    det.processEvent(ev("a", sig(true, false), "live"), CTX);
+    expect(notify).toHaveBeenCalledTimes(1);
+    expect(notify).toHaveBeenCalledWith("a", "blocked");
+  });
+
+  it("S4b: a snapshot-origin hold confirm (unseen rising) does not fire done", () => {
+    const { det, notify } = makeDetector();
+    det.processEvent(ev("a", sig(false, false), "snapshot"), CTX); // restored, held as working
+    det.processEvent(ev("a", sig(false, true), "snapshot"), CTX); // hold confirm, snapshot epoch
+    expect(notify).not.toHaveBeenCalled();
+    // A genuinely new live completion afterwards still alerts.
+    det.processEvent(ev("a", sig(false, false), "live"), CTX);
+    det.processEvent(ev("a", sig(false, true), "live"), CTX);
+    expect(notify).toHaveBeenCalledTimes(1);
+    expect(notify).toHaveBeenCalledWith("a", "done");
+  });
+
   it("prime seeds the baseline without firing", () => {
     const { det, notify } = makeDetector();
     det.prime({ a: sig(true, false) });
@@ -308,5 +335,33 @@ describe("fireOsNotification — best-effort + cached permission (S13)", () => {
     await fireOsNotification("a", "blocked"); // caches denied (1 request)
     await ensureNotifyPermission(true); // gesture → requests again
     expect(plugin.requestPermission).toHaveBeenCalledTimes(2);
+  });
+
+  it("S13: concurrent fires share ONE in-flight permission request", async () => {
+    (plugin.isPermissionGranted as ReturnType<typeof vi.fn>).mockResolvedValue(false);
+    // Park the request so both fires overlap while it's pending.
+    let release: (v: string) => void = () => {};
+    (plugin.requestPermission as ReturnType<typeof vi.fn>).mockImplementation(
+      () => new Promise<string>((res) => (release = res)),
+    );
+    const p1 = fireOsNotification("a", "blocked");
+    const p2 = fireOsNotification("b", "done");
+    // Let both pass isPermissionGranted and reach the (single) parked request.
+    await new Promise((r) => setTimeout(r, 0));
+    release("granted");
+    await Promise.all([p1, p2]);
+    expect(plugin.requestPermission).toHaveBeenCalledTimes(1);
+    expect(plugin.sendNotification).toHaveBeenCalledTimes(2); // both delivered
+  });
+
+  it("S13: a throwing permission API caches 'failed' — the fire path stops retrying", async () => {
+    (plugin.isPermissionGranted as ReturnType<typeof vi.fn>).mockRejectedValue(new Error("ipc down"));
+    await fireOsNotification("a", "blocked"); // attempt → failed
+    await fireOsNotification("a", "blocked"); // must not touch the API again
+    expect(plugin.isPermissionGranted).toHaveBeenCalledTimes(1);
+    expect(plugin.sendNotification).not.toHaveBeenCalled();
+    // The settings button (interactive) may still retry — and can recover.
+    (plugin.isPermissionGranted as ReturnType<typeof vi.fn>).mockResolvedValue(true);
+    await expect(ensureNotifyPermission(true)).resolves.toBe(true);
   });
 });

@@ -84,21 +84,27 @@ async function handOff(
     acked = true;
     un();
     clearTimeout(ackTimer);
-    if (!re.payload.ok) {
-      reinsert();
-    } else {
-      // Transfer committed (target accepted, latest safe point): the target
-      // window now owns this session's badge in its own status store, so drop the
-      // now-stale entry from THIS (source) window's store (S9). Only on `ok` — a
-      // reject/timeout reinserts the panel here, so its badge must stay. A
-      // non-Claude panel has no uuid → no-op.
-      const uuid =
-        (spec.params.sessionUuid as string | undefined) ??
-        (spec.params.loadSessionId as string | undefined) ??
-        null;
-      if (uuid) useClaudeStatus.getState().remove(uuid);
+    // try/finally: whatever the post-ack bookkeeping throws (reinsert's addPanel,
+    // the badge remove — S11), the in-flight lock MUST release, or this panel
+    // could never be transferred again.
+    try {
+      if (!re.payload.ok) {
+        reinsert();
+      } else {
+        // Transfer committed (target accepted, latest safe point): the target
+        // window now owns this session's badge in its own status store, so drop
+        // the now-stale entry from THIS (source) window's store (S9). Only on
+        // `ok` — a reject/timeout reinserts the panel here, so its badge must
+        // stay. A non-Claude panel has no uuid → no-op.
+        const uuid =
+          (spec.params.sessionUuid as string | undefined) ??
+          (spec.params.loadSessionId as string | undefined) ??
+          null;
+        if (uuid) useClaudeStatus.getState().remove(uuid);
+      }
+    } finally {
+      inFlight.delete(panelId);
     }
-    inFlight.delete(panelId);
   });
   ackTimer = setTimeout(() => {
     if (acked) return;

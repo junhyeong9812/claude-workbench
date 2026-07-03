@@ -38,21 +38,32 @@ interface TimelinePayload {
 }
 
 let started = false;
-/** Set by the disposer so a `listen()` promise that resolves *after* teardown
- * immediately unlistens instead of leaking (S3 async race). */
-let disposed = false;
+/** Monotonic init generation (S3). Each init stamps its registrations with the
+ * current generation; dispose (and a partial-registration failure) bumps it, so
+ * a `listen()` promise from an OLD generation that resolves late — even after a
+ * NEWER init already started — self-unlistens instead of leaking into the new
+ * generation's list (the shared-boolean `disposed` couldn't tell A from B). */
+let generation = 0;
 let unlisteners: UnlistenFn[] = [];
 
-/** Track a pending `listen()` registration: push its unlistener when it lands,
- * or unlisten at once if we were already disposed. A rejected registration
- * warns and reopens `started` so a later init can retry (S3). */
-function track(p: Promise<UnlistenFn>): void {
+/** Track a pending `listen()` registration for generation `gen`: push its
+ * unlistener when it lands if `gen` is still current, else unlisten at once. A
+ * rejected registration tears down any same-generation listeners that DID land
+ * (partial-failure cleanup — a lone survivor would duplicate events after the
+ * retry), bumps the generation so late siblings self-unlisten, and reopens
+ * `started` so a later init retries (S3). */
+function track(p: Promise<UnlistenFn>, gen: number): void {
   p.then((un) => {
-    if (disposed) un();
+    if (gen !== generation) un();
     else unlisteners.push(un);
   }).catch((err) => {
     console.warn("[claudeStatusGlobal] listener registration failed — will retry on next init", err);
-    started = false;
+    if (gen === generation) {
+      generation++;
+      for (const un of unlisteners) un();
+      unlisteners = [];
+      started = false;
+    }
   });
 }
 
@@ -62,10 +73,12 @@ function track(p: Promise<UnlistenFn>): void {
 export function initClaudeStatusGlobal(): () => void {
   if (started) return disposeClaudeStatusGlobal;
   started = true;
-  disposed = false;
+  generation++;
+  const gen = generation;
 
   track(
     listen<TimelinePayload>("claude-timeline", (e) => {
+      if (gen !== generation) return; // stale generation — ignore
       const uuid = lookupSessionUuid(e.payload.id);
       if (!uuid) return; // an id we never registered (another window's session)
       // A mounted panel owns its own (accurate-seenNow) update — don't clobber it.
@@ -79,20 +92,23 @@ export function initClaudeStatusGlobal(): () => void {
         origin: "live",
       });
     }),
+    gen,
   );
 
   track(
     listen<number>("claude-session-closed", (e) => {
+      if (gen !== generation) return; // stale generation — ignore
       const uuid = lookupSessionUuid(e.payload);
       if (uuid) useClaudeStatus.getState().remove(uuid);
     }),
+    gen,
   );
 
   return disposeClaudeStatusGlobal;
 }
 
 function disposeClaudeStatusGlobal() {
-  disposed = true;
+  generation++; // invalidate any in-flight registrations of the old generation
   for (const un of unlisteners) un();
   unlisteners = [];
   started = false;

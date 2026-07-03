@@ -174,6 +174,28 @@ export function makeDebouncedScanner(
 }
 
 /**
+ * Empty-screen scan gate (S1). A blank live screen right after a panel mounts is
+ * just "restore hasn't painted yet" — clearing screen-blocked on it would false-
+ * negative a session reopened while sitting at a prompt. But once the screen has
+ * been seen non-empty, a later blank screen is a REAL clear-screen and must be
+ * allowed to clear the signal (otherwise blocked goes sticky). `admit(nonEmpty)`
+ * returns whether the scan result may be applied, latching on the first
+ * non-empty screen. One gate per panel mount.
+ */
+export function makeScanGate(): { admit: (nonEmpty: boolean) => boolean } {
+  let sawNonEmpty = false;
+  return {
+    admit(nonEmpty: boolean): boolean {
+      if (nonEmpty) {
+        sawNonEmpty = true;
+        return true;
+      }
+      return sawNonEmpty;
+    },
+  };
+}
+
+/**
  * Attention level for sorting/roll-up and notification edges (higher = louder):
  * 3 blocked, 2 done-unseen, 1 working, 0 idle. `unseen` only elevates a
  * non-blocked entry (blocked already wins), so callers pass the display status
@@ -319,7 +341,16 @@ export function onAttentionEvent(cb: (ev: AttentionEvent) => void): () => void {
 }
 
 function emitAttention(ev: AttentionEvent): void {
-  for (const cb of attentionListeners) cb(ev);
+  // Isolate each listener: one throwing subscriber must not starve the ones
+  // after it, nor propagate up into the store action — and through it into the
+  // action's caller (e.g. the S9 transfer-ack handler calling remove) (S11).
+  for (const cb of attentionListeners) {
+    try {
+      cb(ev);
+    } catch (err) {
+      console.error("[claudeStatus] attention listener failed", err);
+    }
+  }
 }
 
 /** Recompute the display status from the internal fields. Blocked (question or
@@ -338,6 +369,11 @@ export const HOLD_MS = 1000;
  * on re-entry, cleared on working / remove. Uses setTimeout so vi.useFakeTimers
  * drives it in tests. */
 const holdTimers = new Map<string, ReturnType<typeof setTimeout>>();
+/** uuid → the origin of the update that SCHEDULED the pending hold. The confirm
+ * commit fires with this origin, so a snapshot-seeded working→quiet epoch
+ * confirms as `snapshot` (silent restore) instead of leaking a `live` done
+ * alert (S4b). Cleared together with the timer. */
+const holdOrigins = new Map<string, TimelineOrigin>();
 
 /** numeric PTY/session id → stable uuid. The `claude-timeline` payload carries
  * only the numeric id, so the app-level global listener (claudeStatusGlobal)
@@ -380,8 +416,10 @@ interface StatusStore {
   /** Record a timeline tick for `uuid`, applying the working→quiet hold and the
    * unseen rule at hold-confirm. Blocked (question) is applied immediately. */
   updateFromTimeline: (uuid: string, d: DerivedTimeline) => void;
-  /** P2 hook — set the screen-scan blocked signal (OR'd with question). */
-  setScreenBlocked: (uuid: string, blocked: boolean) => void;
+  /** P2 hook — set the screen-scan blocked signal (OR'd with question).
+   * `origin` marks a restore-replay scan as `snapshot` (silent notifier seed —
+   * S4a); defaults to `live`. */
+  setScreenBlocked: (uuid: string, blocked: boolean, origin?: TimelineOrigin) => void;
   /** The user looked: clear unseen and remember seen. */
   markSeen: (uuid: string) => void;
   /** Panel unmounted / session ended — drop the entry and any hold timer. */
@@ -403,6 +441,7 @@ export const useClaudeStatus = create<StatusStore>((set, get) => {
       clearTimeout(t);
       holdTimers.delete(uuid);
     }
+    holdOrigins.delete(uuid);
   };
 
   /** Commit a new entry for `uuid` and push its attention delta to the notifier
@@ -422,10 +461,15 @@ export const useClaudeStatus = create<StatusStore>((set, get) => {
     });
   };
 
-  const scheduleHold = (uuid: string) => {
+  const scheduleHold = (uuid: string, origin: TimelineOrigin) => {
     clearHold(uuid);
+    holdOrigins.set(uuid, origin);
     const t = setTimeout(() => {
       holdTimers.delete(uuid);
+      // Confirm with the origin of the update that scheduled this epoch — a
+      // snapshot-seeded quiet confirms silently instead of firing done (S4b).
+      const confirmOrigin = holdOrigins.get(uuid) ?? "live";
+      holdOrigins.delete(uuid);
       const prev = get().entries[uuid];
       if (!prev) return;
       // Confirm quiet. done-unseen iff the panel wasn't seen at completion —
@@ -440,7 +484,7 @@ export const useClaudeStatus = create<StatusStore>((set, get) => {
         seenDuringHold: false,
       };
       e.status = statusOf(e);
-      commit(uuid, e, prev, "live");
+      commit(uuid, e, prev, confirmOrigin);
     }, HOLD_MS);
     holdTimers.set(uuid, t);
   };
@@ -472,8 +516,9 @@ export const useClaudeStatus = create<StatusStore>((set, get) => {
         e.seenDuringHold = false;
       } else if (prev.activity === "working") {
         // working→quiet: don't confirm yet. Keep showing "working" through the
-        // hold; if the hold is already running, let it keep ticking.
-        if (!holdTimers.has(uuid)) scheduleHold(uuid);
+        // hold; if the hold is already running, let it keep ticking (its confirm
+        // origin stays that of the tick that scheduled it — S4b).
+        if (!holdTimers.has(uuid)) scheduleHold(uuid, d.origin ?? "live");
         e.activity = "working";
       } else {
         // Already quiet (or never worked) — nothing to hold.
@@ -483,7 +528,7 @@ export const useClaudeStatus = create<StatusStore>((set, get) => {
       commit(uuid, e, prevEntry, d.origin ?? "live");
     },
 
-    setScreenBlocked: (uuid, blocked) => {
+    setScreenBlocked: (uuid, blocked, origin) => {
       const prevEntry = get().entries[uuid];
       // Don't materialize a ghost idle entry for a never-seen uuid when clearing
       // (blocked:false) — only a real blocked signal creates an entry (minor).
@@ -492,7 +537,7 @@ export const useClaudeStatus = create<StatusStore>((set, get) => {
       if (prev.screenBlocked === blocked && prevEntry) return;
       const e: SessionEntry = { ...prev, screenBlocked: blocked };
       e.status = statusOf(e);
-      commit(uuid, e, prevEntry, "live");
+      commit(uuid, e, prevEntry, origin ?? "live");
     },
 
     markSeen: (uuid) => {

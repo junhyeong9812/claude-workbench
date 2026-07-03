@@ -8,6 +8,7 @@ import {
   ensureNotifyPermission,
   refreshNotifyPermission,
   notifyPermissionState,
+  type NotifyPermission,
   primeAudio,
 } from "../state/notify";
 
@@ -42,16 +43,24 @@ export function TerminalSettings({ onClose }: { onClose: () => void }) {
   // denied, so surface the state here and offer an explicit request — a user
   // gesture, the reliable moment to both request permission and resume the
   // AudioContext (autoplay policy) so later tones aren't blocked.
-  const [perm, setPerm] = useState<"granted" | "denied" | "unknown">(notifyPermissionState());
+  const [perm, setPerm] = useState<NotifyPermission>(notifyPermissionState());
   useEffect(() => {
     void refreshNotifyPermission().then(setPerm);
   }, []);
   const requestPerm = () => {
     primeAudio(); // user gesture — unblock tones
-    void ensureNotifyPermission(true).then((ok) => setPerm(ok ? "granted" : "denied"));
+    // Interactive: retries even after a cached denial/API failure; re-read the
+    // cache afterwards so "failed" (API threw) shows as such, not as 거부됨.
+    void ensureNotifyPermission(true).then(() => setPerm(notifyPermissionState()));
   };
   const permLabel =
-    perm === "granted" ? "허용됨" : perm === "denied" ? "거부됨 (OS 설정에서 변경)" : "미확인";
+    perm === "granted"
+      ? "허용됨"
+      : perm === "denied"
+        ? "거부됨 (OS 설정에서 변경)"
+        : perm === "failed"
+          ? "요청 실패 — 다시 시도 가능"
+          : "미확인";
 
   return (
     <div className="modal-backdrop" onClick={onClose}>

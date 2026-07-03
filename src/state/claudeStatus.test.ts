@@ -7,6 +7,7 @@ import {
   HOLD_MS,
   lookupSessionUuid,
   makeDebouncedScanner,
+  makeScanGate,
   nextCycleTarget,
   onAttentionEvent,
   PROMPT_SCAN_MAX_LINES,
@@ -647,5 +648,100 @@ describe("store: onAttentionEvent bus (S11)", () => {
     S.getState().remove("a");
     unsub();
     expect(seen[seen.length - 1]).toMatchObject({ uuid: "a", next: null });
+  });
+
+  it("S11: a throwing listener is isolated — later listeners still run, the action survives", () => {
+    const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    const after = vi.fn();
+    const un1 = onAttentionEvent(() => {
+      throw new Error("subscriber boom");
+    });
+    const un2 = onAttentionEvent(after);
+    // The action (and through it its caller) must not see the throw.
+    expect(() =>
+      S.getState().updateFromTimeline("a", { activity: "working", questionBlocked: false, seenNow: false }),
+    ).not.toThrow();
+    expect(after).toHaveBeenCalledTimes(1);
+    expect(errSpy).toHaveBeenCalled();
+    un1();
+    un2();
+    errSpy.mockRestore();
+  });
+});
+
+// --- S4a/S4b: snapshot-origin propagation ------------------------------------
+
+describe("store: snapshot origin propagation (S4a/S4b)", () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+    for (const uuid of Object.keys(S.getState().entries)) S.getState().remove(uuid);
+  });
+  afterEach(() => {
+    vi.clearAllTimers();
+    vi.useRealTimers();
+  });
+
+  it("S4a: setScreenBlocked forwards a snapshot origin to the bus (restore scan)", () => {
+    const seen: AttentionEvent[] = [];
+    const unsub = onAttentionEvent((e) => seen.push(e));
+    S.getState().setScreenBlocked("a", true, "snapshot");
+    unsub();
+    expect(seen[0]).toMatchObject({
+      uuid: "a",
+      next: { blockedActive: true, unseen: false },
+      origin: "snapshot",
+    });
+  });
+
+  it("S4a: setScreenBlocked defaults to live (new-output scan)", () => {
+    const seen: AttentionEvent[] = [];
+    const unsub = onAttentionEvent((e) => seen.push(e));
+    S.getState().setScreenBlocked("a", true);
+    unsub();
+    expect(seen[0]?.origin).toBe("live");
+  });
+
+  it("S4b: a hold scheduled by a snapshot tick confirms with origin snapshot", () => {
+    const u = "a";
+    // Snapshot seed shows mid-work, then a snapshot quiet schedules the hold.
+    S.getState().updateFromTimeline(u, { activity: "working", questionBlocked: false, seenNow: false, origin: "snapshot" });
+    S.getState().updateFromTimeline(u, { activity: "quiet", questionBlocked: false, seenNow: false, origin: "snapshot" });
+    const seen: AttentionEvent[] = [];
+    const unsub = onAttentionEvent((e) => seen.push(e));
+    vi.advanceTimersByTime(HOLD_MS);
+    unsub();
+    // The confirm commit (unseen goes true) carries the scheduling origin.
+    expect(seen[seen.length - 1]).toMatchObject({
+      uuid: u,
+      next: { blockedActive: false, unseen: true },
+      origin: "snapshot",
+    });
+  });
+
+  it("S4b: a hold scheduled by a live tick still confirms live", () => {
+    const u = "a";
+    S.getState().updateFromTimeline(u, { activity: "working", questionBlocked: false, seenNow: false });
+    S.getState().updateFromTimeline(u, { activity: "quiet", questionBlocked: false, seenNow: false });
+    const seen: AttentionEvent[] = [];
+    const unsub = onAttentionEvent((e) => seen.push(e));
+    vi.advanceTimersByTime(HOLD_MS);
+    unsub();
+    expect(seen[seen.length - 1]?.origin).toBe("live");
+  });
+});
+
+// --- S1: empty-screen scan gate ------------------------------------------------
+
+describe("makeScanGate (S1)", () => {
+  it("rejects empty scans before the first non-empty screen (restore not painted)", () => {
+    const g = makeScanGate();
+    expect(g.admit(false)).toBe(false); // blank pre-restore — ignore
+    expect(g.admit(false)).toBe(false); // still blank — ignore
+  });
+
+  it("admits empty scans after a non-empty screen (real clear-screen unblocks)", () => {
+    const g = makeScanGate();
+    expect(g.admit(true)).toBe(true); // restore painted (maybe a prompt)
+    expect(g.admit(false)).toBe(true); // later blank = actual clear → may clear blocked
   });
 });

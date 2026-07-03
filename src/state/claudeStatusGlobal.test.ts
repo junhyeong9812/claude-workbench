@@ -66,4 +66,73 @@ describe("initClaudeStatusGlobal — async race + retry (S3)", () => {
     await flush();
     dispose();
   });
+
+  it("S3: generation-crossed resolve — A's late listeners can't join B's set", async () => {
+    // init A (deferred) → dispose A → init B (deferred) → A's listens resolve.
+    // With a shared boolean, B's init would reset `disposed=false` and A's late
+    // resolutions would be pushed into B's list (leak). Generations prevent it.
+    const disposeA = initClaudeStatusGlobal();
+    const aResolvers = resolvers.splice(0);
+    disposeA();
+
+    const disposeB = initClaudeStatusGlobal(); // new generation, still pending
+    const bResolvers = resolvers.splice(0);
+
+    // A's registrations land AFTER B started — must self-unlisten immediately.
+    const aSpies = aResolvers.map(() => vi.fn());
+    aResolvers.forEach((r, i) => r(aSpies[i]));
+    await flush();
+    for (const s of aSpies) expect(s).toHaveBeenCalledTimes(1);
+
+    // B's registrations stay live and are exactly what dispose B tears down.
+    const bSpies = bResolvers.map(() => vi.fn());
+    bResolvers.forEach((r, i) => r(bSpies[i]));
+    await flush();
+    for (const s of bSpies) expect(s).not.toHaveBeenCalled();
+    disposeB();
+    for (const s of bSpies) expect(s).toHaveBeenCalledTimes(1);
+  });
+
+  it("S3: partial registration failure cleans up the surviving sibling (no duplicate on retry)", async () => {
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    // First listen succeeds, second rejects.
+    const survivor = vi.fn();
+    let call = 0;
+    listenImpl = () =>
+      call++ === 0 ? Promise.resolve(survivor) : Promise.reject(new Error("half failed"));
+    initClaudeStatusGlobal();
+    await flush();
+    // The failure must have torn down the sibling that DID register…
+    expect(survivor).toHaveBeenCalledTimes(1);
+
+    // …and reopened started so a retry re-registers cleanly.
+    resolvers = [];
+    listenImpl = () => new Promise<() => void>((res) => resolvers.push(res));
+    (listen as ReturnType<typeof vi.fn>).mockClear();
+    const dispose = initClaudeStatusGlobal();
+    expect(listen).toHaveBeenCalledTimes(2); // both listeners re-registered
+    const spies = resolvers.map(() => vi.fn());
+    resolvers.forEach((r, i) => r(spies[i]));
+    await flush();
+    dispose();
+    for (const s of spies) expect(s).toHaveBeenCalledTimes(1);
+  });
+
+  it("S3: failure landing after the sibling's success still cleans up (order-independent)", async () => {
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    const survivor = vi.fn();
+    let rejectLate: (e: Error) => void = () => {};
+    let call = 0;
+    listenImpl = () =>
+      call++ === 0
+        ? Promise.resolve(survivor)
+        : new Promise<() => void>((_res, rej) => (rejectLate = rej));
+    initClaudeStatusGlobal();
+    await flush(); // success already pushed into the current generation
+    expect(survivor).not.toHaveBeenCalled();
+    rejectLate(new Error("late failure"));
+    await flush();
+    // The late failure still unlistens the already-registered sibling.
+    expect(survivor).toHaveBeenCalledTimes(1);
+  });
 });

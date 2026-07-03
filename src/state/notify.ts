@@ -133,9 +133,11 @@ const IDLE_SIGNALS: AttentionSignals = { blockedActive: false, unseen: false };
  * Incremental rising-edge detector (S11). It holds each uuid's last signals and,
  * on each {@link AttentionEvent}, fires the sinks for a rising edge. `prime`
  * seeds baselines without firing (so pre-existing states at startup don't alert).
- * A uuid's **first** observation seeds silently when it comes from a `snapshot`
- * (restore must not re-alert — S4); a `live` first sighting edges from idle so a
- * genuinely-new blocked/done still fires.
+ * ANY `snapshot`-origin event silently re-seeds the baseline — restore paths
+ * (the snapshot timeline seed, the restore-replay screen scan, a snapshot-
+ * scheduled hold confirm) must never alert, even for a uuid already tracked
+ * (S4/S4a/S4b). A `live` first sighting edges from idle so a genuinely-new
+ * blocked/done still fires.
  */
 export function createTransitionDetector(sinks: NotifySinks) {
   const prev = new Map<string, AttentionSignals>();
@@ -153,18 +155,16 @@ export function createTransitionDetector(sinks: NotifySinks) {
         return;
       }
       const next = ev.next;
-      const hadPrev = prev.has(ev.uuid);
-      let base = prev.get(ev.uuid);
-      if (!hadPrev) {
-        if (ev.origin === "snapshot") {
-          prev.set(ev.uuid, next); // silent restore baseline
-          return;
-        }
-        base = IDLE_SIGNALS; // live first sighting edges from idle
+      if (ev.origin === "snapshot") {
+        // Restore seed — adopt the state silently (S4a: whether or not the uuid
+        // was already seen; a restore scan can land after the timeline seed).
+        prev.set(ev.uuid, next);
+        return;
       }
+      const base = prev.get(ev.uuid) ?? IDLE_SIGNALS; // live first sighting edges from idle
       prev.set(ev.uuid, next);
       const watching = ctx.watchedUuid === ev.uuid && ctx.focused;
-      const d = decideNotify(base!, next, {
+      const d = decideNotify(base, next, {
         watching,
         notifEnabled: ctx.notifEnabled,
         soundEnabled: ctx.soundEnabled,
@@ -180,39 +180,58 @@ export function createTransitionDetector(sinks: NotifySinks) {
 
 let warnedPermission = false;
 let warnedSend = false;
-/** Cached permission verdict so the fire path doesn't re-prompt a user who
- * already declined (S13). "unknown" until first checked. */
-let permissionState: "granted" | "denied" | "unknown" = "unknown";
+
+/** Cached permission verdict (S13). "unknown" until first checked; "failed" =
+ * the permission API itself threw — the fire path won't retry (only the settings
+ * button's interactive request can). */
+export type NotifyPermission = "granted" | "denied" | "unknown" | "failed";
+let permissionState: NotifyPermission = "unknown";
+/** In-flight permission check/request — concurrent fires await the SAME promise
+ * so a burst of alerts can't stack OS permission prompts (S13). */
+let permRequest: Promise<boolean> | null = null;
 
 /**
  * Ensure OS-notification permission, caching the result. `interactive:false`
- * (the fire path) requests at most once and, once denied, never re-prompts —
- * best-effort silence, no per-alert nagging. `interactive:true` (the settings
- * button — a user gesture) always attempts a request. Never throws.
+ * (the fire path) requests at most once, and once denied — or once the API
+ * threw ("failed") — never retries. `interactive:true` (the settings button, a
+ * user gesture) always attempts again. Concurrent callers share one in-flight
+ * request. Never throws.
  */
-export async function ensureNotifyPermission(interactive: boolean): Promise<boolean> {
-  try {
-    if (permissionState === "granted") return true;
-    if (await isPermissionGranted()) {
-      permissionState = "granted";
-      return true;
-    }
-    if (permissionState === "denied" && !interactive) return false;
-    const res = await requestPermission();
-    permissionState = res === "granted" ? "granted" : "denied";
-    return permissionState === "granted";
-  } catch {
-    return false;
+export function ensureNotifyPermission(interactive: boolean): Promise<boolean> {
+  if (permissionState === "granted") return Promise.resolve(true);
+  if (!interactive && (permissionState === "denied" || permissionState === "failed")) {
+    return Promise.resolve(false);
   }
+  if (permRequest) return permRequest;
+  permRequest = (async () => {
+    try {
+      if (await isPermissionGranted()) {
+        permissionState = "granted";
+        return true;
+      }
+      if (permissionState === "denied" && !interactive) return false;
+      const res = await requestPermission();
+      permissionState = res === "granted" ? "granted" : "denied";
+      return permissionState === "granted";
+    } catch {
+      // API failure (plugin missing, IPC error): remember it so the fire path
+      // stops retrying — the settings button (interactive) may try again.
+      permissionState = "failed";
+      return false;
+    } finally {
+      permRequest = null;
+    }
+  })();
+  return permRequest;
 }
 
 /** Current cached permission verdict (for the settings display). */
-export function notifyPermissionState(): "granted" | "denied" | "unknown" {
+export function notifyPermissionState(): NotifyPermission {
   return permissionState;
 }
 
 /** Re-query the OS permission (settings panel open) and update the cache. */
-export async function refreshNotifyPermission(): Promise<"granted" | "denied" | "unknown"> {
+export async function refreshNotifyPermission(): Promise<NotifyPermission> {
   try {
     if (await isPermissionGranted()) permissionState = "granted";
     else if (permissionState === "granted") permissionState = "unknown";
@@ -345,6 +364,7 @@ export function playTone(kind: NotifKind): void {
  * prefs leak across cases otherwise). */
 export function __resetNotifyForTest(): void {
   permissionState = "unknown";
+  permRequest = null;
   warnedPermission = false;
   warnedSend = false;
   warnedAudio = false;
