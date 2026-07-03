@@ -2527,6 +2527,14 @@ body {
   text-align: center;
 }
 
+/* gitignored entries: shown but muted (VS Code style). Dim the label/icon only —
+ * never the whole row — so the cursor/peek/selection highlights stay legible. */
+.tree-row-ignored .tree-label,
+.tree-row-ignored .tree-icon {
+  color: var(--fg-dim);
+  opacity: 0.7;
+}
+
 .tree-empty,
 .tree-empty-child {
   color: var(--fg-dim);
@@ -2755,6 +2763,13 @@ body {
 }
 .study-tree-file .study-tree-name {
   color: var(--fg);
+}
+/* gitignored entries dimmed (matches FolderTree). Placed after the file rule so
+ * it wins for files too; row-level highlights are left untouched. */
+.study-tree-row-ignored .study-tree-name,
+.study-tree-row-ignored .study-tree-caret {
+  color: var(--fg-dim);
+  opacity: 0.7;
 }
 
 /* ---- Study viewer + tabs (P2) ---- */

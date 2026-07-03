@@ -27,10 +27,14 @@ function TreeNode({
   entry,
   depth,
   onContext,
+  parentIgnored,
 }: {
   entry: DirEntry;
   depth: number;
   onContext: ContextHandler;
+  /** An ignored dir's children come back non-ignored from a walk rooted inside
+   * it, so ignored-ness is inherited down the subtree for consistent dimming. */
+  parentIgnored?: boolean;
 }) {
   const expanded = useAppStore((s) => {
     const active = s.projects.find((p) => p.path === s.activeProject);
@@ -59,11 +63,12 @@ function TreeNode({
   };
 
   const icon = entry.is_dir ? (expanded ? "▾" : "▸") : "·";
+  const ignored = parentIgnored || !!entry.is_ignored;
 
   return (
     <div className="tree-node">
       <div
-        className={`tree-row${isCursor ? " tree-row-cursor" : ""}${isPeeked ? " tree-row-peeked" : ""}`}
+        className={`tree-row${isCursor ? " tree-row-cursor" : ""}${isPeeked ? " tree-row-peeked" : ""}${ignored ? " tree-row-ignored" : ""}`}
         data-tree-path={entry.path}
         style={{ paddingLeft: depth * 14 + 8 }}
         onClick={onClick}
@@ -90,7 +95,13 @@ function TreeNode({
             </div>
           ) : (
             children.map((child) => (
-              <TreeNode key={child.path} entry={child} depth={depth + 1} onContext={onContext} />
+              <TreeNode
+                key={child.path}
+                entry={child}
+                depth={depth + 1}
+                onContext={onContext}
+                parentIgnored={ignored}
+              />
             ))
           )}
         </div>
