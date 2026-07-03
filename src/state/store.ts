@@ -66,6 +66,32 @@ function saveStudyView(s: {
 
 const STUDY0 = loadStudyView();
 
+/** Safe-parse a persisted `Record<string, string>` map (project → value),
+ * dropping non-string entries so corrupt/old JSON can't break consumers. */
+function loadStringMap(key: string): Record<string, string> {
+  try {
+    const v = JSON.parse(localStorage.getItem(key) || "null");
+    if (!v || typeof v !== "object" || Array.isArray(v)) return {};
+    const out: Record<string, string> = {};
+    for (const [k, val] of Object.entries(v as Record<string, unknown>)) {
+      if (typeof val === "string") out[k] = val;
+    }
+    return out;
+  } catch {
+    return {};
+  }
+}
+
+/** Per-project workspace flavor. "dev" opens tree files as editor tabs with the
+ * project's dev Claude session pinned beside them (the ✓확인 loop's layout);
+ * "integrated" keeps the plain workspace behavior. */
+function loadProjectModes(): Record<string, "integrated" | "dev"> {
+  const raw = loadStringMap("projectModes");
+  const out: Record<string, "integrated" | "dev"> = {};
+  for (const [k, v] of Object.entries(raw)) if (v === "dev") out[k] = "dev";
+  return out; // "integrated" is the default — only "dev" entries persist
+}
+
 const TERM_COLOR_KEYS = new Set([
   "background",
   "foreground",
@@ -279,6 +305,14 @@ interface AppState {
   fontSize: number;
   /** Workspace view mode: normal workspace or the two-folder study view. Persisted. */
   mode: "workspace" | "study";
+  /** Per-project workspace flavor (개발↔통합 토글). "dev": opening a tree file
+   * shows the editable editor tab with the project's dev Claude session pinned
+   * beside it (확인 loop layout). Absent key = "integrated". Persisted. */
+  projectModes: Record<string, "integrated" | "dev">;
+  /** Per-project dev Claude session uuid — stable across restarts so the dev
+   * session resumes. The backend already degrades a stale uuid gracefully
+   * (missing transcript → fresh `--session-id` under the same uuid). Persisted. */
+  devUuids: Record<string, string>;
   /** Study view: root folder per side (persisted). */
   studyFolders: { left: string | null; right: string | null };
   /** Study view: open file tabs per side, MRU order (most recent first). */
@@ -398,6 +432,10 @@ interface AppState {
   setTermColors: (c: Partial<ITheme> | null) => void;
   /** Switch the workspace view mode (workspace / study). */
   setMode: (mode: "workspace" | "study") => void;
+  /** Toggle a project's 개발↔통합 flavor and persist. */
+  setProjectMode: (project: string, mode: "integrated" | "dev") => void;
+  /** Get (minting + persisting on first use) the project's stable dev session uuid. */
+  ensureDevUuid: (project: string) => string;
   /** Set (or clear) a study side's root folder (resets that side's tabs). */
   setStudyFolder: (side: "left" | "right", path: string | null) => void;
   /** Open a file in a study side's viewer (front of MRU + active). */
@@ -456,7 +494,9 @@ export const useAppStore = create<AppState>((set, get) => ({
   theme: (localStorage.getItem("theme") as "dark" | "light") || "dark",
   fontSize: clampFontSize(Number(localStorage.getItem("fontSize")) || 13),
   termColors: loadTermColors(),
-  mode: (localStorage.getItem("mode") as "workspace" | "study") || "workspace",
+  mode: localStorage.getItem("mode") === "study" ? "study" : "workspace",
+  projectModes: loadProjectModes(),
+  devUuids: loadStringMap("devUuids"),
   studyFolders: STUDY0.folders,
   studyTabs: STUDY0.tabs,
   studyActive: STUDY0.active,
@@ -621,6 +661,22 @@ export const useAppStore = create<AppState>((set, get) => ({
   setMode: (mode) => {
     localStorage.setItem("mode", mode);
     set({ mode });
+  },
+  setProjectMode: (project, mode) => {
+    const next = { ...get().projectModes };
+    if (mode === "dev") next[project] = "dev";
+    else delete next[project]; // "integrated" is the default — keep the map sparse
+    localStorage.setItem("projectModes", JSON.stringify(next));
+    set({ projectModes: next });
+  },
+  ensureDevUuid: (project) => {
+    const cur = get().devUuids[project];
+    if (cur) return cur;
+    const uuid = crypto.randomUUID();
+    const next = { ...get().devUuids, [project]: uuid };
+    localStorage.setItem("devUuids", JSON.stringify(next));
+    set({ devUuids: next });
+    return uuid;
   },
   setStudyFolder: (side, path) => {
     set((s) => ({

@@ -9,6 +9,7 @@
     "preview": "vite preview",
     "test": "vitest run",
     "test:watch": "vitest",
+    "css-audit": "node scripts/css-audit.mjs",
     "tauri": "tauri"
   },
   "dependencies": {
