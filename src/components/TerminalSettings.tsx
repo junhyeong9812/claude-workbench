@@ -1,5 +1,7 @@
+import { useState } from "react";
 import { useAppStore } from "../state/store";
 import { TERM_PRESETS, TERM_EDITABLE, xtermTheme } from "./xtermTheme";
+import { readNotifPrefs, setNotifEnabled, setSoundEnabled } from "../state/notify";
 
 /**
  * Terminal color customization dialog: pick a named preset, or set individual
@@ -14,6 +16,19 @@ export function TerminalSettings({ onClose }: { onClose: () => void }) {
 
   const setKey = (key: string, value: string) =>
     setTermColors({ ...(termColors ?? {}), [key]: value });
+
+  // Attention alert/sound toggles (P4). Persisted to localStorage (same pattern
+  // as the rest of the app); the notifier reads them at fire time. Both default
+  // on. Local state so the checkboxes reflect toggles immediately.
+  const [notif, setNotif] = useState(() => readNotifPrefs());
+  const toggleNotif = (on: boolean) => {
+    setNotifEnabled(on);
+    setNotif((p) => ({ ...p, notifEnabled: on }));
+  };
+  const toggleSound = (on: boolean) => {
+    setSoundEnabled(on);
+    setNotif((p) => ({ ...p, soundEnabled: on }));
+  };
 
   return (
     <div className="modal-backdrop" onClick={onClose}>
@@ -65,6 +80,26 @@ export function TerminalSettings({ onClose }: { onClose: () => void }) {
               </div>
             );
           })}
+        </div>
+
+        <div className="ts-section">
+          <div className="ts-label">세션 알림</div>
+          <label className="ts-toggle">
+            <input
+              type="checkbox"
+              checked={notif.notifEnabled}
+              onChange={(e) => toggleNotif(e.target.checked)}
+            />
+            <span>OS 알림 — 세션이 입력 대기·작업 완료 시</span>
+          </label>
+          <label className="ts-toggle">
+            <input
+              type="checkbox"
+              checked={notif.soundEnabled}
+              onChange={(e) => toggleSound(e.target.checked)}
+            />
+            <span>소리 — 알림 톤 재생</span>
+          </label>
         </div>
 
         <div className="ts-foot">

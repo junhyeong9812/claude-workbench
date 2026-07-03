@@ -475,23 +475,41 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
     // focused — clear its done-unseen badge then (invariant ①).
     const markSeenIfLooking = () => {
       const uuid = statusUuidRef.current;
-      if (uuid && props.api.isActive && document.hasFocus()) {
-        useClaudeStatus.getState().markSeen(uuid);
+      if (!uuid) return;
+      const st = useClaudeStatus.getState();
+      if (props.api.isActive && document.hasFocus()) {
+        st.markSeen(uuid);
+        // This panel is what the user is actively watching now — suppress its
+        // attention alerts (P4 N4). `watchedUuid` is a live signal (cleared on
+        // blur / tab-away below), distinct from the store's per-tick `seen`.
+        st.setWatched(uuid);
+      } else if (st.watchedUuid === uuid) {
+        // Was the watched panel, but no longer active+focused — stop suppressing.
+        st.setWatched(null);
       }
     };
     const d = props.api.onDidActiveChange(() => {
-      if (props.api.isActive) {
-        restoreFocus();
-        markSeenIfLooking();
-      }
+      // Run on both activate and deactivate so `watchedUuid` clears when this tab
+      // stops being active (markSeenIfLooking handles the not-looking branch).
+      if (props.api.isActive) restoreFocus();
+      markSeenIfLooking();
     });
     // Also flip seen when this window regains focus while the panel is active.
     window.addEventListener("focus", markSeenIfLooking);
+    // Losing window focus means the user isn't watching this panel anymore.
+    const onBlur = () => {
+      const uuid = statusUuidRef.current;
+      if (uuid && useClaudeStatus.getState().watchedUuid === uuid) {
+        useClaudeStatus.getState().setWatched(null);
+      }
+    };
+    window.addEventListener("blur", onBlur);
     // Seed: if we mount already active+focused, count it as seen immediately.
     markSeenIfLooking();
     return () => {
       d.dispose();
       window.removeEventListener("focus", markSeenIfLooking);
+      window.removeEventListener("blur", onBlur);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [props.api]);

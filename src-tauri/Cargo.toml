@@ -16,6 +16,9 @@ tauri-build = { version = "2", features = [] }
 [dependencies]
 tauri = { version = "2", features = ["protocol-asset"] }
 tauri-plugin-dialog = "2"
+# OS notifications for session attention (agent-status-badges P4). Official
+# tauri-apps plugin; paired with @tauri-apps/plugin-notification on the JS side.
+tauri-plugin-notification = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # Local calendar date for timeline persistence folders (YYYY-MM-DD).

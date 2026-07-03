@@ -29,6 +29,7 @@ import {
   shouldShowRollup,
 } from "./state/claudeStatus";
 import { initClaudeStatusGlobal } from "./state/claudeStatusGlobal";
+import { initNotify } from "./state/notify";
 import "./App.css";
 
 /**
@@ -121,6 +122,11 @@ function AppMain() {
   // while its panel is a backgrounded (unmounted) tab. Module-guarded to once per
   // window, so this is the single init point for the main window.
   useEffect(() => initClaudeStatusGlobal(), []);
+
+  // Attention notifications + tones (P4): subscribe to the status store and fire
+  // an OS notification / tone on a session's rising edge into blocked/done-unseen
+  // (best-effort, suppressed while watching). Idempotent per window.
+  useEffect(() => initNotify(), []);
 
   // Reopen popout windows that were open at the last quit (multiwindow P2). Runs
   // once on main-window startup; each reopened popout self-restores its layout

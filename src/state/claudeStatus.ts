@@ -303,6 +303,15 @@ interface StatusStore {
    * >0 a live panel owns this session's timeline/seen updates (it has the
    * accurate `seenNow`), so the global listener skips it — no double update. */
   attached: Record<string, number>;
+  /** The one session (in this window) the user is actively looking at right now:
+   * its panel is the active tab AND the window is focused. Set/cleared at the
+   * markSeen points in ClaudeTermPanel. The notifier reads it to suppress an
+   * alert for a session the user is already watching (invariant ③, N4). A live
+   * "watching" signal distinct from `SessionEntry.seen` (which is a snapshot from
+   * the last timeline tick and isn't cleared on blur). */
+  watchedUuid: string | null;
+  /** Set the actively-watched session (null when the user looks away/blurs). */
+  setWatched: (uuid: string | null) => void;
   /** Record a timeline tick for `uuid`, applying the working→quiet hold and the
    * unseen rule at hold-confirm. Blocked (question) is applied immediately. */
   updateFromTimeline: (uuid: string, d: DerivedTimeline) => void;
@@ -352,6 +361,11 @@ export const useClaudeStatus = create<StatusStore>((set) => {
   return {
     entries: {},
     attached: {},
+    watchedUuid: null,
+
+    setWatched: (uuid) => {
+      set((s) => (s.watchedUuid === uuid ? {} : { watchedUuid: uuid }));
+    },
 
     updateFromTimeline: (uuid, d) => {
       set((s) => {

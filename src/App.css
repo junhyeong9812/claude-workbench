@@ -2703,6 +2703,14 @@ body {
   font-family: "JetBrains Mono", monospace;
   font-size: 0.9em;
 }
+.ts-toggle {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 3px 0;
+  font-size: 0.9em;
+  cursor: pointer;
+}
 .ts-foot {
   padding: 10px 12px;
   display: flex;

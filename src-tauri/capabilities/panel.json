@@ -5,6 +5,7 @@
   "windows": ["panel-*"],
   "permissions": [
     "core:default",
+    "notification:default",
     "core:window:allow-destroy",
     "core:window:allow-close",
     "core:window:allow-get-all-windows",
