@@ -4,6 +4,7 @@ import { emit, listen } from "@tauri-apps/api/event";
 import type { DockviewApi, IDockviewPanel } from "dockview-react";
 import { useAppStore } from "./store";
 import { beginTransfer, endTransfer } from "./panelTransfer";
+import { useClaudeStatus } from "./claudeStatus";
 
 const KNOWN_COMPONENTS = new Set([
   "placeholder",
@@ -81,17 +82,43 @@ async function handOff(
   const un = await listen<{ transferId: string; ok: boolean }>("transfer-result", (re) => {
     if (acked || re.payload.transferId !== transferId) return;
     acked = true;
-    un();
-    clearTimeout(ackTimer);
-    if (!re.payload.ok) reinsert();
-    inFlight.delete(panelId);
+    // try/finally on the WHOLE settle path (S11): whatever the post-ack
+    // bookkeeping throws (reinsert's addPanel, the badge remove), the listener
+    // release and the in-flight lock MUST both happen — a leaked `inFlight`
+    // entry would make this panel untransferable forever, a leaked listener
+    // would double-settle a future transfer.
+    try {
+      clearTimeout(ackTimer);
+      if (!re.payload.ok) {
+        reinsert();
+      } else {
+        // Transfer committed (target accepted, latest safe point): the target
+        // window now owns this session's badge in its own status store, so drop
+        // the now-stale entry from THIS (source) window's store (S9). Only on
+        // `ok` — a reject/timeout reinserts the panel here, so its badge must
+        // stay. A non-Claude panel has no uuid → no-op.
+        const uuid =
+          (spec.params.sessionUuid as string | undefined) ??
+          (spec.params.loadSessionId as string | undefined) ??
+          null;
+        if (uuid) useClaudeStatus.getState().remove(uuid);
+      }
+    } finally {
+      un();
+      inFlight.delete(panelId);
+    }
   });
   ackTimer = setTimeout(() => {
     if (acked) return;
     acked = true;
-    un();
-    reinsert();
-    inFlight.delete(panelId);
+    // Same discipline as the ack path: reinsert may throw (dockview state), but
+    // the listener + in-flight lock must still release (S11).
+    try {
+      reinsert();
+    } finally {
+      un();
+      inFlight.delete(panelId);
+    }
   }, ACCEPT_TIMEOUT_MS);
 
   // Detach the source panel (session survives via the guard), then VERIFY it

@@ -27,6 +27,9 @@
   --st-warn: #d29922;
   --st-fail: #f85149;
   --st-danger: #f38ba8;
+  /* done-unseen (attention) blue — a status peer of the git "renamed" blue,
+     used by the tab badge + toolbar roll-up (agent-status-badges P3). */
+  --st-info: #4493f8;
   --accent-bright: #89b4fa;
   /* soft add/ok green for text-on-tint (pairs with --st-danger in diff views) */
   --st-ok-soft: #a6e3a1;
@@ -87,6 +90,7 @@
   --st-warn: #9a6700;
   --st-fail: #cf222e;
   --st-danger: #cf222e;
+  --st-info: #0969da;
   --accent-bright: #0969da;
   --st-ok-soft: #1a7f37;
   --sel-bg: rgba(9, 105, 218, 0.12);
@@ -214,6 +218,47 @@ body {
 .toolbar-btn-on {
   color: var(--accent-bright);
   border-color: var(--accent-bright);
+}
+
+/* Attention roll-up (agent-status-badges P3): red `●n` blocked + blue `●n`
+   done-unseen; each a clickable pill that cycles its group's session tabs. */
+.toolbar-rollup {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.toolbar-rollup-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 1px 7px 1px 5px;
+  font-size: 12px;
+  line-height: 1.4;
+  cursor: pointer;
+  color: var(--fg);
+}
+.toolbar-rollup-item:hover {
+  background: var(--bg-hover);
+}
+.toolbar-rollup-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+}
+.toolbar-rollup-item.is-blocked {
+  border-color: color-mix(in srgb, var(--st-fail) 45%, var(--border));
+}
+.toolbar-rollup-item.is-blocked .toolbar-rollup-dot {
+  background: var(--st-fail);
+}
+.toolbar-rollup-item.is-done {
+  border-color: color-mix(in srgb, var(--st-info) 45%, var(--border));
+}
+.toolbar-rollup-item.is-done .toolbar-rollup-dot {
+  background: var(--st-info);
 }
 
 .toolbar-title {
@@ -1148,6 +1193,35 @@ body {
 }
 .claude-tab-title {
   font-size: 13px;
+}
+/* Attention dot (agent-status-badges P3). Color + title (never color-only) at
+   the store-resolved priority; blocked pulses to draw the eye. */
+.claude-tab-badge {
+  flex: 0 0 auto;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--fg-dim);
+}
+.claude-tab-badge.is-working {
+  background: var(--st-warn);
+}
+.claude-tab-badge.is-done {
+  background: var(--st-info);
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--st-info) 30%, transparent);
+}
+.claude-tab-badge.is-blocked {
+  background: var(--st-fail);
+  animation: claude-badge-pulse 1.4s ease-in-out infinite;
+}
+@keyframes claude-badge-pulse {
+  0%,
+  100% {
+    box-shadow: 0 0 0 0 color-mix(in srgb, var(--st-fail) 55%, transparent);
+  }
+  50% {
+    box-shadow: 0 0 0 3px color-mix(in srgb, var(--st-fail) 0%, transparent);
+  }
 }
 .claude-tab-x {
   cursor: pointer;
@@ -2652,6 +2726,14 @@ body {
   padding: 2px 6px;
   font-family: "JetBrains Mono", monospace;
   font-size: 0.9em;
+}
+.ts-toggle {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 3px 0;
+  font-size: 0.9em;
+  cursor: pointer;
 }
 .ts-foot {
   padding: 10px 12px;

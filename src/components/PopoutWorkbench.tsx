@@ -16,6 +16,8 @@ import { installDragOut, hasInFlight } from "../state/windowTransfer";
 import { installTransferTarget } from "../state/panelTransferTarget";
 import { DropTargetOverlay } from "./DropTargetOverlay";
 import { components, AppTab } from "./panelRegistry";
+import { initClaudeStatusGlobal } from "../state/claudeStatusGlobal";
+import { initNotify } from "../state/notify";
 
 const AUTOCLOSE_DEBOUNCE_MS = 1500;
 
@@ -96,6 +98,14 @@ export function PopoutWorkbench() {
   useEffect(() => {
     document.documentElement.setAttribute("data-theme", theme);
   }, [theme]);
+
+  // App-level attention listener so this popout's backgrounded tabs keep their
+  // badges updating too (module-guarded to once per window).
+  useEffect(() => initClaudeStatusGlobal(), []);
+
+  // Attention notifications + tones for sessions living in this popout (P4);
+  // idempotent per window.
+  useEffect(() => initNotify(), []);
 
   // Dispose dock listeners on unmount (window close).
   useEffect(

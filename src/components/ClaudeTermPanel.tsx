@@ -14,6 +14,15 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 import { TimelineView, ItemDetail, MarkdownText, type TimelineItem } from "./TimelineView";
 import { SubagentsPane } from "./SubagentsPane";
 import { handleScrollKey } from "./scrollKeys";
+import {
+  useClaudeStatus,
+  deriveSessionActivity,
+  hasOpenQuestion,
+  scanBottomForPrompt,
+  makeDebouncedScanner,
+  makeScanGate,
+  PROMPT_SCAN_MAX_LINES,
+} from "../state/claudeStatus";
 
 /**
  * Architecture A Claude panel: the **real** `claude` CLI in an xterm PTY (left)
@@ -216,6 +225,10 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
   // Current live PTY session id, mirrored out of the effect so handoff (component
   // scope) can read/close it. The effect remains the sole writer.
   const sessionIdRef = useRef<number | null>(null);
+  // This session's stable uuid, used to key the attention-status store (badges).
+  // Set alongside the numeric session id once the session opens; the timeline
+  // payload carries only the numeric id, so status derivation reads it here.
+  const statusUuidRef = useRef<string | null>(null);
   // Seed to inject into a freshly-started session once it looks ready (handoff).
   const pendingSeedRef = useRef<string | null>(null);
   // On a handoff remount, the exact session to attach to — so the effect doesn't
@@ -459,10 +472,60 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
   // another group is clicked) doesn't re-run the mount effect, so restore focus
   // here too. The mount path calls restoreFocus() directly once xterm is ready.
   useEffect(() => {
+    // The user "sees" this session when it's the active tab and its window is
+    // focused — clear its done-unseen badge then (invariant ①).
+    const markSeenIfLooking = () => {
+      const uuid = statusUuidRef.current;
+      if (!uuid) return;
+      const st = useClaudeStatus.getState();
+      // activeClaudeUuid tracks the dock-active tab regardless of focus — the
+      // roll-up's cycle cursor (S12). Distinct from watchedUuid (active AND
+      // focused) which drives alert suppression.
+      if (props.api.isActive) st.setActiveClaudeUuid(uuid);
+      else if (st.activeClaudeUuid === uuid) st.setActiveClaudeUuid(null);
+      if (props.api.isActive && document.hasFocus()) {
+        st.markSeen(uuid);
+        // This panel is what the user is actively watching now — suppress its
+        // attention alerts (P4 N4). `watchedUuid` is a live signal (cleared on
+        // blur / tab-away below), distinct from the store's per-tick `seen`.
+        st.setWatched(uuid);
+      } else if (st.watchedUuid === uuid) {
+        // Was the watched panel, but no longer active+focused — stop suppressing.
+        st.setWatched(null);
+      }
+    };
     const d = props.api.onDidActiveChange(() => {
+      // Run on both activate and deactivate so `watchedUuid` clears when this tab
+      // stops being active (markSeenIfLooking handles the not-looking branch).
       if (props.api.isActive) restoreFocus();
+      markSeenIfLooking();
     });
-    return () => d.dispose();
+    // Also flip seen when this window regains focus while the panel is active.
+    window.addEventListener("focus", markSeenIfLooking);
+    // Losing window focus means the user isn't watching this panel anymore.
+    const onBlur = () => {
+      const uuid = statusUuidRef.current;
+      if (uuid && useClaudeStatus.getState().watchedUuid === uuid) {
+        useClaudeStatus.getState().setWatched(null);
+      }
+    };
+    window.addEventListener("blur", onBlur);
+    // Seed: if we mount already active+focused, count it as seen immediately.
+    markSeenIfLooking();
+    return () => {
+      d.dispose();
+      window.removeEventListener("focus", markSeenIfLooking);
+      window.removeEventListener("blur", onBlur);
+      // This panel is unmounting (tab switch / close) — if it was the watched or
+      // active-cycle session, release those live signals so a stale uuid doesn't
+      // keep suppressing alerts or anchoring the roll-up cycle (S8/S12).
+      const uuid = statusUuidRef.current;
+      if (uuid) {
+        const st = useClaudeStatus.getState();
+        if (st.watchedUuid === uuid) st.setWatched(null);
+        if (st.activeClaudeUuid === uuid) st.setActiveClaudeUuid(null);
+      }
+    };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [props.api]);
   // Drag the terminal|viewer splitter to resize the viewer (timeline stays 360px).
@@ -643,17 +706,24 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
     // Set once a live timeline event arrives, so a slower snapshot-seed (reopen /
     // re-attach restore) doesn't overwrite newer live state.
     let gotLive = false;
+    // The uuid this mount attached to the attention store (P3). Tracked locally so
+    // the cleanup detaches exactly what it attached, regardless of a later handoff
+    // reassigning statusUuidRef.
+    let attachedUuid: string | null = null;
     const pending: TerminalOutputEvent[] = [];
 
-    const applySnapshot = (s: {
-      items: TimelineItem[];
-      turns: [number, string][];
-      answers: [number, string][];
-      dates: [number, string][];
-      tokens?: [number, TokenUsage][];
-      model?: string | null;
-      last_usage?: TokenUsage | null;
-    }) => {
+    const applySnapshot = (
+      s: {
+        items: TimelineItem[];
+        turns: [number, string][];
+        answers: [number, string][];
+        dates: [number, string][];
+        tokens?: [number, TokenUsage][];
+        model?: string | null;
+        last_usage?: TokenUsage | null;
+      },
+      origin: "snapshot" | "live",
+    ) => {
       setItems([...s.items].sort((a, b) => a.seq - b.seq));
       setTurns(new Map(s.turns));
       setAnswers(new Map(s.answers));
@@ -669,13 +739,75 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
       setCtxModel(s.model ?? null);
       const lu = s.last_usage;
       setCtxTokens(lu ? lu.input + lu.cache_read + lu.cache_creation : 0);
+      // Derive the attention status from the same snapshot so a restart / reopen
+      // restores the badge (invariant ⑥) — not just live events (S5). A
+      // `snapshot` origin seeds the notifier silently (no restore re-alert);
+      // `live` (the timeline-event caller) edges normally.
+      const statusUuid = statusUuidRef.current;
+      if (statusUuid) {
+        useClaudeStatus.getState().updateFromTimeline(statusUuid, {
+          activity: deriveSessionActivity(s.turns, s.answers, s.items),
+          questionBlocked: hasOpenQuestion(s.items),
+          seenNow: props.api.isActive && document.hasFocus(),
+          origin,
+        });
+      }
     };
 
+    // P2: after PTY output settles, scan the live screen bottom for an
+    // input-waiting prompt (permission dialog / numbered menu) and set the
+    // screen-blocked signal. No-op until a session is open (statusUuidRef).
+    //
+    // Origin (S4a): scans triggered by the restore replay (the scrollback
+    // backfill write + the scheduled open scan) are a *snapshot* of pre-existing
+    // screen state — they must seed the notifier silently, not re-alert a prompt
+    // the user already saw before the restart. The first genuinely NEW output
+    // (a live terminal-output event) or a keystroke flips this to "live". Each
+    // trigger passes the origin AT TRIGGER TIME — the debounced scanner resolves
+    // a coalesced batch to snapshot only when every trigger was snapshot, so live
+    // output landing inside the debounce window can't retroactively promote a
+    // pure restore scan.
+    let scanOrigin: "snapshot" | "live" = "snapshot";
+    // S1: gate empty-screen scans — blank before the restore paints is "no data"
+    // (don't clear a blocked signal); after the post-restore scan is armed (or a
+    // non-empty screen was seen) a blank screen is a real verdict and may clear.
+    const scanGate = makeScanGate();
+    const runBlockedScan = (origin: "snapshot" | "live") => {
+      const t = termRef.current;
+      const uuid = statusUuidRef.current;
+      if (!t || !uuid) return;
+      const buf = t.buffer.active;
+      // Read the *live screen* rows [baseY … baseY+rows-1] bottom-first — not the
+      // scrolled viewport — so scrolling up to an old, already-answered prompt
+      // can't drag it into range. translateToString has already stripped ANSI.
+      const lines: string[] = [];
+      const bottom = buf.baseY + t.rows - 1;
+      for (let i = bottom; i >= buf.baseY && lines.length < PROMPT_SCAN_MAX_LINES; i--) {
+        const s = buf.getLine(i)?.translateToString(true) ?? "";
+        if (s.trim() === "") continue;
+        lines.push(s);
+      }
+      if (!scanGate.admit(lines.length > 0)) return;
+      // NOTE: a permission/menu prompt that Claude drew while this session was a
+      // *backgrounded* (unmounted) tab isn't scanned until the panel remounts and
+      // repaints — the scan reads this window's live xterm buffer only. Remount +
+      // the scheduled open scan (below) recover it; a still-backgrounded prompt is
+      // a known limitation (its blocked badge still comes from the timeline
+      // question path when applicable).
+      useClaudeStatus.getState().setScreenBlocked(uuid, scanBottomForPrompt(lines), origin);
+    };
+    const blockedScanner = makeDebouncedScanner(runBlockedScan, 300);
+
     const write = (bytes: number[]) => {
-      if (!disposed) term.write(new Uint8Array(bytes));
+      if (!disposed) {
+        term.write(new Uint8Array(bytes));
+        blockedScanner.trigger(scanOrigin);
+      }
     };
     const applyLive = (ev: TerminalOutputEvent) => {
       if (ev.session_id === sessionId && ev.seq > lastApplied) {
+        // Genuinely new PTY output — from here on, scans report live edges (S4a).
+        scanOrigin = "live";
         write(ev.data);
         lastApplied = ev.seq;
       }
@@ -691,7 +823,10 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
       unlistenTl = await listen<ClaudeTimelineEvent>("claude-timeline", (e) => {
         if (sessionId == null || e.payload.id !== sessionId) return;
         gotLive = true;
-        applySnapshot(e.payload);
+        // applySnapshot("live") also derives this session's attention status
+        // (badge) from the same payload — "seen" = this panel is the active tab
+        // AND its window is focused right now (S5 unified the derive path).
+        applySnapshot(e.payload, "live");
         setSubagents(e.payload.subagents ?? []);
       });
       // Driver changes (P6): lock/unlock input by whether we hold the driver role.
@@ -711,6 +846,11 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
         inputLockedRef.current = true;
         isDriverRef.current = false;
         setIsDriver(false);
+        // Session is truly dead now — drop its attention badge. (Not done in the
+        // detach cleanup below, which is a mere tab-switch remount; a done-unseen
+        // badge must survive that so it stays visible until the user looks.)
+        const closedUuid = statusUuidRef.current;
+        if (closedUuid) useClaudeStatus.getState().remove(closedUuid);
         if (!disposed) term.write("\r\n\x1b[2m[세션이 다른 창에서 종료되었습니다]\x1b[0m\r\n");
       });
       if (disposed) return;
@@ -733,6 +873,29 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
           rows: term.rows,
         });
         sessionId = opened.id;
+        statusUuidRef.current = opened.session_uuid;
+        // Register this session's numeric↔uuid mapping so the app-level global
+        // listener can resolve its timeline events while this panel is a
+        // backgrounded (unmounted) tab, and mark it attached so the global
+        // listener defers to this panel's own (accurate-seenNow) updates (P3).
+        attachedUuid = opened.session_uuid;
+        useClaudeStatus.getState().registerSession(opened.session_uuid, opened.id);
+        useClaudeStatus.getState().attachPanel(opened.session_uuid);
+        // Audit gap: the mount-time markSeenIfLooking ran before statusUuidRef was
+        // set (uuid null → no-op), so an initially active+focused panel would set
+        // neither watchedUuid (alert suppression) nor activeClaudeUuid (roll-up
+        // cursor) until its next activate event. Establish them now the uuid is
+        // known (S8/S12). markSeen is a no-op until the first timeline tick creates
+        // the entry — the entry's seen flag is captured there via seenNow — so
+        // watched/active are the load-bearing part here.
+        {
+          const st = useClaudeStatus.getState();
+          if (props.api.isActive) st.setActiveClaudeUuid(opened.session_uuid);
+          if (props.api.isActive && document.hasFocus()) {
+            st.markSeen(opened.session_uuid);
+            st.setWatched(opened.session_uuid);
+          }
+        }
         driverRevRef.current = opened.rev;
         const driving = opened.driver === myLabel;
         isDriverRef.current = driving;
@@ -775,6 +938,20 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
       for (const ev of pending) applyLive(ev);
       pending.length = 0;
 
+      // Mount rescan (S1): the scrollback `write()` above already triggers the
+      // debounced scanner, but a fresh reopen with no new scrollback wouldn't —
+      // so schedule one scan now that the session uuid is set and the screen is
+      // restored, recovering a blocked badge for a session reopened while sitting
+      // at a permission/menu prompt. This restore scan reports origin "snapshot"
+      // (silent notifier seed — S4a) unless live output already arrived. Arming
+      // the gate here (S1): the restore is over, so from this scan onward even a
+      // genuinely-empty screen is a valid verdict and may clear a stale blocked
+      // signal (before arming, blank = "not painted yet" and is ignored).
+      if (sessionId != null) {
+        scanGate.arm();
+        blockedScanner.trigger(scanOrigin);
+      }
+
       // Handoff: seed the freshly-restarted session once it should be at a prompt.
       // Ready detection is best-effort (codex P3 D3) — a fixed settle delay, with a
       // manual "요약 주입" button if it missed. The seed is idempotent (it points at
@@ -802,7 +979,7 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
           tokens?: [number, TokenUsage][];
         } | null>("claude_session_snapshot", { project, uuid: seedUuid })
           .then((snap) => {
-            if (snap && !gotLive && !disposed) applySnapshot(snap);
+            if (snap && !gotLive && !disposed) applySnapshot(snap, "snapshot");
           })
           .catch(() => {});
 
@@ -818,6 +995,11 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
     })();
 
     const onData = term.onData((d) => {
+      // A keystroke is a response too — rescan so a prompt that the key dismisses
+      // clears quickly (the PTY redraw also triggers a scan; this just leads it).
+      // User interaction ends the restore phase — subsequent scans are live (S4a).
+      scanOrigin = "live";
+      blockedScanner.trigger("live");
       // Mirrors are read-only; only the driver writes (backend also enforces — P6).
       if (sessionId == null || inputLockedRef.current || !isDriverRef.current) return;
       // Drop IME composition output (multi-byte / non-ASCII) — Hangul only
@@ -854,6 +1036,12 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
       // Detach only — the PTY + poll thread live on (closed by claude_close on
       // real panel removal in MainArea).
       disposed = true;
+      // Release this panel's attention-store attachment so the global listener
+      // takes over the (still-live) session's badge. Does NOT remove the entry /
+      // mapping — a done-unseen badge must survive a tab-switch remount (the
+      // session is only truly removed on claude-session-closed).
+      if (attachedUuid) useClaudeStatus.getState().detachPanel(attachedUuid);
+      blockedScanner.cancel();
       ro.disconnect();
       onData.dispose();
       onResize.dispose();

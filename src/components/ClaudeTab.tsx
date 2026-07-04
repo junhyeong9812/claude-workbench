@@ -3,6 +3,25 @@ import type { IDockviewPanelHeaderProps } from "dockview";
 import { invoke } from "@tauri-apps/api/core";
 import { useAppStore } from "../state/store";
 import { useClaudeUi } from "../state/claudeUi";
+import { useClaudeStatus, attentionOf } from "../state/claudeStatus";
+
+/** Attention dot for a Claude tab (agent-status-badges P3). A color dot (never
+ * color-only — every state carries a `title`, F3 a11y) at the priority the store
+ * resolved: 🔴 blocked > 🔵 done-unseen > 🟡 working > none. */
+function TabBadge({ sessionId }: { sessionId: string | null }) {
+  const level = useClaudeStatus((s) => {
+    const e = sessionId ? s.entries[sessionId] : undefined;
+    return e ? attentionOf(e.status, e.unseen) : 0;
+  });
+  if (level === 0) return null; // idle / unknown — no dot
+  const [cls, label] =
+    level === 3
+      ? ["is-blocked", "입력 대기 중"]
+      : level === 2
+        ? ["is-done", "완료 — 확인 안 함"]
+        : ["is-working", "작업 중"];
+  return <span className={`claude-tab-badge ${cls}`} title={label} aria-label={label} />;
+}
 
 /**
  * Custom dockview tab for Claude panels (B3-1/B3-5). Double-click the title to
@@ -34,6 +53,7 @@ export function ClaudeTab(props: IDockviewPanelHeaderProps) {
 
   return (
     <div className="claude-tab">
+      <TabBadge sessionId={sessionId} />
       {editing ? (
         <input
           className="claude-tab-input"

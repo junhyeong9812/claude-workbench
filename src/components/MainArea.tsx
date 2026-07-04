@@ -126,6 +126,7 @@ export function MainArea() {
   const runRequest = useAppStore((s) => s.runRequest);
   const requestRun = useAppStore((s) => s.requestRun);
   const focusMainRequest = useAppStore((s) => s.focusMainRequest);
+  const focusSessionRequest = useAppStore((s) => s.focusSessionRequest);
   const setLayout = useAppStore((s) => s.setLayout);
 
   const apiRef = useRef<DockviewApi | null>(null);
@@ -847,6 +848,30 @@ export function MainArea() {
     focusActivePanelContent(recallArea(api.activePanel?.id ?? ""));
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [focusMainRequest, layerMode]);
+
+  // Attention roll-up cycle: activate the panel for the requested session uuid.
+  // Matched by the panel's live `sessionUuid` or its resume `loadSessionId` (a
+  // fresh session's uuid == its loadSessionId). No-op if no panel here owns it —
+  // it lives in another window's dock (a documented limitation of the roll-up).
+  useEffect(() => {
+    if (!focusSessionRequest) return;
+    const api = apiRef.current;
+    if (!api) return;
+    const { uuid } = focusSessionRequest;
+    const panel = api.panels.find((p) => {
+      const prm = p.params as { sessionUuid?: string; loadSessionId?: string } | undefined;
+      return prm?.sessionUuid === uuid || prm?.loadSessionId === uuid;
+    });
+    if (!panel) return;
+    // 레이어 스왑 접합: the target tab lives in this (integrated) dock — if the
+    // dev layer is in front, bring integrated forward first so the activated tab
+    // is actually visible (같은 원칙: 뷰-행 요청의 대칭 전환, layerRouting 참조).
+    if (!integratedIsFront(layerMode) && activeProject) {
+      useAppStore.getState().setProjectMode(activeProject, "integrated");
+    }
+    panel.api.setActive();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [focusSessionRequest]);
 
   return (
     <div className="main-area">
