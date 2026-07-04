@@ -97,3 +97,5 @@ Categories=Development;Utility;
 ## 크레딧 / 참고
 
 타임라인의 일부 UI는 **[tessera](https://github.com/horang-labs/tessera)** (Apache-2.0)를 참고했습니다 — CSS 색 토큰 규율과 타임라인 "보는 경험" 패턴(턴 접기·KIND 라벨·thinking 디엠퍼시스·서브에이전트 레일·컨텍스트 게이지)의 *아이디어*만 차용했고, 코드를 복사하거나 Tailwind를 도입하지는 않았습니다(기존 순수 CSS 위에 자체 구현).
+
+세션 attention 배지·알림은 **[herdr](https://github.com/ogulcancelik/herdr)** (AGPL-3.0)의 *개념*을 참고했습니다 — "누가 나를 부르나" 상태 롤업(blocked/working/done), **done = 완료됐는데 아직 안 봄(seen)** 의미론, 화면 기반 입력 대기 감지라는 발상만 차용했고, AGPL 코드·감지 룰은 일절 복사하지 않았습니다(감지 규칙·상태 머신·알림 전부 자체 설계·구현).
