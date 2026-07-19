@@ -1585,6 +1585,17 @@ body {
   flex: 1;
   min-width: 0;
 }
+/* 아카이브 여부 배지 (세션 picker). */
+.claude-picker-arch {
+  margin-left: 6px;
+  font-size: 0.75em;
+  color: var(--fg-dim);
+  opacity: 0.7;
+}
+.claude-picker-arch.is-archived {
+  color: var(--accent-bright);
+  opacity: 1;
+}
 .claude-picker-proj {
   color: var(--accent);
   font-size: 10px;

@@ -310,6 +310,22 @@ pub fn archive_list(app: AppHandle) -> Result<Vec<ArchiveProjectGroup>, AppError
         .collect())
 }
 
+/// The archived session uuids of one project — the picker marks saved sessions
+/// as 아카이브됨/미아카이브 with this set. Infallible (empty on any failure);
+/// the badge is informational, never load-bearing.
+#[tauri::command]
+pub fn archive_uuids(app: AppHandle, project: String) -> Vec<String> {
+    let Ok(root) = archive_root(&app) else {
+        return vec![];
+    };
+    core_lib::archive::list_archives(&root)
+        .into_iter()
+        .filter(|p| p.project == project)
+        .flat_map(|p| p.sessions)
+        .map(|s| s.meta.uuid)
+        .collect()
+}
+
 /// Open an archived artifact (book.html, a knowledge file, …) with the system
 /// handler. Confined to the archive root — canonicalized containment check, so
 /// the renderer can't turn this into an arbitrary-file opener.
