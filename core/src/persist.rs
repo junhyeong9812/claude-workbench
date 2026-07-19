@@ -87,6 +87,11 @@ pub struct WorkspaceState {
     /// so state saved before this field loads as an empty list.
     #[serde(default)]
     pub saved_connections: Vec<SshConnection>,
+    /// User-configured session-archive root directory (app-global). `None` (or
+    /// blank) means the default `<app_data_dir>/archive`; the resolution lives
+    /// in the command layer so this stays a plain persisted preference.
+    #[serde(default)]
+    pub archive_root: Option<String>,
 }
 
 /// Serialize `state` to `path` as pretty JSON, creating parent dirs as needed.
@@ -160,6 +165,7 @@ mod tests {
             ],
             active_project: Some("/home/u/proj-b".into()),
             saved_connections: vec![],
+            archive_root: None,
         }
     }
 
@@ -222,6 +228,7 @@ mod tests {
             }],
             active_project: Some("/home/u/proj-a".into()),
             saved_connections: vec![],
+            archive_root: None,
         };
         save_state(&state, &path).unwrap();
         let loaded = load_state(&path);
@@ -256,6 +263,7 @@ mod tests {
                 sample_connection("uuid-1", "password"),
                 sample_connection("uuid-2", "publickey"),
             ],
+            archive_root: None,
         };
         save_state(&state, &path).unwrap();
         let loaded = load_state(&path);
@@ -284,6 +292,27 @@ mod tests {
         assert!(!json.contains("\"password\":"), "no password field");
         assert!(!json.contains("\"passphrase\":"), "no passphrase field");
         assert!(!json.contains("\"secret\":"), "no secret field");
+    }
+
+    #[test]
+    fn old_state_without_archive_root_loads_as_none() {
+        let path = temp_path("archive_root_migration");
+        // State saved before the archive feature: no `archive_root` key.
+        let json = r#"{ "open_projects": [], "active_project": null }"#;
+        fs::write(&path, json).unwrap();
+        let loaded = load_state(&path);
+        assert_eq!(loaded.archive_root, None);
+    }
+
+    #[test]
+    fn archive_root_round_trips() {
+        let path = temp_path("archive_root_rt");
+        let state = WorkspaceState {
+            archive_root: Some("/data/claude-archive".into()),
+            ..WorkspaceState::default()
+        };
+        save_state(&state, &path).unwrap();
+        assert_eq!(load_state(&path).archive_root, Some("/data/claude-archive".into()));
     }
 
     #[test]
