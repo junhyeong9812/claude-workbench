@@ -21,6 +21,8 @@ use core_lib::knowledge::{extraction_prompt, parse_extraction, render_session_fo
 
 struct Args {
     days: u64,
+    /// 이번 실행에서 처리할 최대 세션 수 (mtime 최신순) — 0 = 무제한.
+    limit: usize,
     concurrency: usize,
     model: String,
     effort: String,
@@ -44,6 +46,7 @@ fn parse_args() -> Args {
     let app_data = home.join(".local/share/com.multiterminal.dev");
     let mut a = Args {
         days: 7,
+        limit: 0,
         concurrency: 3,
         model: "opus".into(),
         effort: "xhigh".into(),
@@ -61,6 +64,9 @@ fn parse_args() -> Args {
         match flag.as_str() {
             "--days" => {
                 a.days = val(&mut it).parse().unwrap_or_else(|_| die("--days는 숫자여야 합니다"))
+            }
+            "--limit" => {
+                a.limit = val(&mut it).parse().unwrap_or_else(|_| die("--limit는 숫자여야 합니다"))
             }
             "--concurrency" => {
                 a.concurrency =
@@ -83,6 +89,7 @@ fn parse_args() -> Args {
 struct Candidate {
     uuid: String,
     jsonl_path: PathBuf,
+    mtime: SystemTime,
 }
 
 /// First `cwd` + last timestamp date (YYYY-MM-DD) from the transcript records.
@@ -155,8 +162,14 @@ fn main() {
             if complete.contains(&uuid) {
                 continue;
             }
-            candidates.push(Candidate { uuid, jsonl_path: path });
+            candidates.push(Candidate { uuid, jsonl_path: path, mtime });
         }
+    }
+    // --limit N: 최신 세션부터 N개만 (0 = 무제한) — "최근 것 50개 더" 류의
+    // 점진 백필용.
+    if args.limit > 0 && candidates.len() > args.limit {
+        candidates.sort_by(|a, b| b.mtime.cmp(&a.mtime));
+        candidates.truncate(args.limit);
     }
     println!(
         "후보 {}개 (최근 {}일, 완료 {} skip, 재추출 대상 {}) — model={} effort={} 동시 {}프로젝트",
