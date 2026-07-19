@@ -290,7 +290,21 @@ fn parse_entry(lines: &[&str]) -> Option<KnowledgeEntry> {
 }
 
 fn yaml_quote(s: &str) -> String {
-    format!("\"{}\"", s.replace('"', "'"))
+    // Proper double-quoted YAML scalar: backslash first, then quotes — a
+    // Windows path or a quoted error message must survive a real YAML parser
+    // (the future MCP contract). Values are single-line by construction
+    // (header parsing is line-based), so control chars can't appear.
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            _ => out.push(c),
+        }
+    }
+    out.push('"');
+    out
 }
 
 fn yaml_list(items: &[String]) -> String {
@@ -410,7 +424,10 @@ fn remove_session_entries(root: &Path, session_uuid: &str) -> io::Result<()> {
             if path.extension().and_then(|e| e.to_str()) != Some("md") {
                 continue;
             }
-            let Ok(text) = fs::read_to_string(&path) else { continue };
+            // An unreadable file makes the removal decision unknowable — surface
+            // it instead of skipping (a silent skip would leave a stale entry and
+            // duplicate it on the re-write; 감사 A12).
+            let text = fs::read_to_string(&path)?;
             let is_ours = parse_frontmatter(&text)
                 .and_then(|fm| fm.get("session").cloned())
                 .is_some_and(|s| s == session_uuid);
