@@ -8,6 +8,7 @@
 //! headless and tauri-free (host-key prompts are surfaced over a channel, not a
 //! Tauri event).
 
+pub mod archive;
 pub mod fs;
 pub mod git;
 pub mod history;
