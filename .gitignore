@@ -17,3 +17,6 @@ dist-ssr
 # Dev docs & local agent state (kept local, not published)
 /docs
 .claude/
+
+# 기계 종속 MCP 등록 (아카이브 지식 서버 — 절대경로 포함)
+.mcp.json
