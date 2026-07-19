@@ -92,10 +92,14 @@ struct Candidate {
     mtime: SystemTime,
 }
 
-/// First `cwd` + last timestamp date (YYYY-MM-DD) from the transcript records.
-fn probe_transcript(text: &str) -> (Option<String>, Option<String>) {
+/// First `cwd` + last timestamp date (YYYY-MM-DD) + whether this transcript is
+/// one of OUR extraction runs (첫 사용자 프롬프트가 추출 마커로 시작 — 되먹임
+/// 루프 방어선 2중: cwd 격리가 1차, 이 필터가 2차).
+fn probe_transcript(text: &str) -> (Option<String>, Option<String>, bool) {
     let mut cwd = None;
     let mut date = None;
+    let mut is_extraction = false;
+    let mut seen_first_prompt = false;
     for line in text.lines() {
         let Some(rec) = core_lib::jsonl::RawRecord::parse_line(line) else { continue };
         if cwd.is_none() {
@@ -104,8 +108,24 @@ fn probe_transcript(text: &str) -> (Option<String>, Option<String>) {
         if let Some(ts) = rec.timestamp.as_deref().and_then(|t| t.get(..10)) {
             date = Some(ts.to_string());
         }
+        if !seen_first_prompt {
+            if let Some(msg) = &rec.message {
+                if msg.role.as_deref() == Some("user") {
+                    let prompt_text = match &msg.content {
+                        Some(core_lib::jsonl::Content::Text(s)) => Some(s.as_str()),
+                        _ => None,
+                    };
+                    if let Some(p) = prompt_text {
+                        seen_first_prompt = true;
+                        is_extraction = p
+                            .trim_start()
+                            .starts_with(core_lib::knowledge::EXTRACTION_MARKER);
+                    }
+                }
+            }
+        }
     }
-    (cwd, date)
+    (cwd, date, is_extraction)
 }
 
 fn main() {
@@ -192,8 +212,13 @@ fn main() {
             skipped_probe += 1;
             continue;
         };
-        let (cwd, date) = probe_transcript(&text);
+        let (cwd, date, is_extraction) = probe_transcript(&text);
         drop(text);
+        if is_extraction {
+            eprintln!("skip(추출 세션 — 우리 도구의 부산물): {}", c.uuid);
+            skipped_probe += 1;
+            continue;
+        }
         let Some(cwd) = cwd else {
             eprintln!("skip(cwd 레코드 없음): {}", c.uuid);
             skipped_probe += 1;
@@ -299,10 +324,14 @@ fn archive_one(
     let prompt = extraction_prompt(&rendered);
     let mut knowledge_files = 0usize;
     let mut extraction_ok = false;
-    let raw = run_claude_p(project, &prompt, Duration::from_secs(300), opts)
+    // 추출은 /tmp 스크래치 cwd — 프로젝트 안에서 돌리면 추출 트랜스크립트가
+    // 다음 스캔의 후보가 되는 되먹임 루프 (2026-07-19 실측 179→256).
+    let workdir = core_lib::claude_cli::extraction_workdir();
+    let workdir = workdir.to_string_lossy();
+    let raw = run_claude_p(&workdir, &prompt, Duration::from_secs(300), opts)
         .or_else(|e1| {
             notes.push(format!("추출 1차 실패({e1}) — 재시도"));
-            run_claude_p(project, &prompt, Duration::from_secs(300), opts)
+            run_claude_p(&workdir, &prompt, Duration::from_secs(300), opts)
         });
     match raw {
         Ok(raw) => {

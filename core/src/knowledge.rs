@@ -158,6 +158,11 @@ pub fn render_session_for_extraction(s: &NormalizedSession) -> String {
 /// emits off-format are skipped there, never fatal. Shared by the app's
 /// archive command and the backfill CLI (단일 출처 — 프롬프트가 갈라지면 지식
 /// 스키마가 갈라진다).
+/// The first characters of every extraction prompt — transcripts whose first
+/// user prompt starts with this are **our own extraction runs**, never a user
+/// conversation (backfill filter, 되먹임 루프 방어선 2중).
+pub const EXTRACTION_MARKER: &str = "다음은 끝난 Claude 코딩 세션의 타임라인이다.";
+
 pub fn extraction_prompt(rendered: &str) -> String {
     format!(
         "다음은 끝난 Claude 코딩 세션의 타임라인이다. 이 세션을 아카이브하기 위해 (1) 제목+요약과 \

@@ -184,8 +184,11 @@ fn archive_session_blocking(
     let mut extraction = None;
     let rendered = core_lib::knowledge::render_session_for_extraction(&session);
     let opts = extraction_opts(&app);
+    // 추출은 /tmp 스크래치 cwd에서 — 프로젝트 안에서 돌리면 추출 자체가 그
+    // 프로젝트의 새 세션 트랜스크립트가 되어 백필 되먹임 루프를 만든다.
+    let workdir = core_lib::claude_cli::extraction_workdir();
     match core_lib::claude_cli::run_claude_p(
-        &cwd,
+        &workdir.to_string_lossy(),
         &core_lib::knowledge::extraction_prompt(&rendered),
         Duration::from_secs(300),
         &opts,
