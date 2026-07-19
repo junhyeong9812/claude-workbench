@@ -92,6 +92,14 @@ pub struct WorkspaceState {
     /// in the command layer so this stays a plain persisted preference.
     #[serde(default)]
     pub archive_root: Option<String>,
+    /// Claude model alias/name for archive extraction (`--model`). `None` =
+    /// the app default (opus).
+    #[serde(default)]
+    pub archive_model: Option<String>,
+    /// Reasoning effort for archive extraction (`--effort`). `None` = the app
+    /// default (xhigh).
+    #[serde(default)]
+    pub archive_effort: Option<String>,
 }
 
 /// Serialize `state` to `path` as pretty JSON, creating parent dirs as needed.
@@ -165,7 +173,8 @@ mod tests {
             ],
             active_project: Some("/home/u/proj-b".into()),
             saved_connections: vec![],
-            archive_root: None,
+            // Fixture stays immune to future field additions (learned: J-7).
+            ..WorkspaceState::default()
         }
     }
 
@@ -228,7 +237,7 @@ mod tests {
             }],
             active_project: Some("/home/u/proj-a".into()),
             saved_connections: vec![],
-            archive_root: None,
+            ..WorkspaceState::default()
         };
         save_state(&state, &path).unwrap();
         let loaded = load_state(&path);
@@ -263,7 +272,7 @@ mod tests {
                 sample_connection("uuid-1", "password"),
                 sample_connection("uuid-2", "publickey"),
             ],
-            archive_root: None,
+            ..WorkspaceState::default()
         };
         save_state(&state, &path).unwrap();
         let loaded = load_state(&path);
@@ -313,6 +322,26 @@ mod tests {
         };
         save_state(&state, &path).unwrap();
         assert_eq!(load_state(&path).archive_root, Some("/data/claude-archive".into()));
+    }
+
+    #[test]
+    fn archive_model_and_effort_round_trip_and_default_none() {
+        let path = temp_path("archive_model_rt");
+        let state = WorkspaceState {
+            archive_model: Some("sonnet".into()),
+            archive_effort: Some("high".into()),
+            ..WorkspaceState::default()
+        };
+        save_state(&state, &path).unwrap();
+        let loaded = load_state(&path);
+        assert_eq!(loaded.archive_model, Some("sonnet".into()));
+        assert_eq!(loaded.archive_effort, Some("high".into()));
+        // Pre-field state loads as None (backward compat).
+        let path2 = temp_path("archive_model_migration");
+        fs::write(&path2, r#"{ "open_projects": [], "active_project": null }"#).unwrap();
+        let old = load_state(&path2);
+        assert_eq!(old.archive_model, None);
+        assert_eq!(old.archive_effort, None);
     }
 
     #[test]
