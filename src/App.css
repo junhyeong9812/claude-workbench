@@ -320,6 +320,101 @@ body {
   border-bottom: 1px solid var(--border, #333);
 }
 
+/* ---- Archive browser (sidebar tab) ---- */
+.archive-panel {
+  flex: 1 1 0;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  font-size: 0.8em;
+}
+.archive-head {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 4px 8px;
+  color: var(--fg-dim);
+  border-bottom: 1px solid var(--border, #333);
+}
+.archive-refresh {
+  background: transparent;
+  border: none;
+  color: var(--fg-dim);
+  cursor: pointer;
+}
+.archive-refresh:hover {
+  color: var(--fg, #cdd6f4);
+}
+.archive-error,
+.archive-empty {
+  padding: 10px;
+  color: var(--fg-dim);
+  line-height: 1.6;
+}
+.archive-list {
+  flex: 1 1 0;
+  min-height: 0;
+  overflow-y: auto;
+}
+.archive-project-head {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 4px 8px;
+  cursor: pointer;
+  color: var(--fg, #cdd6f4);
+  border-bottom: 1px solid var(--border, #333);
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+.archive-project-head:hover {
+  background: var(--bg-hover, rgba(127, 127, 127, 0.1));
+}
+.archive-count {
+  color: var(--fg-dim);
+  font-size: 0.85em;
+}
+.archive-session {
+  padding: 4px 8px 4px 20px;
+  border-bottom: 1px solid var(--border, #333);
+}
+.archive-session-title {
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+.archive-session-meta {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  color: var(--fg-dim);
+  font-size: 0.85em;
+}
+.archive-session-actions {
+  display: flex;
+  gap: 4px;
+}
+.archive-btn {
+  background: transparent;
+  border: 1px solid var(--border, #333);
+  border-radius: 4px;
+  color: var(--fg-dim);
+  cursor: pointer;
+  font-size: 0.9em;
+  padding: 0 6px;
+}
+.archive-btn:hover:not(:disabled) {
+  color: var(--fg, #cdd6f4);
+  border-color: var(--accent-bright);
+}
+.archive-btn:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+
 .pane-main {
   /* dockview positions its own children; keep the pane a plain sized box. */
   overflow: hidden;
