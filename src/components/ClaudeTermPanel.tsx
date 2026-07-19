@@ -250,6 +250,9 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
   // the prompt (codex P3 D3 — ready detection is best-effort).
   const [lastSeed, setLastSeed] = useState<string | null>(null);
   const [handoffBusy, setHandoffBusy] = useState(false);
+  // 종료(아카이브): archive the session's transcript + extraction. The session
+  // stays live (closing the tab is a separate, archive-free action).
+  const [archiveBusy, setArchiveBusy] = useState(false);
   // The generated summary awaiting review/edit (null = modal closed).
   const [summaryDraft, setSummaryDraft] = useState<{
     cwd: string;
@@ -388,6 +391,40 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
       alert(`핸드오프 실패: ${errText(e)}`);
     } finally {
       setHandoffBusy(false);
+    }
+  };
+
+  // 종료(아카이브): copy the JSONL verbatim + normalized.json + book.html, then
+  // claude extracts title/summary/knowledge (best-effort — extraction failure
+  // still leaves the archive). Idempotent: re-archiving replaces the old folder.
+  const archiveSession = async () => {
+    const cwd = props.params.project ?? useAppStore.getState().activeProject ?? null;
+    const uuid = props.params.sessionUuid ?? null;
+    if (!cwd || !uuid) {
+      alert("현재 세션 정보를 찾을 수 없습니다.");
+      return;
+    }
+    if (!confirm("이 세션을 아카이브할까요?\n(요약·지식 추출에 1~2분 걸릴 수 있습니다. 세션은 계속 사용할 수 있습니다.)"))
+      return;
+    setArchiveBusy(true);
+    try {
+      const res = await invoke<{
+        dir: string;
+        book_path: string;
+        replaced: boolean;
+        summary_ok: boolean;
+        knowledge_files: number;
+        extraction_error?: string | null;
+      }>("archive_session", { cwd, uuid });
+      alert(
+        `아카이브 완료${res.replaced ? " (기존 아카이브 교체)" : ""}\n${res.dir}\n` +
+          `요약: ${res.summary_ok ? "생성됨" : "없음"} · 지식 항목 ${res.knowledge_files}건` +
+          (res.extraction_error ? `\n추출 경고: ${res.extraction_error}` : ""),
+      );
+    } catch (e) {
+      alert(`아카이브 실패: ${errText(e)}`);
+    } finally {
+      setArchiveBusy(false);
     }
   };
 
@@ -1140,6 +1177,14 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
               onClick={startHandoff}
             >
               {handoffBusy ? "처리 중…" : "task 시작"}
+            </button>
+            <button
+              className="claudeterm-head-btn"
+              title="세션 아카이브: JSONL 원본 + 책(book.html) + 요약 + 지식(issue/method/domain) 추출 — 세션은 계속 사용 가능"
+              disabled={archiveBusy || !props.params.sessionUuid}
+              onClick={archiveSession}
+            >
+              {archiveBusy ? "아카이브 중…" : "종료(아카이브)"}
             </button>
           </span>
         </div>
