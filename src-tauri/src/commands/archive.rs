@@ -20,9 +20,10 @@ use tauri::{AppHandle, Manager};
 
 use super::{io_message, AppError};
 
-/// Sessions with an archive currently in flight. All windows share this process,
-/// so an in-process set fully serializes concurrent "아카이브" clicks on the same
-/// session (which would otherwise race the knowledge delete→write→INDEX cycle).
+/// Projects with an archive currently in flight. All windows share this process,
+/// so an in-process set fully serializes concurrent "아카이브" runs per project —
+/// keyed by project (not session), because two sessions of one project share the
+/// same knowledge files + INDEX.md rebuild (감사 A9).
 fn in_flight() -> &'static Mutex<HashSet<String>> {
     static SET: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
     SET.get_or_init(|| Mutex::new(HashSet::new()))
@@ -170,11 +171,11 @@ pub async fn archive_session(
         let mut set = in_flight()
             .lock()
             .map_err(|_| AppError::new("Archive state unavailable"))?;
-        if !set.insert(uuid.clone()) {
-            return Err(AppError::new("이 세션은 이미 아카이브 진행 중입니다"));
+        if !set.insert(cwd.clone()) {
+            return Err(AppError::new("이 프로젝트는 이미 아카이브 진행 중입니다"));
         }
     }
-    let key = uuid.clone();
+    let key = cwd.clone();
     let result = tauri::async_runtime::spawn_blocking(move || archive_session_blocking(app, cwd, uuid))
         .await
         .map_err(|_| AppError::new("Archive task failed to run"));
@@ -215,33 +216,47 @@ fn archive_session_blocking(
         return Err(AppError::new("아카이브할 대화가 없습니다"));
     }
 
-    // Extraction (title + summary + knowledge) — best-effort, before the write
-    // so the folder slug can use the extracted title.
-    let mut extraction = None;
-    let mut extraction_error = None;
-    let rendered = core_lib::knowledge::render_session_for_extraction(&session);
-    match run_claude_p(&cwd, &extraction_prompt(&rendered), Duration::from_secs(180)) {
-        Ok(raw) => {
-            let ex = core_lib::knowledge::parse_extraction(&raw);
-            if !ex.title.trim().is_empty() {
-                session.title = ex.title.trim().to_string();
-            }
-            extraction = Some(ex);
-        }
-        Err(e) => extraction_error = Some(e.message.clone()),
-    }
-
     let root = archive_root(&app)?;
-    let out = core_lib::archive::write_archive(&root, &cwd, &session, &jsonl_bytes)
+
+    // Last-good summary of a previous archive of this session — read BEFORE the
+    // first write below displaces that folder (감사 A1: 지식만 남고 요약만
+    // 사라지는 비대칭 방지).
+    let prev_summary = core_lib::archive::list_archives(&root)
+        .into_iter()
+        .flat_map(|p| p.sessions)
+        .find(|s| s.meta.uuid == uuid)
+        .and_then(|s| s.summary_path)
+        .and_then(|p| std::fs::read_to_string(p).ok());
+
+    // 1) The core archive lands FIRST, under the fallback title — an app quit or
+    // crash during the (up to 3-minute) extraction below must never cost the
+    // transcript copy + book (감사 A11 — "부분 성공은 먼저 남아야 성립").
+    let mut out = core_lib::archive::write_archive(&root, &cwd, &session, &jsonl_bytes)
         .map_err(|e| AppError::new(io_message("Cannot write archive", &e)))?;
 
-    // Summary + knowledge land after the core archive; their failures downgrade
-    // to reported extraction errors (merged, so neither masks the other), never
-    // a failed archive.
+    // 2) Extraction (title + summary + knowledge) — best-effort. Failures merge
+    // into reported errors (neither masks the other), never a failed archive.
+    let mut extraction = None;
+    let mut errors: Vec<String> = Vec::new();
+    let rendered = core_lib::knowledge::render_session_for_extraction(&session);
+    match run_claude_p(&cwd, &extraction_prompt(&rendered), Duration::from_secs(180)) {
+        Ok(raw) => extraction = Some(core_lib::knowledge::parse_extraction(&raw)),
+        Err(e) => errors.push(e.message.clone()),
+    }
+
     let mut summary_ok = false;
     let mut knowledge_files = 0;
-    let mut errors: Vec<String> = extraction_error.into_iter().collect();
     if let Some(ex) = extraction {
+        // Extracted title → re-land the archive under it. write_archive is
+        // idempotent per uuid, so this just replaces our own fallback folder.
+        let new_title = ex.title.trim();
+        if !new_title.is_empty() && new_title != session.title {
+            session.title = new_title.to_string();
+            match core_lib::archive::write_archive(&root, &cwd, &session, &jsonl_bytes) {
+                Ok(o) => out = o,
+                Err(e) => errors.push(io_message("Cannot retitle archive", &e)),
+            }
+        }
         if !ex.summary.trim().is_empty() {
             match std::fs::write(out.dir.join("summary.md"), &ex.summary) {
                 Ok(()) => summary_ok = true,
@@ -251,6 +266,16 @@ fn archive_session_blocking(
         match core_lib::knowledge::write_knowledge(&root, &cwd, &uuid, &date, &ex.entries) {
             Ok(paths) => knowledge_files = paths.len(),
             Err(e) => errors.push(io_message("Cannot save knowledge", &e)),
+        }
+    }
+    // 3) No fresh summary → keep the previous archive's (last-good), mirroring
+    // how knowledge entries persist when extraction fails.
+    if !summary_ok {
+        if let Some(prev) = prev_summary {
+            if std::fs::write(out.dir.join("summary.md"), prev).is_ok() {
+                summary_ok = true;
+                errors.push("요약은 이전 아카이브분을 유지".to_string());
+            }
         }
     }
     let extraction_error = if errors.is_empty() {
