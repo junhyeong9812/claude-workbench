@@ -13,6 +13,7 @@ pub mod fs;
 pub mod git;
 pub mod history;
 pub mod jsonl;
+pub mod knowledge;
 pub mod label;
 pub mod persist;
 pub mod project_type;
