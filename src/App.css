@@ -320,6 +320,106 @@ body {
   border-bottom: 1px solid var(--border, #333);
 }
 
+/* ---- Archive browser (sidebar tab) ---- */
+.archive-panel {
+  flex: 1 1 0;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  font-size: 0.8em;
+}
+.archive-head {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 4px 8px;
+  color: var(--fg-dim);
+  border-bottom: 1px solid var(--border, #333);
+}
+.archive-head-actions {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+.archive-refresh {
+  background: transparent;
+  border: none;
+  color: var(--fg-dim);
+  cursor: pointer;
+}
+.archive-refresh:hover {
+  color: var(--fg, #cdd6f4);
+}
+.archive-error,
+.archive-empty {
+  padding: 10px;
+  color: var(--fg-dim);
+  line-height: 1.6;
+}
+.archive-list {
+  flex: 1 1 0;
+  min-height: 0;
+  overflow-y: auto;
+}
+.archive-project-head {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 4px 8px;
+  cursor: pointer;
+  color: var(--fg, #cdd6f4);
+  border-bottom: 1px solid var(--border, #333);
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+.archive-project-head:hover {
+  background: var(--bg-hover, rgba(127, 127, 127, 0.1));
+}
+.archive-count {
+  color: var(--fg-dim);
+  font-size: 0.85em;
+}
+.archive-session {
+  padding: 4px 8px 4px 20px;
+  border-bottom: 1px solid var(--border, #333);
+}
+.archive-session-title {
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+.archive-session-meta {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  color: var(--fg-dim);
+  font-size: 0.85em;
+}
+.archive-session-actions {
+  display: flex;
+  gap: 4px;
+}
+.archive-btn {
+  background: transparent;
+  border: 1px solid var(--border, #333);
+  border-radius: 4px;
+  color: var(--fg-dim);
+  cursor: pointer;
+  font-size: 0.9em;
+  padding: 0 6px;
+}
+.archive-btn:hover:not(:disabled) {
+  color: var(--fg, #cdd6f4);
+  border-color: var(--accent-bright);
+}
+.archive-btn:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+
 .pane-main {
   /* dockview positions its own children; keep the pane a plain sized box. */
   overflow: hidden;
@@ -1449,15 +1549,6 @@ body {
   flex: 1;
   min-width: 0;
 }
-.claude-picker-caret {
-  display: flex;
-  align-items: center;
-  padding: 0 2px;
-  font-size: 10px;
-  color: var(--fg-dim);
-  cursor: pointer;
-  user-select: none;
-}
 .claude-picker-proj {
   color: var(--accent);
   font-size: 10px;
@@ -1486,7 +1577,7 @@ body {
   display: flex;
   height: 100%;
   min-height: 0;
-  position: relative; /* anchor the handoff modal overlay */
+  position: relative;
 }
 .claudeterm-pane {
   display: flex;
@@ -1643,115 +1734,6 @@ body {
   opacity: 0.4;
   cursor: default;
 }
-/* Non-blocking busy spinner in the Claude pane head (handoff in progress). */
-.claudeterm-spinner {
-  flex: 0 0 auto;
-  display: inline-block;
-  width: 11px;
-  height: 11px;
-  border: 2px solid color-mix(in srgb, var(--accent-bright) 30%, transparent);
-  border-top-color: var(--accent-bright);
-  border-radius: 50%;
-  animation: claudeterm-spin 0.7s linear infinite;
-}
-@keyframes claudeterm-spin {
-  to {
-    transform: rotate(360deg);
-  }
-}
-/* Input-lock overlay over the terminal while a handoff is in progress, so the
- * user can't type into a session that's about to be replaced. */
-.claudeterm-term-pane {
-  position: relative;
-}
-.claudeterm-term-lock {
-  position: absolute;
-  inset: 0;
-  z-index: var(--z-lock);
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  gap: 8px;
-  font-size: 0.85em;
-  color: var(--fg, #cdd6f4);
-  background: rgba(30, 30, 46, 0.6);
-  cursor: progress;
-}
-/* Handoff summary review/edit modal. */
-.claudeterm-modal-overlay {
-  position: absolute;
-  inset: 0;
-  z-index: var(--z-pane-modal);
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  background: rgba(0, 0, 0, 0.5);
-}
-.claudeterm-modal {
-  display: flex;
-  flex-direction: column;
-  width: min(720px, 86%);
-  height: min(560px, 80%);
-  background: var(--bg);
-  border: 1px solid var(--border, #45475a);
-  border-radius: 8px;
-  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.5);
-}
-.claudeterm-modal-head {
-  flex: 0 0 auto;
-  padding: 8px 12px;
-  font-size: 0.85em;
-  color: var(--fg-dim);
-  border-bottom: 1px solid var(--border, #333);
-}
-.claudeterm-modal-title {
-  flex: 0 0 auto;
-  margin: 0;
-  padding: 8px 12px;
-  border: 0;
-  border-bottom: 1px solid var(--border, #333);
-  outline: none;
-  background: transparent;
-  color: var(--fg, #cdd6f4);
-  font-family: "JetBrains Mono", "DejaVu Sans Mono", "Noto Sans Mono CJK KR", monospace;
-  font-size: 0.9em;
-  font-weight: 600;
-}
-.claudeterm-modal-body {
-  flex: 1 1 auto;
-  min-height: 0;
-  margin: 0;
-  padding: 10px 12px;
-  resize: none;
-  border: 0;
-  outline: none;
-  background: transparent;
-  color: var(--fg, #cdd6f4);
-  font-family: "JetBrains Mono", "DejaVu Sans Mono", "Noto Sans Mono CJK KR", monospace;
-  font-size: 0.85em;
-  line-height: 1.5;
-}
-.claudeterm-modal-foot {
-  flex: 0 0 auto;
-  display: flex;
-  justify-content: flex-end;
-  gap: 8px;
-  padding: 8px 12px;
-  border-top: 1px solid var(--border, #333);
-}
-.claudeterm-modal-foot button {
-  padding: 4px 14px;
-  font-size: 0.9em;
-  color: var(--fg, #cdd6f4);
-  background: color-mix(in srgb, var(--accent-bright) 15%, transparent);
-  border: 1px solid color-mix(in srgb, var(--accent-bright) 40%, transparent);
-  border-radius: 4px;
-  cursor: pointer;
-}
-.claudeterm-modal-foot button:disabled {
-  opacity: 0.4;
-  cursor: default;
-}
 /* Subagent (Task) groups nested under their turn — collapsible (B1). Indented
  * to read as "during this question, this agent did …". */
 .timeline-agent {
@@ -1802,48 +1784,13 @@ body {
 .claudeterm-timeline {
   flex: 1 1 0;
   min-height: 0;
-  /* Single scroll container so the live timeline + previous-task timelines stack
-   * and scroll as one continuous history (Phase 2). */
   overflow-y: auto;
   display: flex;
   flex-direction: column;
 }
-/* Inside the stacked view, each list is content-sized; the container scrolls. */
 .claudeterm-timeline .timeline-list {
   flex: 0 0 auto;
   overflow-y: visible;
-}
-/* Prev-task expand/collapse control inside the timeline pane header. */
-.claudeterm-prevtasks-toggle {
-  flex: 0 0 auto;
-  cursor: pointer;
-  user-select: none;
-  font-size: 10px;
-  color: var(--fg-dim);
-  padding: 1px 6px;
-  border: 1px solid var(--border);
-  border-radius: 3px;
-}
-.claudeterm-prevtasks-toggle:hover {
-  color: var(--fg);
-  background: var(--bg-hover);
-}
-/* A previous task in the handoff chain — a task-layer header above its dates. */
-.claudeterm-prevtask {
-  border-top: 2px solid color-mix(in srgb, var(--accent-bright) 45%, transparent);
-}
-.claudeterm-prevtask-head {
-  position: sticky;
-  top: 0;
-  z-index: var(--z-sticky);
-  padding: 4px 8px;
-  font-size: 0.8em;
-  font-weight: 600;
-  color: var(--fg, #cdd6f4);
-  background: color-mix(in srgb, var(--accent-bright) 16%, transparent);
-  border-bottom: 1px solid var(--border, #333);
-  cursor: pointer;
-  user-select: none;
 }
 .claudeterm-viewer-body {
   flex: 1 1 0;

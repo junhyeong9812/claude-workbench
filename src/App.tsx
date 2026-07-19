@@ -9,6 +9,7 @@ import { ProjectTabs } from "./components/ProjectTabs";
 import { FolderTree } from "./components/FolderTree";
 import { GitPanel } from "./components/GitPanel";
 import { WorktreePanel } from "./components/WorktreePanel";
+import { ArchivePanel } from "./components/ArchivePanel";
 import { MainArea } from "./components/MainArea";
 import { DevView } from "./components/DevView";
 import { FilePeekViewer } from "./components/FilePeekViewer";
@@ -103,7 +104,7 @@ function AppMain() {
 
   const treePanelRef = useRef<ImperativePanelHandle>(null);
   const [collapsed, setCollapsed] = useState(false);
-  const [sideTab, setSideTab] = useState<"files" | "git" | "worktree">("files");
+  const [sideTab, setSideTab] = useState<"files" | "git" | "worktree" | "archive">("files");
   const [termSettingsOpen, setTermSettingsOpen] = useState(false);
   const theme = useAppStore((s) => s.theme);
   const setTheme = useAppStore((s) => s.setTheme);
@@ -384,6 +385,12 @@ function AppMain() {
             >
               워크트리
             </button>
+            <button
+              className={`sidebar-tab${sideTab === "archive" ? " active" : ""}`}
+              onClick={() => setSideTab("archive")}
+            >
+              아카이브
+            </button>
           </div>
           <div className="sidebar-content">
             {sideTab === "files" ? (
@@ -402,8 +409,10 @@ function AppMain() {
               </>
             ) : sideTab === "git" ? (
               <GitPanel />
-            ) : (
+            ) : sideTab === "worktree" ? (
               <WorktreePanel />
+            ) : (
+              <ArchivePanel />
             )}
           </div>
         </Panel>

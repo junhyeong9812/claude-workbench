@@ -86,6 +86,9 @@ export interface WorkspaceState {
   open_projects: Project[];
   active_project: string | null;
   saved_connections?: SshConnection[];
+  /** Session-archive root override (null/absent = default app-data dir). Must
+   * round-trip through persist() — dropping it here would wipe the setting. */
+  archive_root?: string | null;
 }
 
 /** PTY output event pushed from Rust (`*_output` listen) — incremental bytes. */
