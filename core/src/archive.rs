@@ -325,10 +325,12 @@ pub fn write_archive(
         return Err(e);
     }
 
-    // Find the previous archive of THIS session: candidates share the `-{uuid8}`
-    // suffix, but only a full-uuid match in their `meta.json` (or an exact
-    // final-name match) counts — a different session that merely shares the
-    // first 8 uuid chars must never be deleted (silent data loss).
+    // Find the previous archive of THIS session. The ONLY authority is the
+    // full uuid in each candidate's `meta.json` — never the folder name: a
+    // different session sharing the first 8 uuid chars (even with an identical
+    // date+slug) must not be deleted (silent data loss). `.old-*` leftovers
+    // from an interrupted replace carry the same meta, so a matching one is
+    // reclaimed here too (self-healing cleanup); `.tmp-*` never has final data.
     let suffix = format!("-{short}");
     let mut previous: Vec<PathBuf> = Vec::new();
     if let Ok(entries) = fs::read_dir(&sessions_dir) {
@@ -336,14 +338,16 @@ pub fn write_archive(
             let path = entry.path();
             let name = entry.file_name();
             let name = name.to_string_lossy();
-            if !path.is_dir() || name.starts_with('.') || !name.ends_with(&suffix) {
+            if !path.is_dir() || name.starts_with(".tmp-") {
                 continue;
             }
-            let same_session = name == final_name
-                || fs::read_to_string(path.join("meta.json"))
-                    .ok()
-                    .and_then(|t| serde_json::from_str::<ArchiveMeta>(&t).ok())
-                    .is_some_and(|m| m.uuid == session.uuid);
+            if !name.ends_with(&suffix) && !name.starts_with(".old-") {
+                continue;
+            }
+            let same_session = fs::read_to_string(path.join("meta.json"))
+                .ok()
+                .and_then(|t| serde_json::from_str::<ArchiveMeta>(&t).ok())
+                .is_some_and(|m| m.uuid == session.uuid);
             if same_session {
                 previous.push(path);
             }
@@ -747,6 +751,28 @@ mod tests {
         let out_b2 = write_archive(&root, "/p", &b, jsonl.as_bytes()).unwrap();
         assert!(out_b2.replaced);
         assert!(out_a.dir.exists());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    // post-fix P1: 중단된 교체가 남긴 `.old-*`(meta의 uuid 일치)는 다음
+    // 아카이브가 회수한다 — 영구 쓰레기가 아니라 자기치유 대상.
+    #[test]
+    fn interrupted_replace_leftover_is_reclaimed() {
+        let root = temp_root("oldreclaim");
+        let jsonl = sample_jsonl("p");
+        let s = sample_session("복구 테스트");
+        let out = write_archive(&root, "/p", &s, jsonl.as_bytes()).unwrap();
+        let sessions = out.dir.parent().unwrap().to_path_buf();
+        // 크래시 시나리오 재현: 최종 폴더가 `.old-*`로만 남아 있는 상태.
+        let leftover = sessions.join(".old-crashed-1");
+        fs::rename(&out.dir, &leftover).unwrap();
+        assert!(list_archives(&root).is_empty(), "dot-dir는 목록에 안 보임");
+        // 재아카이브가 leftover를 회수하고 정상 폴더 하나만 남긴다.
+        let out2 = write_archive(&root, "/p", &s, jsonl.as_bytes()).unwrap();
+        assert!(out2.replaced, "leftover 회수도 교체로 집계");
+        assert!(!leftover.exists());
+        assert_eq!(fs::read_dir(&sessions).unwrap().flatten().count(), 1);
+        assert_eq!(list_archives(&root)[0].sessions.len(), 1);
         let _ = fs::remove_dir_all(&root);
     }
 
