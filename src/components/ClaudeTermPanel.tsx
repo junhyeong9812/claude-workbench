@@ -219,7 +219,7 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
       alert("현재 세션 정보를 찾을 수 없습니다.");
       return;
     }
-    if (!confirm("이 세션을 아카이브할까요?\n(요약·지식 추출에 1~2분 걸릴 수 있습니다. 세션은 계속 사용할 수 있습니다.)"))
+    if (!confirm("이 세션을 아카이브할까요?\n(요약·지식 추출에 1~2분 걸릴 수 있습니다. 세션은 계속 사용할 수 있고, 이후 대화는 다시 아카이브하면 반영됩니다.)"))
       return;
     setArchiveBusy(true);
     try {
@@ -231,6 +231,8 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
         knowledge_files: number;
         extraction_error?: string | null;
       }>("archive_session", { cwd, uuid });
+      // 아카이브 브라우저 탭이 이미 열려 있으면 즉시 갱신되도록 알린다.
+      window.dispatchEvent(new CustomEvent("mt-archive-updated"));
       alert(
         `아카이브 완료${res.replaced ? " (기존 아카이브 교체)" : ""}\n${res.dir}\n` +
           `요약: ${res.summary_ok ? "생성됨" : "없음"} · 지식 항목 ${res.knowledge_files}건` +
@@ -968,11 +970,11 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
             )}
             <button
               className="claudeterm-head-btn"
-              title="세션 아카이브: JSONL 원본 + 책(book.html) + 요약 + 지식(issue/method/domain) 추출 — 세션은 계속 사용 가능"
+              title="세션 아카이브: JSONL 원본 + 책(book.html) + 요약 + 지식(issue/method/domain) 추출 — 세션은 종료되지 않고 계속 사용 가능"
               disabled={archiveBusy || !props.params.sessionUuid}
               onClick={archiveSession}
             >
-              {archiveBusy ? "아카이브 중…" : "종료(아카이브)"}
+              {archiveBusy ? "아카이브 중…" : "아카이브"}
             </button>
           </span>
         </div>
