@@ -48,16 +48,20 @@ export function ArchivePanel() {
     return () => window.removeEventListener("mt-archive-updated", load);
   }, []);
 
-  // 저장 경로 변경(기본 = 앱 데이터 폴더). 빈 값 = 기본으로 복귀. 변경 후 재조회.
+  // 저장 경로 변경(기본 = 앱 데이터 폴더). 빈 값 = 기본으로 복귀. 절대 경로만
+  // 허용하고, 저장 완료를 기다린 뒤 재조회한다(새 루트로 읽기 보장).
   const changeRoot = () => {
     const next = window.prompt(
-      "아카이브 저장 경로 (비우면 기본: 앱 데이터 폴더/archive)",
+      "아카이브 저장 경로 — 절대 경로 (비우면 기본: 앱 데이터 폴더/archive)",
       archiveRoot ?? "",
     );
     if (next === null) return; // 취소
-    setArchiveRoot(next);
-    // persist는 fire-and-forget이라 백엔드 반영 직후 목록을 다시 읽는다.
-    setTimeout(load, 150);
+    const trimmed = next.trim();
+    if (trimmed !== "" && !trimmed.startsWith("/")) {
+      alert("절대 경로(/로 시작)만 사용할 수 있습니다.");
+      return;
+    }
+    void setArchiveRoot(trimmed === "" ? null : trimmed).then(load);
   };
 
   const toggle = (project: string) =>

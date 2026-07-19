@@ -351,8 +351,9 @@ interface AppState {
   /** Session-archive root override (null = default app-data dir). Part of
    * WorkspaceState — MUST ride through persist() or it gets wiped. */
   archiveRoot: string | null;
-  /** Set (or clear, with null) the archive root override and persist. */
-  setArchiveRoot: (path: string | null) => void;
+  /** Set (or clear, with null) the archive root override and persist. Resolves
+   * when the backend save finished, so callers can re-query with the new root. */
+  setArchiveRoot: (path: string | null) => Promise<void>;
   /** Opt-in: persist terminal/SSH scrollback to disk so tabs restore their prior
    * output after a restart. Default OFF — output can contain secrets (review
    * F11). Persisted to localStorage. */
@@ -529,9 +530,19 @@ export const useAppStore = create<AppState>((set, get) => ({
   savedConnections: [],
   archiveRoot: null,
 
-  setArchiveRoot: (path) => {
+  setArchiveRoot: async (path) => {
     set({ archiveRoot: path && path.trim() ? path.trim() : null });
-    get().persist();
+    // Await the actual backend save (not the fire-and-forget persist()) so the
+    // caller's follow-up archive_list reads the NEW root, not the old one.
+    const state: WorkspaceState = {
+      open_projects: get().projects,
+      active_project: get().activeProject,
+      saved_connections: get().savedConnections,
+      archive_root: get().archiveRoot,
+    };
+    await invoke("save_state", { state }).catch((err) => {
+      console.error("save_state failed", err);
+    });
   },
   persistScrollback: localStorage.getItem("persistScrollback") === "1",
 
