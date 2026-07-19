@@ -465,10 +465,14 @@ fn rebuild_index(root: &Path) -> io::Result<()> {
         }
     }
     if total == 0 {
-        // No entries at all → no index file to mislead a scanner.
-        match fs::remove_file(root.join("INDEX.md")) {
-            Ok(()) | Err(_) => return Ok(()),
-        }
+        // No entries at all → no index file to mislead a scanner. A missing file
+        // is that state already; any other removal error is real (a stale INDEX
+        // would keep pointing at deleted entries) and must surface.
+        return match fs::remove_file(root.join("INDEX.md")) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e),
+        };
     }
     fs::create_dir_all(root)?;
     fs::write(root.join("INDEX.md"), out)
