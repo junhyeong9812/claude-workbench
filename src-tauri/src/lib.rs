@@ -130,6 +130,8 @@ pub fn run() {
             commands::save_task_summary,
             commands::claude_set_task_meta,
             commands::archive_session,
+            commands::archive_list,
+            commands::archive_open_path,
             commands::claude_rename,
             commands::claude_delete,
             commands::acp_read_file,

@@ -80,6 +80,42 @@ pub struct ArchiveOutcome {
     pub replaced: bool,
 }
 
+/// Small per-session `meta.json`, written alongside the archive so listing the
+/// browser tree never has to parse the (potentially large) `normalized.json`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ArchiveMeta {
+    pub schema_version: u32,
+    pub uuid: String,
+    /// Original project root (cwd) — the `project_key` folder name is hashed,
+    /// so this is the only way back to the real path.
+    pub project: String,
+    pub title: String,
+    pub date: String,
+    pub model: Option<String>,
+    /// Conversation turn count (browser subtext).
+    pub turns: usize,
+}
+
+/// One archived session as the browser lists it.
+#[derive(Debug, Clone)]
+pub struct ArchiveSessionEntry {
+    pub dir: PathBuf,
+    pub book_path: PathBuf,
+    /// `summary.md` path when extraction produced one.
+    pub summary_path: Option<PathBuf>,
+    pub meta: ArchiveMeta,
+}
+
+/// All archived sessions of one project, plus its knowledge index if any.
+#[derive(Debug, Clone)]
+pub struct ArchiveProjectListing {
+    /// Original project root path (from the sessions' meta).
+    pub project: String,
+    pub index_path: Option<PathBuf>,
+    /// Newest first (date-prefixed folder names sort that way).
+    pub sessions: Vec<ArchiveSessionEntry>,
+}
+
 /// Same character policy as the snapshot sidecars, plus a minimum length so the
 /// `uuid8` folder suffix is meaningful.
 fn is_safe_uuid(uuid: &str) -> bool {
@@ -254,6 +290,18 @@ pub fn write_archive(
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
         fs::write(tmp_dir.join("normalized.json"), json)?;
         fs::write(tmp_dir.join("book.html"), render_book_html(session))?;
+        let meta = ArchiveMeta {
+            schema_version: session.schema_version,
+            uuid: session.uuid.clone(),
+            project: session.project.clone(),
+            title: session.title.clone(),
+            date: session.date.clone(),
+            model: session.model.clone(),
+            turns: session.turns.len(),
+        };
+        let meta_json = serde_json::to_string_pretty(&meta)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        fs::write(tmp_dir.join("meta.json"), meta_json)?;
         Ok(())
     })();
     if let Err(e) = write_all {
@@ -285,6 +333,53 @@ pub fn write_archive(
         dir: final_dir,
         replaced,
     })
+}
+
+/// List every archived session under `archive_root`, grouped by project and
+/// newest-first within each. Infallible by design (a missing root or a session
+/// folder without a readable `meta.json` is simply skipped) — the browser must
+/// always render.
+pub fn list_archives(archive_root: &Path) -> Vec<ArchiveProjectListing> {
+    let mut out = Vec::new();
+    let Ok(project_dirs) = fs::read_dir(archive_root) else {
+        return out;
+    };
+    for project_dir in project_dirs.flatten() {
+        let pdir = project_dir.path();
+        if !pdir.is_dir() {
+            continue;
+        }
+        let mut sessions = Vec::new();
+        if let Ok(session_dirs) = fs::read_dir(pdir.join("sessions")) {
+            for sdir in session_dirs.flatten() {
+                let dir = sdir.path();
+                if !dir.is_dir() {
+                    continue;
+                }
+                let Ok(text) = fs::read_to_string(dir.join("meta.json")) else { continue };
+                let Ok(meta) = serde_json::from_str::<ArchiveMeta>(&text) else { continue };
+                let summary = dir.join("summary.md");
+                sessions.push(ArchiveSessionEntry {
+                    book_path: dir.join("book.html"),
+                    summary_path: summary.is_file().then_some(summary),
+                    dir,
+                    meta,
+                });
+            }
+        }
+        if sessions.is_empty() {
+            continue;
+        }
+        sessions.sort_by(|a, b| b.dir.file_name().cmp(&a.dir.file_name()));
+        let index = pdir.join("knowledge").join("INDEX.md");
+        out.push(ArchiveProjectListing {
+            project: sessions[0].meta.project.clone(),
+            index_path: index.is_file().then_some(index),
+            sessions,
+        });
+    }
+    out.sort_by(|a, b| a.project.cmp(&b.project));
+    out
 }
 
 /// The self-contained reader page. Placeholders: `__TITLE__` (HTML-escaped) and
@@ -572,6 +667,30 @@ mod tests {
         assert!(!out_b.replaced, "a different uuid never replaces another session");
         let sessions = out_b.dir.parent().unwrap();
         assert_eq!(fs::read_dir(sessions).unwrap().flatten().count(), 2);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn list_archives_reads_meta_and_flags_summary() {
+        let root = temp_root("list");
+        let jsonl = sample_jsonl("p");
+        let out = write_archive(&root, "/p", &sample_session("목록 테스트"), jsonl.as_bytes()).unwrap();
+        let listed = list_archives(&root);
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].project, "/p");
+        assert_eq!(listed[0].index_path, None, "지식 없으면 인덱스 없음");
+        let s = &listed[0].sessions[0];
+        assert_eq!(s.meta.uuid, UUID);
+        assert_eq!(s.meta.title, "목록 테스트");
+        assert_eq!(s.meta.turns, 1);
+        assert_eq!(s.summary_path, None);
+        assert_eq!(s.book_path, out.book_path);
+        // summary.md가 생기면 플래그가 선다.
+        fs::write(out.dir.join("summary.md"), "요약").unwrap();
+        let again = list_archives(&root);
+        assert!(again[0].sessions[0].summary_path.is_some());
+        // 없는 루트는 빈 목록 (에러 아님).
+        assert!(list_archives(&root.join("nope")).is_empty());
         let _ = fs::remove_dir_all(&root);
     }
 

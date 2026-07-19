@@ -141,6 +141,74 @@ fn archive_session_blocking(
     })
 }
 
+/// One archived session for the browser pane.
+#[derive(Serialize)]
+pub struct ArchiveListEntry {
+    pub dir: String,
+    pub book_path: String,
+    pub summary_path: Option<String>,
+    pub uuid: String,
+    pub title: String,
+    pub date: String,
+    pub turns: usize,
+}
+
+/// One project's archived sessions + its knowledge index.
+#[derive(Serialize)]
+pub struct ArchiveProjectGroup {
+    pub project: String,
+    pub index_path: Option<String>,
+    pub sessions: Vec<ArchiveListEntry>,
+}
+
+/// List every archived session, grouped by project (newest first within each).
+/// Never fails — an empty archive is an empty list.
+#[tauri::command]
+pub fn archive_list(app: AppHandle) -> Result<Vec<ArchiveProjectGroup>, AppError> {
+    let root = archive_root(&app)?;
+    let path_s = |p: PathBuf| p.to_string_lossy().to_string();
+    Ok(core_lib::archive::list_archives(&root)
+        .into_iter()
+        .map(|proj| ArchiveProjectGroup {
+            project: proj.project,
+            index_path: proj.index_path.map(path_s),
+            sessions: proj
+                .sessions
+                .into_iter()
+                .map(|s| ArchiveListEntry {
+                    dir: path_s(s.dir),
+                    book_path: path_s(s.book_path),
+                    summary_path: s.summary_path.map(path_s),
+                    uuid: s.meta.uuid,
+                    title: s.meta.title,
+                    date: s.meta.date,
+                    turns: s.meta.turns,
+                })
+                .collect(),
+        })
+        .collect())
+}
+
+/// Open an archived artifact (book.html, a knowledge file, …) with the system
+/// handler. Confined to the archive root — canonicalized containment check, so
+/// the renderer can't turn this into an arbitrary-file opener.
+#[tauri::command]
+pub fn archive_open_path(app: AppHandle, path: String) -> Result<(), AppError> {
+    let root = archive_root(&app)?;
+    let root_c = std::fs::canonicalize(&root)
+        .map_err(|_| AppError::new("아카이브 폴더를 확인할 수 없습니다"))?;
+    let target = std::fs::canonicalize(&path)
+        .map_err(|_| AppError::new("경로를 확인할 수 없습니다"))?;
+    if !target.starts_with(&root_c) {
+        return Err(AppError::new("아카이브 밖 경로는 열 수 없습니다"));
+    }
+    std::process::Command::new("xdg-open")
+        .arg(&target)
+        .spawn()
+        .map(|_| ())
+        .map_err(|_| AppError::new("시스템 뷰어를 열 수 없습니다"))
+}
+
 /// The fixed extraction contract. Output format is pinned hard (markers + fixed
 /// keys) because `core_lib::knowledge::parse_extraction` parses it; entries the
 /// model emits off-format are skipped there, never fatal.
