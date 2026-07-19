@@ -3,6 +3,22 @@ name = "core"
 version = "0.2.0"
 edition = "2021"
 
+# 자기 패키지의 bin들이 lib를 참조할 때 내장 `core` 크레이트와 충돌하지 않도록
+# lib 타깃 이름을 코드에서 쓰는 이름(core_lib)으로 맞춘다 — src-tauri의
+# `core_lib = { package = "core" }` 별칭과도 일치.
+[lib]
+name = "core_lib"
+
+# 지식 조회 MCP 서버(stdio)와 아카이브 백필 CLI — 앱과 별개로 실행되는 얇은
+# 바이너리. 로직은 lib 모듈(mcp·archive·knowledge·claude_cli)에 살고 여기는 진입점만.
+[[bin]]
+name = "knowledge-mcp"
+path = "src/bin/knowledge_mcp.rs"
+
+[[bin]]
+name = "archive-backfill"
+path = "src/bin/archive_backfill.rs"
+
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

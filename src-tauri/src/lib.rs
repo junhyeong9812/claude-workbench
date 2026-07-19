@@ -128,6 +128,7 @@ pub fn run() {
             commands::archive_session,
             commands::archive_list,
             commands::archive_open_path,
+            commands::archive_uuids,
             commands::claude_rename,
             commands::claude_delete,
             commands::acp_read_file,

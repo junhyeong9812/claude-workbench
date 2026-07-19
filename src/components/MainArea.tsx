@@ -30,6 +30,8 @@ interface SessionSummary {
   count: number;
   /** The project (cwd) this session belongs to — passed through on reopen. */
   project: string;
+  /** Whether this session has an archive (책·요약·지식) — picker badge. */
+  archived: boolean;
 }
 
 
@@ -660,15 +662,19 @@ export function MainArea() {
   const openPicker = async () => {
     let sessions: SessionSummary[] = [];
     if (activeProject) {
-      const raw = await invoke<
-        {
-          uuid: string;
-          name: string;
-          title: string;
-          date: string;
-          count: number;
-        }[]
-      >("claude_sessions", { project: activeProject }).catch(() => []);
+      const [raw, archivedUuids] = await Promise.all([
+        invoke<
+          {
+            uuid: string;
+            name: string;
+            title: string;
+            date: string;
+            count: number;
+          }[]
+        >("claude_sessions", { project: activeProject }).catch(() => []),
+        invoke<string[]>("archive_uuids", { project: activeProject }).catch(() => []),
+      ]);
+      const archivedSet = new Set(archivedUuids);
       sessions = raw.map((s) => ({
         id: s.uuid,
         name: s.name,
@@ -676,6 +682,7 @@ export function MainArea() {
         date: s.date,
         count: s.count,
         project: activeProject,
+        archived: archivedSet.has(s.uuid),
       }));
     }
     setNewName(`Claude ${sessions.length + openKindCount("claudeterm") + 1}`);
@@ -941,7 +948,15 @@ export function MainArea() {
                           });
                         }}
                       >
-                        <span className="claude-picker-title">{s.name || "(이름 없음)"}</span>
+                        <span className="claude-picker-title">
+                          {s.name || "(이름 없음)"}
+                          <span
+                            className={`claude-picker-arch${s.archived ? " is-archived" : ""}`}
+                            title={s.archived ? "아카이브됨 (책·요약·지식 있음)" : "미아카이브"}
+                          >
+                            {s.archived ? "📦 아카이브됨" : "미아카이브"}
+                          </span>
+                        </span>
                         <span className="claude-picker-meta">
                           {s.title ? `${s.title.slice(0, 40)} · ` : ""}
                           {s.date} · 변경 {s.count}

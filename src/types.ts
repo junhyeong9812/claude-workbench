@@ -89,6 +89,12 @@ export interface WorkspaceState {
   /** Session-archive root override (null/absent = default app-data dir). Must
    * round-trip through persist() — dropping it here would wipe the setting. */
   archive_root?: string | null;
+  /** Archive-extraction claude model (`--model`). null = 기본(opus). Must
+   * round-trip through persist(). */
+  archive_model?: string | null;
+  /** Archive-extraction effort (`--effort`). null = 기본(xhigh). Must
+   * round-trip through persist(). */
+  archive_effort?: string | null;
 }
 
 /** PTY output event pushed from Rust (`*_output` listen) — incremental bytes. */

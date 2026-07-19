@@ -153,6 +153,44 @@ pub fn render_session_for_extraction(s: &NormalizedSession) -> String {
     out
 }
 
+/// The fixed extraction contract prompt. Output format is pinned hard (markers
+/// + fixed keys) because [`parse_extraction`] parses it; entries the model
+/// emits off-format are skipped there, never fatal. Shared by the app's
+/// archive command and the backfill CLI (단일 출처 — 프롬프트가 갈라지면 지식
+/// 스키마가 갈라진다).
+/// The first characters of every extraction prompt — transcripts whose first
+/// user prompt starts with this are **our own extraction runs**, never a user
+/// conversation (backfill filter, 되먹임 루프 방어선 2중).
+pub const EXTRACTION_MARKER: &str = "다음은 끝난 Claude 코딩 세션의 타임라인이다.";
+
+pub fn extraction_prompt(rendered: &str) -> String {
+    format!(
+        "다음은 끝난 Claude 코딩 세션의 타임라인이다. 이 세션을 아카이브하기 위해 (1) 제목+요약과 \
+(2) 지식 항목들을 추출하라.\n\n\
+출력 형식 (마커·키를 정확히 지킬 것, 다른 텍스트 금지):\n\
+===SUMMARY===\n\
+TITLE: <이 세션이 무엇을 했는지 한 줄 (40자 이내)>\n\
+<markdown 요약: (1) 목표와 한 일 (2) 핵심 변경 파일과 이유 (3) 미해결/다음 할 일>\n\n\
+그 뒤, 추출할 가치가 있는 지식마다 (없으면 생략):\n\
+===ENTRY===\n\
+type: issue | method | domain\n\
+title: <한 줄 — issue는 에러코드/원인을 제목으로>\n\
+error_code: <있으면, issue만>\n\
+problem: <해결한 문제 한 줄, method만>\n\
+applies_when: <재사용 조건 한 줄, method/domain>\n\
+status: resolved | open  (issue만)\n\
+tags: [소문자, 쉼표, 구분]\n\
+files: [관련 파일 경로]\n\
+---\n\
+<markdown 본문 — issue: ## 증상(에러 원문 그대로) / ## 원인 / ## 해결 / ## 실패한 시도 / ## 재발 방지. \
+method: ## 상황 / ## 검토한 선택지 / ## 선택한 방법과 이유 / ## 결과 / ## 재사용 조건. \
+domain: ## 개념 / ## 상세 / ## 적용 맥락>\n\n\
+규칙: 이 세션에서 실제 발생·확인한 것만. 에러 메시지는 원문 보존(나중에 grep 대상). \
+사소한 오타 수정 따위는 항목으로 만들지 말 것. 항목 0개도 정상.\n\n\
+{rendered}"
+    )
+}
+
 /// Parse the extraction output. Format contract (the prompt pins it):
 /// ```text
 /// ===SUMMARY===

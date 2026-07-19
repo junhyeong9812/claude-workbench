@@ -12,9 +12,9 @@
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
-use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
+use core_lib::claude_cli::ClaudeOpts;
 use serde::Serialize;
 use tauri::{AppHandle, Manager};
 
@@ -44,100 +44,13 @@ impl Drop for InFlightGuard {
     }
 }
 
-/// Run a one-shot `claude -p --output-format text` in `cwd`, feeding `prompt` on
-/// stdin and capturing stdout. Drains stdout/stderr on threads (so a full pipe
-/// can't deadlock the child), enforces `timeout` with kill+wait (no zombie), caps
-/// captured output, and treats only `exit 0 && non-empty stdout` as success
-/// (codex P3 D7).
-fn run_claude_p(cwd: &str, prompt: &str, timeout: Duration) -> Result<String, AppError> {
-    use std::io::{Read, Write};
-    use std::process::{Command, Stdio};
-    const CAP: usize = 256 * 1024;
-
-    let mut child = Command::new("claude")
-        .args(["-p", "--output-format", "text"])
-        .current_dir(cwd)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|_| AppError::new("Cannot start claude for summary"))?;
-
-    // Feed the prompt and close stdin (EOF) on its own thread so a large prompt
-    // can't deadlock against an unread stdout pipe.
-    if let Some(mut stdin) = child.stdin.take() {
-        let p = prompt.to_string();
-        thread::spawn(move || {
-            let _ = stdin.write_all(p.as_bytes());
-            // `stdin` drops here -> EOF.
-        });
-    }
-
-    // Drain stdout on its own thread, sending the captured (capped) bytes on a
-    // channel so we collect with a *timeout* — never an unbounded `join`, which
-    // could hang if a descendant of `claude` keeps the pipe open past the child's
-    // own exit (codex P3-impl 3).
-    let (otx, orx) = std::sync::mpsc::channel::<Vec<u8>>();
-    if let Some(mut so) = child.stdout.take() {
-        thread::spawn(move || {
-            let mut buf = Vec::new();
-            let mut chunk = [0u8; 8192];
-            while let Ok(n) = so.read(&mut chunk) {
-                if n == 0 {
-                    break;
-                }
-                if buf.len() < CAP {
-                    let take = n.min(CAP - buf.len());
-                    buf.extend_from_slice(&chunk[..take]);
-                }
-            }
-            let _ = otx.send(buf);
-        });
-    }
-    // Drain stderr to a sink (so a full stderr pipe can't block the child) and
-    // discard it — error text isn't surfaced to the UI. Detached.
-    if let Some(mut se) = child.stderr.take() {
-        thread::spawn(move || {
-            let mut sink = [0u8; 8192];
-            while let Ok(n) = se.read(&mut sink) {
-                if n == 0 {
-                    break;
-                }
-            }
-        });
-    }
-
-    // Wait with a deadline; kill + reap on timeout.
-    let start = Instant::now();
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(st)) => break Some(st),
-            Ok(None) => {
-                if start.elapsed() >= timeout {
-                    let _ = child.kill();
-                    let _ = child.wait(); // reap so we don't leave a zombie
-                    break None;
-                }
-                thread::sleep(Duration::from_millis(50));
-            }
-            Err(_) => break None,
-        }
-    };
-
-    match status {
-        Some(st) if st.success() => {
-            // Collect stdout with a bounded wait (the drain thread finishes as the
-            // pipe closed on exit) — never block the command thread indefinitely.
-            let stdout = orx.recv_timeout(Duration::from_secs(3)).unwrap_or_default();
-            let text = String::from_utf8_lossy(&stdout).trim().to_string();
-            if text.is_empty() {
-                Err(AppError::new("Claude returned an empty summary"))
-            } else {
-                Ok(text)
-            }
-        }
-        Some(_) => Err(AppError::new("Claude failed to produce a summary")),
-        None => Err(AppError::new("Claude summary timed out")),
+/// The archive-extraction model/effort: workspace settings when set, else the
+/// app default **opus + xhigh** (사용자 결정 — 추출 품질 우선).
+fn extraction_opts(app: &AppHandle) -> ClaudeOpts {
+    let ws = super::load_state(app.clone());
+    ClaudeOpts {
+        model: Some(ws.archive_model.filter(|m| !m.trim().is_empty()).unwrap_or_else(|| "opus".into())),
+        effort: Some(ws.archive_effort.filter(|e| !e.trim().is_empty()).unwrap_or_else(|| "xhigh".into())),
     }
 }
 
@@ -270,9 +183,18 @@ fn archive_session_blocking(
     // into reported errors (neither masks the other), never a failed archive.
     let mut extraction = None;
     let rendered = core_lib::knowledge::render_session_for_extraction(&session);
-    match run_claude_p(&cwd, &extraction_prompt(&rendered), Duration::from_secs(180)) {
+    let opts = extraction_opts(&app);
+    // 추출은 /tmp 스크래치 cwd에서 — 프로젝트 안에서 돌리면 추출 자체가 그
+    // 프로젝트의 새 세션 트랜스크립트가 되어 백필 되먹임 루프를 만든다.
+    let workdir = core_lib::claude_cli::extraction_workdir();
+    match core_lib::claude_cli::run_claude_p(
+        &workdir.to_string_lossy(),
+        &core_lib::knowledge::extraction_prompt(&rendered),
+        Duration::from_secs(300),
+        &opts,
+    ) {
         Ok(raw) => extraction = Some(core_lib::knowledge::parse_extraction(&raw)),
-        Err(e) => errors.push(e.message.clone()),
+        Err(e) => errors.push(e),
     }
 
     let mut summary_ok = false;
@@ -299,6 +221,26 @@ fn archive_session_blocking(
             Err(e) => errors.push(io_message("Cannot save knowledge", &e)),
         }
     }
+    // 지식 MCP 서버를 대상 프로젝트 .mcp.json에 등록(병합·멱등) — 이후 그
+    // 프로젝트의 Claude 세션이 이슈 발생 시 과거 지식을 바로 조회한다. 서버
+    // 바이너리는 앱 실행 파일 옆(knowledge-mcp) — dev(target/…)와 설치본 모두
+    // 같은 규약. 실패·부재는 보고만(아카이브는 성공).
+    let proj_path = std::path::Path::new(&cwd);
+    if proj_path.is_dir() {
+        let bin = std::env::current_exe()
+            .ok()
+            .and_then(|p| p.parent().map(|d| d.join("knowledge-mcp")));
+        match bin {
+            Some(bin) if bin.is_file() => {
+                let kdir = core_lib::knowledge::knowledge_dir(&root, &cwd);
+                if let Err(e) = core_lib::mcp::register_in_mcp_json(proj_path, &bin, &kdir) {
+                    errors.push(io_message("Cannot register mcp", &e));
+                }
+            }
+            _ => errors.push("knowledge-mcp 바이너리 없음 — MCP 등록 생략".to_string()),
+        }
+    }
+
     // 3) No fresh summary → keep the previous archive's (last-good), mirroring
     // how knowledge entries persist when extraction fails. (Re-written here
     // because a retitle re-land above replaced the folder the early copy was
@@ -391,6 +333,50 @@ pub fn archive_list(app: AppHandle) -> Result<Vec<ArchiveProjectGroup>, AppError
         .collect())
 }
 
+/// Ensure the knowledge MCP server is registered in `project`'s `.mcp.json`
+/// when that project has archived knowledge — called right before a Claude PTY
+/// spawns (the CLI reads `.mcp.json` only at session start, so this is the
+/// moment that makes the server "그냥 있음"). Best-effort: any failure (no
+/// knowledge, no binary, foreign entry, corrupt file) must never block the
+/// session from opening.
+pub(super) fn ensure_mcp_registration(app: &AppHandle, project: &str) {
+    let Ok(root) = archive_root(app) else { return };
+    let kdir = core_lib::knowledge::knowledge_dir(&root, project);
+    if !kdir.is_dir() {
+        return;
+    }
+    let proj = std::path::Path::new(project);
+    if !proj.is_dir() {
+        return;
+    }
+    let Some(bin) = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.join("knowledge-mcp")))
+    else {
+        return;
+    };
+    if !bin.is_file() {
+        return;
+    }
+    let _ = core_lib::mcp::register_in_mcp_json(proj, &bin, &kdir);
+}
+
+/// The archived session uuids of one project — the picker marks saved sessions
+/// as 아카이브됨/미아카이브 with this set. Infallible (empty on any failure);
+/// the badge is informational, never load-bearing.
+#[tauri::command]
+pub fn archive_uuids(app: AppHandle, project: String) -> Vec<String> {
+    let Ok(root) = archive_root(&app) else {
+        return vec![];
+    };
+    core_lib::archive::list_archives(&root)
+        .into_iter()
+        .filter(|p| p.project == project)
+        .flat_map(|p| p.sessions)
+        .map(|s| s.meta.uuid)
+        .collect()
+}
+
 /// Open an archived artifact (book.html, a knowledge file, …) with the system
 /// handler. Confined to the archive root — canonicalized containment check, so
 /// the renderer can't turn this into an arbitrary-file opener.
@@ -411,33 +397,3 @@ pub fn archive_open_path(app: AppHandle, path: String) -> Result<(), AppError> {
         .map_err(|_| AppError::new("시스템 뷰어를 열 수 없습니다"))
 }
 
-/// The fixed extraction contract. Output format is pinned hard (markers + fixed
-/// keys) because `core_lib::knowledge::parse_extraction` parses it; entries the
-/// model emits off-format are skipped there, never fatal.
-fn extraction_prompt(rendered: &str) -> String {
-    format!(
-        "다음은 끝난 Claude 코딩 세션의 타임라인이다. 이 세션을 아카이브하기 위해 (1) 제목+요약과 \
-(2) 지식 항목들을 추출하라.\n\n\
-출력 형식 (마커·키를 정확히 지킬 것, 다른 텍스트 금지):\n\
-===SUMMARY===\n\
-TITLE: <이 세션이 무엇을 했는지 한 줄 (40자 이내)>\n\
-<markdown 요약: (1) 목표와 한 일 (2) 핵심 변경 파일과 이유 (3) 미해결/다음 할 일>\n\n\
-그 뒤, 추출할 가치가 있는 지식마다 (없으면 생략):\n\
-===ENTRY===\n\
-type: issue | method | domain\n\
-title: <한 줄 — issue는 에러코드/원인을 제목으로>\n\
-error_code: <있으면, issue만>\n\
-problem: <해결한 문제 한 줄, method만>\n\
-applies_when: <재사용 조건 한 줄, method/domain>\n\
-status: resolved | open  (issue만)\n\
-tags: [소문자, 쉼표, 구분]\n\
-files: [관련 파일 경로]\n\
----\n\
-<markdown 본문 — issue: ## 증상(에러 원문 그대로) / ## 원인 / ## 해결 / ## 실패한 시도 / ## 재발 방지. \
-method: ## 상황 / ## 검토한 선택지 / ## 선택한 방법과 이유 / ## 결과 / ## 재사용 조건. \
-domain: ## 개념 / ## 상세 / ## 적용 맥락>\n\n\
-규칙: 이 세션에서 실제 발생·확인한 것만. 에러 메시지는 원문 보존(나중에 grep 대상). \
-사소한 오타 수정 따위는 항목으로 만들지 말 것. 항목 0개도 정상.\n\n\
-{rendered}"
-    )
-}

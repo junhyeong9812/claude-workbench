@@ -351,9 +351,18 @@ interface AppState {
   /** Session-archive root override (null = default app-data dir). Part of
    * WorkspaceState — MUST ride through persist() or it gets wiped. */
   archiveRoot: string | null;
-  /** Set (or clear, with null) the archive root override and persist. Resolves
-   * when the backend save finished, so callers can re-query with the new root. */
-  setArchiveRoot: (path: string | null) => Promise<void>;
+  /** Archive-extraction claude model / effort (null = 기본 opus / xhigh). Part
+   * of WorkspaceState — MUST ride through persist() or they get wiped. */
+  archiveModel: string | null;
+  archiveEffort: string | null;
+  /** Set archive root/model/effort together in ONE save (two racing saves could
+   * land out of order and roll fields back — 리뷰 G5). Resolves `true` only
+   * when the backend save actually succeeded (리뷰 G6 — 실패 무음 금지). */
+  setArchiveConfig: (
+    root: string | null,
+    model: string | null,
+    effort: string | null,
+  ) => Promise<boolean>;
   /** Opt-in: persist terminal/SSH scrollback to disk so tabs restore their prior
    * output after a restart. Default OFF — output can contain secrets (review
    * F11). Persisted to localStorage. */
@@ -529,20 +538,19 @@ export const useAppStore = create<AppState>((set, get) => ({
   studySessionUuid: localStorage.getItem("studySessionUuid"),
   savedConnections: [],
   archiveRoot: null,
+  archiveModel: null,
+  archiveEffort: null,
 
-  setArchiveRoot: async (path) => {
-    set({ archiveRoot: path && path.trim() ? path.trim() : null });
-    // Await the actual backend save (not the fire-and-forget persist()) so the
-    // caller's follow-up archive_list reads the NEW root, not the old one.
-    const state: WorkspaceState = {
-      open_projects: get().projects,
-      active_project: get().activeProject,
-      saved_connections: get().savedConnections,
-      archive_root: get().archiveRoot,
-    };
-    await invoke("save_state", { state }).catch((err) => {
-      console.error("save_state failed", err);
+  setArchiveConfig: async (root, model, effort) => {
+    const norm = (v: string | null) => (v && v.trim() ? v.trim() : null);
+    set({
+      archiveRoot: norm(root),
+      archiveModel: norm(model),
+      archiveEffort: norm(effort),
     });
+    // ONE awaited save — the caller re-queries only after the backend has the
+    // new values, and learns about a failed save instead of a silent lie.
+    return savePersisted(get);
   },
   persistScrollback: localStorage.getItem("persistScrollback") === "1",
 
@@ -565,6 +573,8 @@ export const useAppStore = create<AppState>((set, get) => ({
         activeProject: ws.active_project ?? null,
         savedConnections: ws.saved_connections ?? [],
         archiveRoot: ws.archive_root ?? null,
+        archiveModel: ws.archive_model ?? null,
+        archiveEffort: ws.archive_effort ?? null,
       });
 
       // Self-heal: re-detect types for every loaded project so old saved
@@ -920,14 +930,27 @@ export const useAppStore = create<AppState>((set, get) => ({
   },
 
   persist: () => {
-    const state: WorkspaceState = {
-      open_projects: get().projects,
-      active_project: get().activeProject,
-      saved_connections: get().savedConnections,
-      archive_root: get().archiveRoot,
-    };
-    invoke("save_state", { state }).catch((err) => {
-      console.error("save_state failed", err);
-    });
+    void savePersisted(get);
   },
 }));
+
+/** The single assembly point for the persisted WorkspaceState — every field the
+ * backend stores MUST appear here, or the next save wipes it (the archive_root
+ * lesson). Resolves `true` on a successful backend save, `false` on failure
+ * (logged) — settings callers surface the failure instead of pretending. */
+function savePersisted(get: () => AppState): Promise<boolean> {
+  const state: WorkspaceState = {
+    open_projects: get().projects,
+    active_project: get().activeProject,
+    saved_connections: get().savedConnections,
+    archive_root: get().archiveRoot,
+    archive_model: get().archiveModel,
+    archive_effort: get().archiveEffort,
+  };
+  return invoke("save_state", { state })
+    .then(() => true)
+    .catch((err) => {
+      console.error("save_state failed", err);
+      return false;
+    });
+}
