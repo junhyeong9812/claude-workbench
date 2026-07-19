@@ -51,6 +51,17 @@ impl McpServer {
         let Ok(msg) = serde_json::from_str::<Value>(line) else {
             return Some(error_response(Value::Null, -32700, "Parse error"));
         };
+        // JSON-RPC 2.0: a request is an object with "jsonrpc":"2.0" (arrays /
+        // scalars / wrong version are invalid requests, not silence — 리뷰 G8).
+        if !msg.is_object() {
+            return Some(error_response(Value::Null, -32600, "Invalid request"));
+        }
+        if msg.get("jsonrpc").and_then(Value::as_str) != Some("2.0") {
+            return match msg.get("id").cloned() {
+                Some(id) => Some(error_response(id, -32600, "Invalid request (jsonrpc must be \"2.0\")")),
+                None => None,
+            };
+        }
         let id = msg.get("id").cloned();
         let method = msg.get("method").and_then(Value::as_str).unwrap_or("");
         // A message without a method: either a (client-side) response — ignore —
@@ -82,12 +93,20 @@ impl McpServer {
     }
 
     fn initialize(&self, params: &Value) -> Value {
-        // Echo the client's protocol version when given (the tools subset used
-        // here is stable across revisions); fall back to a known-good one.
-        let version = params
+        // Agree to the client's protocol version only when it's one we know the
+        // tools subset is identical in; anything unknown gets our baseline so a
+        // future client never mistakes us for supporting a newer contract
+        // (리뷰 G7 — 무조건 에코 금지).
+        const SUPPORTED: [&str; 3] = ["2024-11-05", "2025-03-26", "2025-06-18"];
+        let requested = params
             .get("protocolVersion")
             .and_then(Value::as_str)
             .unwrap_or("2024-11-05");
+        let version = if SUPPORTED.contains(&requested) {
+            requested
+        } else {
+            "2024-11-05"
+        };
         json!({
             "protocolVersion": version,
             "capabilities": { "tools": {} },
@@ -144,6 +163,9 @@ impl McpServer {
             let Ok(entries) = fs::read_dir(&dir) else { continue };
             let mut names: Vec<PathBuf> = entries
                 .flatten()
+                // 심볼릭 링크는 루트 밖을 가리킬 수 있다 — read_entry의 containment와
+                // 대칭으로, 검색도 실파일만 읽는다 (리뷰 G4).
+                .filter(|e| e.file_type().map(|t| !t.is_symlink()).unwrap_or(false))
                 .map(|e| e.path())
                 .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("md"))
                 .collect();
@@ -203,7 +225,9 @@ impl McpServer {
     }
 
     fn list_index(&self) -> Result<String, String> {
-        match fs::read_to_string(self.knowledge_root.join("INDEX.md")) {
+        // read_entry와 같은 containment 경로를 태워 INDEX.md 심볼릭 링크로도
+        // 루트 밖이 노출되지 않게 한다 (리뷰 G4).
+        match self.read_entry(&json!({ "path": "INDEX.md" })) {
             Ok(text) => Ok(text),
             Err(_) => Ok("지식 인덱스가 아직 없습니다 (아카이브된 지식 0건).".to_string()),
         }
@@ -301,16 +325,38 @@ pub fn register_in_mcp_json(
         ));
     }
     let servers = servers.as_object_mut().unwrap();
-    if servers.get(SERVER_NAME) == Some(&entry) {
-        return Ok(false);
+    match servers.get(SERVER_NAME) {
+        Some(existing) if existing == &entry => return Ok(false),
+        Some(existing) => {
+            // 같은 키가 이미 있는데 우리 서버(knowledge-mcp 바이너리)가 아니면
+            // 사용자의 다른 등록을 덮어쓰는 것 — 병합 불변식 위반이므로 거부
+            // (리뷰 G3). 우리 항목이면 경로/인자 갱신만 허용.
+            let is_ours = existing
+                .get("command")
+                .and_then(Value::as_str)
+                .and_then(|c| Path::new(c).file_name())
+                .map(|f| f.to_string_lossy().contains("knowledge-mcp"))
+                .unwrap_or(false);
+            if !is_ours {
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    "같은 이름의 다른 MCP 서버가 등록돼 있어 덮어쓰지 않았습니다",
+                ));
+            }
+        }
+        None => {}
     }
     servers.insert(SERVER_NAME.to_string(), entry);
     let text = serde_json::to_string_pretty(&root)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-    // Atomic write (tmp + rename) — a crash never leaves a half-written file.
+    // Atomic write (tmp + rename) — a crash never leaves a half-written file,
+    // and a failed rename never leaves the tmp behind (리뷰 G11).
     let tmp = project_dir.join(format!(".mcp.json.{}.tmp", std::process::id()));
     fs::write(&tmp, text)?;
-    fs::rename(&tmp, &path)?;
+    if let Err(e) = fs::rename(&tmp, &path) {
+        let _ = fs::remove_file(&tmp);
+        return Err(e);
+    }
     Ok(true)
 }
 
@@ -434,6 +480,65 @@ mod tests {
         let again =
             register_in_mcp_json(&proj, Path::new("/bin/knowledge-mcp"), Path::new("/kn")).unwrap();
         assert!(!again);
+    }
+
+    #[test]
+    fn register_refuses_foreign_server_with_same_name() {
+        let proj = temp_dir("foreign");
+        fs::write(
+            proj.join(".mcp.json"),
+            r#"{ "mcpServers": { "workbench-knowledge": { "command": "/usr/bin/other-tool" } } }"#,
+        )
+        .unwrap();
+        let err = register_in_mcp_json(&proj, Path::new("/b/knowledge-mcp"), Path::new("/k"))
+            .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
+        let v: Value =
+            serde_json::from_str(&fs::read_to_string(proj.join(".mcp.json")).unwrap()).unwrap();
+        assert_eq!(v["mcpServers"][SERVER_NAME]["command"], "/usr/bin/other-tool", "미변경");
+        // 우리 바이너리를 가리키는 기존 항목은 경로 갱신 허용.
+        fs::write(
+            proj.join(".mcp.json"),
+            r#"{ "mcpServers": { "workbench-knowledge": { "command": "/old/knowledge-mcp", "args": [] } } }"#,
+        )
+        .unwrap();
+        assert!(register_in_mcp_json(&proj, Path::new("/new/knowledge-mcp"), Path::new("/k")).unwrap());
+    }
+
+    #[test]
+    fn jsonrpc_envelope_is_validated() {
+        let s = McpServer::new(knowledge_fixture("envelope"));
+        // 배열/스칼라 → -32600.
+        let arr = call(&s, r#"[1,2]"#);
+        assert_eq!(arr["error"]["code"], -32600);
+        // jsonrpc 필드 누락 + id 있음 → -32600.
+        let nover = call(&s, r#"{"id":1,"method":"ping"}"#);
+        assert_eq!(nover["error"]["code"], -32600);
+        // 미지의 protocolVersion은 에코하지 않고 기준 버전으로 응답.
+        let init = call(
+            &s,
+            r#"{"jsonrpc":"2.0","id":2,"method":"initialize","params":{"protocolVersion":"2099-01-01"}}"#,
+        );
+        assert_eq!(init["result"]["protocolVersion"], "2024-11-05");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn search_skips_symlinks_outside_root() {
+        let root = knowledge_fixture("symlink");
+        let outside = temp_dir("symlink-outside").join("secret.md");
+        fs::write(&outside, "---\ntitle: \"secret\"\n---\nSECRET-NEEDLE").unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("issues").join("link.md")).unwrap();
+        let s = McpServer::new(&root);
+        let res = call(
+            &s,
+            r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"search_knowledge","arguments":{"query":"SECRET-NEEDLE"}}}"#,
+        );
+        let text = res["result"]["content"][0]["text"].as_str().unwrap();
+        // 유일한 매칭 파일이 심볼릭 링크 → 히트 0 ("없음" 메시지는 검색어를
+        // 인용하므로 needle 포함 검사 대신 히트/경로 부재로 판정한다).
+        assert!(text.contains("없음"), "히트 0이어야 함: {text}");
+        assert!(!text.contains("link.md"), "심볼릭 링크 파일 미노출");
     }
 
     #[test]
