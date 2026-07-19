@@ -28,8 +28,8 @@ pub struct TaskSummary {
 /// stdin and capturing stdout. Drains stdout/stderr on threads (so a full pipe
 /// can't deadlock the child), enforces `timeout` with kill+wait (no zombie), caps
 /// captured output, and treats only `exit 0 && non-empty stdout` as success
-/// (codex P3 D7).
-fn run_claude_p(cwd: &str, prompt: &str, timeout: Duration) -> Result<String, AppError> {
+/// (codex P3 D7). Shared with the archive extraction (`commands::archive`).
+pub(super) fn run_claude_p(cwd: &str, prompt: &str, timeout: Duration) -> Result<String, AppError> {
     use std::io::{Read, Write};
     use std::process::{Command, Stdio};
     const CAP: usize = 256 * 1024;
