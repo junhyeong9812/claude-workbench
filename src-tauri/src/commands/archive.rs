@@ -333,6 +333,34 @@ pub fn archive_list(app: AppHandle) -> Result<Vec<ArchiveProjectGroup>, AppError
         .collect())
 }
 
+/// Ensure the knowledge MCP server is registered in `project`'s `.mcp.json`
+/// when that project has archived knowledge — called right before a Claude PTY
+/// spawns (the CLI reads `.mcp.json` only at session start, so this is the
+/// moment that makes the server "그냥 있음"). Best-effort: any failure (no
+/// knowledge, no binary, foreign entry, corrupt file) must never block the
+/// session from opening.
+pub(super) fn ensure_mcp_registration(app: &AppHandle, project: &str) {
+    let Ok(root) = archive_root(app) else { return };
+    let kdir = core_lib::knowledge::knowledge_dir(&root, project);
+    if !kdir.is_dir() {
+        return;
+    }
+    let proj = std::path::Path::new(project);
+    if !proj.is_dir() {
+        return;
+    }
+    let Some(bin) = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.join("knowledge-mcp")))
+    else {
+        return;
+    };
+    if !bin.is_file() {
+        return;
+    }
+    let _ = core_lib::mcp::register_in_mcp_json(proj, &bin, &kdir);
+}
+
 /// The archived session uuids of one project — the picker marks saved sessions
 /// as 아카이브됨/미아카이브 with this set. Infallible (empty on any failure);
 /// the badge is informational, never load-bearing.
