@@ -97,7 +97,10 @@ impl McpServer {
         // tools subset is identical in; anything unknown gets our baseline so a
         // future client never mistakes us for supporting a newer contract
         // (리뷰 G7 — 무조건 에코 금지).
-        const SUPPORTED: [&str; 3] = ["2024-11-05", "2025-03-26", "2025-06-18"];
+        // 2025-03-26은 JSON-RPC batch 수신을 요구하는데 이 서버는 batch를
+        // 구현하지 않는다 — 지원 선언에서 제외 (2024-11-05는 batch 이전,
+        // 2025-06-18은 batch 제거 후라 봉투 검증과 정합).
+        const SUPPORTED: [&str; 2] = ["2024-11-05", "2025-06-18"];
         let requested = params
             .get("protocolVersion")
             .and_then(Value::as_str)
@@ -160,7 +163,16 @@ impl McpServer {
                 }
             }
             let dir = self.knowledge_root.join(dir_name);
-            let Ok(entries) = fs::read_dir(&dir) else { continue };
+            // 카테고리 디렉터리 자체가 루트 밖을 가리키는 심볼릭 링크일 수 있다
+            // — canonicalize 후 containment 확인 (post-fix P1).
+            let (Ok(root_c), Ok(dir_c)) = (fs::canonicalize(&self.knowledge_root), fs::canonicalize(&dir))
+            else {
+                continue;
+            };
+            if !dir_c.starts_with(&root_c) {
+                continue;
+            }
+            let Ok(entries) = fs::read_dir(&dir_c) else { continue };
             let mut names: Vec<PathBuf> = entries
                 .flatten()
                 // 심볼릭 링크는 루트 밖을 가리킬 수 있다 — read_entry의 containment와
@@ -331,11 +343,13 @@ pub fn register_in_mcp_json(
             // 같은 키가 이미 있는데 우리 서버(knowledge-mcp 바이너리)가 아니면
             // 사용자의 다른 등록을 덮어쓰는 것 — 병합 불변식 위반이므로 거부
             // (리뷰 G3). 우리 항목이면 경로/인자 갱신만 허용.
+            // 정확한 basename 일치만 우리 것으로 인정 — `contains`는
+            // "not-knowledge-mcp-wrapper" 류를 오인한다 (post-fix P1).
             let is_ours = existing
                 .get("command")
                 .and_then(Value::as_str)
                 .and_then(|c| Path::new(c).file_name())
-                .map(|f| f.to_string_lossy().contains("knowledge-mcp"))
+                .map(|f| f == "knowledge-mcp")
                 .unwrap_or(false);
             if !is_ours {
                 return Err(io::Error::new(
@@ -539,6 +553,35 @@ mod tests {
         // 인용하므로 needle 포함 검사 대신 히트/경로 부재로 판정한다).
         assert!(text.contains("없음"), "히트 0이어야 함: {text}");
         assert!(!text.contains("link.md"), "심볼릭 링크 파일 미노출");
+    }
+
+    // post-fix P1: 카테고리 *디렉터리* 자체가 루트 밖 심볼릭 링크인 경우도 차단.
+    #[cfg(unix)]
+    #[test]
+    fn search_skips_symlinked_category_dir() {
+        let root = temp_dir("dirlink-root");
+        let outside = temp_dir("dirlink-outside");
+        fs::write(outside.join("leak.md"), "---\ntitle: \"leak\"\n---\nDIR-NEEDLE").unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("issues")).unwrap();
+        let s = McpServer::new(&root);
+        let res = call(
+            &s,
+            r#"{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"search_knowledge","arguments":{"query":"DIR-NEEDLE"}}}"#,
+        );
+        let text = res["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("없음") && !text.contains("leak.md"), "디렉터리 링크 미추적: {text}");
+    }
+
+    #[test]
+    fn register_ownership_is_exact_basename() {
+        let proj = temp_dir("owner-exact");
+        fs::write(
+            proj.join(".mcp.json"),
+            r#"{ "mcpServers": { "workbench-knowledge": { "command": "/usr/bin/not-knowledge-mcp-wrapper" } } }"#,
+        )
+        .unwrap();
+        // basename이 정확히 "knowledge-mcp"가 아니면 타 서버로 간주해 거부.
+        assert!(register_in_mcp_json(&proj, Path::new("/b/knowledge-mcp"), Path::new("/k")).is_err());
     }
 
     #[test]
