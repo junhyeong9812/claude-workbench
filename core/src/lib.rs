@@ -9,6 +9,7 @@
 //! Tauri event).
 
 pub mod archive;
+pub mod claude_cli;
 pub mod fs;
 pub mod git;
 pub mod history;
