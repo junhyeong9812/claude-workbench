@@ -343,6 +343,42 @@ body {
   align-items: center;
   gap: 4px;
 }
+/* Inline settings form (경로·모델·effort) under the head. */
+.archive-settings {
+  flex: 0 0 auto;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 6px 8px;
+  border-bottom: 1px solid var(--border, #333);
+  background: var(--bg-alt);
+}
+.archive-settings-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 0.85em;
+  color: var(--fg-dim);
+}
+.archive-settings-row > span {
+  flex: 0 0 44px;
+}
+.archive-settings-row input,
+.archive-settings-row select {
+  flex: 1 1 0;
+  min-width: 0;
+  background: var(--bg);
+  border: 1px solid var(--border, #333);
+  border-radius: 4px;
+  color: var(--fg, #cdd6f4);
+  font: inherit;
+  padding: 2px 6px;
+}
+.archive-settings-foot {
+  display: flex;
+  justify-content: flex-end;
+  gap: 4px;
+}
 .archive-refresh {
   background: transparent;
   border: none;
