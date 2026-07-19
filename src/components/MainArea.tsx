@@ -28,8 +28,6 @@ interface SessionSummary {
   name: string;
   title: string;
   count: number;
-  /** Handoff chain link (claudeterm only) — groups sessions into task chains. */
-  prev_uuid?: string | null;
   /** The project (cwd) this session belongs to — passed through on reopen. */
   project: string;
 }
@@ -143,16 +141,6 @@ export function MainArea() {
   const [picker, setPicker] = useState<SessionSummary[] | null>(null);
   // Which kind the open picker creates/reopens: ACP `claude` or A `claudeterm`.
   const [newName, setNewName] = useState("Claude 1");
-  // Expanded task chains in the picker (by head uuid) — collapsed shows only the
-  // latest task of each chain; expand reveals its previous tasks.
-  const [expandedChains, setExpandedChains] = useState<Set<string>>(new Set());
-  const toggleChain = (uuid: string) =>
-    setExpandedChains((prev) => {
-      const next = new Set(prev);
-      if (next.has(uuid)) next.delete(uuid);
-      else next.add(uuid);
-      return next;
-    });
   // Close request raised by a Claude tab's × (B3-1).
   const closeRequest = useClaudeUi((s) => s.closeRequest);
   const clearClose = useClaudeUi((s) => s.clearClose);
@@ -666,10 +654,10 @@ export function MainArea() {
       (p) => (p.params as { kind?: string } | undefined)?.kind === kind,
     ).length;
 
-  // "+ Claude(A)": open the picker — name a new task session or reopen a saved
-  // (not-already-open) one, grouped into task chains. Per-project (active project).
+  // "+ Claude(A)": open the picker — name a new session or reopen a saved
+  // (not-already-open) one. Per-project (active project). Sessions are a flat,
+  // newest-first list — 새 태스크 = 순수 새 세션 (아카이브 모델, 체인 없음).
   const openPicker = async () => {
-    setExpandedChains(new Set());
     let sessions: SessionSummary[] = [];
     if (activeProject) {
       const raw = await invoke<
@@ -679,7 +667,6 @@ export function MainArea() {
           title: string;
           date: string;
           count: number;
-          prev_uuid?: string | null;
         }[]
       >("claude_sessions", { project: activeProject }).catch(() => []);
       sessions = raw.map((s) => ({
@@ -688,59 +675,20 @@ export function MainArea() {
         title: s.title,
         date: s.date,
         count: s.count,
-        prev_uuid: s.prev_uuid ?? null,
         project: activeProject,
       }));
     }
     setNewName(`Claude ${sessions.length + openKindCount("claudeterm") + 1}`);
-    setPicker(sessions); // open-session filtering + chain grouping happen at render
+    setPicker(sessions); // open-session filtering happens at render
   };
 
-  // Picker rows: group saved task sessions into chains (head + collapsed previous
-  // tasks). Already-open sessions never appear as rows (their predecessors still
-  // surface via the fallback below). Chain indexing keys on uuid alone — handoff
-  // uuids are random v4 (globally unique); the React row key is still compounded
-  // with project to be safe (codex P2 F2).
-  const pickerRows = (): { s: SessionSummary; depth: number; hasPrev: boolean }[] => {
+  // Picker rows: saved sessions newest-first, excluding already-open ones.
+  const pickerRows = (): SessionSummary[] => {
     if (picker == null) return [];
     const open = openSessionIds();
-    const byUuid = new Map(picker.map((s) => [s.id, s]));
-    const referenced = new Set(picker.map((s) => s.prev_uuid).filter(Boolean) as string[]);
-    const rows: { s: SessionSummary; depth: number; hasPrev: boolean }[] = [];
-    const visited = new Set<string>();
-
-    // Emit a chain rooted at `head`: the head row + (when expanded) its previous
-    // tasks, both skipping already-open sessions.
-    const emit = (head: SessionSummary) => {
-      visited.add(head.id);
-      const prev: SessionSummary[] = [];
-      const seen = new Set([head.id]);
-      let cur = head.prev_uuid ? byUuid.get(head.prev_uuid) : undefined;
-      while (cur && !seen.has(cur.id)) {
-        seen.add(cur.id);
-        visited.add(cur.id);
-        prev.push(cur);
-        cur = cur.prev_uuid ? byUuid.get(cur.prev_uuid) : undefined;
-      }
-      const shownPrev = prev.filter((p) => !open.has(p.id));
-      rows.push({ s: head, depth: 0, hasPrev: shownPrev.length > 0 });
-      if (expandedChains.has(head.id)) {
-        for (const p of shownPrev) rows.push({ s: p, depth: 1, hasPrev: false });
-      }
-    };
-
-    // Heads = sessions no one continues from (the latest task of each chain).
-    const heads = picker
-      .filter((s) => !referenced.has(s.id) && !open.has(s.id))
+    return picker
+      .filter((s) => !open.has(s.id))
       .sort((a, b) => b.date.localeCompare(a.date));
-    for (const head of heads) emit(head);
-    // Fallback: any session not reached from a head (pure cycle / orphan, or a
-    // predecessor whose head is currently open) — emit so nothing is silently
-    // dropped (codex P2 F3).
-    for (const s of picker) {
-      if (!visited.has(s.id) && !open.has(s.id)) emit(s);
-    }
-    return rows;
   };
 
   const createNewSession = () => {
@@ -979,25 +927,9 @@ export function MainArea() {
               if (rows.length === 0) return null;
               return (
                 <>
-                  <div className="claude-picker-sep">저장된 task</div>
-                  {rows.map(({ s, depth, hasPrev }) => (
-                    <div
-                      key={`${s.project}:${s.id}`}
-                      className="claude-picker-row"
-                      style={{ paddingLeft: 4 + depth * 16 }}
-                    >
-                      <span
-                        className="claude-picker-caret"
-                        onClick={(e) => {
-                          if (!hasPrev) return;
-                          e.stopPropagation();
-                          toggleChain(s.id);
-                        }}
-                        style={{ visibility: hasPrev ? "visible" : "hidden" }}
-                        title={expandedChains.has(s.id) ? "이전 task 접기" : "이전 task 펼치기"}
-                      >
-                        {expandedChains.has(s.id) ? "▾" : "▸"}
-                      </span>
+                  <div className="claude-picker-sep">저장된 세션</div>
+                  {rows.map((s) => (
+                    <div key={`${s.project}:${s.id}`} className="claude-picker-row">
                       <button
                         className="claude-picker-item"
                         onClick={() => {
@@ -1009,10 +941,7 @@ export function MainArea() {
                           });
                         }}
                       >
-                        <span className="claude-picker-title">
-                          {depth > 0 ? "↳ " : ""}
-                          {s.name || "(이름 없음)"}
-                        </span>
+                        <span className="claude-picker-title">{s.name || "(이름 없음)"}</span>
                         <span className="claude-picker-meta">
                           {s.title ? `${s.title.slice(0, 40)} · ` : ""}
                           {s.date} · 변경 {s.count}
