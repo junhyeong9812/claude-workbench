@@ -149,6 +149,12 @@ fn main() {
             skipped_probe += 1;
             continue;
         };
+        // 일회성 스크래치 세션(/tmp cwd)은 보존 가치가 없다 — 추출 비용도 아낀다.
+        if cwd.starts_with("/tmp/") {
+            eprintln!("skip(/tmp 스크래치): {}", c.uuid);
+            skipped_probe += 1;
+            continue;
+        }
         let date = date.unwrap_or_else(|| "unknown".to_string());
         by_project.entry(cwd).or_default().push((c, date, text));
     }
