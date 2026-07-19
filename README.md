@@ -1,6 +1,6 @@
 # Claude Workbench
 
-여러 **Claude Code CLI 세션**을 타임라인·핸드오프로 오케스트레이션하고, 터미널·Git·에디터·스터디(2폴더 비교)를 한 화면에서 다루는 **Claude 중심 IDE 셸**.
+여러 **Claude Code CLI 세션**을 타임라인으로 보고 **아카이브(책·요약·지식 베이스)**로 기록하며, 터미널·Git·에디터·스터디(2폴더 비교)를 한 화면에서 다루는 **Claude 중심 IDE 셸**.
 
 > Tauri 2 (Rust) + React + TypeScript. 데스크톱(Linux/WebKitGTK 검증) 앱.
 > 패키지/바이너리 `claude-workbench`. 번들 식별자만 `com.multiterminal.dev` 유지(앱 저장 상태 경로 보존).
@@ -14,8 +14,9 @@
 - **멀티 터미널** — xterm.js + PTY. 테마/폰트 크기/색 커스텀.
 - **Claude Code 세션 (아키텍처 A)** — 진짜 `claude` CLI를 PTY로 띄우고, 세션 JSONL(`~/.claude/projects/<slug>/<uuid>.jsonl`)을 tail 해 **타임라인**으로 렌더.
   - 멀티 세션, 세션 관리(생성/재오픈/닫기/삭제/rename), 토큰 사용량·서브에이전트 트리.
-  - **task 핸드오프** — 이전 task를 헤드리스 요약 → 새 세션으로 재기동 + 요약 시드 주입, `prev_uuid` 체인으로 타임라인 stitching.
-  - **재시작 세션 재개** — 안정 UUID로 `--resume`/`--session-id`(대화 없어도 동일 세션 유지).
+  - **세션 아카이브 (라이브 체크포인트)** — 버튼 한 번으로 JSONL 원본 복사 + 정규화 JSON + **자기완결 `book.html`**(대화를 처음부터 단계별로 넘겨보는 책, 외부 의존 0) + 헤드리스 `claude -p` 추출로 **요약·지식 베이스**(issue/method/domain frontmatter + INDEX.md) 생성. 멱등 재아카이브, 세션은 계속 사용 가능.
+  - **아카이브 브라우저** — 사이드바 탭에서 프로젝트별 `날짜-요약-uuid` 트리로 열람(책=시스템 브라우저, 요약/지식=peek 뷰어). 저장 위치는 중앙 기본 + 설정 변경.
+  - **재시작 세션 재개** — 안정 UUID로 `--resume`/`--session-id`(대화 없어도 동일 세션 유지). 새 태스크 = 순수 새 세션(체인 없음 — 맥락은 아카이브가 담당).
 - **에디터 / 뷰어** — CodeMirror 6. 트리 키보드 네비 + peek 뷰어(Enter/↑↓/Esc, Ctrl+E 에디터), dockview 패널 편집·저장(Ctrl+S, 원자적 write). 디스크 리로드(폴링 + ↻).
 - **Git 패널 (사이드바 빌트인)** — 상태/스테이지/커밋, 로컬·원격 브랜치 전환·생성·삭제, merge·fetch·pull·push·stash·tag, **머지 충돌 해결**(내것/상대/인라인 편집), **멀티레인 커밋 그래프**(정렬), diff 뷰어, **worktree**.
 - **스터디 모드** — 두 폴더를 좌우로 동시 탐색/비교: `[좌SB][좌뷰어][우뷰어][우SB]` + 하단 단일 Claude 세션(질문·고민 기록).
@@ -91,6 +92,8 @@ Categories=Development;Utility;
 ## 아키텍처 노트 (A)
 
 앱이 UUID를 생성해 `claude --session-id <uuid>`로 세션을 시작(또는 `--resume <uuid>`로 이어붙임)하고, claude가 쓰는 **네이티브 세션 JSONL**을 tail 한다. 즉 앱이 이벤트를 따로 저장하지 않고 **claude의 파일을 단일 출처로** 읽어 타임라인을 구성한다. (구버전 B = ACP 커스텀 프로토콜은 제거됨.)
+
+**아카이브**도 같은 원칙의 파생물이다: 원본 JSONL은 절대 수정하지 않고(복사만), 정규화 JSON·book.html·지식 파일은 전부 원본에서 재생성 가능하다. 과거의 task 핸드오프 체인(요약 시드 재기동 + `prev_uuid` stitching)은 이 아카이브 모델로 대체·제거됐다.
 
 ---
 
