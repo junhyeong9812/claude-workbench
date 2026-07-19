@@ -9,7 +9,9 @@
 // normalized.json and book.html always land first). The source transcript under
 // ~/.claude/projects is read, never modified.
 
+use std::collections::HashSet;
 use std::path::PathBuf;
+use std::sync::{Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -17,6 +19,14 @@ use serde::Serialize;
 use tauri::{AppHandle, Manager};
 
 use super::{io_message, AppError};
+
+/// Sessions with an archive currently in flight. All windows share this process,
+/// so an in-process set fully serializes concurrent "아카이브" clicks on the same
+/// session (which would otherwise race the knowledge delete→write→INDEX cycle).
+fn in_flight() -> &'static Mutex<HashSet<String>> {
+    static SET: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+    SET.get_or_init(|| Mutex::new(HashSet::new()))
+}
 
 /// Run a one-shot `claude -p --output-format text` in `cwd`, feeding `prompt` on
 /// stdin and capturing stdout. Drains stdout/stderr on threads (so a full pipe
@@ -156,9 +166,22 @@ pub async fn archive_session(
     cwd: String,
     uuid: String,
 ) -> Result<ArchiveResult, AppError> {
-    tauri::async_runtime::spawn_blocking(move || archive_session_blocking(app, cwd, uuid))
+    {
+        let mut set = in_flight()
+            .lock()
+            .map_err(|_| AppError::new("Archive state unavailable"))?;
+        if !set.insert(uuid.clone()) {
+            return Err(AppError::new("이 세션은 이미 아카이브 진행 중입니다"));
+        }
+    }
+    let key = uuid.clone();
+    let result = tauri::async_runtime::spawn_blocking(move || archive_session_blocking(app, cwd, uuid))
         .await
-        .map_err(|_| AppError::new("Archive task failed to run"))?
+        .map_err(|_| AppError::new("Archive task failed to run"));
+    if let Ok(mut set) = in_flight().lock() {
+        set.remove(&key);
+    }
+    result?
 }
 
 fn archive_session_blocking(
@@ -212,22 +235,29 @@ fn archive_session_blocking(
     let out = core_lib::archive::write_archive(&root, &cwd, &session, &jsonl_bytes)
         .map_err(|e| AppError::new(io_message("Cannot write archive", &e)))?;
 
-    // Summary + knowledge land after the core archive; their failure downgrades
-    // to a reported extraction error, never a failed archive.
+    // Summary + knowledge land after the core archive; their failures downgrade
+    // to reported extraction errors (merged, so neither masks the other), never
+    // a failed archive.
     let mut summary_ok = false;
     let mut knowledge_files = 0;
+    let mut errors: Vec<String> = extraction_error.into_iter().collect();
     if let Some(ex) = extraction {
         if !ex.summary.trim().is_empty() {
             match std::fs::write(out.dir.join("summary.md"), &ex.summary) {
                 Ok(()) => summary_ok = true,
-                Err(e) => extraction_error = Some(io_message("Cannot save summary", &e)),
+                Err(e) => errors.push(io_message("Cannot save summary", &e)),
             }
         }
         match core_lib::knowledge::write_knowledge(&root, &cwd, &uuid, &date, &ex.entries) {
             Ok(paths) => knowledge_files = paths.len(),
-            Err(e) => extraction_error = Some(io_message("Cannot save knowledge", &e)),
+            Err(e) => errors.push(io_message("Cannot save knowledge", &e)),
         }
     }
+    let extraction_error = if errors.is_empty() {
+        None
+    } else {
+        Some(errors.join(" / "))
+    };
 
     Ok(ArchiveResult {
         dir: out.dir.to_string_lossy().to_string(),
@@ -264,6 +294,12 @@ pub struct ArchiveProjectGroup {
 #[tauri::command]
 pub fn archive_list(app: AppHandle) -> Result<Vec<ArchiveProjectGroup>, AppError> {
     let root = archive_root(&app)?;
+    // An absent root is a real empty archive; an *unreadable* existing root
+    // (permissions) must surface, not render as "no archives" (리뷰 K5).
+    if root.is_dir() {
+        std::fs::read_dir(&root)
+            .map_err(|e| AppError::new(io_message("Cannot read archive", &e)))?;
+    }
     let path_s = |p: PathBuf| p.to_string_lossy().to_string();
     Ok(core_lib::archive::list_archives(&root)
         .into_iter()
