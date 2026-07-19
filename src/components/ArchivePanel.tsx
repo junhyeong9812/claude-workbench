@@ -31,6 +31,8 @@ export function ArchivePanel() {
   const [error, setError] = useState<string | null>(null);
   const [collapsed, setCollapsed] = useState<Set<string>>(new Set());
   const setPeekFile = useAppStore((s) => s.setPeekFile);
+  const archiveRoot = useAppStore((s) => s.archiveRoot);
+  const setArchiveRoot = useAppStore((s) => s.setArchiveRoot);
 
   const load = () => {
     setError(null);
@@ -39,6 +41,24 @@ export function ArchivePanel() {
       .catch((e) => setError(errText(e)));
   };
   useEffect(load, []);
+  // 아카이브 완료(ClaudeTermPanel) 시 즉시 반영 — 탭이 이미 열려 있어도 새 세션이
+  // 수동 새로고침 없이 나타난다.
+  useEffect(() => {
+    window.addEventListener("mt-archive-updated", load);
+    return () => window.removeEventListener("mt-archive-updated", load);
+  }, []);
+
+  // 저장 경로 변경(기본 = 앱 데이터 폴더). 빈 값 = 기본으로 복귀. 변경 후 재조회.
+  const changeRoot = () => {
+    const next = window.prompt(
+      "아카이브 저장 경로 (비우면 기본: 앱 데이터 폴더/archive)",
+      archiveRoot ?? "",
+    );
+    if (next === null) return; // 취소
+    setArchiveRoot(next);
+    // persist는 fire-and-forget이라 백엔드 반영 직후 목록을 다시 읽는다.
+    setTimeout(load, 150);
+  };
 
   const toggle = (project: string) =>
     setCollapsed((prev) => {
@@ -56,9 +76,18 @@ export function ArchivePanel() {
     <div className="archive-panel">
       <div className="archive-head">
         <span>세션 아카이브</span>
-        <button className="archive-refresh" title="다시 읽기" onClick={load}>
-          ↻
-        </button>
+        <span className="archive-head-actions">
+          <button
+            className="archive-btn"
+            title={`저장 경로 변경 (현재: ${archiveRoot ?? "기본 — 앱 데이터 폴더/archive"})`}
+            onClick={changeRoot}
+          >
+            경로
+          </button>
+          <button className="archive-refresh" title="다시 읽기" onClick={load}>
+            ↻
+          </button>
+        </span>
       </div>
       {error && <div className="archive-error">{error}</div>}
       {!error && groups.length === 0 && (

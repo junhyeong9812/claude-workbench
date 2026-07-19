@@ -338,6 +338,11 @@ body {
   color: var(--fg-dim);
   border-bottom: 1px solid var(--border, #333);
 }
+.archive-head-actions {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
 .archive-refresh {
   background: transparent;
   border: none;
