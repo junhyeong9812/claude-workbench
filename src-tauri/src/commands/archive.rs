@@ -186,7 +186,7 @@ fn archive_session_blocking(
     let opts = extraction_opts(&app);
     match core_lib::claude_cli::run_claude_p(
         &cwd,
-        &extraction_prompt(&rendered),
+        &core_lib::knowledge::extraction_prompt(&rendered),
         Duration::from_secs(300),
         &opts,
     ) {
@@ -218,6 +218,26 @@ fn archive_session_blocking(
             Err(e) => errors.push(io_message("Cannot save knowledge", &e)),
         }
     }
+    // 지식 MCP 서버를 대상 프로젝트 .mcp.json에 등록(병합·멱등) — 이후 그
+    // 프로젝트의 Claude 세션이 이슈 발생 시 과거 지식을 바로 조회한다. 서버
+    // 바이너리는 앱 실행 파일 옆(knowledge-mcp) — dev(target/…)와 설치본 모두
+    // 같은 규약. 실패·부재는 보고만(아카이브는 성공).
+    let proj_path = std::path::Path::new(&cwd);
+    if proj_path.is_dir() {
+        let bin = std::env::current_exe()
+            .ok()
+            .and_then(|p| p.parent().map(|d| d.join("knowledge-mcp")));
+        match bin {
+            Some(bin) if bin.is_file() => {
+                let kdir = core_lib::knowledge::knowledge_dir(&root, &cwd);
+                if let Err(e) = core_lib::mcp::register_in_mcp_json(proj_path, &bin, &kdir) {
+                    errors.push(io_message("Cannot register mcp", &e));
+                }
+            }
+            _ => errors.push("knowledge-mcp 바이너리 없음 — MCP 등록 생략".to_string()),
+        }
+    }
+
     // 3) No fresh summary → keep the previous archive's (last-good), mirroring
     // how knowledge entries persist when extraction fails. (Re-written here
     // because a retitle re-land above replaced the folder the early copy was
@@ -346,33 +366,3 @@ pub fn archive_open_path(app: AppHandle, path: String) -> Result<(), AppError> {
         .map_err(|_| AppError::new("시스템 뷰어를 열 수 없습니다"))
 }
 
-/// The fixed extraction contract. Output format is pinned hard (markers + fixed
-/// keys) because `core_lib::knowledge::parse_extraction` parses it; entries the
-/// model emits off-format are skipped there, never fatal.
-fn extraction_prompt(rendered: &str) -> String {
-    format!(
-        "다음은 끝난 Claude 코딩 세션의 타임라인이다. 이 세션을 아카이브하기 위해 (1) 제목+요약과 \
-(2) 지식 항목들을 추출하라.\n\n\
-출력 형식 (마커·키를 정확히 지킬 것, 다른 텍스트 금지):\n\
-===SUMMARY===\n\
-TITLE: <이 세션이 무엇을 했는지 한 줄 (40자 이내)>\n\
-<markdown 요약: (1) 목표와 한 일 (2) 핵심 변경 파일과 이유 (3) 미해결/다음 할 일>\n\n\
-그 뒤, 추출할 가치가 있는 지식마다 (없으면 생략):\n\
-===ENTRY===\n\
-type: issue | method | domain\n\
-title: <한 줄 — issue는 에러코드/원인을 제목으로>\n\
-error_code: <있으면, issue만>\n\
-problem: <해결한 문제 한 줄, method만>\n\
-applies_when: <재사용 조건 한 줄, method/domain>\n\
-status: resolved | open  (issue만)\n\
-tags: [소문자, 쉼표, 구분]\n\
-files: [관련 파일 경로]\n\
----\n\
-<markdown 본문 — issue: ## 증상(에러 원문 그대로) / ## 원인 / ## 해결 / ## 실패한 시도 / ## 재발 방지. \
-method: ## 상황 / ## 검토한 선택지 / ## 선택한 방법과 이유 / ## 결과 / ## 재사용 조건. \
-domain: ## 개념 / ## 상세 / ## 적용 맥락>\n\n\
-규칙: 이 세션에서 실제 발생·확인한 것만. 에러 메시지는 원문 보존(나중에 grep 대상). \
-사소한 오타 수정 따위는 항목으로 만들지 말 것. 항목 0개도 정상.\n\n\
-{rendered}"
-    )
-}
