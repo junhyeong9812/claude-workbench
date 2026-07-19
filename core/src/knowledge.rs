@@ -412,6 +412,12 @@ pub fn write_knowledge(
 /// Remove every knowledge file previously written for `session_uuid` (matched
 /// by its frontmatter, never by filename guessing).
 fn remove_session_entries(root: &Path, session_uuid: &str) -> io::Result<()> {
+    // Two phases: decide EVERYTHING first, delete only after every candidate
+    // was readable. Deleting while scanning would let a late read failure leave
+    // a half-removed session (some entries gone, none rewritten — post-fix P2);
+    // an unreadable file makes the removal decision unknowable, so it surfaces
+    // as an error before anything is touched (감사 A12).
+    let mut to_remove: Vec<std::path::PathBuf> = Vec::new();
     for kind in [KnowledgeKind::Issue, KnowledgeKind::Method, KnowledgeKind::Domain] {
         let dir = root.join(kind.dir_name());
         let entries = match fs::read_dir(&dir) {
@@ -424,17 +430,17 @@ fn remove_session_entries(root: &Path, session_uuid: &str) -> io::Result<()> {
             if path.extension().and_then(|e| e.to_str()) != Some("md") {
                 continue;
             }
-            // An unreadable file makes the removal decision unknowable — surface
-            // it instead of skipping (a silent skip would leave a stale entry and
-            // duplicate it on the re-write; 감사 A12).
             let text = fs::read_to_string(&path)?;
             let is_ours = parse_frontmatter(&text)
                 .and_then(|fm| fm.get("session").cloned())
                 .is_some_and(|s| s == session_uuid);
             if is_ours {
-                fs::remove_file(&path)?;
+                to_remove.push(path);
             }
         }
+    }
+    for path in to_remove {
+        fs::remove_file(&path)?;
     }
     Ok(())
 }
