@@ -250,7 +250,11 @@ fn html_escape(s: &str) -> String {
 pub fn render_book_html(session: &NormalizedSession) -> String {
     let json = serde_json::to_string(session)
         .unwrap_or_else(|_| "null".to_string())
-        .replace('<', "\\u003c");
+        .replace('<', "\\u003c")
+        // U+2028/U+2029 are legal in JSON but line terminators in older JS
+        // engines — escape them so the literal can never break.
+        .replace('\u{2028}', "\\u2028")
+        .replace('\u{2029}', "\\u2029");
     BOOK_TEMPLATE
         .replace("__TITLE__", &html_escape(&session.title))
         .replace("__DATA__", &json)
@@ -309,24 +313,61 @@ pub fn write_archive(
         return Err(e);
     }
 
-    // Drop any previous archive of this session (suffix match, so a changed
-    // title/date can't leave a duplicate folder behind).
+    // Find the previous archive of THIS session: candidates share the `-{uuid8}`
+    // suffix, but only a full-uuid match in their `meta.json` (or an exact
+    // final-name match) counts — a different session that merely shares the
+    // first 8 uuid chars must never be deleted (silent data loss).
     let suffix = format!("-{short}");
-    let mut replaced = false;
+    let mut previous: Vec<PathBuf> = Vec::new();
     if let Ok(entries) = fs::read_dir(&sessions_dir) {
         for entry in entries.flatten() {
+            let path = entry.path();
             let name = entry.file_name();
             let name = name.to_string_lossy();
-            if entry.path().is_dir() && !name.starts_with(".tmp-") && name.ends_with(&suffix) {
-                fs::remove_dir_all(entry.path())?;
-                replaced = true;
+            if !path.is_dir() || name.starts_with('.') || !name.ends_with(&suffix) {
+                continue;
+            }
+            let same_session = name == final_name
+                || fs::read_to_string(path.join("meta.json"))
+                    .ok()
+                    .and_then(|t| serde_json::from_str::<ArchiveMeta>(&t).ok())
+                    .is_some_and(|m| m.uuid == session.uuid);
+            if same_session {
+                previous.push(path);
             }
         }
     }
 
+    // Replace without a destructive window: move the previous folder(s) aside,
+    // land the new one, then drop the displaced copies. If the final rename
+    // fails, the displaced folders are moved back — a crash or error never
+    // leaves the session with no archive at all (only extra dot-dirs).
+    let replaced = !previous.is_empty();
+    let mut displaced: Vec<(PathBuf, PathBuf)> = Vec::new();
+    for (i, old) in previous.iter().enumerate() {
+        let aside = sessions_dir.join(format!(
+            ".old-{short}-{}-{}-{i}",
+            std::process::id(),
+            TMP_SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        if let Err(e) = fs::rename(old, &aside) {
+            for (orig, moved) in &displaced {
+                let _ = fs::rename(moved, orig);
+            }
+            let _ = fs::remove_dir_all(&tmp_dir);
+            return Err(e);
+        }
+        displaced.push((old.clone(), aside));
+    }
     if let Err(e) = fs::rename(&tmp_dir, &final_dir) {
+        for (orig, moved) in &displaced {
+            let _ = fs::rename(moved, orig);
+        }
         let _ = fs::remove_dir_all(&tmp_dir);
         return Err(e);
+    }
+    for (_, moved) in &displaced {
+        let _ = fs::remove_dir_all(moved);
     }
     Ok(ArchiveOutcome {
         book_path: final_dir.join("book.html"),
@@ -353,7 +394,10 @@ pub fn list_archives(archive_root: &Path) -> Vec<ArchiveProjectListing> {
         if let Ok(session_dirs) = fs::read_dir(pdir.join("sessions")) {
             for sdir in session_dirs.flatten() {
                 let dir = sdir.path();
-                if !dir.is_dir() {
+                // Skip work dirs (`.tmp-*` / `.old-*` from an interrupted replace).
+                if !dir.is_dir()
+                    || sdir.file_name().to_string_lossy().starts_with('.')
+                {
                     continue;
                 }
                 let Ok(text) = fs::read_to_string(dir.join("meta.json")) else { continue };
@@ -668,6 +712,39 @@ mod tests {
         let sessions = out_b.dir.parent().unwrap();
         assert_eq!(fs::read_dir(sessions).unwrap().flatten().count(), 2);
         let _ = fs::remove_dir_all(&root);
+    }
+
+    // 리뷰 K1: uuid 앞 8자가 같은 *다른* 세션은 삭제 대상이 아니다 — 판별은
+    // 폴더 suffix가 아니라 meta.json의 전체 uuid.
+    #[test]
+    fn shared_uuid8_prefix_does_not_delete_other_session() {
+        let root = temp_root("prefix");
+        let jsonl = sample_jsonl("p");
+        let a = sample_session("작업 A"); // abcd1234-...
+        let mut b = sample_session("작업 B");
+        b.uuid = format!("{}-9999-8888-7777-666655554444", &UUID[..8]); // 같은 앞 8자
+        let out_a = write_archive(&root, "/p", &a, jsonl.as_bytes()).unwrap();
+        let out_b = write_archive(&root, "/p", &b, jsonl.as_bytes()).unwrap();
+        assert!(!out_b.replaced, "같은 8자 접두여도 전체 uuid가 다르면 교체 아님");
+        assert!(out_a.dir.exists(), "기존 세션 아카이브 보존");
+        assert_eq!(
+            fs::read_dir(out_b.dir.parent().unwrap()).unwrap().flatten().count(),
+            2
+        );
+        // 같은 세션 재아카이브는 여전히 자신만 교체.
+        let out_b2 = write_archive(&root, "/p", &b, jsonl.as_bytes()).unwrap();
+        assert!(out_b2.replaced);
+        assert!(out_a.dir.exists());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    // 리뷰 K12: U+2028/2029(JS 라인 종결자)는 JSON 페이로드에서 이스케이프된다.
+    #[test]
+    fn book_html_escapes_js_line_separators() {
+        let s = normalize("/p", UUID, "t", "2026-07-19", &sample_jsonl("줄\u{2028}분리\u{2029}끝"));
+        let html = render_book_html(&s);
+        assert!(!html.contains('\u{2028}') && !html.contains('\u{2029}'));
+        assert!(html.contains("\\u2028") && html.contains("\\u2029"));
     }
 
     #[test]
