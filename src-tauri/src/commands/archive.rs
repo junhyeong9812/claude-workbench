@@ -29,6 +29,21 @@ fn in_flight() -> &'static Mutex<HashSet<String>> {
     SET.get_or_init(|| Mutex::new(HashSet::new()))
 }
 
+/// RAII release of an in-flight key — dropping the command future (window
+/// closed mid-await) must release the slot too, not just the normal return
+/// paths (post-fix P4).
+struct InFlightGuard {
+    key: String,
+}
+
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        if let Ok(mut set) = in_flight().lock() {
+            set.remove(&self.key);
+        }
+    }
+}
+
 /// Run a one-shot `claude -p --output-format text` in `cwd`, feeding `prompt` on
 /// stdin and capturing stdout. Drains stdout/stderr on threads (so a full pipe
 /// can't deadlock the child), enforces `timeout` with kill+wait (no zombie), caps
@@ -167,22 +182,23 @@ pub async fn archive_session(
     cwd: String,
     uuid: String,
 ) -> Result<ArchiveResult, AppError> {
+    // Canonical project identity, so `.`/trailing-slash/symlink aliases of the
+    // same project can't slip past the guard (post-fix P4).
+    let key = std::fs::canonicalize(&cwd)
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_else(|_| cwd.clone());
     {
         let mut set = in_flight()
             .lock()
             .map_err(|_| AppError::new("Archive state unavailable"))?;
-        if !set.insert(cwd.clone()) {
+        if !set.insert(key.clone()) {
             return Err(AppError::new("이 프로젝트는 이미 아카이브 진행 중입니다"));
         }
     }
-    let key = cwd.clone();
-    let result = tauri::async_runtime::spawn_blocking(move || archive_session_blocking(app, cwd, uuid))
+    let _guard = InFlightGuard { key };
+    tauri::async_runtime::spawn_blocking(move || archive_session_blocking(app, cwd, uuid))
         .await
-        .map_err(|_| AppError::new("Archive task failed to run"));
-    if let Ok(mut set) = in_flight().lock() {
-        set.remove(&key);
-    }
-    result?
+        .map_err(|_| AppError::new("Archive task failed to run"))?
 }
 
 fn archive_session_blocking(
@@ -220,24 +236,39 @@ fn archive_session_blocking(
 
     // Last-good summary of a previous archive of this session — read BEFORE the
     // first write below displaces that folder (감사 A1: 지식만 남고 요약만
-    // 사라지는 비대칭 방지).
+    // 사라지는 비대칭 방지). A read failure is reported, not swallowed.
+    let mut errors: Vec<String> = Vec::new();
     let prev_summary = core_lib::archive::list_archives(&root)
         .into_iter()
         .flat_map(|p| p.sessions)
         .find(|s| s.meta.uuid == uuid)
         .and_then(|s| s.summary_path)
-        .and_then(|p| std::fs::read_to_string(p).ok());
+        .and_then(|p| match std::fs::read_to_string(&p) {
+            Ok(text) => Some(text),
+            Err(e) => {
+                errors.push(io_message("Cannot read previous summary", &e));
+                None
+            }
+        });
 
     // 1) The core archive lands FIRST, under the fallback title — an app quit or
     // crash during the (up to 3-minute) extraction below must never cost the
     // transcript copy + book (감사 A11 — "부분 성공은 먼저 남아야 성립").
     let mut out = core_lib::archive::write_archive(&root, &cwd, &session, &jsonl_bytes)
         .map_err(|e| AppError::new(io_message("Cannot write archive", &e)))?;
+    let replaced = out.replaced;
+    // The last-good summary goes to disk NOW — held only in memory, a crash
+    // during extraction would lose it for good (post-fix P3). A fresh summary
+    // below simply overwrites it.
+    if let Some(prev) = &prev_summary {
+        if let Err(e) = std::fs::write(out.dir.join("summary.md"), prev) {
+            errors.push(io_message("Cannot keep previous summary", &e));
+        }
+    }
 
     // 2) Extraction (title + summary + knowledge) — best-effort. Failures merge
     // into reported errors (neither masks the other), never a failed archive.
     let mut extraction = None;
-    let mut errors: Vec<String> = Vec::new();
     let rendered = core_lib::knowledge::render_session_for_extraction(&session);
     match run_claude_p(&cwd, &extraction_prompt(&rendered), Duration::from_secs(180)) {
         Ok(raw) => extraction = Some(core_lib::knowledge::parse_extraction(&raw)),
@@ -269,12 +300,17 @@ fn archive_session_blocking(
         }
     }
     // 3) No fresh summary → keep the previous archive's (last-good), mirroring
-    // how knowledge entries persist when extraction fails.
+    // how knowledge entries persist when extraction fails. (Re-written here
+    // because a retitle re-land above replaced the folder the early copy was
+    // in.) A restore failure is reported like any other (post-fix P6).
     if !summary_ok {
         if let Some(prev) = prev_summary {
-            if std::fs::write(out.dir.join("summary.md"), prev).is_ok() {
-                summary_ok = true;
-                errors.push("요약은 이전 아카이브분을 유지".to_string());
+            match std::fs::write(out.dir.join("summary.md"), prev) {
+                Ok(()) => {
+                    summary_ok = true;
+                    errors.push("요약은 이전 아카이브분을 유지".to_string());
+                }
+                Err(e) => errors.push(io_message("Cannot keep previous summary", &e)),
             }
         }
     }
@@ -287,7 +323,10 @@ fn archive_session_blocking(
     Ok(ArchiveResult {
         dir: out.dir.to_string_lossy().to_string(),
         book_path: out.book_path.to_string_lossy().to_string(),
-        replaced: out.replaced,
+        // The FIRST write's verdict — the retitle re-land always "replaces" the
+        // fallback folder it just made, which is not a user-meaningful replace
+        // (post-fix P7).
+        replaced,
         summary_ok,
         knowledge_files,
         extraction_error,
@@ -320,8 +359,12 @@ pub struct ArchiveProjectGroup {
 pub fn archive_list(app: AppHandle) -> Result<Vec<ArchiveProjectGroup>, AppError> {
     let root = archive_root(&app)?;
     // An absent root is a real empty archive; an *unreadable* existing root
-    // (permissions) must surface, not render as "no archives" (리뷰 K5).
-    if root.is_dir() {
+    // (permissions) or a root that isn't a directory (misconfigured setting)
+    // must surface, not render as "no archives" (리뷰 K5, post-fix).
+    if root.exists() {
+        if !root.is_dir() {
+            return Err(AppError::new("아카이브 경로가 폴더가 아닙니다"));
+        }
         std::fs::read_dir(&root)
             .map_err(|e| AppError::new(io_message("Cannot read archive", &e)))?;
     }
