@@ -100,9 +100,6 @@ pub struct SnapshotSummary {
     pub date: String,
     /// Number of tool-call items recorded.
     pub count: usize,
-    /// The task this session continues from (handoff chain link, from the `.task`
-    /// sidecar) — lets the picker group sessions into task chains.
-    pub prev_uuid: Option<String>,
 }
 
 fn dir(base: &Path, project: &str) -> PathBuf {
@@ -294,14 +291,12 @@ pub fn list(base: &Path, project: &str) -> Vec<SnapshotSummary> {
             .map(|(_, p)| p.clone())
             .unwrap_or_default();
         let name = read_name(base, project, &snap.uuid).unwrap_or(snap.name);
-        let prev_uuid = read_task_meta(base, project, &snap.uuid).and_then(|m| m.prev_uuid);
         out.push(SnapshotSummary {
             uuid: snap.uuid,
             name,
             title,
             date: snap.date,
             count: snap.items.len(),
-            prev_uuid,
         });
     }
     out.sort_by(|a, b| b.date.cmp(&a.date).then(a.name.cmp(&b.name)));
@@ -334,103 +329,6 @@ pub fn load(base: &Path, project: &str, uuid: &str) -> Option<SessionSnapshot> {
     snap.title = read_title(base, project, uuid);
     snap.summary = read_summary(base, project, uuid);
     Some(snap)
-}
-
-/// Reconstruct a handoff chain: walk `prev_uuid` from `head` back to the root and
-/// return the sessions **oldest-first**, so the UI can render one continuous
-/// timeline across restarts (each task is a separate session). The link is
-/// followed via the `.task` sidecar — which exists even before a just-restarted
-/// head has saved a snapshot body — so the chain still reaches the previous tasks
-/// that *do* have snapshots (a head with no snapshot is simply absent from the
-/// result, not a dead end). A cycle (corrupt `prev_uuid`) is bounded by a visited
-/// set so it can't loop forever.
-pub fn load_chain(base: &Path, project: &str, head: &str) -> Vec<SessionSnapshot> {
-    let mut chain = Vec::new();
-    let mut seen = std::collections::HashSet::new();
-    let mut cur = Some(head.to_string());
-    while let Some(uuid) = cur {
-        if !seen.insert(uuid.clone()) {
-            break; // cycle guard
-        }
-        let next = read_task_meta(base, project, &uuid).and_then(|m| m.prev_uuid);
-        if let Some(snap) = load(base, project, &uuid) {
-            chain.push(snap);
-        }
-        cur = next;
-    }
-    chain.reverse(); // oldest-first
-    chain
-}
-
-/// Char-boundary-safe truncation with an ellipsis, so a long prompt/answer can't
-/// blow the handoff prompt (and never panics on a multi-byte boundary).
-fn truncate_chars(s: &str, max: usize) -> String {
-    if s.chars().count() <= max {
-        return s.to_string();
-    }
-    let head: String = s.chars().take(max).collect();
-    format!("{head}…")
-}
-
-/// Render a session's timeline as compact text for a handoff-summary prompt
-/// (`claude -p`): each turn's user prompt, the assistant's answer, and the files
-/// that turn changed. Bounded by the caps below so a huge session can't blow the
-/// prompt — only the most recent `MAX_TURNS` are kept (most relevant to a
-/// hand-off), with a note about how many older turns were dropped (no silent
-/// truncation). Subagent-only file changes are not enumerated here (the snapshot
-/// body doesn't persist them — the spawning Agent/Task call and its result are).
-pub fn render_for_summary(snap: &SessionSnapshot) -> String {
-    use std::fmt::Write as _;
-    const MAX_TURNS: usize = 200;
-    const MAX_TEXT: usize = 800; // per prompt/answer char cap
-    const MAX_FILES_PER_TURN: usize = 40;
-
-    let mut out = String::new();
-    let _ = writeln!(
-        out,
-        "# 이전 작업(task) 타임라인 — \"{}\" ({})",
-        snap.name, snap.date
-    );
-
-    let answers: std::collections::HashMap<u64, &String> =
-        snap.answers.iter().map(|(t, a)| (*t, a)).collect();
-    let mut files_by_turn: std::collections::BTreeMap<u64, Vec<String>> = Default::default();
-    for it in &snap.items {
-        for d in &it.diffs {
-            files_by_turn
-                .entry(it.turn)
-                .or_default()
-                .push(d.path.display().to_string());
-        }
-    }
-
-    let mut turns = snap.turns.clone();
-    turns.sort_by_key(|(t, _)| *t);
-    let total = turns.len();
-    let start = total.saturating_sub(MAX_TURNS);
-    if start > 0 {
-        let _ = writeln!(out, "\n(앞 {start} turn 생략 — 최근 {MAX_TURNS} turn만)");
-    }
-    for (t, prompt) in turns.iter().skip(start) {
-        let _ = writeln!(out, "\n## Turn {t}");
-        let _ = writeln!(out, "- 사용자: {}", truncate_chars(prompt, MAX_TEXT));
-        if let Some(ans) = answers.get(t) {
-            let _ = writeln!(out, "- 어시스턴트: {}", truncate_chars(ans, MAX_TEXT));
-        }
-        if let Some(files) = files_by_turn.get(t) {
-            let mut uniq: Vec<&String> = files.iter().collect();
-            uniq.sort();
-            uniq.dedup();
-            if !uniq.is_empty() {
-                let shown: Vec<&str> = uniq.iter().take(MAX_FILES_PER_TURN).map(|s| s.as_str()).collect();
-                let _ = writeln!(out, "- 변경 파일: {}", shown.join(", "));
-                if uniq.len() > MAX_FILES_PER_TURN {
-                    let _ = writeln!(out, "  (외 {}개 생략)", uniq.len() - MAX_FILES_PER_TURN);
-                }
-            }
-        }
-    }
-    out
 }
 
 /// Delete a session's snapshot body + name override (the `삭제` action). Missing
@@ -533,18 +431,6 @@ mod tests {
         assert_eq!(sessions[0].uuid, "u2", "newest date first");
         assert_eq!(sessions[0].title, "first prompt");
         assert_eq!(sessions[0].count, 4);
-        let _ = fs::remove_dir_all(&base);
-    }
-
-    #[test]
-    fn list_includes_prev_uuid_for_chain_grouping() {
-        let base = temp_base("listprev");
-        save(&base, "/p", &snap("u1", "n", "2026-06-19", 1)).unwrap();
-        save(&base, "/p", &snap("u2", "n", "2026-06-20", 1)).unwrap();
-        save_task_meta(&base, "/p", "u2", &TaskMeta { prev_uuid: Some("u1".into()), summary_path: None }).unwrap();
-        let list = list(&base, "/p");
-        assert_eq!(list.iter().find(|s| s.uuid == "u2").unwrap().prev_uuid, Some("u1".to_string()));
-        assert_eq!(list.iter().find(|s| s.uuid == "u1").unwrap().prev_uuid, None);
         let _ = fs::remove_dir_all(&base);
     }
 
@@ -654,107 +540,6 @@ mod tests {
         assert_eq!(got.prev_uuid, Some("u1".to_string()));
         assert_eq!(got.summary_path, Some("/x/summary.md".to_string()));
         let _ = fs::remove_dir_all(&base);
-    }
-
-    #[test]
-    fn load_chain_walks_prev_uuid_oldest_first() {
-        let base = temp_base("chain");
-        for u in ["u1", "u2", "u3"] {
-            save(&base, "/p", &snap(u, "n", "2026-06-19", 1)).unwrap();
-        }
-        // u1 <- u2 <- u3 (u3 is the head/newest task).
-        save_task_meta(&base, "/p", "u2", &TaskMeta { prev_uuid: Some("u1".into()), summary_path: None }).unwrap();
-        save_task_meta(&base, "/p", "u3", &TaskMeta { prev_uuid: Some("u2".into()), summary_path: None }).unwrap();
-        let chain = load_chain(&base, "/p", "u3");
-        let uuids: Vec<_> = chain.iter().map(|s| s.uuid.as_str()).collect();
-        assert_eq!(uuids, vec!["u1", "u2", "u3"], "oldest-first");
-        let _ = fs::remove_dir_all(&base);
-    }
-
-    #[test]
-    fn load_chain_is_bounded_on_cycle() {
-        let base = temp_base("cycle");
-        save(&base, "/p", &snap("a", "n", "d", 1)).unwrap();
-        save(&base, "/p", &snap("b", "n", "d", 1)).unwrap();
-        // a <-> b (corrupt cycle): the walk must terminate, not loop forever.
-        save_task_meta(&base, "/p", "a", &TaskMeta { prev_uuid: Some("b".into()), summary_path: None }).unwrap();
-        save_task_meta(&base, "/p", "b", &TaskMeta { prev_uuid: Some("a".into()), summary_path: None }).unwrap();
-        let chain = load_chain(&base, "/p", "a");
-        assert_eq!(chain.len(), 2, "each node visited once under the cycle guard");
-        let _ = fs::remove_dir_all(&base);
-    }
-
-    // A just-restarted head has a `.task` sidecar but no snapshot body yet; the
-    // chain must still reach the previous task (which does have a snapshot).
-    #[test]
-    fn load_chain_follows_link_without_head_snapshot() {
-        let base = temp_base("nohead");
-        save(&base, "/p", &snap("old", "n", "d", 1)).unwrap();
-        save_task_meta(&base, "/p", "new", &TaskMeta { prev_uuid: Some("old".into()), summary_path: None }).unwrap();
-        // "new" has only a sidecar (no .json) — load_chain still returns [old].
-        let chain = load_chain(&base, "/p", "new");
-        assert_eq!(chain.iter().map(|s| s.uuid.as_str()).collect::<Vec<_>>(), vec!["old"]);
-        let _ = fs::remove_dir_all(&base);
-    }
-
-    #[test]
-    fn load_chain_stops_at_missing_link() {
-        let base = temp_base("missing");
-        save(&base, "/p", &snap("u2", "n", "d", 1)).unwrap();
-        // u2.prev = u1 but u1 was never saved — the chain is just [u2].
-        save_task_meta(&base, "/p", "u2", &TaskMeta { prev_uuid: Some("u1".into()), summary_path: None }).unwrap();
-        let chain = load_chain(&base, "/p", "u2");
-        assert_eq!(chain.iter().map(|s| s.uuid.as_str()).collect::<Vec<_>>(), vec!["u2"]);
-        let _ = fs::remove_dir_all(&base);
-    }
-
-    #[test]
-    fn render_for_summary_includes_turns_answers_and_changed_files() {
-        use crate::timeline::{AgentStatus, FileDiff, ItemKind, WriteStatus};
-        let mut s = snap("u1", "내 작업", "2026-06-20", 0);
-        // Two turns with answers.
-        s.turns = vec![(1, "첫 질문".into()), (2, "둘째 질문".into())];
-        s.answers = vec![(1, "첫 답변".into()), (2, "둘째 답변".into())];
-        // An edit item on turn 2 that changed a file.
-        s.items = vec![TimelineItem {
-            session_id: "u1".into(),
-            tool_call_id: "c1".into(),
-            turn: 2,
-            seq: 0,
-            kind: ItemKind::Edit,
-            title: "edit".into(),
-            locations: vec![],
-            project_label: None,
-            cwd: None,
-            diffs: vec![FileDiff {
-                path: PathBuf::from("src/main.rs"),
-                old_text: Some("a".into()),
-                new_text: "b".into(),
-            }],
-            content_text: None,
-            raw_input: None,
-            agent_status: AgentStatus::Completed,
-            write_status: WriteStatus::None,
-            revision: 1,
-        }];
-        let text = render_for_summary(&s);
-        assert!(text.contains("내 작업"), "title present");
-        assert!(text.contains("첫 질문") && text.contains("첫 답변"));
-        assert!(text.contains("둘째 질문") && text.contains("둘째 답변"));
-        assert!(text.contains("src/main.rs"), "changed file listed");
-    }
-
-    #[test]
-    fn render_for_summary_truncates_long_text_safely() {
-        let mut s = snap("u1", "n", "d", 0);
-        // A long multi-byte (한글) prompt must truncate without panicking.
-        let long = "가".repeat(5000);
-        s.turns = vec![(1, long)];
-        s.answers = vec![];
-        let text = render_for_summary(&s);
-        assert!(text.contains('…'), "truncated with ellipsis");
-        // The whole 5000-char prompt is not emitted verbatim.
-        assert!(text.chars().filter(|c| *c == '가').count() < 5000);
     }
 
     #[test]

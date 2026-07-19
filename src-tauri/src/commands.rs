@@ -20,7 +20,6 @@ mod claude;
 mod files;
 mod git;
 mod ssh;
-mod task;
 mod terminal;
 
 pub use archive::*;
@@ -28,7 +27,6 @@ pub use claude::*;
 pub use files::*;
 pub use git::*;
 pub use ssh::*;
-pub use task::*;
 pub use terminal::*;
 
 /// A single, consistent error type shared by all commands.

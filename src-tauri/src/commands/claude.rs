@@ -719,22 +719,6 @@ pub fn claude_session_snapshot(
     core_lib::snapshot::load(&base, &project, &uuid)
 }
 
-/// Load a whole handoff chain (the `head` task and every task it continues from),
-/// oldest-first, so the panel can render one continuous timeline across the
-/// `/clear`-style restarts that split a task into separate sessions. Empty if the
-/// head is absent. (Task-chain links live in each session's `.task` sidecar.)
-#[tauri::command]
-pub fn claude_session_chain(
-    app: AppHandle,
-    project: String,
-    head_uuid: String,
-) -> Vec<core_lib::snapshot::SessionSnapshot> {
-    let Ok(base) = app.path().app_data_dir() else {
-        return vec![];
-    };
-    core_lib::snapshot::load_chain(&base, &project, &head_uuid)
-}
-
 /// Rename a saved session (persists in its snapshot; the poll thread reads the
 /// name back so it isn't clobbered).
 #[tauri::command]
