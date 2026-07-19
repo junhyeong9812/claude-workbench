@@ -68,6 +68,11 @@ pub struct NormalizedSession {
     pub model: Option<String>,
     /// Sum of all turns' token usage.
     pub total_tokens: TokenUsage,
+    /// Non-empty transcript lines that failed to parse as records (truncated
+    /// tail mid-write, corrupt lines). Recorded so a normalized/book gap is
+    /// diagnosable later instead of silently absent.
+    #[serde(default)]
+    pub skipped_lines: usize,
     pub turns: Vec<NormalizedTurn>,
 }
 
@@ -170,7 +175,13 @@ pub fn normalize(
     jsonl_text: &str,
 ) -> NormalizedSession {
     let mut mapper = JsonlMapper::new(project, uuid);
+    let mut skipped_lines = 0usize;
     for line in jsonl_text.lines() {
+        // Count what the defensive parser drops (mapper behavior unchanged) —
+        // a truncated tail from a live copy shows up here, not as silence.
+        if !line.trim().is_empty() && crate::jsonl::RawRecord::parse_line(line).is_none() {
+            skipped_lines += 1;
+        }
         mapper.apply_line(line);
     }
 
@@ -221,6 +232,7 @@ pub fn normalize(
         date: date.to_string(),
         model: mapper.model().map(str::to_string),
         total_tokens,
+        skipped_lines,
         turns,
     }
 }
