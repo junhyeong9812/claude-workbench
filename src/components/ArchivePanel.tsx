@@ -37,14 +37,16 @@ export function ArchivePanel() {
   const [collapsed, setCollapsed] = useState<Set<string>>(new Set());
   const setPeekFile = useAppStore((s) => s.setPeekFile);
   const archiveRoot = useAppStore((s) => s.archiveRoot);
-  const setArchiveRoot = useAppStore((s) => s.setArchiveRoot);
   const archiveModel = useAppStore((s) => s.archiveModel);
   const archiveEffort = useAppStore((s) => s.archiveEffort);
-  const setArchiveExtraction = useAppStore((s) => s.setArchiveExtraction);
+  const setArchiveConfig = useAppStore((s) => s.setArchiveConfig);
   // 설정 폼 (열려 있을 때만 로컬 편집값 유지; 저장 시 store로 확정).
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [formRoot, setFormRoot] = useState("");
   const [formModel, setFormModel] = useState("");
+  // "직접 입력…" 상태를 값 센티널이 아니라 별도 플래그로 — 큐레이션 값에서
+  // 직접 입력으로 전환이 안 되던 UX 결함 방지 (리뷰 G9).
+  const [customModel, setCustomModel] = useState(false);
   const [formEffort, setFormEffort] = useState("");
 
   const load = () => {
@@ -65,22 +67,26 @@ export function ArchivePanel() {
   const openSettings = () => {
     setFormRoot(archiveRoot ?? "");
     setFormModel(archiveModel ?? "");
+    setCustomModel(
+      archiveModel !== null && !MODEL_CHOICES.includes(archiveModel as (typeof MODEL_CHOICES)[number]),
+    );
     setFormEffort(archiveEffort ?? "");
     setSettingsOpen(true);
   };
 
   // 저장: 경로는 절대 경로만(빈 값 = 기본), 모델/effort 빈 값 = 기본(opus/xhigh).
-  // 저장 완료를 기다린 뒤 재조회한다(새 루트로 읽기 보장).
+  // 단일 setter로 한 번에 저장(경쟁 없음) + 실패 시 폼을 닫지 않고 알린다.
   const saveSettings = () => {
     const root = formRoot.trim();
     if (root !== "" && !root.startsWith("/")) {
       alert("경로는 절대 경로(/로 시작)만 사용할 수 있습니다.");
       return;
     }
-    void Promise.all([
-      setArchiveRoot(root === "" ? null : root),
-      setArchiveExtraction(formModel, formEffort),
-    ]).then(() => {
+    void setArchiveConfig(root === "" ? null : root, formModel, formEffort).then((saved) => {
+      if (!saved) {
+        alert("설정 저장에 실패했습니다 — 백엔드 로그를 확인하세요.");
+        return;
+      }
       setSettingsOpen(false);
       load();
     });
@@ -129,8 +135,15 @@ export function ArchivePanel() {
           <label className="archive-settings-row">
             <span>모델</span>
             <select
-              value={MODEL_CHOICES.includes(formModel as (typeof MODEL_CHOICES)[number]) || formModel === "" ? formModel : "custom"}
-              onChange={(e) => setFormModel(e.target.value === "custom" ? formModel || " " : e.target.value)}
+              value={customModel ? "custom" : formModel}
+              onChange={(e) => {
+                if (e.target.value === "custom") {
+                  setCustomModel(true);
+                } else {
+                  setCustomModel(false);
+                  setFormModel(e.target.value);
+                }
+              }}
             >
               <option value="">기본 (opus)</option>
               {MODEL_CHOICES.map((m) => (
@@ -141,13 +154,14 @@ export function ArchivePanel() {
               <option value="custom">직접 입력…</option>
             </select>
           </label>
-          {!MODEL_CHOICES.includes(formModel as (typeof MODEL_CHOICES)[number]) && formModel !== "" && (
+          {customModel && (
             <label className="archive-settings-row">
               <span>모델명</span>
               <input
                 value={formModel}
                 placeholder="예: claude-opus-4-8"
                 spellCheck={false}
+                autoFocus
                 onChange={(e) => setFormModel(e.target.value)}
               />
             </label>

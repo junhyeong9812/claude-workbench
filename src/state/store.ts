@@ -355,11 +355,14 @@ interface AppState {
    * of WorkspaceState — MUST ride through persist() or they get wiped. */
   archiveModel: string | null;
   archiveEffort: string | null;
-  /** Set (or clear, with null) the archive root override and persist. Resolves
-   * when the backend save finished, so callers can re-query with the new root. */
-  setArchiveRoot: (path: string | null) => Promise<void>;
-  /** Set archive extraction model/effort and persist (null = 기본). */
-  setArchiveExtraction: (model: string | null, effort: string | null) => Promise<void>;
+  /** Set archive root/model/effort together in ONE save (two racing saves could
+   * land out of order and roll fields back — 리뷰 G5). Resolves `true` only
+   * when the backend save actually succeeded (리뷰 G6 — 실패 무음 금지). */
+  setArchiveConfig: (
+    root: string | null,
+    model: string | null,
+    effort: string | null,
+  ) => Promise<boolean>;
   /** Opt-in: persist terminal/SSH scrollback to disk so tabs restore their prior
    * output after a restart. Default OFF — output can contain secrets (review
    * F11). Persisted to localStorage. */
@@ -538,19 +541,16 @@ export const useAppStore = create<AppState>((set, get) => ({
   archiveModel: null,
   archiveEffort: null,
 
-  setArchiveRoot: async (path) => {
-    set({ archiveRoot: path && path.trim() ? path.trim() : null });
-    // Await the actual backend save so the caller's follow-up archive_list
-    // reads the NEW root, not the old one.
-    await savePersisted(get);
-  },
-
-  setArchiveExtraction: async (model, effort) => {
+  setArchiveConfig: async (root, model, effort) => {
+    const norm = (v: string | null) => (v && v.trim() ? v.trim() : null);
     set({
-      archiveModel: model && model.trim() ? model.trim() : null,
-      archiveEffort: effort && effort.trim() ? effort.trim() : null,
+      archiveRoot: norm(root),
+      archiveModel: norm(model),
+      archiveEffort: norm(effort),
     });
-    await savePersisted(get);
+    // ONE awaited save — the caller re-queries only after the backend has the
+    // new values, and learns about a failed save instead of a silent lie.
+    return savePersisted(get);
   },
   persistScrollback: localStorage.getItem("persistScrollback") === "1",
 
@@ -936,8 +936,9 @@ export const useAppStore = create<AppState>((set, get) => ({
 
 /** The single assembly point for the persisted WorkspaceState — every field the
  * backend stores MUST appear here, or the next save wipes it (the archive_root
- * lesson). Setters that need save-completion await `savePersisted` directly. */
-function savePersisted(get: () => AppState): Promise<void> {
+ * lesson). Resolves `true` on a successful backend save, `false` on failure
+ * (logged) — settings callers surface the failure instead of pretending. */
+function savePersisted(get: () => AppState): Promise<boolean> {
   const state: WorkspaceState = {
     open_projects: get().projects,
     active_project: get().activeProject,
@@ -947,8 +948,9 @@ function savePersisted(get: () => AppState): Promise<void> {
     archive_effort: get().archiveEffort,
   };
   return invoke("save_state", { state })
-    .then(() => {})
+    .then(() => true)
     .catch((err) => {
       console.error("save_state failed", err);
+      return false;
     });
 }
