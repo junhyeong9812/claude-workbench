@@ -12,9 +12,9 @@
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
-use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
+use core_lib::claude_cli::ClaudeOpts;
 use serde::Serialize;
 use tauri::{AppHandle, Manager};
 
@@ -44,100 +44,13 @@ impl Drop for InFlightGuard {
     }
 }
 
-/// Run a one-shot `claude -p --output-format text` in `cwd`, feeding `prompt` on
-/// stdin and capturing stdout. Drains stdout/stderr on threads (so a full pipe
-/// can't deadlock the child), enforces `timeout` with kill+wait (no zombie), caps
-/// captured output, and treats only `exit 0 && non-empty stdout` as success
-/// (codex P3 D7).
-fn run_claude_p(cwd: &str, prompt: &str, timeout: Duration) -> Result<String, AppError> {
-    use std::io::{Read, Write};
-    use std::process::{Command, Stdio};
-    const CAP: usize = 256 * 1024;
-
-    let mut child = Command::new("claude")
-        .args(["-p", "--output-format", "text"])
-        .current_dir(cwd)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|_| AppError::new("Cannot start claude for summary"))?;
-
-    // Feed the prompt and close stdin (EOF) on its own thread so a large prompt
-    // can't deadlock against an unread stdout pipe.
-    if let Some(mut stdin) = child.stdin.take() {
-        let p = prompt.to_string();
-        thread::spawn(move || {
-            let _ = stdin.write_all(p.as_bytes());
-            // `stdin` drops here -> EOF.
-        });
-    }
-
-    // Drain stdout on its own thread, sending the captured (capped) bytes on a
-    // channel so we collect with a *timeout* — never an unbounded `join`, which
-    // could hang if a descendant of `claude` keeps the pipe open past the child's
-    // own exit (codex P3-impl 3).
-    let (otx, orx) = std::sync::mpsc::channel::<Vec<u8>>();
-    if let Some(mut so) = child.stdout.take() {
-        thread::spawn(move || {
-            let mut buf = Vec::new();
-            let mut chunk = [0u8; 8192];
-            while let Ok(n) = so.read(&mut chunk) {
-                if n == 0 {
-                    break;
-                }
-                if buf.len() < CAP {
-                    let take = n.min(CAP - buf.len());
-                    buf.extend_from_slice(&chunk[..take]);
-                }
-            }
-            let _ = otx.send(buf);
-        });
-    }
-    // Drain stderr to a sink (so a full stderr pipe can't block the child) and
-    // discard it — error text isn't surfaced to the UI. Detached.
-    if let Some(mut se) = child.stderr.take() {
-        thread::spawn(move || {
-            let mut sink = [0u8; 8192];
-            while let Ok(n) = se.read(&mut sink) {
-                if n == 0 {
-                    break;
-                }
-            }
-        });
-    }
-
-    // Wait with a deadline; kill + reap on timeout.
-    let start = Instant::now();
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(st)) => break Some(st),
-            Ok(None) => {
-                if start.elapsed() >= timeout {
-                    let _ = child.kill();
-                    let _ = child.wait(); // reap so we don't leave a zombie
-                    break None;
-                }
-                thread::sleep(Duration::from_millis(50));
-            }
-            Err(_) => break None,
-        }
-    };
-
-    match status {
-        Some(st) if st.success() => {
-            // Collect stdout with a bounded wait (the drain thread finishes as the
-            // pipe closed on exit) — never block the command thread indefinitely.
-            let stdout = orx.recv_timeout(Duration::from_secs(3)).unwrap_or_default();
-            let text = String::from_utf8_lossy(&stdout).trim().to_string();
-            if text.is_empty() {
-                Err(AppError::new("Claude returned an empty summary"))
-            } else {
-                Ok(text)
-            }
-        }
-        Some(_) => Err(AppError::new("Claude failed to produce a summary")),
-        None => Err(AppError::new("Claude summary timed out")),
+/// The archive-extraction model/effort: workspace settings when set, else the
+/// app default **opus + xhigh** (사용자 결정 — 추출 품질 우선).
+fn extraction_opts(app: &AppHandle) -> ClaudeOpts {
+    let ws = super::load_state(app.clone());
+    ClaudeOpts {
+        model: Some(ws.archive_model.filter(|m| !m.trim().is_empty()).unwrap_or_else(|| "opus".into())),
+        effort: Some(ws.archive_effort.filter(|e| !e.trim().is_empty()).unwrap_or_else(|| "xhigh".into())),
     }
 }
 
@@ -270,9 +183,15 @@ fn archive_session_blocking(
     // into reported errors (neither masks the other), never a failed archive.
     let mut extraction = None;
     let rendered = core_lib::knowledge::render_session_for_extraction(&session);
-    match run_claude_p(&cwd, &extraction_prompt(&rendered), Duration::from_secs(180)) {
+    let opts = extraction_opts(&app);
+    match core_lib::claude_cli::run_claude_p(
+        &cwd,
+        &extraction_prompt(&rendered),
+        Duration::from_secs(300),
+        &opts,
+    ) {
         Ok(raw) => extraction = Some(core_lib::knowledge::parse_extraction(&raw)),
-        Err(e) => errors.push(e.message.clone()),
+        Err(e) => errors.push(e),
     }
 
     let mut summary_ok = false;
