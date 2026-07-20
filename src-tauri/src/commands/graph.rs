@@ -146,6 +146,58 @@ fn read_graph_info(root: &Path, project_path: &str) -> Option<GraphInfo> {
     })
 }
 
+/// One `.claude`-marked folder under a project (task-07): its absolute path, the
+/// project-relative display path, and whether a graph is already cached for it.
+#[derive(Serialize)]
+pub struct MarkedFolder {
+    pub path: String,
+    /// Path relative to the project root (`.` for the project root itself).
+    pub rel: String,
+    /// Whether a cached graph.json already exists for this folder (same cache
+    /// probe as [`graph_list`]) — lets the UI show 생성 vs 열기.
+    pub has_graph: bool,
+}
+
+/// List the folders under `project_path` the user opted into graphing by placing
+/// a `.claude` marker directory (task-07). Each folder can then be generated /
+/// opened via the existing `graph_generate` / `graph_open_path` commands by
+/// passing its `path` — no per-folder command is needed. Cache probing reuses the
+/// same canonical key as [`graph_generate`] writes under, so `has_graph` agrees
+/// with what a later generate/list would find.
+#[tauri::command]
+pub fn graph_marked_folders(
+    app: AppHandle,
+    project_path: String,
+) -> Result<Vec<MarkedFolder>, AppError> {
+    let root = super::archive::archive_root(&app)?;
+    // Scan from the canonical project root so the folder paths (and their derived
+    // project_keys) match what graph_generate/graph_list use.
+    Ok(collect_marked_folders(&root, &canonical_project(&project_path)))
+}
+
+/// Build the [`MarkedFolder`] list for the canonical project root `canon` under
+/// archive `root`. Pure (no `AppHandle`) so the rel/has_graph mapping is
+/// unit-testable; the command is a thin wrapper resolving `root`/`canon`.
+fn collect_marked_folders(root: &Path, canon: &str) -> Vec<MarkedFolder> {
+    let base = Path::new(canon);
+    core_lib::graph::find_marked_folders(canon)
+        .into_iter()
+        .map(|p| {
+            let rel = match p.strip_prefix(base) {
+                Ok(r) if r.as_os_str().is_empty() => ".".to_string(),
+                Ok(r) => r.to_string_lossy().to_string(),
+                Err(_) => p.to_string_lossy().to_string(),
+            };
+            let path = p.to_string_lossy().to_string();
+            // `find_marked_folders` returns paths under the canonical base, so they
+            // are already canonical; canonical_project is idempotent here and keeps
+            // the key identical to a subsequent graph_generate on this path.
+            let has_graph = read_graph_info(root, &canonical_project(&path)).is_some();
+            MarkedFolder { path, rel, has_graph }
+        })
+        .collect()
+}
+
 /// Open a generated graph artifact (graph.html) with the system handler —
 /// confined to the archive root by a canonicalized containment check, so a
 /// buggy/compromised renderer can't turn this into an arbitrary-file opener
@@ -286,6 +338,54 @@ mod tests {
         std::fs::write(&file, b"<!doctype html>").unwrap();
         let got = contained_target(&root, &file.to_string_lossy()).expect("inside root accepted");
         assert!(got.ends_with("graph.html"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn collect_marked_folders_maps_rel_and_has_graph() {
+        // A project tree with two marked folders; one already has a cached graph.
+        let proj = temp_root("marked-proj");
+        let root = temp_root("marked-archive");
+        let canon = std::fs::canonicalize(&proj).unwrap().to_string_lossy().to_string();
+
+        std::fs::create_dir_all(Path::new(&canon).join("svc-a").join(".claude")).unwrap();
+        std::fs::create_dir_all(Path::new(&canon).join("svc-b").join(".claude")).unwrap();
+
+        // Seed a cached graph for svc-a only (same writer/key the command reads).
+        let svc_a = Path::new(&canon).join("svc-a").to_string_lossy().to_string();
+        let graph = core_lib::graph::Graph {
+            schema_version: 1,
+            project: svc_a.clone(),
+            generated_at: "2026-07-20T00:00:00Z".into(),
+            nodes: vec![],
+            edges: vec![],
+            notes: vec![],
+        };
+        let root_c = std::fs::canonicalize(&root).unwrap();
+        core_lib::graph::save_graph_all(&root_c, &svc_a, &graph).unwrap();
+
+        let got = collect_marked_folders(&root_c, &canon);
+        assert_eq!(got.len(), 2, "both marked folders listed");
+        // Sorted by absolute path → svc-a before svc-b.
+        assert_eq!(got[0].rel, "svc-a");
+        assert!(got[0].has_graph, "svc-a has a cached graph");
+        assert_eq!(got[1].rel, "svc-b");
+        assert!(!got[1].has_graph, "svc-b has no cached graph yet");
+
+        let _ = std::fs::remove_dir_all(&proj);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn collect_marked_folders_root_marker_rel_is_dot() {
+        let proj = temp_root("marked-root");
+        let root = temp_root("marked-root-archive");
+        let canon = std::fs::canonicalize(&proj).unwrap().to_string_lossy().to_string();
+        std::fs::create_dir_all(Path::new(&canon).join(".claude")).unwrap();
+        let got = collect_marked_folders(&root, &canon);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].rel, ".", "a marked project root shows rel '.'");
+        let _ = std::fs::remove_dir_all(&proj);
         let _ = std::fs::remove_dir_all(&root);
     }
 

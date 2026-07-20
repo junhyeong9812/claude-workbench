@@ -13,9 +13,13 @@ import { useAppStore } from "../state/store";
  * rendered HTML viewer in the system browser (`graph_open_path`), mirroring the
  * ArchivePanel invoke/AppError/refresh-on-event conventions.
  *
- * Auto-generate on open and the `.claude` selection marker are deliberately out
- * of scope here (후속 작업) — this panel never runs Opus without an explicit
- * click.
+ * Below the project-level graph, a "marked folders" section (task-07) lists the
+ * folders the user opted in by placing a `.claude` marker directory
+ * (`graph_marked_folders`). Each folder generates / opens its own graph through
+ * the same `graph_generate` / `graph_open_path` commands (passing the folder
+ * path), with per-folder race guards so switching projects or overlapping
+ * generations never resurrect stale state. This panel never runs Opus without an
+ * explicit click.
  */
 
 // Mirrors `commands::graph::GraphInfo` (serde). `graph_list` returns this or
@@ -39,6 +43,13 @@ interface GraphGenerated {
   json_path: string;
   html_path: string;
 }
+// Mirrors `commands::graph::MarkedFolder` (serde) — a `.claude`-marked folder
+// under the active project. `path` is what we pass to graph_generate/open.
+interface MarkedFolder {
+  path: string;
+  rel: string;
+  has_graph: boolean;
+}
 
 // Best-effort local-time formatting of the graph's ISO-8601 generation stamp;
 // fall back to the raw string if it doesn't parse (never hide the value).
@@ -59,6 +70,59 @@ export function GraphPanel() {
   // generate superseding the first) can never resurrect old state or flip
   // `generating` for a newer request.
   const genToken = useRef(0);
+
+  // Marked-folder (task-07) state: the `.claude`-opted folders under the active
+  // project, which of them are mid-generation, and any list-load error.
+  const [markers, setMarkers] = useState<MarkedFolder[]>([]);
+  const [markersError, setMarkersError] = useState<string | null>(null);
+  const [genFolders, setGenFolders] = useState<Set<string>>(new Set());
+  // Per-folder monotonic tokens — same race discipline as `genToken`, keyed by
+  // folder path so overlapping folder generations don't cross-cancel.
+  const folderTokens = useRef<Map<string, number>>(new Map());
+
+  // Load the marked-folder list for `project` (a bounded fs scan, no Opus).
+  // Stale-response guarded against the active project like `load`.
+  const loadMarkers = (project: string) => {
+    invoke<MarkedFolder[]>("graph_marked_folders", { projectPath: project })
+      .then((res) => {
+        if (useAppStore.getState().activeProject !== project) return;
+        setMarkers(res ?? []);
+        setMarkersError(null);
+      })
+      .catch((e) => {
+        if (useAppStore.getState().activeProject !== project) return;
+        setMarkers([]);
+        setMarkersError(errText(e));
+      });
+  };
+
+  // Generate the graph for one marked folder. Reuses `graph_generate` with the
+  // folder path; a per-folder token + active-project check reject stale results.
+  const generateFolder = (folderPath: string) => {
+    if (!activeProject) return;
+    const project = activeProject;
+    const token = (folderTokens.current.get(folderPath) ?? 0) + 1;
+    folderTokens.current.set(folderPath, token);
+    const current = () =>
+      folderTokens.current.get(folderPath) === token &&
+      useAppStore.getState().activeProject === project;
+    setGenFolders((prev) => new Set(prev).add(folderPath));
+    invoke<GraphPaths>("graph_generate", { projectPath: folderPath })
+      .then(() => {
+        if (current()) loadMarkers(project);
+      })
+      .catch((e) => {
+        if (current()) alert(`생성 실패: ${errText(e)}`);
+      })
+      .finally(() => {
+        if (current())
+          setGenFolders((prev) => {
+            const next = new Set(prev);
+            next.delete(folderPath);
+            return next;
+          });
+      });
+  };
 
   // Probe the cache for `project` (no Opus). Guards against a stale response
   // landing after the active project changed by re-checking the current store
@@ -89,7 +153,15 @@ export function GraphPanel() {
     setInfo(null);
     setError(null);
     setGenerating(false);
-    if (activeProject) load(activeProject);
+    // Reset marker state so a previous project's folders never flash for the new
+    // one; in-flight folder gens are rejected by the active-project check.
+    setMarkers([]);
+    setMarkersError(null);
+    setGenFolders(new Set());
+    if (activeProject) {
+      load(activeProject);
+      loadMarkers(activeProject);
+    }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [activeProject]);
 
@@ -100,7 +172,11 @@ export function GraphPanel() {
   useEffect(() => {
     if (!activeProject) return;
     const un = listen<GraphGenerated>("graph-generated", (e) => {
+      // Project-level generation refreshes the project meta; any generation
+      // (project- or folder-level) may change a marked folder's cache state, so
+      // re-probe the marker list too (bounded fs scan, no Opus).
       if (e.payload.project === activeProject) load(activeProject);
+      loadMarkers(activeProject);
     });
     return () => {
       un.then((f) => f()).catch(() => {});
@@ -136,6 +212,17 @@ export function GraphPanel() {
 
   const openViewer = (path: string) => {
     invoke("graph_open_path", { path }).catch((e) => alert(`열기 실패: ${errText(e)}`));
+  };
+
+  // Open a marked folder's viewer: MarkedFolder carries only `has_graph`, so
+  // resolve the folder's html_path via graph_list (same cache probe) then open it.
+  const openFolderGraph = (folderPath: string) => {
+    invoke<GraphInfo | null>("graph_list", { projectPath: folderPath })
+      .then((res) => {
+        if (res?.html_path) openViewer(res.html_path);
+        else alert("렌더된 그래프 HTML이 없습니다 — 다시 생성하세요.");
+      })
+      .catch((e) => alert(`열기 실패: ${errText(e)}`));
   };
 
   return (
@@ -200,6 +287,55 @@ export function GraphPanel() {
               </div>
             </div>
           )}
+
+          <div className="graph-markers">
+            <div className="graph-markers-head">
+              마커 폴더 (<code>.claude</code>)
+            </div>
+            {markersError ? (
+              <div className="archive-error">{markersError}</div>
+            ) : markers.length === 0 ? (
+              <div className="graph-meta">
+                <code>.claude</code> 폴더로 표시된 대상이 없습니다.
+              </div>
+            ) : (
+              <ul className="graph-marker-list">
+                {markers.map((m) => {
+                  const busy = genFolders.has(m.path);
+                  return (
+                    <li key={m.path} className="graph-marker">
+                      <span className="graph-marker-rel" title={m.path}>
+                        {m.rel}
+                      </span>
+                      <span className="archive-session-actions">
+                        {busy ? (
+                          <span className="graph-meta">생성 중…</span>
+                        ) : (
+                          <>
+                            <button
+                              className="archive-btn"
+                              title="이 폴더의 의존성 그래프를 생성합니다 (Opus 분석 — 수백 초)"
+                              onClick={() => generateFolder(m.path)}
+                            >
+                              {m.has_graph ? "다시 생성" : "생성"}
+                            </button>
+                            <button
+                              className="archive-btn"
+                              title={m.has_graph ? "이 폴더의 그래프 뷰어 열기" : "먼저 생성하세요"}
+                              disabled={!m.has_graph}
+                              onClick={() => openFolderGraph(m.path)}
+                            >
+                              열기
+                            </button>
+                          </>
+                        )}
+                      </span>
+                    </li>
+                  );
+                })}
+              </ul>
+            )}
+          </div>
         </>
       )}
     </div>

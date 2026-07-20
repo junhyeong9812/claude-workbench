@@ -468,6 +468,43 @@ body {
   line-height: 1.6;
 }
 
+/* ---- Marked folders (`.claude` opt-in) list, under the project graph ---- */
+.graph-markers {
+  border-top: 1px solid var(--border, #333);
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 10px;
+}
+.graph-markers-head {
+  color: var(--fg-dim);
+  font-size: 0.9em;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+.graph-marker-list {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+.graph-marker {
+  align-items: center;
+  display: flex;
+  gap: 8px;
+  justify-content: space-between;
+}
+.graph-marker-rel {
+  color: var(--fg, #cdd6f4);
+  font-family: var(--font-mono, monospace);
+  font-size: 0.9em;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .pane-main {
   /* dockview positions its own children; keep the pane a plain sized box. */
   overflow: hidden;

@@ -330,6 +330,93 @@ pub fn generate_project_graph(project_path: &str, opts: &ClaudeOpts) -> Result<G
     Ok(graph)
 }
 
+// ---- `.claude` marker discovery (task-07: per-folder graphs) ----
+
+/// Marker directory name: a folder is a graph target iff it directly contains a
+/// `.claude` directory. The user creates these by hand to opt a folder in.
+const MARKER_DIR: &str = ".claude";
+/// Bounded-scan caps for [`find_marked_folders`], mirroring `git::git_roots`
+/// (worktree.rs): depth, result count, and total directories visited. A
+/// pathological tree can never hang the caller, and hitting a cap is logged
+/// (never silent — F1).
+const MARKER_MAX_DEPTH: usize = 8;
+const MARKER_MAX_COUNT: usize = 200;
+const MARKER_MAX_VISITED_DIRS: usize = 20_000;
+/// Directory names pruned during the marker scan — VCS internals and heavy
+/// build/dependency trees that never hold a hand-placed marker we'd want.
+/// `.claude` itself is pruned from *descent* (it is the marker, detected on its
+/// parent — we never look for markers inside it). Kept in sync with
+/// `git::PRUNE_DIRS` (the reference scanner).
+const MARKER_PRUNE_DIRS: &[&str] = &[
+    ".claude", ".git", ".hg", ".svn", "node_modules", "target", "dist", "build", "out", ".next",
+    "vendor", ".cache", "coverage", "__pycache__", ".venv", "venv", ".tox", ".gradle",
+];
+
+/// Find every folder at or under `project_path` that directly contains a
+/// `.claude` marker directory — the set of user-opted graph targets. The project
+/// root itself is included when it is marked.
+///
+/// Bounded like `git::git_roots`: it prunes VCS/build dirs, **never follows
+/// symlinks** (so it can't escape the tree or loop), and stops at depth / count /
+/// visited-dir caps; hitting a cap is logged to stderr (never silent). A marked
+/// folder is still descended into, so nested markers are found. Results are
+/// returned lexicographically sorted (deterministic).
+pub fn find_marked_folders(project_path: &str) -> Vec<PathBuf> {
+    let base = Path::new(project_path);
+    let mut found: Vec<PathBuf> = Vec::new();
+    let mut visited = 0usize;
+    scan_marked_folders(base, 0, &mut found, &mut visited);
+    if found.len() >= MARKER_MAX_COUNT || visited >= MARKER_MAX_VISITED_DIRS {
+        eprintln!(
+            "graph: marker scan under {project_path} hit a cap ({} folders, {visited} dirs visited) — the list may be truncated",
+            found.len()
+        );
+    }
+    found.sort();
+    found
+}
+
+/// Recursive worker for [`find_marked_folders`]. Checks whether `dir` itself is
+/// marked (holds a `.claude` dir), records it, then descends into non-pruned real
+/// subdirectories. Bounded by the same depth/count/visited caps.
+fn scan_marked_folders(dir: &Path, depth: usize, found: &mut Vec<PathBuf>, visited: &mut usize) {
+    if depth > MARKER_MAX_DEPTH || found.len() >= MARKER_MAX_COUNT || *visited >= MARKER_MAX_VISITED_DIRS
+    {
+        return;
+    }
+    *visited += 1;
+    // `dir` is marked when it directly contains a `.claude` directory.
+    if dir.join(MARKER_DIR).is_dir() {
+        found.push(dir.to_path_buf());
+        if found.len() >= MARKER_MAX_COUNT {
+            return;
+        }
+    }
+    let entries = match fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(_) => return, // unreadable dir (permissions) — skip, not fatal
+    };
+    for entry in entries.flatten() {
+        let file_type = match entry.file_type() {
+            Ok(t) => t,
+            Err(_) => continue,
+        };
+        // Never follow symlinks (could escape the tree or cycle); real dirs only.
+        if file_type.is_symlink() || !file_type.is_dir() {
+            continue;
+        }
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if MARKER_PRUNE_DIRS.contains(&name.as_ref()) {
+            continue;
+        }
+        scan_marked_folders(&entry.path(), depth + 1, found, visited);
+        if found.len() >= MARKER_MAX_COUNT || *visited >= MARKER_MAX_VISITED_DIRS {
+            return;
+        }
+    }
+}
+
 /// Reject a target that does not live under `root` (both already canonicalized).
 fn ensure_contained(root: &Path, target: &Path) -> Result<(), String> {
     if target.starts_with(root) {
@@ -1132,6 +1219,73 @@ mod tests {
         // Truncated variant carries a visible (non-silent) note.
         let pt = project_graph_prompt("/p", &roots, true);
         assert!(pt.contains("잘랐다"), "truncation is stated in the prompt");
+    }
+
+    // --- `.claude` marker discovery (task-07) ---
+
+    /// Build `<dir>/.claude` so `dir` reads as a marked folder.
+    fn mark(dir: &Path) {
+        fs::create_dir_all(dir.join(".claude")).unwrap();
+    }
+
+    #[test]
+    fn find_marked_folders_detects_marked_dirs_and_ignores_unmarked() {
+        let root = temp_root("markers");
+        // root/a is marked; root/b is not; root/a/nested is marked (descend past a mark).
+        mark(&root.join("a"));
+        fs::create_dir_all(root.join("b")).unwrap();
+        mark(&root.join("a").join("nested"));
+        // The root itself is unmarked here.
+        let got = find_marked_folders(&root.to_string_lossy());
+        assert_eq!(
+            got,
+            vec![root.join("a"), root.join("a").join("nested")],
+            "only .claude-holding folders, sorted, unmarked skipped"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn find_marked_folders_includes_root_when_marked() {
+        let root = temp_root("markers-root");
+        mark(&root);
+        let got = find_marked_folders(&root.to_string_lossy());
+        assert_eq!(got, vec![root.to_path_buf()], "a marked project root is a target");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn find_marked_folders_prunes_build_and_vcs_trees() {
+        let root = temp_root("markers-prune");
+        // Markers buried inside pruned dirs must NOT be discovered.
+        mark(&root.join("node_modules").join("pkg"));
+        mark(&root.join("target").join("debug"));
+        mark(&root.join(".git").join("hooksdir"));
+        // A real marker outside the pruned trees is found.
+        mark(&root.join("src"));
+        let got = find_marked_folders(&root.to_string_lossy());
+        assert_eq!(got, vec![root.join("src")], "pruned subtrees yield no markers");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn find_marked_folders_does_not_descend_into_the_marker_dir() {
+        let root = temp_root("markers-nodescend");
+        // A `.claude` that itself contains a nested `.claude` must not produce a
+        // second result — the marker dir is never scanned into.
+        mark(&root.join("proj"));
+        fs::create_dir_all(root.join("proj").join(".claude").join(".claude")).unwrap();
+        let got = find_marked_folders(&root.to_string_lossy());
+        assert_eq!(got, vec![root.join("proj")], "marker dir is not descended");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn find_marked_folders_empty_when_none_marked() {
+        let root = temp_root("markers-empty");
+        fs::create_dir_all(root.join("x").join("y")).unwrap();
+        assert!(find_marked_folders(&root.to_string_lossy()).is_empty());
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]

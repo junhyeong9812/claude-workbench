@@ -131,6 +131,7 @@ pub fn run() {
             commands::archive_uuids,
             commands::graph_generate,
             commands::graph_list,
+            commands::graph_marked_folders,
             commands::graph_open_path,
             commands::claude_rename,
             commands::claude_delete,
