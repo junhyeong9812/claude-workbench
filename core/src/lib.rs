@@ -1,4 +1,4 @@
-//! Pure logic for the multi-terminal IDE shell.
+//! Pure logic for the claude-workbench IDE shell.
 //!
 //! This crate intentionally has **no** dependency on `tauri` (and therefore no
 //! transitive link against `webkit2gtk`), so `cargo test -p core` runs without

@@ -219,7 +219,7 @@ mod tests {
 
     #[test]
     fn nonexistent_path_is_err_not_panic() {
-        let p = PathBuf::from("/this/path/should/not/exist/multi-terminal-xyz");
+        let p = PathBuf::from("/this/path/should/not/exist/claude-workbench-xyz");
         assert!(list_dir(&p).is_err());
     }
 }
