@@ -30,6 +30,9 @@ struct Args {
     archive_root: PathBuf,
     snapshot_base: PathBuf,
     mcp_bin: PathBuf,
+    /// cwd에 이 부분 문자열이 들어가는 프로젝트는 제외 (반복 지정 가능) —
+    /// 실험용 프로젝트(acp-test 등)를 백필에서 영구 배제.
+    exclude: Vec<String>,
     dry_run: bool,
 }
 
@@ -54,6 +57,7 @@ fn parse_args() -> Args {
         archive_root: app_data.join("archive"),
         snapshot_base: app_data,
         mcp_bin: home.join(".local/share/claude-workbench/knowledge-mcp"),
+        exclude: Vec::new(),
         dry_run: false,
     };
     let mut it = std::env::args().skip(1);
@@ -78,6 +82,7 @@ fn parse_args() -> Args {
             "--archive-root" => a.archive_root = val(&mut it).into(),
             "--snapshot-base" => a.snapshot_base = val(&mut it).into(),
             "--mcp-bin" => a.mcp_bin = val(&mut it).into(),
+            "--exclude" => a.exclude.push(val(&mut it)),
             "--dry-run" => a.dry_run = true,
             other => die(&format!("알 수 없는 플래그: {other}")),
         }
@@ -165,6 +170,12 @@ fn main() {
         if !dir.path().is_dir() {
             continue;
         }
+        // /tmp cwd의 슬러그("-tmp-…")는 스캔 자체에서 제외 — 추출 스크래치
+        // 트랜스크립트가 mtime 최신이라 --limit 슬롯을 전부 삼키는 것 방지
+        // (limit은 probe 전에 걸리므로 스캔 레벨 필터가 정위치).
+        if dir.file_name().to_string_lossy().starts_with("-tmp-") {
+            continue;
+        }
         let Ok(files) = std::fs::read_dir(dir.path()) else { continue };
         for f in files.flatten() {
             let path = f.path();
@@ -227,6 +238,11 @@ fn main() {
         // 일회성 스크래치 세션(/tmp cwd)은 보존 가치가 없다 — 추출 비용도 아낀다.
         if cwd.starts_with("/tmp/") {
             eprintln!("skip(/tmp 스크래치): {}", c.uuid);
+            skipped_probe += 1;
+            continue;
+        }
+        if let Some(pat) = args.exclude.iter().find(|e| cwd.contains(e.as_str())) {
+            eprintln!("skip(--exclude {pat}): {}", c.uuid);
             skipped_probe += 1;
             continue;
         }
