@@ -347,7 +347,7 @@ function AppMain() {
         <ToolbarRollup />
         <RunMenu />
         <span className="toolbar-title">
-          {activeProject ?? "multi-terminal"}
+          {activeProject ?? "claude-workbench"}
         </span>
       </div>
       {mode === "study" ? (

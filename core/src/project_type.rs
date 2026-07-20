@@ -292,7 +292,7 @@ mod tests {
 
     #[test]
     fn nonexistent_path_is_empty_not_panic() {
-        let p = PathBuf::from("/this/path/should/not/exist/multi-terminal-xyz");
+        let p = PathBuf::from("/this/path/should/not/exist/claude-workbench-xyz");
         assert_eq!(detect_project_types(&p), Vec::<ProjectType>::new());
     }
 }
