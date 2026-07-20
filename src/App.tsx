@@ -10,6 +10,7 @@ import { FolderTree } from "./components/FolderTree";
 import { GitPanel } from "./components/GitPanel";
 import { WorktreePanel } from "./components/WorktreePanel";
 import { ArchivePanel } from "./components/ArchivePanel";
+import { GraphPanel } from "./components/GraphPanel";
 import { MainArea } from "./components/MainArea";
 import { DevView } from "./components/DevView";
 import { FilePeekViewer } from "./components/FilePeekViewer";
@@ -104,7 +105,9 @@ function AppMain() {
 
   const treePanelRef = useRef<ImperativePanelHandle>(null);
   const [collapsed, setCollapsed] = useState(false);
-  const [sideTab, setSideTab] = useState<"files" | "git" | "worktree" | "archive">("files");
+  const [sideTab, setSideTab] = useState<"files" | "git" | "worktree" | "archive" | "graph">(
+    "files",
+  );
   const [termSettingsOpen, setTermSettingsOpen] = useState(false);
   const theme = useAppStore((s) => s.theme);
   const setTheme = useAppStore((s) => s.setTheme);
@@ -391,6 +394,12 @@ function AppMain() {
             >
               아카이브
             </button>
+            <button
+              className={`sidebar-tab${sideTab === "graph" ? " active" : ""}`}
+              onClick={() => setSideTab("graph")}
+            >
+              그래프
+            </button>
           </div>
           <div className="sidebar-content">
             {sideTab === "files" ? (
@@ -411,8 +420,10 @@ function AppMain() {
               <GitPanel />
             ) : sideTab === "worktree" ? (
               <WorktreePanel />
-            ) : (
+            ) : sideTab === "archive" ? (
               <ArchivePanel />
+            ) : (
+              <GraphPanel />
             )}
           </div>
         </Panel>

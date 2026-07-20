@@ -456,6 +456,18 @@ body {
   cursor: default;
 }
 
+/* ---- Dependency graph (sidebar tab) — reuses .archive-* head/btn styles ---- */
+.graph-info {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 10px;
+}
+.graph-meta {
+  color: var(--fg-dim);
+  line-height: 1.6;
+}
+
 .pane-main {
   /* dockview positions its own children; keep the pane a plain sized box. */
   overflow: hidden;
