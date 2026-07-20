@@ -158,16 +158,21 @@ fn ensure_contained(root: &Path, target: &Path) -> Result<(), String> {
     }
 }
 
-/// Persist `graph` at `<archive_root>/<project_key>/graph/graph.json`.
+/// Resolve (creating as needed) the per-project `graph/` folder under
+/// `archive_root` and atomically write `contents` to `file_name` inside it.
 ///
-/// Reuses [`project_key`] for the per-project folder (same key as the session
-/// archive). Canonicalizes the archive root and the graph dir and refuses any
-/// path that escapes the root (containment — archive.rs pattern). Writes to a
-/// temp file and renames into place (atomic; a crash never leaves a half file).
-pub fn save_graph(
+/// The single containment/atomic-write path shared by [`save_graph`] and
+/// [`save_graph_html`]: reuses [`project_key`] for the per-project folder (same
+/// key as the session archive), canonicalizes the archive root and the graph
+/// dir and refuses any path that escapes the root (containment — archive.rs
+/// pattern), then writes to a temp file and renames into place (atomic; a crash
+/// never leaves a half file). `file_name` is a fixed literal (`graph.json` /
+/// `graph.html`), never attacker-controlled, so it needs no sanitization.
+fn write_graph_artifact(
     archive_root: &Path,
     project_path: &str,
-    graph: &Graph,
+    file_name: &str,
+    contents: &str,
 ) -> Result<PathBuf, String> {
     // Root may not exist yet; create it so canonicalize can resolve symlinks.
     fs::create_dir_all(archive_root)
@@ -180,16 +185,13 @@ pub fn save_graph(
     let dir_c = fs::canonicalize(&dir).map_err(|_| "그래프 폴더를 확인할 수 없습니다".to_string())?;
     ensure_contained(&root_c, &dir_c)?;
 
-    let final_path = dir_c.join("graph.json");
-    let json =
-        serde_json::to_string_pretty(graph).map_err(|_| "그래프 직렬화에 실패했습니다".to_string())?;
-
+    let final_path = dir_c.join(file_name);
     let tmp = dir_c.join(format!(
-        ".graph.json.tmp-{}-{}",
+        ".{file_name}.tmp-{}-{}",
         std::process::id(),
         TMP_SEQ.fetch_add(1, Ordering::Relaxed)
     ));
-    if let Err(e) = fs::write(&tmp, &json) {
+    if let Err(e) = fs::write(&tmp, contents) {
         let _ = fs::remove_file(&tmp);
         return Err(format!("그래프를 쓸 수 없습니다: {}", e.kind()));
     }
@@ -198,6 +200,61 @@ pub fn save_graph(
         return Err(format!("그래프 저장에 실패했습니다: {}", e.kind()));
     }
     Ok(final_path)
+}
+
+/// Persist `graph` as JSON at `<archive_root>/<project_key>/graph/graph.json`.
+pub fn save_graph(
+    archive_root: &Path,
+    project_path: &str,
+    graph: &Graph,
+) -> Result<PathBuf, String> {
+    let json =
+        serde_json::to_string_pretty(graph).map_err(|_| "그래프 직렬화에 실패했습니다".to_string())?;
+    write_graph_artifact(archive_root, project_path, "graph.json", &json)
+}
+
+/// Persist the self-contained HTML viewer at
+/// `<archive_root>/<project_key>/graph/graph.html` (same folder as the JSON).
+/// Renders via [`render_graph_html`] — no external requests, fully offline.
+pub fn save_graph_html(
+    archive_root: &Path,
+    project_path: &str,
+    graph: &Graph,
+) -> Result<PathBuf, String> {
+    let html = render_graph_html(graph);
+    write_graph_artifact(archive_root, project_path, "graph.html", &html)
+}
+
+/// Convenience: persist both the JSON document and the HTML viewer for `graph`,
+/// returning `(json_path, html_path)`. Individual `save_graph` / `save_graph_html`
+/// stay public so the command layer (task-03) can compose them differently.
+pub fn save_graph_all(
+    archive_root: &Path,
+    project_path: &str,
+    graph: &Graph,
+) -> Result<(PathBuf, PathBuf), String> {
+    let json_path = save_graph(archive_root, project_path, graph)?;
+    let html_path = save_graph_html(archive_root, project_path, graph)?;
+    Ok((json_path, html_path))
+}
+
+/// Render `graph` as a **self-contained** HTML viewer string — one document with
+/// inline `<style>`/`<script>` and **zero external requests** (no CDN, no remote
+/// fonts, no images). Mirrors [`crate::archive::render_book_html`]: the graph is
+/// embedded as JSON in [`GRAPH_TEMPLATE`]'s `__DATA__` slot with every `<`
+/// escaped to `<` (valid both as JSON and as a JS string escape) so no node
+/// label / path can close the `<script>` element or open a tag. The inline SVG
+/// renderer assigns node/edge text via `textContent` only (never innerHTML), so
+/// model-supplied strings are inert (XSS-safe).
+pub fn render_graph_html(graph: &Graph) -> String {
+    let json = serde_json::to_string(graph)
+        .unwrap_or_else(|_| "null".to_string())
+        .replace('<', "\\u003c")
+        // U+2028/U+2029 are legal in JSON but line terminators in older JS
+        // engines — escape them so the literal can never break.
+        .replace('\u{2028}', "\\u2028")
+        .replace('\u{2029}', "\\u2029");
+    GRAPH_TEMPLATE.replace("__DATA__", &json)
 }
 
 /// UTC ISO-8601 (`YYYY-MM-DDThh:mm:ssZ`) for "now". Dependency-free — `core`
@@ -234,6 +291,252 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
     let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32; // [1, 12]
     (if m <= 2 { y + 1 } else { y }, m, d)
 }
+
+/// The self-contained graph viewer page. Sole placeholder: `__DATA__` (the
+/// `<`-escaped JSON [`Graph`]). No external requests, no innerHTML — nodes and
+/// edges are drawn as inline SVG and every model string is set via `textContent`.
+/// Layout is a deterministic Fruchterman–Reingold force pass (no `Math.random`),
+/// so the same graph always renders the same shape.
+const GRAPH_TEMPLATE: &str = r##"<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>의존성 그래프</title>
+<style>
+:root { color-scheme: dark; }
+* { box-sizing: border-box; }
+html, body { margin: 0; height: 100%; }
+body { background: #14161a; color: #d7dae0; font: 14px/1.6 -apple-system, "Noto Sans KR", sans-serif; overflow: hidden; }
+header { position: fixed; top: 0; left: 0; right: 0; background: #1a1d23; border-bottom: 1px solid #2a2e36; padding: 10px 16px; z-index: 3; }
+header h1 { font-size: 15px; margin: 0 0 2px; overflow-wrap: anywhere; }
+header .meta { font-size: 12px; color: #8b93a1; }
+#svg { position: fixed; inset: 0; width: 100%; height: 100%; cursor: grab; }
+#svg.dragging { cursor: grabbing; }
+#empty { position: fixed; inset: 0; display: flex; align-items: center; justify-content: center; color: #8b93a1; font-size: 13px; }
+.edge { stroke: #3a4050; stroke-width: 1.2; }
+.node circle { stroke: #14161a; stroke-width: 1.5; cursor: pointer; }
+.node text { fill: #c4cad4; font-size: 11px; pointer-events: none; user-select: none; }
+.node.sel circle { stroke: #fff; stroke-width: 2.5; }
+#legend { position: fixed; left: 12px; bottom: 12px; background: rgba(26,29,35,.9); border: 1px solid #2a2e36; border-radius: 8px; padding: 8px 10px; font-size: 12px; z-index: 3; }
+#legend .row { display: flex; align-items: center; gap: 6px; margin: 2px 0; }
+#legend .sw { width: 11px; height: 11px; border-radius: 3px; display: inline-block; }
+#panel { position: fixed; right: 12px; top: 62px; width: 260px; max-width: 44vw; background: rgba(26,29,35,.96); border: 1px solid #2a2e36; border-radius: 8px; padding: 10px 12px; font-size: 12px; z-index: 3; display: none; }
+#panel.show { display: block; }
+#panel h2 { font-size: 13px; margin: 0 0 6px; overflow-wrap: anywhere; }
+#panel dt { color: #8b93a1; margin-top: 6px; }
+#panel dd { margin: 0; overflow-wrap: anywhere; font: 12px/1.5 ui-monospace, monospace; }
+#panel .close { position: absolute; top: 6px; right: 8px; cursor: pointer; color: #8b93a1; border: none; background: none; font-size: 14px; }
+</style>
+</head>
+<body>
+<header><h1 id="t"></h1><div class="meta" id="m"></div></header>
+<svg id="svg"><g id="vp"><defs>
+<marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+<path d="M0,0 L10,5 L0,10 z" fill="#4a5265"></path>
+</marker>
+</defs><g id="edges"></g><g id="nodes"></g></g></svg>
+<div id="empty" style="display:none">노드가 없습니다</div>
+<div id="legend"></div>
+<div id="panel"><button class="close" id="pclose" title="닫기">×</button><h2 id="pl"></h2><dl id="pd"></dl></div>
+<script>
+"use strict";
+const DATA = __DATA__;
+// Derive the SVG namespace from the static <svg> the HTML parser already put in
+// it — avoids writing the namespace URI literal, so the source carries zero
+// "http" strings (genuinely no external-request-shaped text).
+const SVGNS = document.getElementById("svg").namespaceURI;
+const COLOR = { module: "#7aa2f7", file: "#9ece6a", package: "#e0af68", external: "#bb9af7" };
+const FALLBACK = "#8b93a1";
+function colorOf(kind) { return COLOR[kind] || FALLBACK; }
+function svg(tag, attrs) { const e = document.createElementNS(SVGNS, tag); if (attrs) for (const k in attrs) e.setAttribute(k, attrs[k]); return e; }
+
+const nodes = (DATA && Array.isArray(DATA.nodes)) ? DATA.nodes.map(n => Object.assign({}, n)) : [];
+const rawEdges = (DATA && Array.isArray(DATA.edges)) ? DATA.edges : [];
+
+document.getElementById("t").textContent = (DATA && DATA.project) || "의존성 그래프";
+document.title = "의존성 그래프 · " + ((DATA && DATA.project) || "");
+document.getElementById("m").textContent =
+  [ "노드 " + nodes.length, "엣지 " + rawEdges.length, (DATA && DATA.generated_at) || "" ].filter(Boolean).join("  ·  ");
+
+// Legend: only the kinds actually present (plus a fallback bucket if any).
+const kinds = new Set(nodes.map(n => n.kind || ""));
+const legend = document.getElementById("legend");
+[["module","module"],["file","file"],["package","package"],["external","external"]].forEach(([k,label]) => {
+  if (!kinds.has(k)) return;
+  const row = document.createElement("div"); row.className = "row";
+  const sw = document.createElement("span"); sw.className = "sw"; sw.style.background = COLOR[k];
+  row.appendChild(sw); const t = document.createElement("span"); t.textContent = label; row.appendChild(t);
+  legend.appendChild(row);
+});
+if ([...kinds].some(k => !COLOR[k])) {
+  const row = document.createElement("div"); row.className = "row";
+  const sw = document.createElement("span"); sw.className = "sw"; sw.style.background = FALLBACK;
+  row.appendChild(sw); const t = document.createElement("span"); t.textContent = "기타"; row.appendChild(t);
+  legend.appendChild(row);
+}
+
+if (nodes.length === 0) {
+  document.getElementById("empty").style.display = "flex";
+  document.getElementById("legend").style.display = "none";
+} else {
+  layoutAndRender();
+}
+
+function layoutAndRender() {
+  const N = nodes.length;
+  const idx = new Map(nodes.map((n, i) => [n.id, i]));
+  const links = [];
+  for (const e of rawEdges) {
+    const s = idx.get(e.from), t = idx.get(e.to);
+    if (s != null && t != null && s !== t) links.push({ s, t });
+  }
+  // Deterministic initial placement on a circle (no Math.random → stable shape).
+  const R = 40 * Math.sqrt(N) + 60;
+  for (let i = 0; i < N; i++) {
+    const a = (2 * Math.PI * i) / Math.max(1, N);
+    nodes[i].x = Math.cos(a) * R;
+    nodes[i].y = Math.sin(a) * R;
+  }
+  // Fruchterman–Reingold: repulsion between all pairs + attraction along links.
+  const area = (2 * R) * (2 * R);
+  const k = Math.sqrt(area / Math.max(1, N));
+  const iters = N > 200 ? 80 : 300;
+  let temp = R * 0.5;
+  const cool = temp / (iters + 1);
+  for (let it = 0; it < iters; it++) {
+    const dispx = new Float64Array(N), dispy = new Float64Array(N);
+    for (let i = 0; i < N; i++) {
+      for (let j = i + 1; j < N; j++) {
+        let dx = nodes[i].x - nodes[j].x, dy = nodes[i].y - nodes[j].y;
+        let d = Math.hypot(dx, dy) || 0.01;
+        const f = (k * k) / d;
+        const ux = dx / d, uy = dy / d;
+        dispx[i] += ux * f; dispy[i] += uy * f;
+        dispx[j] -= ux * f; dispy[j] -= uy * f;
+      }
+    }
+    for (const l of links) {
+      let dx = nodes[l.s].x - nodes[l.t].x, dy = nodes[l.s].y - nodes[l.t].y;
+      let d = Math.hypot(dx, dy) || 0.01;
+      const f = (d * d) / k;
+      const ux = dx / d, uy = dy / d;
+      dispx[l.s] -= ux * f; dispy[l.s] -= uy * f;
+      dispx[l.t] += ux * f; dispy[l.t] += uy * f;
+    }
+    for (let i = 0; i < N; i++) {
+      let dx = dispx[i], dy = dispy[i];
+      const d = Math.hypot(dx, dy) || 0.01;
+      const step = Math.min(d, temp);
+      nodes[i].x += (dx / d) * step;
+      nodes[i].y += (dy / d) * step;
+    }
+    temp = Math.max(temp - cool, 1);
+  }
+
+  // Draw.
+  const gEdges = document.getElementById("edges"), gNodes = document.getElementById("nodes");
+  const rad = 7;
+  for (const l of links) {
+    const a = nodes[l.s], b = nodes[l.t];
+    let dx = b.x - a.x, dy = b.y - a.y;
+    const d = Math.hypot(dx, dy) || 1;
+    const ux = dx / d, uy = dy / d;
+    const line = svg("line", {
+      class: "edge",
+      x1: a.x + ux * rad, y1: a.y + uy * rad,
+      x2: b.x - ux * (rad + 4), y2: b.y - uy * (rad + 4),
+      "marker-end": "url(#arrow)",
+    });
+    gEdges.appendChild(line);
+  }
+  const els = [];
+  nodes.forEach((n) => {
+    const g = svg("g", { class: "node" });
+    g.setAttribute("transform", "translate(" + n.x + "," + n.y + ")");
+    const c = svg("circle", { r: rad, fill: colorOf(n.kind) });
+    const label = svg("text", { x: rad + 3, y: 4 });
+    label.textContent = n.label || n.id;   // textContent → model string inert
+    g.appendChild(c); g.appendChild(label);
+    g.addEventListener("click", (ev) => { ev.stopPropagation(); select(n, g); });
+    gNodes.appendChild(g);
+    els.push(g);
+  });
+
+  // Fit viewBox to the laid-out bounds.
+  let minx = Infinity, miny = Infinity, maxx = -Infinity, maxy = -Infinity;
+  for (const n of nodes) {
+    minx = Math.min(minx, n.x); miny = Math.min(miny, n.y);
+    maxx = Math.max(maxx, n.x); maxy = Math.max(maxy, n.y);
+  }
+  const pad = 80;
+  const svgEl = document.getElementById("svg");
+  svgEl.setAttribute("viewBox", (minx - pad) + " " + (miny - pad) + " " +
+    ((maxx - minx) + 2 * pad) + " " + ((maxy - miny) + 2 * pad));
+
+  // Selection panel.
+  const panel = document.getElementById("panel");
+  const pl = document.getElementById("pl"), pd = document.getElementById("pd");
+  let selEl = null;
+  function select(n, g) {
+    if (selEl) selEl.classList.remove("sel");
+    selEl = g; g.classList.add("sel");
+    pl.textContent = n.label || n.id;
+    pd.replaceChildren();
+    const rows = [["id", n.id], ["kind", n.kind || "(없음)"], ["path", n.path || "(없음)"]];
+    for (const [key, val] of rows) {
+      const dt = document.createElement("dt"); dt.textContent = key;
+      const dd = document.createElement("dd"); dd.textContent = val;   // textContent
+      pd.appendChild(dt); pd.appendChild(dd);
+    }
+    panel.classList.add("show");
+  }
+  document.getElementById("pclose").addEventListener("click", () => {
+    panel.classList.remove("show");
+    if (selEl) { selEl.classList.remove("sel"); selEl = null; }
+  });
+
+  // Zoom (wheel, around cursor) + pan (drag background).
+  const vp = document.getElementById("vp");
+  let scale = 1, tx = 0, ty = 0;
+  function apply() { vp.setAttribute("transform", "translate(" + tx + "," + ty + ") scale(" + scale + ")"); }
+  function toWorld(ev) {
+    const r = svgEl.getBoundingClientRect();
+    const vb = svgEl.viewBox.baseVal;
+    return {
+      x: vb.x + (ev.clientX - r.left) / r.width * vb.width,
+      y: vb.y + (ev.clientY - r.top) / r.height * vb.height,
+    };
+  }
+  svgEl.addEventListener("wheel", (ev) => {
+    ev.preventDefault();
+    const w = toWorld(ev);
+    const factor = ev.deltaY < 0 ? 1.1 : 1 / 1.1;
+    const ns = Math.min(8, Math.max(0.15, scale * factor));
+    tx = w.x - (w.x - tx) * (ns / scale);
+    ty = w.y - (w.y - ty) * (ns / scale);
+    scale = ns; apply();
+  }, { passive: false });
+  let dragging = false, lastx = 0, lasty = 0;
+  svgEl.addEventListener("pointerdown", (ev) => {
+    dragging = true; lastx = ev.clientX; lasty = ev.clientY;
+    svgEl.classList.add("dragging"); svgEl.setPointerCapture(ev.pointerId);
+  });
+  svgEl.addEventListener("pointermove", (ev) => {
+    if (!dragging) return;
+    const vb = svgEl.viewBox.baseVal, r = svgEl.getBoundingClientRect();
+    tx += (ev.clientX - lastx) / r.width * vb.width;
+    ty += (ev.clientY - lasty) / r.height * vb.height;
+    lastx = ev.clientX; lasty = ev.clientY; apply();
+  });
+  function endDrag() { dragging = false; svgEl.classList.remove("dragging"); }
+  svgEl.addEventListener("pointerup", endDrag);
+  svgEl.addEventListener("pointercancel", endDrag);
+}
+</script>
+</body>
+</html>
+"##;
 
 #[cfg(test)]
 mod tests {
@@ -386,5 +689,121 @@ mod tests {
         assert_eq!(now.len(), 20, "YYYY-MM-DDThh:mm:ssZ");
         assert!(now.ends_with('Z'));
         assert!(now.starts_with("20"), "sometime this century: {now}");
+    }
+
+    // --- HTML viewer (task-02) ---
+
+    /// The set of substrings that would betray an external request. Kept in sync
+    /// with the packet's `grep -iE 'https?://|src=|cdn|@import|fonts.googleapis'`.
+    fn external_ref_markers(html: &str) -> Vec<&'static str> {
+        let lower = html.to_lowercase();
+        ["http://", "https://", "src=", "cdn", "@import", "fonts.googleapis"]
+            .into_iter()
+            .filter(|m| lower.contains(m))
+            .collect()
+    }
+
+    #[test]
+    fn render_html_is_self_contained() {
+        let g = parse_graph_json(SAMPLE).unwrap();
+        let html = render_graph_html(&g);
+        // Placeholder fully substituted.
+        assert!(!html.contains("__DATA__"), "template placeholder left in output");
+        // Zero external references (offline / CSP-independent self-containment).
+        let refs = external_ref_markers(&html);
+        assert!(refs.is_empty(), "unexpected external references: {refs:?}");
+        // Well-formed enough: balanced script/style tags, doctype present.
+        assert!(html.starts_with("<!doctype html>"));
+        assert_eq!(html.matches("<script").count(), html.matches("</script>").count());
+        assert_eq!(html.matches("<style").count(), html.matches("</style>").count());
+        assert!(html.contains("</html>"));
+    }
+
+    #[test]
+    fn render_html_embeds_graph_content() {
+        let g = parse_graph_json(SAMPLE).unwrap();
+        let html = render_graph_html(&g);
+        // Node ids/labels and edge endpoints ride in the embedded JSON payload.
+        assert!(html.contains("\"id\":\"a\""), "node id missing from payload");
+        assert!(html.contains("\"label\":\"A\""), "node label missing");
+        assert!(html.contains("\"kind\":\"module\""), "node kind missing");
+        assert!(html.contains("src/a.rs"), "node path missing");
+        assert!(html.contains("\"from\":\"a\""), "edge from missing");
+        assert!(html.contains("\"to\":\"b\""), "edge to missing");
+    }
+
+    #[test]
+    fn render_html_escapes_script_breakout() {
+        // A hostile label must not be able to close the <script> element.
+        let mut g = parse_graph_json(SAMPLE).unwrap();
+        g.nodes.push(Node {
+            id: "x".into(),
+            label: "</script><img src=x onerror=alert(1)>".into(),
+            kind: "file".into(),
+            path: None,
+        });
+        let html = render_graph_html(&g);
+        // The only literal </script> is the template's own closing tag.
+        assert_eq!(html.matches("</script>").count(), 1, "breakout not neutralized");
+        // The '<' of the payload is escaped to the JS/JSON-safe form.
+        assert!(html.contains("\\u003c/script>"), "'<' not escaped in payload");
+        assert!(!html.contains("<img src=x"), "raw tag leaked into document");
+    }
+
+    #[test]
+    fn render_empty_graph_is_valid_html() {
+        let g = Graph {
+            schema_version: 1,
+            project: "/p".into(),
+            generated_at: "2026-07-20T00:00:00Z".into(),
+            nodes: vec![],
+            edges: vec![],
+        };
+        let html = render_graph_html(&g);
+        assert!(!html.contains("__DATA__"));
+        assert!(external_ref_markers(&html).is_empty());
+        assert!(html.contains("\"nodes\":[]"));
+    }
+
+    #[test]
+    fn save_graph_html_writes_under_project_key() {
+        let root = temp_root("html");
+        let project = "/home/x/some-proj";
+        let g = parse_graph_json(SAMPLE).unwrap();
+        let path = save_graph_html(&root, project, &g).unwrap();
+
+        let key = project_key(project);
+        assert!(
+            path.ends_with(PathBuf::from(&key).join("graph").join("graph.html")),
+            "unexpected path: {}",
+            path.display()
+        );
+        assert!(path.is_file());
+        let body = fs::read_to_string(&path).unwrap();
+        assert!(body.starts_with("<!doctype html>"));
+        assert!(external_ref_markers(&body).is_empty());
+        assert!(body.contains("\"id\":\"a\""));
+        // No temp leftovers.
+        let leftovers: Vec<_> = fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().starts_with(".graph.html.tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "temp file not cleaned up");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn save_graph_all_writes_both_artifacts() {
+        let root = temp_root("all");
+        let project = "/home/x/proj";
+        let g = parse_graph_json(SAMPLE).unwrap();
+        let (json_path, html_path) = save_graph_all(&root, project, &g).unwrap();
+        assert!(json_path.ends_with("graph.json"));
+        assert!(html_path.ends_with("graph.html"));
+        assert!(json_path.is_file() && html_path.is_file());
+        // Both landed in the same graph/ folder.
+        assert_eq!(json_path.parent(), html_path.parent());
+        let _ = fs::remove_dir_all(&root);
     }
 }
