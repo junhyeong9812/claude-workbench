@@ -25,6 +25,109 @@
 
 ---
 
+## 프로젝트 레이아웃
+
+```
+multi-terminal/
+├── core/                    # 순수 Rust 로직 (tauri 무의존 — headless 단위 테스트)
+│   ├── src/
+│   │   ├── jsonl/           #   세션 JSONL 파서·타임라인 매퍼·tail·locate
+│   │   ├── archive.rs       #   아카이브 파이프라인 (정규화·book.html·멱등 교체)
+│   │   ├── knowledge.rs     #   지식 베이스 (추출 파싱·issue/method/domain·INDEX)
+│   │   ├── mcp.rs           #   지식 조회 MCP 서버 로직 + .mcp.json 병합 등록
+│   │   ├── claude_cli.rs    #   일회성 claude -p 호출 (--model/--effort)
+│   │   ├── git/ git.rs      #   git CLI 래핑 (그래프·rewrite·worktree)
+│   │   ├── session.rs       #   PTY 세션 매니저
+│   │   ├── snapshot.rs      #   세션 타임라인 스냅샷 영속
+│   │   ├── persist.rs       #   워크스페이스 상태 (workspace.json)
+│   │   └── bin/
+│   │       ├── knowledge_mcp.rs      # MCP stdio 서버 바이너리
+│   │       └── archive_backfill.rs   # 과거 세션 일괄 아카이브 CLI
+├── src-tauri/               # Tauri 셸 — 얇은 command 래퍼
+│   └── src/commands/        #   claude·archive·git·files·ssh·terminal
+├── src/                     # React 프론트
+│   ├── components/          #   ClaudeTermPanel(터미널+타임라인)·ArchivePanel·
+│   │                        #   GitPanel·DevView·StudyView·MainArea(dockview)…
+│   └── state/               #   zustand store·claudeStatus(배지)·layerRouting
+└── scripts/css-audit.mjs    # CSS 가드 (z토큰·flex·네임스페이스)
+```
+
+## 아키텍처 구조
+
+```
+┌──────────────────────────── React 프론트 (WebView) ────────────────────────────┐
+│  ProjectTabs · 사이드바(파일/Git/워크트리/아카이브) · MainArea(dockview)         │
+│  ClaudeTermPanel = [xterm 터미널 | 상세뷰어 | 타임라인] · DevView · StudyView    │
+└──────────────┬────────────────────────────────────────────────────────────────┘
+               │ Tauri IPC (invoke / event)
+┌──────────────▼──────────────── src-tauri commands ─────────────────────────────┐
+│  claude_* (PTY·타임라인 폴링)   archive_* (아카이브·목록·설정)   git_* · ssh_* │
+└──────┬───────────────┬──────────────────┬─────────────────────────────────────┘
+       │               │                  │
+┌──────▼─────┐  ┌──────▼───────┐  ┌───────▼────────┐
+│ core::     │  │ core::       │  │ core::git      │
+│ session    │  │ jsonl→       │  │ (system git)   │
+│ (PTY 스폰) │  │ timeline     │  └────────────────┘
+└──────┬─────┘  └──────▲───────┘
+       │               │ tail (150ms)
+       ▼               │
+  claude CLI ──▶ ~/.claude/projects/<slug>/<uuid>.jsonl   ← 단일 출처 (앱은 읽기만)
+                       │
+                       ▼ 아카이브(수동 버튼 / backfill CLI)
+   <archive_root>/<project>/{sessions/…, knowledge/…}
+                       ▲
+                       │ 조회 (읽기 전용)
+   knowledge-mcp (stdio) ◀── .mcp.json ◀── 아카이브·세션 시작 시 자동 등록
+```
+
+## 동작 프로세스
+
+**세션 → 타임라인 (라이브)**
+
+```
+[+ Claude] ─▶ claude_open_or_attach
+   ├─ (지식 있으면) .mcp.json 등록 보장 ─▶ 새 claude가 지식 서버를 갖고 시작
+   ├─ PTY 스폰: claude --session-id <uuid>
+   └─ 폴링 스레드: JSONL tail ─▶ JsonlMapper ─▶ claude-timeline 이벤트
+                                          └─▶ 스냅샷 영속 (재시작 복원)
+프론트: xterm에 PTY 출력 · 타임라인에 턴/도구/서브에이전트 · 배지(blocked/done)
+```
+
+**아카이브 → 지식 → 재사용 (기록 사이클)**
+
+```
+[아카이브 버튼]  (라이브 체크포인트 — 세션은 계속, 재실행 = 멱등 갱신)
+   ▼
+① core 산출물 선착지: session.jsonl 복사 + normalized.json + book.html + meta.json
+   ▼                                (원본 무변경 · 이후 실패해도 이건 남음)
+② claude -p 추출 (기본 opus + effort xhigh, /tmp 스크래치 cwd에서 실행)
+   │   ===SUMMARY=== 제목·요약 / ===ENTRY=== issue|method|domain
+   ├─ 실패 ─▶ 부분 성공 (이전 요약 last-good 유지, 재아카이브가 재시도)
+   ▼
+③ summary.md + knowledge/{issues,methods,domain}/*.md + INDEX.md 재생성
+   ▼
+④ .mcp.json 병합 등록 (타 서버 보존 · 동명 타 서버 거부 · 손상 시 미변경)
+```
+
+**MCP 조회 사이클 (자동화의 목적지)**
+
+```
+그 프로젝트에서 claude 시작 (앱 안이든 밖이든)
+   │  Claude Code가 .mcp.json 읽음
+   ▼
+knowledge-mcp 자식 프로세스 스폰 (stdio · 상시 데몬 아님 · 읽기 전용)
+   │  initialize(버전 협상) → tools/list
+   ▼
+이슈 발생: "search_knowledge로 <에러코드> 검색"
+   │  이슈 본문에 에러 원문이 보존돼 있어 문자열 그대로 매칭
+   ▼
+과거의 원인·해결·실패한 시도 → read_knowledge로 전문 → 같은 삽질 반복 없음
+```
+
+과거 세션은 `archive-backfill` CLI로 일괄 지식화한다 (`--days`·`--limit`·`--exclude`, 프로젝트 병렬·완료 판정 = summary 존재 → 중단·실패분은 재실행이 자동 회수).
+
+---
+
 ## 기술 스택
 
 | 영역 | 사용 |
