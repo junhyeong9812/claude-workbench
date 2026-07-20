@@ -51,6 +51,7 @@ fn extraction_opts(app: &AppHandle) -> ClaudeOpts {
     ClaudeOpts {
         model: Some(ws.archive_model.filter(|m| !m.trim().is_empty()).unwrap_or_else(|| "opus".into())),
         effort: Some(ws.archive_effort.filter(|e| !e.trim().is_empty()).unwrap_or_else(|| "xhigh".into())),
+        ..Default::default()
     }
 }
 

@@ -265,6 +265,7 @@ fn main() {
     let opts = ClaudeOpts {
         model: Some(args.model.clone()),
         effort: Some(args.effort.clone()),
+        ..Default::default()
     };
     let queue: Mutex<Vec<(String, Vec<(Candidate, String)>)>> =
         Mutex::new(by_project.into_iter().collect());

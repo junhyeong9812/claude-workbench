@@ -27,10 +27,17 @@ pub fn extraction_workdir() -> std::path::PathBuf {
 
 /// Model/effort selection for one invocation. `None` = let the CLI use its
 /// session default. Values are passed verbatim as `--model` / `--effort`.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct ClaudeOpts {
     pub model: Option<String>,
     pub effort: Option<String>,
+    /// Extra directories the run is allowed to read outside its cwd, each passed
+    /// as `--add-dir <dir>`. Lets a run keep a fixed `/tmp` cwd (backfill-safe)
+    /// while still exploring an absolute project path — `claude -p` otherwise
+    /// blocks reads outside cwd. `#[serde(default)]` so opts serialized before
+    /// this field existed still deserialize (empty vec).
+    #[serde(default)]
+    pub add_dirs: Vec<String>,
 }
 
 /// The argv tail after the binary name — split out so tests can pin the flag
@@ -44,6 +51,10 @@ pub fn build_args(opts: &ClaudeOpts) -> Vec<String> {
     if let Some(e) = opts.effort.as_deref().map(str::trim).filter(|e| !e.is_empty()) {
         args.push("--effort".into());
         args.push(e.to_string());
+    }
+    for dir in opts.add_dirs.iter().map(|d| d.trim()).filter(|d| !d.is_empty()) {
+        args.push("--add-dir".into());
+        args.push(dir.to_string());
     }
     args
 }
@@ -163,6 +174,7 @@ mod tests {
         let opts = ClaudeOpts {
             model: Some("opus".into()),
             effort: Some("xhigh".into()),
+            ..Default::default()
         };
         assert_eq!(
             build_args(&opts),
@@ -175,7 +187,33 @@ mod tests {
         let opts = ClaudeOpts {
             model: Some("  ".into()),
             effort: Some("".into()),
+            ..Default::default()
         };
         assert_eq!(build_args(&opts), vec!["-p", "--output-format", "text"]);
+    }
+
+    #[test]
+    fn build_args_appends_add_dir_per_entry_skipping_blanks() {
+        let opts = ClaudeOpts {
+            add_dirs: vec!["/proj/a".into(), "  ".into(), "".into(), "/proj/b".into()],
+            ..Default::default()
+        };
+        assert_eq!(
+            build_args(&opts),
+            vec!["-p", "--output-format", "text", "--add-dir", "/proj/a", "--add-dir", "/proj/b"]
+        );
+    }
+
+    #[test]
+    fn opts_json_without_add_dirs_deserializes_to_empty() {
+        // Opts serialized before `add_dirs` existed must still parse (serde default).
+        let opts: ClaudeOpts =
+            serde_json::from_str(r#"{ "model": "opus", "effort": "high" }"#).unwrap();
+        assert_eq!(opts.model.as_deref(), Some("opus"));
+        assert_eq!(opts.effort.as_deref(), Some("high"));
+        assert!(opts.add_dirs.is_empty());
+        // And a fully empty object still yields defaults.
+        let empty: ClaudeOpts = serde_json::from_str("{}").unwrap();
+        assert!(empty.add_dirs.is_empty() && empty.model.is_none());
     }
 }

@@ -12,6 +12,7 @@ pub mod archive;
 pub mod claude_cli;
 pub mod fs;
 pub mod git;
+pub mod graph;
 pub mod history;
 pub mod jsonl;
 pub mod knowledge;
@@ -31,6 +32,7 @@ pub use timeline::{
     AgentStatus, FileDiff, ItemKind, Timeline, TimelineItem, TokenUsage, WriteStatus,
 };
 pub use fs::{list_dir, DirEntry};
+pub use graph::{generate_graph, save_graph, Edge, Graph, Node};
 pub use label::nearest_project_marker;
 pub use persist::{load_state, save_state, Project, SshConnection, TreeState, WorkspaceState};
 pub use project_type::{detect_project_types, ProjectType};
