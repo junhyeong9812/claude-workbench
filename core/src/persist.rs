@@ -100,6 +100,16 @@ pub struct WorkspaceState {
     /// default (xhigh).
     #[serde(default)]
     pub archive_effort: Option<String>,
+    /// Claude model alias/name for dependency-graph generation (`--model`).
+    /// `None` = the app default (opus). Kept separate from `archive_model` so a
+    /// user can pick a different model for graphs. `#[serde(default)]` so a
+    /// workspace.json saved before this field loads as `None` (backward compat).
+    #[serde(default)]
+    pub graph_model: Option<String>,
+    /// Reasoning effort for dependency-graph generation (`--effort`). `None` =
+    /// the app default (xhigh).
+    #[serde(default)]
+    pub graph_effort: Option<String>,
 }
 
 /// Serialize `state` to `path` as pretty JSON, creating parent dirs as needed.
@@ -342,6 +352,27 @@ mod tests {
         let old = load_state(&path2);
         assert_eq!(old.archive_model, None);
         assert_eq!(old.archive_effort, None);
+    }
+
+    #[test]
+    fn graph_model_and_effort_round_trip_and_default_none() {
+        let path = temp_path("graph_model_rt");
+        let state = WorkspaceState {
+            graph_model: Some("sonnet".into()),
+            graph_effort: Some("high".into()),
+            ..WorkspaceState::default()
+        };
+        save_state(&state, &path).unwrap();
+        let loaded = load_state(&path);
+        assert_eq!(loaded.graph_model, Some("sonnet".into()));
+        assert_eq!(loaded.graph_effort, Some("high".into()));
+        // A workspace.json that predates the graph fields loads them as None
+        // (backward compat — existing files are never invalidated).
+        let path2 = temp_path("graph_model_migration");
+        fs::write(&path2, r#"{ "open_projects": [], "active_project": null }"#).unwrap();
+        let old = load_state(&path2);
+        assert_eq!(old.graph_model, None);
+        assert_eq!(old.graph_effort, None);
     }
 
     #[test]

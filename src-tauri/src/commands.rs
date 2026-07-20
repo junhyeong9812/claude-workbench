@@ -19,6 +19,7 @@ mod archive;
 mod claude;
 mod files;
 mod git;
+mod graph;
 mod ssh;
 mod terminal;
 
@@ -26,6 +27,7 @@ pub use archive::*;
 pub use claude::*;
 pub use files::*;
 pub use git::*;
+pub use graph::*;
 pub use ssh::*;
 pub use terminal::*;
 

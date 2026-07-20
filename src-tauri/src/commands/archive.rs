@@ -71,8 +71,9 @@ pub struct ArchiveResult {
 }
 
 /// The effective archive root: the workspace-configured directory when set and
-/// non-blank, else `<app_data_dir>/archive`.
-fn archive_root(app: &AppHandle) -> Result<PathBuf, AppError> {
+/// non-blank, else `<app_data_dir>/archive`. `pub(super)` so sibling command
+/// modules (e.g. the graph viewer) resolve the identical root — single source.
+pub(super) fn archive_root(app: &AppHandle) -> Result<PathBuf, AppError> {
     let configured = super::load_state(app.clone()).archive_root;
     if let Some(root) = configured {
         let trimmed = root.trim();
