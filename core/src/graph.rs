@@ -83,6 +83,14 @@ pub struct Graph {
     pub nodes: Vec<Node>,
     #[serde(default)]
     pub edges: Vec<Edge>,
+    /// Human-readable advisories about this graph's completeness — e.g. a note
+    /// that the sub-project list was capped (see [`MAX_GRAPH_ROOTS`]). Set
+    /// authoritatively by the generators (never trusted from model output); the
+    /// viewer surfaces them in a banner so a truncated graph is never mistaken
+    /// for a complete one. `#[serde(default, skip_serializing_if)]` keeps older
+    /// graph.json (no `notes`) parsing unchanged and omits the field when empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub notes: Vec<String>,
 }
 
 /// The prompt for one graph-generation run. The model is told to explore the
@@ -105,17 +113,45 @@ pub fn graph_prompt(project_path: &str) -> String {
     )
 }
 
-/// Extract the first balanced-looking JSON object substring (`{` … last `}`) —
-/// a fallback when the model wraps the object in a code fence or stray prose
-/// despite the prompt. Best-effort: assumes a single top-level object.
+/// Extract the **first balanced** JSON object substring (from the first `{` to
+/// the `}` that closes it) — a fallback when the model wraps the object in a code
+/// fence or stray prose despite the prompt. Counts brace depth so trailing prose
+/// with its own braces (e.g. `{…valid…}\n필드는 {from,to} 형식`) can't extend the
+/// range into a second, unparseable object. Braces and quotes *inside* string
+/// literals are ignored (tracking `"` open/close and `\` escapes), so a label like
+/// `"a{b}c"` doesn't skew the count. Char-boundary safe: the structural bytes
+/// (`{}"\`) are all ASCII, and `char_indices` skips over any multibyte chars.
 fn extract_json_object(s: &str) -> Option<&str> {
     let start = s.find('{')?;
-    let end = s.rfind('}')?;
-    if end > start {
-        Some(&s[start..=end])
-    } else {
-        None
+    let mut depth: usize = 0;
+    let mut in_string = false;
+    let mut escaped = false;
+    for (off, ch) in s[start..].char_indices() {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match ch {
+            '"' => in_string = true,
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    // `off` is the byte offset within `s[start..]`; `}` is ASCII,
+                    // so `start + off` is a valid inclusive char boundary.
+                    return Some(&s[start..=start + off]);
+                }
+            }
+            _ => {}
+        }
     }
+    None
 }
 
 /// Parse a graph-generation response into a [`Graph`]. Tries the trimmed text
@@ -154,6 +190,9 @@ pub fn generate_graph(project_path: &str, opts: &ClaudeOpts) -> Result<Graph, St
     graph.schema_version = SCHEMA_VERSION;
     graph.project = project_path.to_string();
     graph.generated_at = now_iso8601();
+    // Single-project path is never truncated — authoritative empty (don't trust
+    // any `notes` the model may have emitted).
+    graph.notes = Vec::new();
     Ok(graph)
 }
 
@@ -250,11 +289,11 @@ pub fn generate_project_graph(project_path: &str, opts: &ClaudeOpts) -> Result<G
     // Cap the prompt's root list (never silently — log the truncation). Roots are
     // sorted lexicographically, so the project's own (shortest) root sorts first
     // and always survives the truncate.
-    let truncated = roots.len() > MAX_GRAPH_ROOTS;
+    let total_roots = roots.len();
+    let truncated = total_roots > MAX_GRAPH_ROOTS;
     if truncated {
         eprintln!(
-            "graph: {} sub-project roots under {canon}; capping the prompt to {MAX_GRAPH_ROOTS} (truncated)",
-            roots.len()
+            "graph: {total_roots} sub-project roots under {canon}; capping the prompt to {MAX_GRAPH_ROOTS} (truncated)"
         );
         roots.truncate(MAX_GRAPH_ROOTS);
     }
@@ -278,6 +317,16 @@ pub fn generate_project_graph(project_path: &str, opts: &ClaudeOpts) -> Result<G
     graph.schema_version = SCHEMA_VERSION;
     graph.project = project_path.to_string();
     graph.generated_at = now_iso8601();
+    // Surface truncation to the viewer (authoritative) — a capped graph is
+    // incomplete, and stderr alone is invisible to the GUI user (F1: no silent
+    // failure). Empty otherwise (don't trust any model-emitted `notes`).
+    graph.notes = if truncated {
+        vec![format!(
+            "하위 저장소 {total_roots}개 중 상한 {MAX_GRAPH_ROOTS}개만 포함 — 그래프가 불완전합니다"
+        )]
+    } else {
+        Vec::new()
+    };
     Ok(graph)
 }
 
@@ -443,6 +492,9 @@ body { background: #14161a; color: #d7dae0; font: 14px/1.6 -apple-system, "Noto 
 header { position: fixed; top: 0; left: 0; right: 0; background: #1a1d23; border-bottom: 1px solid #2a2e36; padding: 10px 16px; z-index: 3; }
 header h1 { font-size: 15px; margin: 0 0 2px; overflow-wrap: anywhere; }
 header .meta { font-size: 12px; color: #8b93a1; }
+#banner { margin-top: 8px; background: #3a2e12; border: 1px solid #e0af68; border-radius: 6px; padding: 6px 10px; color: #f0d9a0; font-size: 12px; }
+#banner div { overflow-wrap: anywhere; }
+#banner div + div { margin-top: 4px; }
 #svg { position: fixed; inset: 0; width: 100%; height: 100%; cursor: grab; }
 #svg.dragging { cursor: grabbing; }
 #empty { position: fixed; inset: 0; display: flex; align-items: center; justify-content: center; color: #8b93a1; font-size: 13px; }
@@ -501,6 +553,22 @@ document.getElementById("t").textContent = (DATA && DATA.project) || "의존성 
 document.title = "의존성 그래프 · " + ((DATA && DATA.project) || "");
 document.getElementById("m").textContent =
   [ "노드 " + nodes.length, "엣지 " + rawEdges.length, (DATA && DATA.generated_at) || "" ].filter(Boolean).join("  ·  ");
+
+// Completeness advisories (e.g. sub-project list capped): show a prominent
+// warning banner so a truncated graph is never mistaken for a complete one
+// (F1 — GUI users never see stderr). textContent only → model strings inert.
+const notes = (DATA && Array.isArray(DATA.notes)) ? DATA.notes.filter(Boolean) : [];
+if (notes.length) {
+  const banner = document.createElement("div");
+  banner.id = "banner";
+  banner.setAttribute("role", "alert");
+  notes.forEach(msg => {
+    const line = document.createElement("div");
+    line.textContent = "⚠ " + msg;
+    banner.appendChild(line);
+  });
+  document.querySelector("header").appendChild(banner);
+}
 
 // Legend. Grouped graphs list the sub-projects (color = group); otherwise the
 // kinds actually present (color = kind) — the original single-project legend.
@@ -741,6 +809,25 @@ mod tests {
     }
 
     #[test]
+    fn parse_stops_at_first_balanced_object_ignoring_trailing_prose_braces() {
+        // Valid object followed by prose that itself contains braces — the old
+        // first-`{`..last-`}` grab would swallow both and fail to parse (F2).
+        let raw = format!("여기 그래프입니다:\n{SAMPLE}\n참고: 필드는 {{from, to}} 형식입니다.");
+        let g = parse_graph_json(&raw).unwrap();
+        assert_eq!(g.nodes.len(), 2);
+        assert_eq!(g.edges.len(), 1);
+    }
+
+    #[test]
+    fn parse_ignores_braces_inside_string_literals() {
+        // A `{`/`}` inside a string value must not skew the depth counter (F2).
+        let raw = r#"prefix {"nodes":[{"id":"n","label":"a{b}c"}],"edges":[]} suffix"#;
+        let g = parse_graph_json(raw).unwrap();
+        assert_eq!(g.nodes.len(), 1);
+        assert_eq!(g.nodes[0].label, "a{b}c");
+    }
+
+    #[test]
     fn parse_missing_optional_fields_defaults() {
         // Only nodes/edges arrays with bare ids — label/kind default to empty.
         let minimal = r#"{ "nodes": [ { "id": "x" } ], "edges": [] }"#;
@@ -908,11 +995,46 @@ mod tests {
             generated_at: "2026-07-20T00:00:00Z".into(),
             nodes: vec![],
             edges: vec![],
+            notes: vec![],
         };
         let html = render_graph_html(&g);
         assert!(!html.contains("__DATA__"));
         assert!(external_ref_markers(&html).is_empty());
         assert!(html.contains("\"nodes\":[]"));
+    }
+
+    #[test]
+    fn notes_serde_is_optional_and_backcompat() {
+        // Pre-notes graph.json (no `notes` key) still parses → notes default empty.
+        let g = parse_graph_json(SAMPLE).unwrap();
+        assert!(g.notes.is_empty(), "absent notes → empty vec");
+        // Empty notes are omitted on serialize (skip_serializing_if) — old readers
+        // never see a new key.
+        let out = serde_json::to_string(&g).unwrap();
+        assert!(!out.contains("\"notes\""), "empty notes must not serialize");
+        // A graph WITH notes round-trips.
+        let withnotes = r#"{ "nodes": [], "edges": [], "notes": ["잘림 경고"] }"#;
+        let g2 = parse_graph_json(withnotes).unwrap();
+        assert_eq!(g2.notes, vec!["잘림 경고".to_string()]);
+    }
+
+    #[test]
+    fn render_html_with_notes_embeds_banner_and_stays_self_contained() {
+        let mut g = parse_graph_json(SAMPLE).unwrap();
+        g.notes.push("하위 저장소 60개 중 상한 50개만 포함 — 그래프가 불완전합니다".into());
+        let html = render_graph_html(&g);
+        // The note rides in the embedded payload (drives the JS-built banner).
+        assert!(html.contains("\"notes\":["), "notes serialized into payload");
+        assert!(
+            html.contains("상한 50개만 포함"),
+            "note text present in payload"
+        );
+        // The banner-building code is present in the template.
+        assert!(html.contains("id = \"banner\"") || html.contains("banner.id = \"banner\""),
+            "banner element is built");
+        // Self-containment invariant preserved (no external references).
+        assert!(external_ref_markers(&html).is_empty(), "noted graph must stay offline");
+        assert!(!html.contains("__DATA__"));
     }
 
     #[test]

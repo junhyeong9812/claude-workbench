@@ -62,6 +62,19 @@ fn graph_opts(app: &AppHandle) -> ClaudeOpts {
     }
 }
 
+/// Canonical project identity for the graph feature — resolves symlinks / `.` /
+/// trailing-slash aliases so the write side ([`graph_generate`]) and the read side
+/// ([`graph_list`]) derive the **same** `project_key`, and so that key matches the
+/// session archive's (`archive_session` canonicalizes identically, archive.rs:102).
+/// Also keeps the core generator's prompt path and `--add-dir` grants consistent
+/// (both then see the canonical path). Falls back to the raw path when it can't be
+/// resolved (e.g. the project isn't on disk).
+fn canonical_project(project_path: &str) -> String {
+    std::fs::canonicalize(project_path)
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_else(|_| project_path.to_string())
+}
+
 /// Generate a dependency graph for `project_path` and persist JSON + HTML under
 /// the archive root. The Opus exploration is up to 3 minutes, so the whole
 /// generate-and-save runs on the blocking pool — the webview must stay
@@ -72,10 +85,14 @@ fn graph_opts(app: &AppHandle) -> ClaudeOpts {
 pub async fn graph_generate(app: AppHandle, project_path: String) -> Result<GraphPaths, AppError> {
     let root = super::archive::archive_root(&app)?;
     let opts = graph_opts(&app);
+    // Emit the original path to the frontend (its listener matches `activeProject`,
+    // the raw store value), but drive generation/persistence off the canonical path
+    // so the project_key is stable across symlink/`.` aliases and matches graph_list.
     let project = project_path.clone();
+    let canon = canonical_project(&project_path);
     let (json, html) = tauri::async_runtime::spawn_blocking(move || -> Result<(PathBuf, PathBuf), String> {
-        let graph = core_lib::graph::generate_project_graph(&project_path, &opts)?;
-        core_lib::graph::save_graph_all(&root, &project_path, &graph)
+        let graph = core_lib::graph::generate_project_graph(&canon, &opts)?;
+        core_lib::graph::save_graph_all(&root, &canon, &graph)
     })
     .await
     .map_err(|_| AppError::new("그래프 생성 작업을 실행하지 못했습니다"))?
@@ -103,7 +120,8 @@ pub async fn graph_generate(app: AppHandle, project_path: String) -> Result<Grap
 #[tauri::command]
 pub fn graph_list(app: AppHandle, project_path: String) -> Result<Option<GraphInfo>, AppError> {
     let root = super::archive::archive_root(&app)?;
-    Ok(read_graph_info(&root, &project_path))
+    // Same canonical key as graph_generate wrote under (read/write must agree).
+    Ok(read_graph_info(&root, &canonical_project(&project_path)))
 }
 
 /// Read the cached graph info under `root` for `project_path`, or `None` if the
@@ -198,6 +216,7 @@ mod tests {
                 group: None,
             }],
             edges: vec![],
+            notes: vec![],
         };
         core_lib::graph::save_graph_all(&root, project, &graph).unwrap();
 
@@ -226,6 +245,26 @@ mod tests {
         // A corrupt cache reads as "no usable graph" → regenerate, not an error.
         assert!(read_graph_info(&root, project).is_none());
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn canonical_project_falls_back_to_raw_when_absent() {
+        // A not-yet-on-disk path can't be canonicalized → raw passthrough (so a
+        // never-generated project still yields a stable, if uncanonical, key).
+        let missing = "/nonexistent/graph-canon-xyz-123";
+        assert_eq!(canonical_project(missing), missing);
+    }
+
+    #[test]
+    fn canonical_project_resolves_existing_path() {
+        let dir = temp_root("canon");
+        let got = canonical_project(&dir.to_string_lossy());
+        let expected = std::fs::canonicalize(&dir)
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        assert_eq!(got, expected, "existing path resolves to its canonical form");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

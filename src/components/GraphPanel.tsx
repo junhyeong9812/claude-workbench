@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { errText } from "../utils/error";
@@ -53,6 +53,12 @@ export function GraphPanel() {
   const [loading, setLoading] = useState(false);
   const [generating, setGenerating] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  // Monotonic token for generation requests. A `generate()` call captures the
+  // current token; its then/catch/finally only touch state while that token is
+  // still current — so a stale run (project switched away and back, or a second
+  // generate superseding the first) can never resurrect old state or flip
+  // `generating` for a newer request.
+  const genToken = useRef(0);
 
   // Probe the cache for `project` (no Opus). Guards against a stale response
   // landing after the active project changed by re-checking the current store
@@ -77,6 +83,9 @@ export function GraphPanel() {
   // Re-probe whenever the active project changes (and reset transient state so a
   // previous project's graph never flashes for the new one).
   useEffect(() => {
+    // Invalidate any in-flight generation from the previous project so its late
+    // response can't apply to (or un-set `generating` on) the new one.
+    genToken.current += 1;
     setInfo(null);
     setError(null);
     setGenerating(false);
@@ -105,17 +114,23 @@ export function GraphPanel() {
   const generate = () => {
     if (!activeProject) return;
     const project = activeProject;
+    const token = (genToken.current += 1);
+    // A result applies only when it is still the latest request AND the project
+    // hasn't changed underneath it (the two guards are complementary: the token
+    // rejects a superseded same-project run, activeProject rejects a switch away).
+    const current = () =>
+      genToken.current === token && useAppStore.getState().activeProject === project;
     setGenerating(true);
     setError(null);
     invoke<GraphPaths>("graph_generate", { projectPath: project })
       .then(() => {
-        if (useAppStore.getState().activeProject === project) load(project);
+        if (current()) load(project);
       })
       .catch((e) => {
-        if (useAppStore.getState().activeProject === project) setError(errText(e));
+        if (current()) setError(errText(e));
       })
       .finally(() => {
-        if (useAppStore.getState().activeProject === project) setGenerating(false);
+        if (current()) setGenerating(false);
       });
   };
 
