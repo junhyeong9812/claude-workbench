@@ -51,7 +51,8 @@ struct GraphGenerated {
 /// The graph-generation model/effort: workspace settings when set, else the app
 /// default **opus + xhigh** — mirrors `archive::extraction_opts`, but reads the
 /// independent `graph_model` / `graph_effort` preferences. `add_dirs` is left
-/// empty here; [`core_lib::graph::generate_graph`] adds the target project itself.
+/// empty here; [`core_lib::graph::generate_project_graph`] adds the target project
+/// and every sub-project root itself.
 fn graph_opts(app: &AppHandle) -> ClaudeOpts {
     let ws = super::load_state(app.clone());
     ClaudeOpts {
@@ -73,7 +74,7 @@ pub async fn graph_generate(app: AppHandle, project_path: String) -> Result<Grap
     let opts = graph_opts(&app);
     let project = project_path.clone();
     let (json, html) = tauri::async_runtime::spawn_blocking(move || -> Result<(PathBuf, PathBuf), String> {
-        let graph = core_lib::graph::generate_graph(&project_path, &opts)?;
+        let graph = core_lib::graph::generate_project_graph(&project_path, &opts)?;
         core_lib::graph::save_graph_all(&root, &project_path, &graph)
     })
     .await
@@ -194,6 +195,7 @@ mod tests {
                 label: "A".into(),
                 kind: "module".into(),
                 path: None,
+                group: None,
             }],
             edges: vec![],
         };

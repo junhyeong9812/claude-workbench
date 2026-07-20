@@ -33,8 +33,8 @@ pub use timeline::{
 };
 pub use fs::{list_dir, DirEntry};
 pub use graph::{
-    generate_graph, render_graph_html, save_graph, save_graph_all, save_graph_html, Edge, Graph,
-    Node,
+    generate_graph, generate_project_graph, render_graph_html, save_graph, save_graph_all,
+    save_graph_html, Edge, Graph, Node,
 };
 pub use label::nearest_project_marker;
 pub use persist::{load_state, save_state, Project, SshConnection, TreeState, WorkspaceState};

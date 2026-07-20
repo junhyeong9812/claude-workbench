@@ -26,6 +26,7 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 
 use crate::claude_cli::{extraction_workdir, run_claude_p, ClaudeOpts};
+use crate::git::{git_roots, GitRoot};
 use crate::history::project_key;
 
 /// Bump when the shape of [`Graph`] changes so future readers can branch on it.
@@ -46,6 +47,13 @@ pub struct Node {
     /// Project-relative path when the node maps to a file/dir; absent otherwise.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub path: Option<String>,
+    /// The sub-project (git repo) this node belongs to in a hierarchical graph —
+    /// an absolute path or basename, or `"<top>"` for common/top-level nodes.
+    /// Absent for a single-project graph (the degenerate case renders exactly as
+    /// before). `#[serde(default, skip_serializing_if)]` keeps older graph.json
+    /// (no `group`) parsing unchanged and omits the field when unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<String>,
 }
 
 /// One directed dependency edge between two [`Node`] ids.
@@ -139,6 +147,130 @@ pub fn generate_graph(project_path: &str, opts: &ClaudeOpts) -> Result<Graph, St
     let raw = run_claude_p(
         &workdir.to_string_lossy(),
         &graph_prompt(project_path),
+        Duration::from_secs(300),
+        &opts,
+    )?;
+    let mut graph = parse_graph_json(&raw)?;
+    graph.schema_version = SCHEMA_VERSION;
+    graph.project = project_path.to_string();
+    graph.generated_at = now_iso8601();
+    Ok(graph)
+}
+
+/// Upper bound on sub-project roots fed to one hierarchical prompt. `git_roots`
+/// already caps discovery (depth/count), but a large monorepo can still surface
+/// dozens of nested repos; listing hundreds would bloat the prompt. Kept generous
+/// — hitting it is logged (never silent) and the roots are sorted so the project's
+/// own root (shortest path) always survives truncation.
+const MAX_GRAPH_ROOTS: usize = 50;
+
+/// Keep only the sub-project roots **at or under** `project_path`, discarding any
+/// git root that is an *ancestor* of it. `git_roots` includes the enclosing
+/// work-tree root (via `--show-toplevel`), which for a subdirectory points at a
+/// parent repo *above* the project — the hierarchical graph is "this project and
+/// below", so that parent-direction root is dropped. Pure (no fs) so the filter is
+/// unit-testable; `project_path` and each root path should be canonicalized by the
+/// caller so the component-wise `starts_with` prefix test is sound.
+fn subproject_roots(project_path: &str, roots: Vec<GitRoot>) -> Vec<GitRoot> {
+    let base = Path::new(project_path);
+    roots
+        .into_iter()
+        // `starts_with` is component-wise, so it is true for the project itself and
+        // for any nested repo, and false for a parent (and never false-matches a
+        // sibling like `/foo-bar` against `/foo`).
+        .filter(|r| Path::new(&r.path).starts_with(base))
+        .collect()
+}
+
+/// The prompt for a **hierarchical** graph spanning `project_path` and the listed
+/// sub-project git roots. The model is told the exact sub-project paths and must
+/// tag every node with a `group` (the owning sub-project's path/basename, or
+/// `"<top>"` for common nodes) so the viewer can cluster by sub-project.
+pub fn project_graph_prompt(project_path: &str, roots: &[GitRoot], truncated: bool) -> String {
+    let list = roots
+        .iter()
+        .enumerate()
+        .map(|(i, r)| {
+            let branch = if r.branch.is_empty() { "?" } else { &r.branch };
+            format!("  {}. `{}` (branch: {branch})", i + 1, r.path)
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let trunc_note = if truncated {
+        format!(
+            "\n(주의: 하위 저장소가 상한 {MAX_GRAPH_ROOTS}개를 초과해 목록을 잘랐다 — 위에 나열된 것만 다뤄라.)\n"
+        )
+    } else {
+        String::new()
+    };
+    format!(
+        "절대경로 `{project_path}` 아래에는 아래 하위 프로젝트(각각 별도 git 저장소)들이 있다:\n\
+{list}\n{trunc_note}\n\
+이 하위 프로젝트들을 너의 도구(Read·Grep·Glob·Bash 등)로 직접 탐색해, 전체를 아우르는 **하나의 통합** \
+의존성 그래프를 만들어라. 각 노드에는 그 노드가 속한 하위 프로젝트를 가리키는 `group` 을 **반드시** 표기하라 — \
+group 값은 위 목록의 하위 프로젝트 절대경로(또는 그 basename)로 통일하고, 특정 하위 프로젝트에 속하지 않는 \
+최상위·공통 노드는 group 을 \"<top>\" 으로 둔다.\n\n\
+출력은 아래 JSON 스키마를 정확히 따르는 JSON 객체 **하나만** 낼 것 — 코드펜스(```)·설명·머리말·꼬리말 \
+전부 금지, 순수 JSON 만:\n\
+{{\n\
+  \"project\": \"<프로젝트 절대경로>\",\n\
+  \"generated_at\": \"\",\n\
+  \"nodes\": [ {{ \"id\": \"<고유 id>\", \"label\": \"<표시 이름>\", \"kind\": \"<module|file|package|external 중 하나>\", \"path\": \"<프로젝트 상대경로, 없으면 생략>\", \"group\": \"<소속 하위 프로젝트 경로 또는 basename, 공통이면 <top>>\" }} ],\n\
+  \"edges\": [ {{ \"from\": \"<노드 id>\", \"to\": \"<노드 id>\", \"kind\": \"<의존 종류, 선택>\" }} ]\n\
+}}\n\n\
+규칙: 노드마다 id 는 고유. edges 의 from/to 는 반드시 nodes 의 id 중 하나여야 한다. \
+실제 코드에서 확인한 의존만 넣을 것(추측 금지). 하위 프로젝트 경계를 넘는 의존이 있으면 그 엣지도 포함하라. \
+generated_at 은 빈 문자열로 두라(호출자가 채운다)."
+    )
+}
+
+/// Generate a **hierarchical** dependency graph for `project_path`: one graph that
+/// unifies the project and every nested git repo under it, each node tagged with
+/// its owning sub-project (`Node::group`) so the viewer can cluster them.
+///
+/// Discovers sub-projects with [`git_roots`] filtered to those at/under the project
+/// ([`subproject_roots`] drops the parent-direction root). With ≤1 root (a leaf or
+/// single repo, the common case) it degrades to the plain single-project
+/// [`generate_graph`] path — no `group`, byte-identical output — so only genuine
+/// multi-repo trees pay for grouping. Like `generate_graph`, cwd stays fixed to the
+/// `/tmp` scratch dir (backfill-safe); every root is granted via `--add-dir`.
+pub fn generate_project_graph(project_path: &str, opts: &ClaudeOpts) -> Result<Graph, String> {
+    // Canonicalize so git's canonicalized `--show-toplevel` output and our prefix
+    // filter agree; fall back to the raw path if it can't be resolved.
+    let canon = fs::canonicalize(project_path)
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_else(|_| project_path.to_string());
+    let mut roots = subproject_roots(&canon, git_roots(&canon));
+
+    // ≤1 root → nothing to cluster: reuse the single-project path verbatim.
+    if roots.len() <= 1 {
+        return generate_graph(project_path, opts);
+    }
+
+    // Cap the prompt's root list (never silently — log the truncation). Roots are
+    // sorted lexicographically, so the project's own (shortest) root sorts first
+    // and always survives the truncate.
+    let truncated = roots.len() > MAX_GRAPH_ROOTS;
+    if truncated {
+        eprintln!(
+            "graph: {} sub-project roots under {canon}; capping the prompt to {MAX_GRAPH_ROOTS} (truncated)",
+            roots.len()
+        );
+        roots.truncate(MAX_GRAPH_ROOTS);
+    }
+
+    let workdir = extraction_workdir();
+    let mut opts = opts.clone();
+    // Grant read access to the project root and every sub-project root.
+    opts.add_dirs.push(canon.clone());
+    for r in &roots {
+        if r.path != canon {
+            opts.add_dirs.push(r.path.clone());
+        }
+    }
+    let raw = run_claude_p(
+        &workdir.to_string_lossy(),
+        &project_graph_prompt(project_path, &roots, truncated),
         Duration::from_secs(300),
         &opts,
     )?;
@@ -318,9 +450,10 @@ header .meta { font-size: 12px; color: #8b93a1; }
 .node circle { stroke: #14161a; stroke-width: 1.5; cursor: pointer; }
 .node text { fill: #c4cad4; font-size: 11px; pointer-events: none; user-select: none; }
 .node.sel circle { stroke: #fff; stroke-width: 2.5; }
-#legend { position: fixed; left: 12px; bottom: 12px; background: rgba(26,29,35,.9); border: 1px solid #2a2e36; border-radius: 8px; padding: 8px 10px; font-size: 12px; z-index: 3; }
+#legend { position: fixed; left: 12px; bottom: 12px; background: rgba(26,29,35,.9); border: 1px solid #2a2e36; border-radius: 8px; padding: 8px 10px; font-size: 12px; z-index: 3; max-width: 240px; max-height: 40vh; overflow-y: auto; }
 #legend .row { display: flex; align-items: center; gap: 6px; margin: 2px 0; }
-#legend .sw { width: 11px; height: 11px; border-radius: 3px; display: inline-block; }
+#legend .sw { width: 11px; height: 11px; border-radius: 3px; display: inline-block; flex: 0 0 auto; }
+#legend .lbl { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 #panel { position: fixed; right: 12px; top: 62px; width: 260px; max-width: 44vw; background: rgba(26,29,35,.96); border: 1px solid #2a2e36; border-radius: 8px; padding: 10px 12px; font-size: 12px; z-index: 3; display: none; }
 #panel.show { display: block; }
 #panel h2 { font-size: 13px; margin: 0 0 6px; overflow-wrap: anywhere; }
@@ -354,26 +487,41 @@ function svg(tag, attrs) { const e = document.createElementNS(SVGNS, tag); if (a
 const nodes = (DATA && Array.isArray(DATA.nodes)) ? DATA.nodes.map(n => Object.assign({}, n)) : [];
 const rawEdges = (DATA && Array.isArray(DATA.edges)) ? DATA.edges : [];
 
+// Hierarchical grouping (task-05): when nodes carry a `group` (owning sub-project),
+// color by group so the viewer clusters visually; with no groups this stays empty
+// and rendering falls back to the kind palette — byte-identical to the pre-group
+// single-project graph.
+const GROUP_COLORS = ["#7aa2f7","#9ece6a","#e0af68","#bb9af7","#f7768e","#2ac3de","#ff9e64","#73daca"];
+const groups = [...new Set(nodes.map(n => n.group).filter(Boolean))].sort();
+const hasGroups = groups.length > 0;
+function groupColor(g) { const i = groups.indexOf(g); return i < 0 ? FALLBACK : GROUP_COLORS[i % GROUP_COLORS.length]; }
+function nodeColor(n) { return hasGroups ? groupColor(n.group) : colorOf(n.kind); }
+
 document.getElementById("t").textContent = (DATA && DATA.project) || "의존성 그래프";
 document.title = "의존성 그래프 · " + ((DATA && DATA.project) || "");
 document.getElementById("m").textContent =
   [ "노드 " + nodes.length, "엣지 " + rawEdges.length, (DATA && DATA.generated_at) || "" ].filter(Boolean).join("  ·  ");
 
-// Legend: only the kinds actually present (plus a fallback bucket if any).
-const kinds = new Set(nodes.map(n => n.kind || ""));
+// Legend. Grouped graphs list the sub-projects (color = group); otherwise the
+// kinds actually present (color = kind) — the original single-project legend.
 const legend = document.getElementById("legend");
-[["module","module"],["file","file"],["package","package"],["external","external"]].forEach(([k,label]) => {
-  if (!kinds.has(k)) return;
+function legendRow(bg, label) {
   const row = document.createElement("div"); row.className = "row";
-  const sw = document.createElement("span"); sw.className = "sw"; sw.style.background = COLOR[k];
-  row.appendChild(sw); const t = document.createElement("span"); t.textContent = label; row.appendChild(t);
-  legend.appendChild(row);
-});
-if ([...kinds].some(k => !COLOR[k])) {
-  const row = document.createElement("div"); row.className = "row";
-  const sw = document.createElement("span"); sw.className = "sw"; sw.style.background = FALLBACK;
-  row.appendChild(sw); const t = document.createElement("span"); t.textContent = "기타"; row.appendChild(t);
-  legend.appendChild(row);
+  const sw = document.createElement("span"); sw.className = "sw"; sw.style.background = bg;
+  row.appendChild(sw);
+  const t = document.createElement("span"); t.className = "lbl";
+  t.textContent = label; t.setAttribute("title", label);   // textContent → model string inert
+  row.appendChild(t); legend.appendChild(row);
+}
+if (hasGroups) {
+  groups.forEach(g => legendRow(groupColor(g), g));
+  if (nodes.some(n => !n.group)) legendRow(FALLBACK, "그룹 없음");
+} else {
+  const kinds = new Set(nodes.map(n => n.kind || ""));
+  [["module","module"],["file","file"],["package","package"],["external","external"]].forEach(([k,label]) => {
+    if (kinds.has(k)) legendRow(COLOR[k], label);
+  });
+  if ([...kinds].some(k => !COLOR[k])) legendRow(FALLBACK, "기타");
 }
 
 if (nodes.length === 0) {
@@ -454,7 +602,7 @@ function layoutAndRender() {
   nodes.forEach((n) => {
     const g = svg("g", { class: "node" });
     g.setAttribute("transform", "translate(" + n.x + "," + n.y + ")");
-    const c = svg("circle", { r: rad, fill: colorOf(n.kind) });
+    const c = svg("circle", { r: rad, fill: nodeColor(n) });
     const label = svg("text", { x: rad + 3, y: 4 });
     label.textContent = n.label || n.id;   // textContent → model string inert
     g.appendChild(c); g.appendChild(label);
@@ -484,6 +632,7 @@ function layoutAndRender() {
     pl.textContent = n.label || n.id;
     pd.replaceChildren();
     const rows = [["id", n.id], ["kind", n.kind || "(없음)"], ["path", n.path || "(없음)"]];
+    if (hasGroups) rows.push(["group", n.group || "(없음)"]);
     for (const [key, val] of rows) {
       const dt = document.createElement("dt"); dt.textContent = key;
       const dd = document.createElement("dd"); dd.textContent = val;   // textContent
@@ -741,6 +890,7 @@ mod tests {
             label: "</script><img src=x onerror=alert(1)>".into(),
             kind: "file".into(),
             path: None,
+            group: None,
         });
         let html = render_graph_html(&g);
         // The only literal </script> is the template's own closing tag.
@@ -805,5 +955,80 @@ mod tests {
         // Both landed in the same graph/ folder.
         assert_eq!(json_path.parent(), html_path.parent());
         let _ = fs::remove_dir_all(&root);
+    }
+
+    // --- hierarchical grouping (task-05) ---
+
+    #[test]
+    fn parse_node_group_is_optional_and_backcompat() {
+        // Pre-group graph.json (no `group` key) still parses → group defaults None.
+        let g = parse_graph_json(SAMPLE).unwrap();
+        assert!(g.nodes.iter().all(|n| n.group.is_none()), "group absent → None");
+        // And a graph WITH group round-trips into Some.
+        let grouped = r#"{ "nodes": [ { "id": "a", "group": "sub-x" } ], "edges": [] }"#;
+        let g2 = parse_graph_json(grouped).unwrap();
+        assert_eq!(g2.nodes[0].group.as_deref(), Some("sub-x"));
+        // Serializing a None group omits the key (skip_serializing_if) — no `"group"`.
+        let out = serde_json::to_string(&g).unwrap();
+        assert!(!out.contains("\"group\""), "None group must not serialize");
+    }
+
+    #[test]
+    fn subproject_roots_keeps_self_and_descendants_drops_ancestor() {
+        let mk = |p: &str| GitRoot { path: p.to_string(), branch: "main".into() };
+        let roots = vec![
+            mk("/home/x"),              // ancestor of the project → dropped
+            mk("/home/x/proj"),         // the project itself → kept
+            mk("/home/x/proj/sub-a"),   // nested repo → kept
+            mk("/home/x/proj/sub-b"),   // nested repo → kept
+            mk("/home/x/proj-other"),   // sibling sharing a name prefix → dropped
+        ];
+        let kept: Vec<String> =
+            subproject_roots("/home/x/proj", roots).into_iter().map(|r| r.path).collect();
+        assert_eq!(
+            kept,
+            vec![
+                "/home/x/proj".to_string(),
+                "/home/x/proj/sub-a".to_string(),
+                "/home/x/proj/sub-b".to_string(),
+            ],
+            "only the project and its descendants survive (component-wise prefix)"
+        );
+    }
+
+    #[test]
+    fn project_graph_prompt_lists_roots_and_requests_group() {
+        let roots = vec![
+            GitRoot { path: "/p".into(), branch: "main".into() },
+            GitRoot { path: "/p/sub".into(), branch: "".into() },
+        ];
+        let p = project_graph_prompt("/p", &roots, false);
+        assert!(p.contains("/p/sub"), "sub-project path listed");
+        assert!(p.contains("group"), "asks the model to tag group");
+        assert!(p.contains("<top>"), "documents the top-level group sentinel");
+        assert!(!p.contains("잘랐다"), "no truncation note when not truncated");
+        // Truncated variant carries a visible (non-silent) note.
+        let pt = project_graph_prompt("/p", &roots, true);
+        assert!(pt.contains("잘랐다"), "truncation is stated in the prompt");
+    }
+
+    #[test]
+    fn render_html_with_groups_shows_group_legend_and_stays_self_contained() {
+        let grouped = r#"{
+            "project": "/mono",
+            "nodes": [
+                { "id": "a", "label": "A", "kind": "module", "group": "svc-a" },
+                { "id": "b", "label": "B", "kind": "module", "group": "svc-b" }
+            ],
+            "edges": [ { "from": "a", "to": "b" } ]
+        }"#;
+        let g = parse_graph_json(grouped).unwrap();
+        let html = render_graph_html(&g);
+        // Group values ride in the embedded payload and drive the group-colored legend.
+        assert!(html.contains("\"group\":\"svc-a\""), "group in payload");
+        assert!(html.contains("\"group\":\"svc-b\""), "group in payload");
+        // Self-containment invariant is preserved (no external references).
+        assert!(external_ref_markers(&html).is_empty(), "grouped graph must stay offline");
+        assert!(!html.contains("__DATA__"));
     }
 }
