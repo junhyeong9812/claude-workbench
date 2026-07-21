@@ -3810,3 +3810,10 @@ body {
   color: var(--accent-bright);
   border-color: var(--accent-bright);
 }
+
+/* 워크트리 패널: 멀티 repo 그룹 헤더 (repo 이름 + 그 repo 대상 추가 버튼). */
+.worktree-repo-head {
+  margin-top: 6px;
+  border-top: 1px solid var(--border);
+  background: var(--bg-alt);
+}

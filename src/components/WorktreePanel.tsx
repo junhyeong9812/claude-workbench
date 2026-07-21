@@ -2,12 +2,17 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { errText } from "../utils/error";
 import { invoke } from "@tauri-apps/api/core";
 import { useAppStore } from "../state/store";
+import {
+  groupWorktrees,
+  type RepoWorktrees,
+  type Worktree,
+  type WorktreeGroup,
+} from "./worktreeGroups";
 
-interface Worktree {
+/** A discovered git root (path + current branch) — `git_roots` backend shape. */
+interface GitRoot {
   path: string;
-  head: string;
   branch: string;
-  is_main: boolean;
 }
 /** A live Claude session + the directory it runs in (its cwd, possibly a worktree).
  * `root` is the git-canonicalized worktree root of `cwd` — match against that. */
@@ -16,6 +21,8 @@ interface SessionCwd {
   cwd: string;
   root: string;
 }
+
+const baseName = (p: string) => p.split("/").filter(Boolean).pop() ?? p;
 
 
 /**
@@ -37,7 +44,7 @@ export function WorktreePanel() {
     await addProject(path);
     requestClaudeOpen({ project: path });
   };
-  const [list, setList] = useState<Worktree[]>([]);
+  const [groups, setGroups] = useState<WorktreeGroup[]>([]);
   const [sessions, setSessions] = useState<SessionCwd[]>([]);
   const [busy, setBusy] = useState(false);
   const [note, setNote] = useState("");
@@ -52,7 +59,7 @@ export function WorktreePanel() {
 
   const reload = useCallback(async () => {
     if (!cwd) {
-      setList([]);
+      setGroups([]);
       setSessions([]);
       return;
     }
@@ -61,20 +68,56 @@ export function WorktreePanel() {
     const myReq = ++reqRef.current;
     const target = cwd;
     try {
-      // Worktrees + live-session cwds together, so each worktree can be badged with
-      // the session(s) running in it. Session list is read-only (never fails hard).
-      const [wts, sess] = await Promise.all([
-        invoke<Worktree[]>("git_worktrees", { cwd: target }),
-        invoke<SessionCwd[]>("claude_session_cwds").catch(() => [] as SessionCwd[]),
-      ]);
+      const sessP = invoke<SessionCwd[]>("claude_session_cwds").catch(() => [] as SessionCwd[]);
+      // WF2: activeProject 자체가 repo면 기존 단일 repo 동작 그대로 — 그 repo의
+      // 목록 하나만(그룹 1개 불변식, 중첩 repo를 노출하지 않는다). 실패하는
+      // 경우(모음 폴더 등 비-repo)에만 git_roots로 하위 repo를 전부 찾아
+      // repo별 그룹핑한다.
+      let repos: RepoWorktrees[] = [];
+      let failed = 0; // WF1: 개별 repo 읽기 실패는 무음 소실 금지 — 집계해 알림
+      let foundRoots = 1;
+      try {
+        repos = [
+          { root: target, worktrees: await invoke<Worktree[]>("git_worktrees", { cwd: target }) },
+        ];
+      } catch (repoErr) {
+        const roots = await invoke<GitRoot[]>("git_roots", { cwd: target });
+        // target을 감싸는 root가 있다 = target은 repo 안이다. 그런데 위
+        // 조회가 실패했다면 "비-repo"가 아니라 실제 오류(권한·git 실행) —
+        // 하위 탐색으로 숨기지 않고 오류로 드러낸다 (감사 WF2: 폴백은
+        // 비-repo에만. 에러 문자열 매칭은 로케일 의존이라 root 포함 관계로
+        // 판별한다).
+        if (roots.some((r) => r.path === target || target.startsWith(r.path + "/"))) {
+          throw repoErr;
+        }
+        foundRoots = roots.length;
+        // WF3: 링크드 워크트리 폴더도 root로 잡히지만 그 목록은 이미 나온
+        // repo와 동일하다 — 순차 순회 + seen으로 같은 repo에 대한 중복 git
+        // 호출을 건너뛴다(실측 13 root → 6 호출).
+        const seen = new Set<string>();
+        for (const r of roots) {
+          if (seen.has(r.path)) continue;
+          try {
+            const wts = await invoke<Worktree[]>("git_worktrees", { cwd: r.path });
+            for (const w of wts) seen.add(w.path);
+            repos.push({ root: r.path, worktrees: wts });
+          } catch {
+            failed += 1;
+          }
+        }
+      }
+      const sess = await sessP;
       if (reqRef.current === myReq) {
-        setList(wts); // ignore superseded (project switch)
+        setGroups(groupWorktrees(repos)); // ignore superseded (project switch)
         setSessions(sess);
+        if (foundRoots === 0) setNote("git 저장소를 찾지 못했습니다.");
+        else if (failed > 0) setNote(`${failed}개 저장소의 워크트리를 읽지 못했습니다.`);
+        else setNote("");
       }
     } catch (e) {
       if (reqRef.current === myReq) {
         setNote(errText(e));
-        setList([]);
+        setGroups([]);
       }
     } finally {
       loadingRef.current = false;
@@ -117,6 +160,72 @@ export function WorktreePanel() {
 
   if (!cwd) return <div className="git-empty">프로젝트를 먼저 여세요.</div>;
 
+  // add/remove는 반드시 그 repo의 main 워크트리(cwd=repoCwd)에서 실행 —
+  // 모음 폴더나 다른 repo에서 실행하면 엉뚱한 저장소를 조작하게 된다.
+  const addWorktree = (repoCwd: string) => {
+    const path = window.prompt(`[${baseName(repoCwd)}] 새 워크트리 경로 (예: ../proj-feature)`);
+    if (!path || !path.trim()) return;
+    const branch = window.prompt("체크아웃할 브랜치");
+    if (!branch || !branch.trim()) return;
+    act(() => invoke("git_worktree_add", { cwd: repoCwd, path: path.trim(), branch: branch.trim() }));
+  };
+
+  const renderRow = (w: Worktree, repoCwd: string) => {
+    const wtSessions = sessions.filter((s) => s.root === w.path);
+    return (
+      <div key={w.path} className="git-file">
+        <span className="git-ref git-ref-local">{w.branch}</span>
+        {w.is_main && (
+          <span className="git-cmeta" title="메인 워크트리">
+            메인
+          </span>
+        )}
+        {wtSessions.length > 0 && (
+          <span
+            className="git-ref git-ref-head"
+            title={`이 워크트리에서 도는 Claude 세션:\n${wtSessions.map((s) => s.uuid).join("\n")}`}
+          >
+            ● 세션 {wtSessions.length}
+          </span>
+        )}
+        <span className="git-path" title={`${w.path}\n${w.head}`}>
+          {w.path}
+        </span>
+        {w.path === cwd ? (
+          <span className="git-cmeta" title="현재 활성 프로젝트">
+            현재
+          </span>
+        ) : (
+          <button className="git-mini" disabled={busy} title="프로젝트 탭으로 열기" onClick={() => void addProject(w.path)}>
+            열기
+          </button>
+        )}
+        <button
+          className="git-mini"
+          disabled={busy}
+          title="이 워크트리에서 Claude 세션 열기"
+          onClick={() => void openClaude(w.path)}
+        >
+          Claude
+        </button>
+        <button
+          className="git-mini"
+          disabled={busy}
+          title="워크트리 제거"
+          onClick={() => {
+            if (window.confirm(`${w.path} 워크트리를 제거할까요?`))
+              act(() => invoke("git_worktree_remove", { cwd: repoCwd, path: w.path }));
+          }}
+        >
+          ×
+        </button>
+      </div>
+    );
+  };
+
+  const total = groups.reduce((n, g) => n + g.worktrees.length, 0);
+  const multi = groups.length > 1;
+
   return (
     <div className="git-panel">
       <div className="tree-hint">
@@ -124,79 +233,43 @@ export function WorktreePanel() {
         격리용 — 브랜치 자체가 아니라 그 브랜치가 놓인 폴더입니다. ‘열기’로 프로젝트 탭에 엽니다.
       </div>
       <div className="git-head">
-        <span className="git-track">워크트리 ({list.length})</span>
-        <button
-          className="git-btn"
-          disabled={busy}
-          title="새 워크트리 추가"
-          onClick={() => {
-            const path = window.prompt("새 워크트리 경로 (예: ../proj-feature)");
-            if (!path || !path.trim()) return;
-            const branch = window.prompt("체크아웃할 브랜치");
-            if (!branch || !branch.trim()) return;
-            act(() => invoke("git_worktree_add", { cwd, path: path.trim(), branch: branch.trim() }));
-          }}
-        >
-          + 추가
-        </button>
+        <span className="git-track">
+          워크트리 ({total}){multi ? ` · 저장소 ${groups.length}` : ""}
+        </span>
+        {!multi && groups.length === 1 && (
+          <button
+            className="git-btn"
+            disabled={busy}
+            title="새 워크트리 추가"
+            onClick={() => addWorktree(groups[0].mainPath)}
+          >
+            + 추가
+          </button>
+        )}
         <button className="git-btn" disabled={busy} title="새로고침" onClick={() => void reload()}>
           ↻
         </button>
       </div>
       <div className="git-body">
-        {list.map((w) => {
-          const wtSessions = sessions.filter((s) => s.root === w.path);
-          return (
-          <div key={w.path} className="git-file">
-            <span className="git-ref git-ref-local">{w.branch}</span>
-            {w.is_main && (
-              <span className="git-cmeta" title="메인 워크트리">
-                메인
-              </span>
+        {groups.map((g) => (
+          <div key={g.mainPath}>
+            {multi && (
+              <div className="git-head worktree-repo-head" title={g.mainPath}>
+                <span className="git-track">{baseName(g.mainPath)}</span>
+                <button
+                  className="git-btn"
+                  disabled={busy}
+                  title={`${baseName(g.mainPath)}에 새 워크트리 추가`}
+                  onClick={() => addWorktree(g.mainPath)}
+                >
+                  + 추가
+                </button>
+              </div>
             )}
-            {wtSessions.length > 0 && (
-              <span
-                className="git-ref git-ref-head"
-                title={`이 워크트리에서 도는 Claude 세션:\n${wtSessions.map((s) => s.uuid).join("\n")}`}
-              >
-                ● 세션 {wtSessions.length}
-              </span>
-            )}
-            <span className="git-path" title={`${w.path}\n${w.head}`}>
-              {w.path}
-            </span>
-            {w.path === cwd ? (
-              <span className="git-cmeta" title="현재 활성 프로젝트">
-                현재
-              </span>
-            ) : (
-              <button className="git-mini" disabled={busy} title="프로젝트 탭으로 열기" onClick={() => void addProject(w.path)}>
-                열기
-              </button>
-            )}
-            <button
-              className="git-mini"
-              disabled={busy}
-              title="이 워크트리에서 Claude 세션 열기"
-              onClick={() => void openClaude(w.path)}
-            >
-              Claude
-            </button>
-            <button
-              className="git-mini"
-              disabled={busy}
-              title="워크트리 제거"
-              onClick={() => {
-                if (window.confirm(`${w.path} 워크트리를 제거할까요?`))
-                  act(() => invoke("git_worktree_remove", { cwd, path: w.path }));
-              }}
-            >
-              ×
-            </button>
+            {g.worktrees.map((w) => renderRow(w, g.mainPath))}
           </div>
-          );
-        })}
-        {list.length === 0 && <div className="git-clean">워크트리 없음</div>}
+        ))}
+        {total === 0 && <div className="git-clean">워크트리 없음</div>}
         {note && <div className="git-clean">{note}</div>}
       </div>
     </div>
