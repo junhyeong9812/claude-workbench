@@ -1,6 +1,8 @@
 import { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import { errText } from "../utils/error";
+import { fmtUnix } from "../utils/time";
 import { useAppStore } from "../state/store";
 
 /** 추출 모델 선택지 — claude CLI에 목록 명령이 없어 별칭을 큐레이션한다.
@@ -14,6 +16,12 @@ const EFFORT_CHOICES = ["xhigh", "high", "medium", "low"] as const;
  * session's 책(book.html) opens in the system browser (self-contained HTML);
  * its 요약/지식 INDEX open in the in-app peek viewer (markdown).
  */
+interface ArchiveHistoryItem {
+  book_path: string;
+  archived_at?: number | null;
+  title: string;
+  turns: number;
+}
 interface ArchiveEntry {
   dir: string;
   book_path: string;
@@ -22,6 +30,9 @@ interface ArchiveEntry {
   title: string;
   date: string;
   turns: number;
+  archived_at?: number | null;
+  /** 보존된 과거 버전 (최신순) — 내용이 달라진 재아카이브가 만든 것. */
+  history: ArchiveHistoryItem[];
 }
 interface ArchiveGroup {
   project: string;
@@ -35,6 +46,8 @@ export function ArchivePanel() {
   const [groups, setGroups] = useState<ArchiveGroup[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [collapsed, setCollapsed] = useState<Set<string>>(new Set());
+  // 과거 버전 목록이 펼쳐진 세션(uuid)들.
+  const [versionsOpen, setVersionsOpen] = useState<Set<string>>(new Set());
   const setPeekFile = useAppStore((s) => s.setPeekFile);
   const archiveRoot = useAppStore((s) => s.archiveRoot);
   const archiveModel = useAppStore((s) => s.archiveModel);
@@ -60,7 +73,13 @@ export function ArchivePanel() {
   // 수동 새로고침 없이 나타난다.
   useEffect(() => {
     window.addEventListener("mt-archive-updated", load);
-    return () => window.removeEventListener("mt-archive-updated", load);
+    // 백엔드 브로드캐스트도 수신 — 다른 창에서 실행한 아카이브 완료가 이 창의
+    // 목록에도 반영된다 (DOM CustomEvent는 창 로컬이라 못 미침).
+    const un = listen("mt-archive-finished", load);
+    return () => {
+      window.removeEventListener("mt-archive-updated", load);
+      void un.then((f) => f());
+    };
   }, []);
 
   // 설정 폼 열기: 현재 store 값을 편집 버퍼로 복사.
@@ -230,6 +249,23 @@ export function ArchivePanel() {
                         {s.date} · {s.turns} turns
                       </span>
                       <span className="archive-session-actions">
+                        {s.history.length > 0 && (
+                          <button
+                            className="archive-btn"
+                            title="보존된 과거 버전 — 내용이 달라진 재아카이브가 이전본을 남긴 것"
+                            aria-expanded={versionsOpen.has(s.uuid)}
+                            onClick={() =>
+                              setVersionsOpen((prev) => {
+                                const next = new Set(prev);
+                                if (next.has(s.uuid)) next.delete(s.uuid);
+                                else next.add(s.uuid);
+                                return next;
+                              })
+                            }
+                          >
+                            {versionsOpen.has(s.uuid) ? "▾" : "▸"} 버전 {s.history.length + 1}
+                          </button>
+                        )}
                         <button
                           className="archive-btn"
                           title="책(book.html)을 시스템 브라우저로 열기 — 처음부터 단계별 넘겨보기"
@@ -247,6 +283,21 @@ export function ArchivePanel() {
                         </button>
                       </span>
                     </div>
+                    {versionsOpen.has(s.uuid) &&
+                      s.history.map((h, i) => (
+                        <div key={h.book_path} className="archive-version-row">
+                          <span className="archive-version-label">
+                            v{s.history.length - i} · {fmtUnix(h.archived_at) || "시각 미상"} · {h.turns} turns
+                          </span>
+                          <button
+                            className="archive-btn"
+                            title="이 버전의 책을 시스템 브라우저로 열기"
+                            onClick={() => openExternal(h.book_path)}
+                          >
+                            책
+                          </button>
+                        </div>
+                      ))}
                   </div>
                 ))}
             </div>

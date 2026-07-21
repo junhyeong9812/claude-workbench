@@ -438,6 +438,20 @@ body {
   display: flex;
   gap: 4px;
 }
+/* 보존된 과거 버전 행 (버전 N 펼침). */
+.archive-version-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 2px 0 2px 12px;
+  color: var(--fg-dim);
+  font-size: 0.8em;
+}
+.archive-version-label {
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
 .archive-btn {
   background: transparent;
   border: 1px solid var(--border, #333);
@@ -1634,16 +1648,40 @@ body {
   flex: 1;
   min-width: 0;
 }
-/* 아카이브 여부 배지 (세션 picker). */
-.claude-picker-arch {
-  margin-left: 6px;
-  font-size: 0.75em;
+/* 아카이브 상태 3그룹 헤더 (세션 picker — 접기/펼치기). */
+.claude-picker-group {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  width: 100%;
+  padding: 4px 10px;
+  font-size: 11px;
   color: var(--fg-dim);
-  opacity: 0.7;
+  background: var(--bg);
+  border: none;
+  border-bottom: 1px solid var(--border);
+  text-align: left;
+  cursor: pointer;
 }
-.claude-picker-arch.is-archived {
+.claude-picker-group:hover {
+  background: var(--bg-hover);
+}
+.claude-picker-group.arch-current {
   color: var(--accent-bright);
-  opacity: 1;
+}
+.claude-picker-group.arch-stale {
+  color: var(--st-warn);
+}
+.claude-picker-group-caret {
+  font-size: 9px;
+  color: var(--fg-dim);
+}
+/* 아카이브 진행중 배너 (picker 상단). */
+.claude-picker-busy {
+  padding: 5px 10px;
+  font-size: 11px;
+  color: var(--st-warn);
+  border-bottom: 1px solid var(--border);
 }
 .claude-picker-proj {
   color: var(--accent);
@@ -1917,6 +1955,22 @@ body {
 }
 .claudeterm-splitter:hover {
   background: var(--accent, #89b4fa);
+}
+/* 접힌 타임라인 자리의 세로 스트립 — 클릭하면 다시 펼침. */
+.claudeterm-timeline-expand {
+  flex: 0 0 22px;
+  padding: 8px 2px;
+  writing-mode: vertical-rl;
+  font-size: 11px;
+  color: var(--fg-dim);
+  background: var(--bg-alt);
+  border: none;
+  border-left: 1px solid var(--border);
+  cursor: pointer;
+}
+.claudeterm-timeline-expand:hover {
+  color: var(--fg);
+  background: var(--bg-hover);
 }
 
 .dock-placeholder {

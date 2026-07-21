@@ -149,6 +149,8 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
   // Width (px) of the detail viewer + timeline panes; drag splitters to resize.
   const [viewerWidth, setViewerWidth] = useState(480);
   const [timelineWidth, setTimelineWidth] = useState(360);
+  // 타임라인 패널 통째 접기 — 접힌 동안 좁은 스트립만 남기고 터미널에 폭을 양보.
+  const [timelineCollapsed, setTimelineCollapsed] = useState(false);
   // 서브에이전트 칼럼 (opt-in): every agent's live progress stacked beside the
   // terminal, instead of digging into the timeline's nested groups.
   const [showAgents, setShowAgents] = useState(false);
@@ -230,14 +232,19 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
         summary_ok: boolean;
         knowledge_files: number;
         extraction_error?: string | null;
+        unchanged: boolean;
       }>("archive_session", { cwd, uuid });
       // 아카이브 브라우저 탭이 이미 열려 있으면 즉시 갱신되도록 알린다.
       window.dispatchEvent(new CustomEvent("mt-archive-updated"));
-      alert(
-        `아카이브 완료${res.replaced ? " (기존 아카이브 교체)" : ""}\n${res.dir}\n` +
-          `요약: ${res.summary_ok ? "생성됨" : "없음"} · 지식 항목 ${res.knowledge_files}건` +
-          (res.extraction_error ? `\n추출 경고: ${res.extraction_error}` : ""),
-      );
+      if (res.unchanged) {
+        alert(`이미 최신 아카이브입니다 — 마지막 아카이브 이후 새 대화가 없어 그대로 두었습니다.\n${res.dir}`);
+      } else {
+        alert(
+          `아카이브 완료${res.replaced ? " (재아카이브 — 달라진 이전 내용은 버전으로 보존)" : ""}\n${res.dir}\n` +
+            `요약: ${res.summary_ok ? "생성됨" : "없음"} · 지식 항목 ${res.knowledge_files}건` +
+            (res.extraction_error ? `\n추출 경고: ${res.extraction_error}` : ""),
+        );
+      }
     } catch (e) {
       alert(`아카이브 실패: ${errText(e)}`);
     } finally {
@@ -1132,14 +1139,32 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
           </div>
         </>
       )}
-      <div className="claudeterm-splitter" title="드래그로 크기 조절" onMouseDown={startDragTimeline} />
+      {!timelineCollapsed && (
+        <div className="claudeterm-splitter" title="드래그로 크기 조절" onMouseDown={startDragTimeline} />
+      )}
+      {timelineCollapsed && (
+        <button
+          className="claudeterm-timeline-expand"
+          title="타임라인 펼치기"
+          onClick={() => setTimelineCollapsed(false)}
+        >
+          ◀ 타임라인
+        </button>
+      )}
       <div
         className="claudeterm-pane claudeterm-timeline-pane"
         ref={timelineRef}
-        style={{ flex: `0 0 ${timelineWidth}px` }}
+        style={timelineCollapsed ? { display: "none" } : { flex: `0 0 ${timelineWidth}px` }}
       >
         <div className="claudeterm-pane-head">
           <span className="claudeterm-pane-head-title">타임라인</span>
+          <span
+            className="claudeterm-viewer-x"
+            title="타임라인 접기"
+            onClick={() => setTimelineCollapsed(true)}
+          >
+            ▶
+          </span>
         </div>
         <div className="claudeterm-timeline">
           <TimelineView

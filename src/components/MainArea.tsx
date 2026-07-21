@@ -19,6 +19,11 @@ import { components, AppTab, type PanelKind } from "./panelRegistry";
 import { resolveLayerMode, integratedIsFront } from "../state/layerRouting";
 import { getAllWindows, getCurrentWindow } from "@tauri-apps/api/window";
 import { fileName } from "./cmLang";
+import { fmtUnix } from "../utils/time";
+
+/** Archive freshness of a saved session — the picker's three groups.
+ * `current` = 아카이브가 최신, `stale` = 아카이브 이후 작업 있음, `none` = 아카이브 없음. */
+type ArchState = "current" | "stale" | "none";
 
 /** A saved session normalized for the reopen picker (ACP `claude` or A
  * `claudeterm`). `id` is the session UUID. */
@@ -30,8 +35,12 @@ interface SessionSummary {
   count: number;
   /** The project (cwd) this session belongs to — passed through on reopen. */
   project: string;
-  /** Whether this session has an archive (책·요약·지식) — picker badge. */
-  archived: boolean;
+  /** Archive freshness (책·요약·지식 유무 + 최신 여부) — picker grouping. */
+  archState: ArchState;
+  /** When the latest archive was written (unix seconds), if archived. */
+  archivedAt: number | null;
+  /** Preserved past archive versions of this session. */
+  versions: number;
 }
 
 
@@ -49,6 +58,17 @@ interface SshForm {
   passphrase: string;
   save: boolean;
 }
+
+/** The picker's archive groups, in display order. */
+const PICKER_GROUPS: { key: ArchState; label: string; hint: string }[] = [
+  { key: "current", label: "📦 아카이브됨", hint: "아카이브가 최신입니다 (책·요약·지식 있음)" },
+  {
+    key: "stale",
+    label: "🕓 아카이브 이후 작업",
+    hint: "아카이브 뒤에 세션이 더 진행됐습니다 — 다시 아카이브하면 최신화됩니다",
+  },
+  { key: "none", label: "미아카이브", hint: "아카이브가 없습니다" },
+];
 
 const EMPTY_SSH_FORM: SshForm = {
   label: "",
@@ -141,6 +161,16 @@ export function MainArea() {
   // Saved-session picker for "+ Claude" (null = closed) + the name a "새 세션"
   // would get (B3-4: per-project "Claude N", computed when the picker opens).
   const [picker, setPicker] = useState<SessionSummary[] | null>(null);
+  // Mirror of `picker` for the archive-event listener (its closure would
+  // otherwise capture a stale snapshot).
+  const pickerRef = useRef<SessionSummary[] | null>(null);
+  pickerRef.current = picker;
+  // 이 프로젝트의 아카이브가 지금 실행 중인지 (picker "아카이브 진행중" 배지).
+  const [archBusy, setArchBusy] = useState(false);
+  // in_flight 조회 세대 — 늦게 도착한 낡은 응답이 배지를 되돌리지 못하게.
+  const archReqRef = useRef(0);
+  // Collapsed picker groups (아카이브됨/아카이브 이후 작업/아카이브 없음).
+  const [pickerCollapsed, setPickerCollapsed] = useState<Set<ArchState>>(new Set());
   // Which kind the open picker creates/reopens: ACP `claude` or A `claudeterm`.
   const [newName, setNewName] = useState("Claude 1");
   // Close request raised by a Claude tab's × (B3-1).
@@ -662,7 +692,8 @@ export function MainArea() {
   const openPicker = async () => {
     let sessions: SessionSummary[] = [];
     if (activeProject) {
-      const [raw, archivedUuids] = await Promise.all([
+      const myReq = ++archReqRef.current;
+      const [raw, statuses, inFlight] = await Promise.all([
         invoke<
           {
             uuid: string;
@@ -672,22 +703,64 @@ export function MainArea() {
             count: number;
           }[]
         >("claude_sessions", { project: activeProject }).catch(() => []),
-        invoke<string[]>("archive_uuids", { project: activeProject }).catch(() => []),
+        invoke<
+          { uuid: string; up_to_date: boolean; archived_at: number | null; versions: number }[]
+        >("archive_status", { project: activeProject }).catch(() => []),
+        invoke<boolean>("archive_in_flight", { project: activeProject }).catch(() => false),
       ]);
-      const archivedSet = new Set(archivedUuids);
-      sessions = raw.map((s) => ({
-        id: s.uuid,
-        name: s.name,
-        title: s.title,
-        date: s.date,
-        count: s.count,
-        project: activeProject,
-        archived: archivedSet.has(s.uuid),
-      }));
+      const byUuid = new Map(statuses.map((s) => [s.uuid, s]));
+      sessions = raw.map((s) => {
+        const st = byUuid.get(s.uuid);
+        return {
+          id: s.uuid,
+          name: s.name,
+          title: s.title,
+          date: s.date,
+          count: s.count,
+          project: activeProject,
+          archState: (st ? (st.up_to_date ? "current" : "stale") : "none") as ArchState,
+          archivedAt: st?.archived_at ?? null,
+          versions: st?.versions ?? 0,
+        };
+      });
+      if (archReqRef.current === myReq) setArchBusy(inFlight);
     }
     setNewName(`Claude ${sessions.length + openKindCount("claudeterm") + 1}`);
     setPicker(sessions); // open-session filtering happens at render
   };
+
+  // 진행중 배지 실시간화: 아카이브 시작/종료 브로드캐스트를 받아 배지를 갱신
+  // 하고, 종료 시 picker가 열려 있으면 그룹 분류를 새로 가져온다. payload의
+  // raw cwd를 activeProject와 문자열 비교하면 경로 정규화 차이(심링크·슬래시)
+  // 에 취약하므로, 이벤트는 트리거로만 쓰고 판정은 백엔드 in_flight 재조회로
+  // 한다 (리뷰 F7 — 백엔드가 canonicalize로 동일성을 판정).
+  useEffect(() => {
+    const refresh = () => {
+      if (!activeProject) return;
+      // started/finished 연속 발생 시 응답 역전으로 낡은 true가 나중에 도착해
+      // 배지가 busy에 갇힐 수 있다 — 최신 요청만 반영(post-fix P4).
+      const my = ++archReqRef.current;
+      void invoke<boolean>("archive_in_flight", { project: activeProject })
+        .then((v) => {
+          if (archReqRef.current === my) setArchBusy(v);
+        })
+        .catch(() => {
+          // 최신 요청이 실패하면 이전 응답도 세대 가드에 막혀 배지가 고착될
+          // 수 있다 — 정보성 배지는 미표시가 고착보다 낫다(fail-soft).
+          if (archReqRef.current === my) setArchBusy(false);
+        });
+    };
+    const un1 = listen("mt-archive-started", refresh);
+    const un2 = listen("mt-archive-finished", () => {
+      refresh();
+      if (pickerRef.current !== null) void openPicker();
+    });
+    return () => {
+      void un1.then((f) => f());
+      void un2.then((f) => f());
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeProject]);
 
   // Picker rows: saved sessions newest-first, excluding already-open ones.
   const pickerRows = (): SessionSummary[] => {
@@ -929,41 +1002,66 @@ export function MainArea() {
                 + 만들기
               </button>
             </div>
+            {archBusy && (
+              <div className="claude-picker-busy" title="이 프로젝트의 세션 아카이브가 실행 중입니다 (책·요약·지식 추출 — 1~2분)">
+                ⏳ 아카이브 진행 중…
+              </div>
+            )}
             {(() => {
               const rows = pickerRows();
               if (rows.length === 0) return null;
+              const renderRow = (s: SessionSummary) => (
+                <div key={`${s.project}:${s.id}`} className="claude-picker-row">
+                  <button
+                    className="claude-picker-item"
+                    onClick={() => {
+                      setPicker(null);
+                      addPanel("claudeterm", {
+                        loadSessionId: s.id,
+                        project: s.project,
+                        title: s.name || s.title?.slice(0, 24) || s.date,
+                      });
+                    }}
+                  >
+                    <span className="claude-picker-title">{s.name || "(이름 없음)"}</span>
+                    <span className="claude-picker-meta">
+                      {s.title ? `${s.title.slice(0, 40)} · ` : ""}
+                      {s.date} · 변경 {s.count}
+                      {s.archivedAt ? ` · 📦 ${fmtUnix(s.archivedAt)}` : ""}
+                      {s.versions > 0 ? ` · 버전 ${s.versions + 1}` : ""}
+                    </span>
+                  </button>
+                </div>
+              );
               return (
                 <>
                   <div className="claude-picker-sep">저장된 세션</div>
-                  {rows.map((s) => (
-                    <div key={`${s.project}:${s.id}`} className="claude-picker-row">
-                      <button
-                        className="claude-picker-item"
-                        onClick={() => {
-                          setPicker(null);
-                          addPanel("claudeterm", {
-                            loadSessionId: s.id,
-                            project: s.project,
-                            title: s.name || s.title?.slice(0, 24) || s.date,
-                          });
-                        }}
-                      >
-                        <span className="claude-picker-title">
-                          {s.name || "(이름 없음)"}
-                          <span
-                            className={`claude-picker-arch${s.archived ? " is-archived" : ""}`}
-                            title={s.archived ? "아카이브됨 (책·요약·지식 있음)" : "미아카이브"}
-                          >
-                            {s.archived ? "📦 아카이브됨" : "미아카이브"}
-                          </span>
-                        </span>
-                        <span className="claude-picker-meta">
-                          {s.title ? `${s.title.slice(0, 40)} · ` : ""}
-                          {s.date} · 변경 {s.count}
-                        </span>
-                      </button>
-                    </div>
-                  ))}
+                  {PICKER_GROUPS.map((g) => {
+                    const members = rows.filter((s) => s.archState === g.key);
+                    if (members.length === 0) return null;
+                    const collapsed = pickerCollapsed.has(g.key);
+                    return (
+                      <div key={g.key}>
+                        <button
+                          className={`claude-picker-group arch-${g.key}`}
+                          title={g.hint}
+                          aria-expanded={!collapsed}
+                          onClick={() =>
+                            setPickerCollapsed((prev) => {
+                              const next = new Set(prev);
+                              if (next.has(g.key)) next.delete(g.key);
+                              else next.add(g.key);
+                              return next;
+                            })
+                          }
+                        >
+                          <span className="claude-picker-group-caret">{collapsed ? "▸" : "▾"}</span>
+                          {g.label} ({members.length})
+                        </button>
+                        {!collapsed && members.map(renderRow)}
+                      </div>
+                    );
+                  })}
                 </>
               );
             })()}
