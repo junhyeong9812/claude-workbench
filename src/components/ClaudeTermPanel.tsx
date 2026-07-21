@@ -149,6 +149,8 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
   // Width (px) of the detail viewer + timeline panes; drag splitters to resize.
   const [viewerWidth, setViewerWidth] = useState(480);
   const [timelineWidth, setTimelineWidth] = useState(360);
+  // 타임라인 패널 통째 접기 — 접힌 동안 좁은 스트립만 남기고 터미널에 폭을 양보.
+  const [timelineCollapsed, setTimelineCollapsed] = useState(false);
   // 서브에이전트 칼럼 (opt-in): every agent's live progress stacked beside the
   // terminal, instead of digging into the timeline's nested groups.
   const [showAgents, setShowAgents] = useState(false);
@@ -1137,14 +1139,32 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
           </div>
         </>
       )}
-      <div className="claudeterm-splitter" title="드래그로 크기 조절" onMouseDown={startDragTimeline} />
+      {!timelineCollapsed && (
+        <div className="claudeterm-splitter" title="드래그로 크기 조절" onMouseDown={startDragTimeline} />
+      )}
+      {timelineCollapsed && (
+        <button
+          className="claudeterm-timeline-expand"
+          title="타임라인 펼치기"
+          onClick={() => setTimelineCollapsed(false)}
+        >
+          ◀ 타임라인
+        </button>
+      )}
       <div
         className="claudeterm-pane claudeterm-timeline-pane"
         ref={timelineRef}
-        style={{ flex: `0 0 ${timelineWidth}px` }}
+        style={timelineCollapsed ? { display: "none" } : { flex: `0 0 ${timelineWidth}px` }}
       >
         <div className="claudeterm-pane-head">
           <span className="claudeterm-pane-head-title">타임라인</span>
+          <span
+            className="claudeterm-viewer-x"
+            title="타임라인 접기"
+            onClick={() => setTimelineCollapsed(true)}
+          >
+            ▶
+          </span>
         </div>
         <div className="claudeterm-timeline">
           <TimelineView

@@ -1956,6 +1956,22 @@ body {
 .claudeterm-splitter:hover {
   background: var(--accent, #89b4fa);
 }
+/* 접힌 타임라인 자리의 세로 스트립 — 클릭하면 다시 펼침. */
+.claudeterm-timeline-expand {
+  flex: 0 0 22px;
+  padding: 8px 2px;
+  writing-mode: vertical-rl;
+  font-size: 11px;
+  color: var(--fg-dim);
+  background: var(--bg-alt);
+  border: none;
+  border-left: 1px solid var(--border);
+  cursor: pointer;
+}
+.claudeterm-timeline-expand:hover {
+  color: var(--fg);
+  background: var(--bg-hover);
+}
 
 .dock-placeholder {
   display: flex;
