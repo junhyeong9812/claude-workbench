@@ -21,6 +21,7 @@ import { SearchPanel } from "./components/SearchPanel";
 import { RunMenu } from "./components/RunMenu";
 import { StudyView } from "./components/StudyView";
 import { PopoutWorkbench } from "./components/PopoutWorkbench";
+import { DropZoneWindow } from "./components/DropZoneWindow";
 import { WebviewWindow } from "@tauri-apps/api/webviewWindow";
 import { getAllWindows } from "@tauri-apps/api/window";
 import { useAppStore } from "./state/store";
@@ -88,6 +89,9 @@ export default function App() {
   // A popped-out panel window loads the same frontend with the `#popout` hash
   // and renders only the minimal panel workbench (multiwindow).
   if (window.location.hash.startsWith("#popout")) return <PopoutWorkbench />;
+  // OS 파일 반입 드롭 존 보조 창 (파일트리 "파일 가져오기") — 이 창만
+  // dragDropEnabled:true로 열린다.
+  if (window.location.hash.startsWith("#dropzone=")) return <DropZoneWindow />;
   return <AppMain />;
 }
 

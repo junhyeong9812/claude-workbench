@@ -426,6 +426,24 @@ mod tests {
         (root, s)
     }
 
+    // 명세 load-bearing 가정 2: 디렉토리 이동도 rename_path(fs::rename)로 된다.
+    #[test]
+    fn rename_path_moves_directory_tree() {
+        let (root, root_s) = temp_root("mvdir");
+        std::fs::create_dir_all(root.join("a/sub")).unwrap();
+        std::fs::write(root.join("a/sub/f.txt"), "F").unwrap();
+        std::fs::create_dir_all(root.join("dest")).unwrap();
+        assert!(rename_path(
+            format!("{root_s}/a"),
+            format!("{root_s}/dest/a"),
+            root_s.clone()
+        )
+        .is_ok());
+        assert_eq!(std::fs::read_to_string(root.join("dest/a/sub/f.txt")).unwrap(), "F");
+        assert!(!root.join("a").exists(), "원본 위치는 비워짐");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     #[test]
     fn copy_path_recursive_with_symlink_and_guards() {
         let (root, root_s) = temp_root("copy");

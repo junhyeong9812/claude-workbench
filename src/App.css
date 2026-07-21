@@ -3811,6 +3811,55 @@ body {
   border-color: var(--accent-bright);
 }
 
+/* 파일트리 DnD: 드롭 후보 하이라이트. */
+.tree-row-drop {
+  outline: 1px dashed var(--accent);
+  outline-offset: -1px;
+  background: var(--bg-hover);
+}
+.tree-drop-root {
+  outline: 2px dashed var(--accent);
+  outline-offset: -2px;
+}
+
+/* OS 파일 반입 드롭 존 보조 창. */
+.dropzone {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  height: 100vh;
+  padding: 16px;
+  box-sizing: border-box;
+  background: var(--bg, #14161a);
+  color: var(--fg, #d7dae0);
+  border: 2px dashed var(--border, #333);
+  font: 13px/1.5 -apple-system, "Noto Sans KR", sans-serif;
+}
+.dropzone-hover {
+  border-color: var(--accent, #89b4fa);
+  background: var(--bg-alt, #1a1d23);
+}
+.dropzone-target {
+  font-size: 14px;
+}
+.dropzone-hint {
+  color: var(--fg-dim, #8a8f98);
+}
+.dropzone-log {
+  flex: 1;
+  overflow-y: auto;
+  font-size: 12px;
+}
+.dropzone-log-line {
+  padding: 1px 0;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+.dropzone-err {
+  color: var(--st-fail);
+}
+
 /* 워크트리 패널: 멀티 repo 그룹 헤더 (repo 이름 + 그 repo 대상 추가 버튼). */
 .worktree-repo-head {
   margin-top: 6px;

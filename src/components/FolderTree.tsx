@@ -1,9 +1,29 @@
 import { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { WebviewWindow } from "@tauri-apps/api/webviewWindow";
 import { errText } from "../utils/error";
 import { useAppStore } from "../state/store";
 import type { DirEntry } from "../types";
 import { TypeBadges } from "./TypeBadges";
+import {
+  TREE_DND_MIME,
+  baseName,
+  decodePayload,
+  dropDisallowed,
+  encodePayload,
+  parentDir,
+  resolveDropDir,
+} from "./treeDnd";
+
+/** 트리 행 DnD 핸들러 묶음 — TreeNode 재귀에 한 덩어리로 내려보낸다. */
+interface TreeDndHandlers {
+  /** 현재 드롭 후보로 하이라이트할 행 경로 ("" = 빈 영역/루트, null = 없음). */
+  hover: string | null;
+  onRowDragStart: (entry: DirEntry, e: React.DragEvent) => void;
+  onRowDragOver: (entry: DirEntry | null, e: React.DragEvent) => void;
+  onRowDrop: (entry: DirEntry | null, e: React.DragEvent) => void;
+  onRowDragEnd: () => void;
+}
 
 /** Quick file-type picks for "새 파일" (fills the extension; the user can also
  * just type a full name like `Foo.java`). Our supported languages + markdown. */
@@ -28,6 +48,7 @@ function TreeNode({
   depth,
   onContext,
   parentIgnored,
+  dnd,
 }: {
   entry: DirEntry;
   depth: number;
@@ -35,6 +56,7 @@ function TreeNode({
   /** An ignored dir's children come back non-ignored from a walk rooted inside
    * it, so ignored-ness is inherited down the subtree for consistent dimming. */
   parentIgnored?: boolean;
+  dnd: TreeDndHandlers;
 }) {
   const expanded = useAppStore((s) => {
     const active = s.projects.find((p) => p.path === s.activeProject);
@@ -68,9 +90,14 @@ function TreeNode({
   return (
     <div className="tree-node">
       <div
-        className={`tree-row${isCursor ? " tree-row-cursor" : ""}${isPeeked ? " tree-row-peeked" : ""}${ignored ? " tree-row-ignored" : ""}`}
+        className={`tree-row${isCursor ? " tree-row-cursor" : ""}${isPeeked ? " tree-row-peeked" : ""}${ignored ? " tree-row-ignored" : ""}${dnd.hover === entry.path ? " tree-row-drop" : ""}`}
         data-tree-path={entry.path}
         style={{ paddingLeft: depth * 14 + 8 }}
+        draggable
+        onDragStart={(e) => dnd.onRowDragStart(entry, e)}
+        onDragOver={(e) => dnd.onRowDragOver(entry, e)}
+        onDrop={(e) => dnd.onRowDrop(entry, e)}
+        onDragEnd={dnd.onRowDragEnd}
         onClick={onClick}
         onContextMenu={(e) => {
           e.preventDefault();
@@ -101,6 +128,7 @@ function TreeNode({
                 depth={depth + 1}
                 onContext={onContext}
                 parentIgnored={ignored}
+                dnd={dnd}
               />
             ))
           )}
@@ -149,10 +177,13 @@ export function FolderTree() {
     | { kind: "newfile" | "newfolder"; dir: string }
     | { kind: "rename"; node: DirEntry }
     | { kind: "delete"; node: DirEntry }
+    | { kind: "dnd-overwrite"; from: string; to: string; destDir: string; srcParent: string; copy: boolean }
     | null
   >(null);
   const [name, setName] = useState("");
   const [opErr, setOpErr] = useState<string | null>(null);
+  // DnD 드롭 후보 하이라이트: 행 경로, "" = 빈 영역(루트), null = 드래그 없음.
+  const [dndHover, setDndHover] = useState<string | null>(null);
 
   // Parent dir of an absolute path; "/" for a root-level entry (so reloadDir
   // never gets "" → the process cwd).
@@ -348,6 +379,114 @@ export function FolderTree() {
     }
   };
 
+  // ---- 트리 내 DnD (이동/복사) ----
+  // 전용 mime + stopPropagation으로 프로젝트 탭 드래그·dockview 탭 드래그와
+  // 서로 오인하지 않는다 (spec §2).
+  const acceptsTreeDrag = (e: React.DragEvent) => e.dataTransfer.types.includes(TREE_DND_MIME);
+
+  const onRowDragStart = (entry: DirEntry, e: React.DragEvent) => {
+    e.stopPropagation();
+    e.dataTransfer.setData(TREE_DND_MIME, encodePayload({ path: entry.path, isDir: entry.is_dir }));
+    e.dataTransfer.effectAllowed = "copyMove";
+  };
+
+  const onRowDragOver = (entry: DirEntry | null, e: React.DragEvent) => {
+    if (!acceptsTreeDrag(e)) return; // 다른 출처(탭 등)의 드래그는 무시
+    e.preventDefault();
+    e.stopPropagation();
+    e.dataTransfer.dropEffect = e.ctrlKey ? "copy" : "move";
+    setDndHover(entry ? entry.path : "");
+  };
+
+  /** 이동/복사 실행. `fromDialog`=덮어쓰기 확인 다이얼로그 경유(에러를 다이얼
+   * 로그 안에 표시), 직접 드롭 실패는 alert. 원본 삭제는 rename 성공으로만
+   * 일어난다 — 덮어쓰기도 "대상 삭제 → 이동/복사" 순서라 원본은 보존(spec §2). */
+  const doDnd = async (
+    from: string,
+    to: string,
+    destDir: string,
+    srcParent: string,
+    copy: boolean,
+    overwrite: boolean,
+    fromDialog: boolean,
+  ) => {
+    const root = activeProject;
+    if (!root) return;
+    try {
+      if (overwrite) await invoke("delete_path", { path: to, root });
+      if (copy) await invoke("copy_path", { from, to, root });
+      else await invoke("rename_path", { from, to, root });
+      setDialog(null);
+      setOpErr(null);
+      await reloadDir(destDir);
+      ensureExpanded(destDir);
+      if (!copy && srcParent !== destDir) await reloadDir(srcParent);
+      if (!copy && useAppStore.getState().treeCursor === from) setTreeCursor(to);
+    } catch (e) {
+      if (fromDialog) setOpErr(errText(e, "작업 실패"));
+      else alert(errText(e, copy ? "복사 실패" : "이동 실패"));
+    }
+  };
+
+  const onRowDrop = (entry: DirEntry | null, e: React.DragEvent) => {
+    if (!acceptsTreeDrag(e) || !activeProject) return;
+    e.preventDefault();
+    e.stopPropagation();
+    setDndHover(null);
+    const payload = decodePayload(e.dataTransfer.getData(TREE_DND_MIME));
+    if (!payload) return;
+    const copy = e.ctrlKey;
+    const destDir = resolveDropDir(entry, activeProject);
+    const reason = dropDisallowed(payload, destDir);
+    if (reason) {
+      alert(reason);
+      return;
+    }
+    const to = `${destDir}/${baseName(payload.path)}`;
+    const srcParent = parentDir(payload.path);
+    void (async () => {
+      // 충돌 검사는 캐시가 아니라 실 디렉토리 목록으로 (미로딩 폴더 대비).
+      // 조회 실패 시엔 백엔드 no-clobber가 최후 방어선.
+      let exists = false;
+      try {
+        const entries = await invoke<DirEntry[]>("read_dir", { path: destDir });
+        exists = entries.some((en) => en.path === to);
+      } catch {
+        exists = false;
+      }
+      if (exists) {
+        setOpErr(null);
+        setDialog({ kind: "dnd-overwrite", from: payload.path, to, destDir, srcParent, copy });
+      } else {
+        await doDnd(payload.path, to, destDir, srcParent, copy, false, false);
+      }
+    })();
+  };
+
+  const dnd: TreeDndHandlers = {
+    hover: dndHover,
+    onRowDragStart,
+    onRowDragOver,
+    onRowDrop,
+    onRowDragEnd: () => setDndHover(null),
+  };
+
+  /** OS 파일 반입용 드롭 존 보조 창 — 메인 창은 dragDropEnabled:false(탭
+   * 드래그 보존)라 OS 드롭을 못 받으므로, 이 창만 true로 열어 받는다. */
+  const openDropZone = (dest: string) => {
+    setMenu(null);
+    if (!activeProject) return;
+    const label = `dropzone-${Date.now().toString(36)}`;
+    new WebviewWindow(label, {
+      url: `${window.location.pathname}#dropzone=${encodeURIComponent(dest)}::${encodeURIComponent(activeProject)}`,
+      title: "파일 가져오기 — 드롭 존",
+      width: 420,
+      height: 300,
+      alwaysOnTop: true,
+      dragDropEnabled: true,
+    });
+  };
+
   if (!activeProject) {
     return <div className="tree-empty">No project open</div>;
   }
@@ -373,11 +512,17 @@ export function FolderTree() {
 
   return (
     <div
-      className="tree"
+      className={`tree${dndHover === "" ? " tree-drop-root" : ""}`}
       id="folder-tree"
       tabIndex={0}
       onKeyDown={onKeyDown}
       onFocus={onFocus}
+      onDragOver={(e) => onRowDragOver(null, e)}
+      onDrop={(e) => onRowDrop(null, e)}
+      onDragLeave={(e) => {
+        // 트리 밖으로 나갈 때만 해제 (자식 행 진입은 유지).
+        if (!e.currentTarget.contains(e.relatedTarget as Node)) setDndHover(null);
+      }}
       onContextMenu={(e) => {
         // Right-click on empty space → operate on the project root.
         e.preventDefault();
@@ -385,7 +530,7 @@ export function FolderTree() {
       }}
     >
       {rootChildren.map((entry) => (
-        <TreeNode key={entry.path} entry={entry} depth={0} onContext={onContext} />
+        <TreeNode key={entry.path} entry={entry} depth={0} onContext={onContext} dnd={dnd} />
       ))}
 
       {menu && (
@@ -397,6 +542,13 @@ export function FolderTree() {
             </button>
             <button className="tree-menu-item" onClick={() => openDialog({ kind: "newfolder", dir: menu.dir })}>
               새 폴더
+            </button>
+            <button
+              className="tree-menu-item"
+              title="OS 파일매니저에서 파일을 끌어다 넣는 보조 창을 엽니다 (이 폴더로 복사)"
+              onClick={() => openDropZone(menu.dir)}
+            >
+              파일 가져오기 (드롭 존)
             </button>
             {menu.node && (
               <>
@@ -422,7 +574,36 @@ export function FolderTree() {
       {dialog && (
         <div className="tree-dialog-backdrop" onClick={() => setDialog(null)}>
           <div className="tree-dialog" onClick={(e) => e.stopPropagation()}>
-            {dialog.kind === "delete" ? (
+            {dialog.kind === "dnd-overwrite" ? (
+              <>
+                <div className="tree-dialog-head">덮어쓰기 확인</div>
+                <div className="tree-dialog-msg">
+                  대상 폴더에 <code>{baseName(dialog.to)}</code> 이(가) 이미 있습니다.
+                  <br />
+                  기존 항목을 삭제하고 {dialog.copy ? "복사" : "이동"}할까요?
+                </div>
+                {opErr && <div className="tree-dialog-err">{opErr}</div>}
+                <div className="tree-dialog-foot">
+                  <button onClick={() => setDialog(null)}>취소</button>
+                  <button
+                    className="tree-menu-danger"
+                    onClick={() =>
+                      void doDnd(
+                        dialog.from,
+                        dialog.to,
+                        dialog.destDir,
+                        dialog.srcParent,
+                        dialog.copy,
+                        true,
+                        true,
+                      )
+                    }
+                  >
+                    덮어쓰기
+                  </button>
+                </div>
+              </>
+            ) : dialog.kind === "delete" ? (
               <>
                 <div className="tree-dialog-head">삭제 확인</div>
                 <div className="tree-dialog-msg">
