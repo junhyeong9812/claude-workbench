@@ -24,6 +24,7 @@ import { PopoutWorkbench } from "./components/PopoutWorkbench";
 import { DropZoneWindow } from "./components/DropZoneWindow";
 import {
   classifyDrops,
+  decodeStrict,
   DROP_MAX_BYTES,
   DROP_MAX_FILES,
   type DroppedFileView,
@@ -124,6 +125,13 @@ function AppMain() {
   // 드롭 처리 직렬화 — 연속 드롭이 겹쳐 절반 상태를 만들지 않게.
   const dropBusyRef = useRef(false);
 
+  // 상호 배타(리뷰 W5): 경로 peek이 어떤 경로(트리 클릭·검색 점프)로든 열리면
+  // 드롭 peek을 닫는다 — 오버레이 이중 적층 방지. (역방향은 드롭 처리부의
+  // setPeekFile(null)이 담당.)
+  useEffect(() => {
+    if (peekFile != null) setDroppedPeek(null);
+  }, [peekFile]);
+
   // ①전역 네비게이션 가드: OS 파일 드래그가 앱 어디에 떨어져도 웹뷰가 그
   // 파일로 이동해버리는 기본 동작을 막는다. `Files` 타입에만 개입 — 앱 내부
   // HTML5 드래그(트리 DnD·탭 정렬·창 분리)는 Files가 없어 무관 (spec §2).
@@ -139,45 +147,58 @@ function AppMain() {
       const pane = document.querySelector(".pane-main");
       if (!pane || !(e.target instanceof Node) || !pane.contains(e.target)) return;
       const files = Array.from(e.dataTransfer?.files ?? []);
-      if (files.length === 0 || dropBusyRef.current) return;
+      if (files.length === 0) return;
+      if (dropBusyRef.current) {
+        alert("이전 드롭을 처리하는 중입니다 — 잠시 후 다시 시도하세요."); // 무음 폐기 금지 (리뷰 W3)
+        return;
+      }
       dropBusyRef.current = true;
       void (async () => {
-        const plans = classifyDrops(files.map((f) => ({ name: f.name, size: f.size })));
-        const notes: string[] = [];
-        const loaded: DroppedFileView[] = [];
-        for (let i = 0; i < files.length; i++) {
-          const f = files[i];
-          const kind = plans[i].kind;
-          if (kind === "too-large") {
-            notes.push(`${f.name}: ${DROP_MAX_BYTES / 1024 / 1024}MB 초과 — 건너뜀`);
-            continue;
-          }
-          if (kind === "over-limit") {
-            notes.push(`${f.name}: 한 번에 최대 ${DROP_MAX_FILES}개 — 건너뜀`);
-            continue;
-          }
-          try {
-            if (kind === "image") {
-              const url = await new Promise<string>((resolve, reject) => {
-                const r = new FileReader();
-                r.onload = () => resolve(r.result as string);
-                r.onerror = () => reject(r.error);
-                r.readAsDataURL(f);
-              });
-              loaded.push({ name: f.name, imageUrl: url });
-            } else {
-              loaded.push({ name: f.name, text: await f.text() });
+        try {
+          const plans = classifyDrops(files.map((f) => ({ name: f.name, size: f.size })));
+          const notes: string[] = [];
+          const loaded: DroppedFileView[] = [];
+          for (let i = 0; i < files.length; i++) {
+            const f = files[i];
+            const kind = plans[i].kind;
+            if (kind === "too-large") {
+              notes.push(`${f.name}: ${DROP_MAX_BYTES / 1024 / 1024}MB 초과 — 건너뜀`);
+              continue;
             }
-          } catch {
-            notes.push(`${f.name}: 읽기 실패`);
+            if (kind === "over-limit") {
+              notes.push(`${f.name}: 한 번에 최대 ${DROP_MAX_FILES}개 — 건너뜀`);
+              continue;
+            }
+            try {
+              if (kind === "image") {
+                const url = await new Promise<string>((resolve, reject) => {
+                  const r = new FileReader();
+                  r.onload = () => resolve(r.result as string);
+                  r.onerror = () => reject(r.error);
+                  r.readAsDataURL(f);
+                });
+                loaded.push({ name: f.name, imageUrl: url });
+              } else {
+                // 엄격 디코드 — File.text()는 바이너리도 조용히 치환해버린다 (리뷰 W1).
+                const text = decodeStrict(await f.arrayBuffer());
+                if (text == null) {
+                  notes.push(`${f.name}: 텍스트로 표시할 수 없는 파일 — 건너뜀`);
+                  continue;
+                }
+                loaded.push({ name: f.name, text });
+              }
+            } catch {
+              notes.push(`${f.name}: 읽기 실패`);
+            }
           }
+          if (loaded.length > 0) {
+            useAppStore.getState().setPeekFile(null); // 경로 기반 peek과 겹치지 않게
+            setDroppedPeek({ files: loaded, active: 0 });
+          }
+          if (notes.length > 0) alert(notes.join("\n"));
+        } finally {
+          dropBusyRef.current = false; // 예기치 못한 throw에도 영구 잠금 금지 (리뷰 W3)
         }
-        dropBusyRef.current = false;
-        if (loaded.length > 0) {
-          useAppStore.getState().setPeekFile(null); // 경로 기반 peek과 겹치지 않게
-          setDroppedPeek({ files: loaded, active: 0 });
-        }
-        if (notes.length > 0) alert(notes.join("\n"));
       })();
     };
     window.addEventListener("dragover", guard);

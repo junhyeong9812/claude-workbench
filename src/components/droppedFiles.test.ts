@@ -1,5 +1,21 @@
 import { describe, expect, it } from "vitest";
-import { classifyDrops, DROP_MAX_BYTES, DROP_MAX_FILES, extOf } from "./droppedFiles";
+import {
+  classifyDrops,
+  decodeStrict,
+  DROP_MAX_BYTES,
+  DROP_MAX_FILES,
+  extOf,
+} from "./droppedFiles";
+
+describe("decodeStrict", () => {
+  it("유효 UTF-8은 디코드, 바이너리는 null (무음 mojibake 금지)", () => {
+    expect(decodeStrict(new TextEncoder().encode("한글 ok").buffer as ArrayBuffer)).toBe("한글 ok");
+    // 0xFF 0xFE — UTF-8로 무효.
+    expect(decodeStrict(new Uint8Array([0xff, 0xfe, 0x00]).buffer as ArrayBuffer)).toBeNull();
+    // 빈 파일은 빈 문자열(유효).
+    expect(decodeStrict(new ArrayBuffer(0))).toBe("");
+  });
+});
 
 describe("classifyDrops", () => {
   it("확장자로 텍스트/이미지 분류, 드롭 순서 보존", () => {

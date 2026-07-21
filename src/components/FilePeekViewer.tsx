@@ -22,22 +22,28 @@ import type { DroppedFileView } from "./droppedFiles";
  * 메모리 텍스트/이미지 데이터 URL을 표시한다. 이때 파일 읽기·Ctrl+E(에디터)
  * 는 비활성이고, 여러 파일이면 `tabs`로 전환한다. 완전 읽기 전용.
  */
+/** 소스는 디스크 경로 XOR 메모리 콘텐츠 — 둘 다 없거나 둘 다 있는 호출을
+ * 타입에서 차단한다(리뷰 W4). 탭 스트립은 메모리(다중 드롭) 분기 전용. */
+type PeekSource =
+  | { path: string; memory?: undefined; tabs?: undefined }
+  | {
+      path?: undefined;
+      /** 드롭된 파일의 메모리 콘텐츠 (경로 없음 — 읽기 전용 표시만). */
+      memory: DroppedFileView;
+      /** 다중 드롭 탭 스트립 — 첫 파일 활성, 클릭으로 전환. */
+      tabs?: { names: string[]; active: number; onSelect: (i: number) => void };
+    };
+
 export function FilePeekViewer({
   path,
   onClose,
   line,
   memory,
   tabs,
-}: {
-  /** 디스크 파일 경로 — `memory` 사용 시 생략. */
-  path?: string;
+}: PeekSource & {
   onClose: () => void;
   /** 1-based line to jump to (content-search result); forces raw source view. */
   line?: number;
-  /** 드롭된 파일의 메모리 콘텐츠 (경로 없음 — 읽기 전용 표시만). */
-  memory?: DroppedFileView;
-  /** 다중 드롭 탭 스트립 — 첫 파일 활성, 클릭으로 전환. */
-  tabs?: { names: string[]; active: number; onSelect: (i: number) => void };
 }) {
   const requestEditorOpen = useAppStore((s) => s.requestEditorOpen);
   const theme = useAppStore((s) => s.theme);
@@ -57,6 +63,12 @@ export function FilePeekViewer({
   const [markdown, setMarkdown] = useState(line == null);
   const md = !isImage && isMarkdownPath(nameForLang);
   const showRaw = !md || !markdown;
+  // 이미지 실제 디코드 실패(<img> 로드 실패) 표시 — 탭/소스 전환 시 초기화
+  // (리뷰 W2 + 감사: 정상 이미지에 실패 표시가 남지 않게).
+  const [imgErr, setImgErr] = useState(false);
+  useEffect(() => {
+    setImgErr(false);
+  }, [memory?.imageUrl]);
 
   // Reset 뷰모드 when the peeked file (or jump target) changes.
   useEffect(() => {
@@ -174,7 +186,16 @@ export function FilePeekViewer({
         <div className="peek-err">{err}</div>
       ) : isImage ? (
         <div className="peek-body peek-img-body" ref={bodyRef}>
-          <img className="peek-img" src={memory!.imageUrl} alt={memory!.name} />
+          {imgErr ? (
+            <div className="peek-err">이미지를 표시할 수 없습니다 (손상되었거나 미지원 형식)</div>
+          ) : (
+            <img
+              className="peek-img"
+              src={memory!.imageUrl}
+              alt={memory!.name}
+              onError={() => setImgErr(true)}
+            />
+          )}
         </div>
       ) : showRaw ? (
         <div className="peek-body" ref={hostRef} />
