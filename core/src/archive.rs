@@ -155,21 +155,31 @@ impl JsonlStat {
 /// 뒤에서부터 파싱한다. 창 안에서 uuid를 못 찾으면 `None`(판별 불가 — 호출자
 /// 가 바이트 길이로 폴백).
 pub fn tail_last_uuid(path: &Path) -> Option<String> {
+    tail_last_uuid_window(path, 256 * 1024)
+}
+
+fn tail_last_uuid_window(path: &Path, window: u64) -> Option<String> {
     use std::io::{Read, Seek, SeekFrom};
-    const WINDOW: u64 = 256 * 1024;
     let mut f = fs::File::open(path).ok()?;
     let len = f.metadata().ok()?.len();
-    let start = len.saturating_sub(WINDOW);
-    f.seek(SeekFrom::Start(start)).ok()?;
+    let start = len.saturating_sub(window);
+    // 창 시작 1바이트 앞부터 읽는다: 그 바이트가 개행이면 창이 정확히 줄
+    // 경계에서 시작한 것 — 첫 줄이 완전하므로 버리지 않는다 (post-fix P3).
+    let adj = start.saturating_sub(1);
+    f.seek(SeekFrom::Start(adj)).ok()?;
     let mut buf = Vec::new();
     f.read_to_end(&mut buf).ok()?;
     let text = String::from_utf8_lossy(&buf);
-    let mut lines: Vec<&str> = text.lines().collect();
-    if start > 0 && !lines.is_empty() {
-        lines.remove(0); // 창 경계에서 잘린 첫 줄
+    let mut tail: &str = &text;
+    if start > 0 {
+        // 첫 개행까지가 (잠재적으로) 잘린 앞줄 — 경계 개행이면 정확히 그
+        // 개행 하나만 소비된다.
+        tail = match tail.find('\n') {
+            Some(i) => &tail[i + 1..],
+            None => "",
+        };
     }
-    lines
-        .iter()
+    tail.lines()
         .rev()
         .filter(|l| !l.trim().is_empty())
         .find_map(|l| crate::jsonl::RawRecord::parse_line(l).and_then(|r| r.uuid))
@@ -572,10 +582,13 @@ pub fn write_archive(
             // 디렉토리가 남고, 아래에서 aside 전체가 보존된다.
             let _ = fs::remove_dir(&old_hist);
         }
-        // 이월이 다 끝났는지 = old history가 더 이상 없는지.
+        // 이월이 다 끝났는지 = old history가 더 이상 없는지. 잔여물이 있으면
+        // 버전화(rename)도 하지 않고 aside 통째로 남긴다 — 버전 폴더 안에
+        // history가 중첩되면 목록에서 보이지 않게 되기 때문(post-fix P2).
+        // aside는 다음 아카이브의 회수 경로가 이월을 재시도한다.
         let carry_leftover = moved.join("history").is_dir();
         match history_name {
-            Some(name) => {
+            Some(name) if !carry_leftover => {
                 let _ = fs::create_dir_all(&history_dir);
                 let mut dest = history_dir.join(name);
                 if dest.exists() {
@@ -585,12 +598,10 @@ pub fn write_archive(
                 // 실패 시 aside 그대로 — 다음 아카이브가 회수.
                 let _ = fs::rename(moved, &dest);
             }
-            None => {
-                if !carry_leftover {
-                    let _ = fs::remove_dir_all(moved);
-                }
-                // carry_leftover면 aside를 남긴다 — 미이월 버전을 지키는 유일한 길.
+            None if !carry_leftover => {
+                let _ = fs::remove_dir_all(moved);
             }
+            _ => {} // carry_leftover — aside 보존이 미이월 버전을 지키는 유일한 길
         }
     }
     Ok(ArchiveOutcome {
@@ -708,7 +719,6 @@ pub fn backfill_meta(archive_root: &Path) -> (usize, usize) {
             if !missing(&s.meta) {
                 continue;
             }
-            candidates += 1;
             // 재아카이브와 직렬화(F3): 잠금 안에서 meta를 재독해, list 시점
             // 이후 폴더가 교체됐으면(uuid 바뀜/이미 채워짐) 건드리지 않는다.
             let _guard = WRITE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
@@ -719,8 +729,11 @@ pub fn backfill_meta(archive_root: &Path) -> (usize, usize) {
                 continue;
             };
             if meta.uuid != s.meta.uuid || !missing(&meta) {
-                continue; // 그 사이 새 아카이브가 앉음 — 백필 불필요
+                continue; // 그 사이 새 아카이브가 앉음 — 백필 불필요(후보 아님)
             }
+            // 후보 집계는 재독 후에 — 잠금 대기 중 재아카이브가 채운 항목을
+            // "부분 실패"로 오인하지 않는다 (post-fix P5).
+            candidates += 1;
             let jsonl_path = s.dir.join("session.jsonl");
             let Ok(raw) = fs::read(&jsonl_path) else { continue };
             let stat = jsonl_stat(&raw);
@@ -1257,6 +1270,30 @@ mod tests {
         text.push_str("truncated-garbage-tail");
         fs::write(&p, &text).unwrap();
         assert_eq!(tail_last_uuid(&p).as_deref(), Some("u-49"), "파싱 불가 꼬리 건너뜀");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    // post-fix P3: 창이 정확히 줄 경계에서 시작하면 첫 줄은 완전한 레코드다 —
+    // 버리면 안 된다.
+    #[test]
+    fn tail_window_on_exact_line_boundary_keeps_first_line() {
+        let root = temp_root("tailb");
+        let p = root.join("s.jsonl");
+        let head = json!({"type":"user","uuid":"u-head","message":{"role":"user","content":"x"}}).to_string();
+        let target = json!({"type":"user","uuid":"u-target","message":{"role":"user","content":"y"}}).to_string();
+        // 창 안 마지막 줄들은 uuid가 없어, 첫 줄(u-target)이 창 안 유일한 uuid.
+        let filler = json!({"type":"system"}).to_string();
+        let text = format!("{head}\n{target}\n{filler}\n{filler}\n");
+        fs::write(&p, &text).unwrap();
+        // 창 시작 = target 줄의 첫 바이트 (정확한 경계).
+        let window = (text.len() - head.len() - 1) as u64;
+        assert_eq!(
+            tail_last_uuid_window(&p, window).as_deref(),
+            Some("u-target"),
+            "경계 첫 줄 보존"
+        );
+        // 창이 줄 중간에서 시작하면 그 잘린 줄은 버린다 → head/target 못 보고 None.
+        assert_eq!(tail_last_uuid_window(&p, window - 5), None, "잘린 첫 줄은 폐기");
         let _ = fs::remove_dir_all(&root);
     }
 

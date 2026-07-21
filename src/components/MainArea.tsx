@@ -167,6 +167,8 @@ export function MainArea() {
   pickerRef.current = picker;
   // 이 프로젝트의 아카이브가 지금 실행 중인지 (picker "아카이브 진행중" 배지).
   const [archBusy, setArchBusy] = useState(false);
+  // in_flight 조회 세대 — 늦게 도착한 낡은 응답이 배지를 되돌리지 못하게.
+  const archReqRef = useRef(0);
   // Collapsed picker groups (아카이브됨/아카이브 이후 작업/아카이브 없음).
   const [pickerCollapsed, setPickerCollapsed] = useState<Set<ArchState>>(new Set());
   // Which kind the open picker creates/reopens: ACP `claude` or A `claudeterm`.
@@ -690,6 +692,7 @@ export function MainArea() {
   const openPicker = async () => {
     let sessions: SessionSummary[] = [];
     if (activeProject) {
+      const myReq = ++archReqRef.current;
       const [raw, statuses, inFlight] = await Promise.all([
         invoke<
           {
@@ -720,7 +723,7 @@ export function MainArea() {
           versions: st?.versions ?? 0,
         };
       });
-      setArchBusy(inFlight);
+      if (archReqRef.current === myReq) setArchBusy(inFlight);
     }
     setNewName(`Claude ${sessions.length + openKindCount("claudeterm") + 1}`);
     setPicker(sessions); // open-session filtering happens at render
@@ -734,8 +737,13 @@ export function MainArea() {
   useEffect(() => {
     const refresh = () => {
       if (!activeProject) return;
+      // started/finished 연속 발생 시 응답 역전으로 낡은 true가 나중에 도착해
+      // 배지가 busy에 갇힐 수 있다 — 최신 요청만 반영(post-fix P4).
+      const my = ++archReqRef.current;
       void invoke<boolean>("archive_in_flight", { project: activeProject })
-        .then(setArchBusy)
+        .then((v) => {
+          if (archReqRef.current === my) setArchBusy(v);
+        })
         .catch(() => {});
     };
     const un1 = listen("mt-archive-started", refresh);

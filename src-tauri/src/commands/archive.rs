@@ -488,14 +488,17 @@ pub async fn archive_status(app: AppHandle, project: String) -> Vec<ArchiveStatu
                 let live = projects_root
                     .as_deref()
                     .and_then(|pr| core_lib::jsonl::find_session_jsonl(pr, &s.meta.uuid).ok().flatten());
-                // spec §2 판별식: 마지막 메시지 uuid 일치 = 최신. tail만 읽어
-                // 전체 파싱을 피하고, uuid를 어느 쪽이든 얻지 못한 전사만
-                // 바이트 길이로 보수 폴백(명시적 fail-soft — 리뷰 F1·F4).
+                // spec §2 판별식: 마지막 메시지 uuid 일치 = 최신 — 단, uuid
+                // 없는 레코드만 append돼 자란 경우를 놓치지 않도록 바이트
+                // 길이도 함께 요구한다(post-fix P1). uuid를 어느 쪽이든 얻지
+                // 못한 전사는 바이트 길이만으로 보수 폴백(명시적 fail-soft).
                 let up_to_date = match (&archived, &live) {
                     (Some(a), Some(path)) => {
+                        let same_len =
+                            std::fs::metadata(path).map(|m| m.len()).ok() == Some(a.bytes);
                         match (core_lib::archive::tail_last_uuid(path), &a.last_uuid) {
-                            (Some(l), Some(m)) => l == *m,
-                            _ => std::fs::metadata(path).map(|m| m.len()).ok() == Some(a.bytes),
+                            (Some(l), Some(m)) => l == *m && same_len,
+                            _ => same_len,
                         }
                     }
                     // 라이브 트랜스크립트 없음(삭제) → 아카이브가 전부.
