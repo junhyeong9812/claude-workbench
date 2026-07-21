@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { errText } from "../utils/error";
+import { fmtUnix } from "../utils/time";
 import { useAppStore } from "../state/store";
 
 /** 추출 모델 선택지 — claude CLI에 목록 명령이 없어 별칭을 큐레이션한다.
@@ -40,18 +41,6 @@ interface ArchiveGroup {
 }
 
 const baseName = (p: string) => p.split("/").filter(Boolean).pop() ?? p;
-
-/** Unix seconds → 짧은 로컬 시각 (버전 라벨). */
-const fmtUnix = (t?: number | null): string =>
-  t
-    ? new Date(t * 1000).toLocaleString("ko-KR", {
-        year: "2-digit",
-        month: "numeric",
-        day: "numeric",
-        hour: "2-digit",
-        minute: "2-digit",
-      })
-    : "시각 미상";
 
 export function ArchivePanel() {
   const [groups, setGroups] = useState<ArchiveGroup[]>([]);
@@ -298,7 +287,7 @@ export function ArchivePanel() {
                       s.history.map((h, i) => (
                         <div key={h.book_path} className="archive-version-row">
                           <span className="archive-version-label">
-                            v{s.history.length - i} · {fmtUnix(h.archived_at)} · {h.turns} turns
+                            v{s.history.length - i} · {fmtUnix(h.archived_at) || "시각 미상"} · {h.turns} turns
                           </span>
                           <button
                             className="archive-btn"

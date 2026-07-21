@@ -19,6 +19,7 @@ import { components, AppTab, type PanelKind } from "./panelRegistry";
 import { resolveLayerMode, integratedIsFront } from "../state/layerRouting";
 import { getAllWindows, getCurrentWindow } from "@tauri-apps/api/window";
 import { fileName } from "./cmLang";
+import { fmtUnix } from "../utils/time";
 
 /** Archive freshness of a saved session — the picker's three groups.
  * `current` = 아카이브가 최신, `stale` = 아카이브 이후 작업 있음, `none` = 아카이브 없음. */
@@ -68,17 +69,6 @@ const PICKER_GROUPS: { key: ArchState; label: string; hint: string }[] = [
   },
   { key: "none", label: "미아카이브", hint: "아카이브가 없습니다" },
 ];
-
-/** Unix seconds → 짧은 로컬 시각 (아카이브 시점 표시). */
-const fmtUnix = (t: number | null): string =>
-  t
-    ? new Date(t * 1000).toLocaleString("ko-KR", {
-        month: "numeric",
-        day: "numeric",
-        hour: "2-digit",
-        minute: "2-digit",
-      })
-    : "";
 
 const EMPTY_SSH_FORM: SshForm = {
   label: "",
@@ -737,19 +727,21 @@ export function MainArea() {
   };
 
   // 진행중 배지 실시간화: 아카이브 시작/종료 브로드캐스트를 받아 배지를 갱신
-  // 하고, 종료 시 picker가 열려 있으면 그룹 분류를 새로 가져온다 (아카이브가
-  // 끝나면 그 세션이 "아카이브됨"으로 이동해야 하므로).
+  // 하고, 종료 시 picker가 열려 있으면 그룹 분류를 새로 가져온다. payload의
+  // raw cwd를 activeProject와 문자열 비교하면 경로 정규화 차이(심링크·슬래시)
+  // 에 취약하므로, 이벤트는 트리거로만 쓰고 판정은 백엔드 in_flight 재조회로
+  // 한다 (리뷰 F7 — 백엔드가 canonicalize로 동일성을 판정).
   useEffect(() => {
-    const match = (p: unknown) =>
-      !!activeProject && (p as { project?: string } | undefined)?.project === activeProject;
-    const un1 = listen("mt-archive-started", (e) => {
-      if (match(e.payload)) setArchBusy(true);
-    });
-    const un2 = listen("mt-archive-finished", (e) => {
-      if (match(e.payload)) {
-        setArchBusy(false);
-        if (pickerRef.current !== null) void openPicker();
-      }
+    const refresh = () => {
+      if (!activeProject) return;
+      void invoke<boolean>("archive_in_flight", { project: activeProject })
+        .then(setArchBusy)
+        .catch(() => {});
+    };
+    const un1 = listen("mt-archive-started", refresh);
+    const un2 = listen("mt-archive-finished", () => {
+      refresh();
+      if (pickerRef.current !== null) void openPicker();
     });
     return () => {
       void un1.then((f) => f());
