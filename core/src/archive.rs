@@ -42,6 +42,12 @@ pub const SCHEMA_VERSION: u32 = 1;
 /// concurrent writers must never race on a shared temp path).
 static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
+/// In-process serialization of archive-tree writers (`write_archive` ↔
+/// `backfill_meta`): lazy 백필이 list 시점에 캡처한 폴더를 재아카이브가
+/// 교체하는 사이에 meta를 덮어쓰는 race(F3)를 막는다. 프로세스 밖(CLI 백필
+/// 병행 실행)은 못 막는다 — 백필이 쓰기 직전 meta를 재독해 창을 최소화한다.
+static WRITE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// One conversation turn of the normalized session: the user's prompt, the
 /// assistant's answer, and the tool items that ran in between (seq order).
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -125,6 +131,48 @@ pub struct JsonlStat {
     pub bytes: u64,
     pub lines: usize,
     pub last_uuid: Option<String>,
+}
+
+impl JsonlStat {
+    /// spec §2의 내용 동일성 판별식: 라인 수가 다르면 다른 내용, 같으면
+    /// 마지막 uuid로 판별한다. uuid가 없는 전사(레코드에 uuid 필드가 전혀
+    /// 없는 비정형)는 바이트 길이로 보수 판정. 버전 생성·unchanged 스킵·
+    /// 최신 판별이 전부 이 한 정의를 쓴다 — 세 곳의 "같음"이 갈리면 UI
+    /// 분류와 저장 동작이 서로 모순된다.
+    pub fn same_content(&self, other: &JsonlStat) -> bool {
+        if self.lines != other.lines {
+            return false;
+        }
+        match (&self.last_uuid, &other.last_uuid) {
+            (Some(a), Some(b)) => a == b,
+            _ => self.bytes == other.bytes,
+        }
+    }
+}
+
+/// Read the last record uuid of a (possibly large) live transcript by reading
+/// only its tail window — 최신 판별용(전체 read 회피). 절단된 첫 줄은 버리고
+/// 뒤에서부터 파싱한다. 창 안에서 uuid를 못 찾으면 `None`(판별 불가 — 호출자
+/// 가 바이트 길이로 폴백).
+pub fn tail_last_uuid(path: &Path) -> Option<String> {
+    use std::io::{Read, Seek, SeekFrom};
+    const WINDOW: u64 = 256 * 1024;
+    let mut f = fs::File::open(path).ok()?;
+    let len = f.metadata().ok()?.len();
+    let start = len.saturating_sub(WINDOW);
+    f.seek(SeekFrom::Start(start)).ok()?;
+    let mut buf = Vec::new();
+    f.read_to_end(&mut buf).ok()?;
+    let text = String::from_utf8_lossy(&buf);
+    let mut lines: Vec<&str> = text.lines().collect();
+    if start > 0 && !lines.is_empty() {
+        lines.remove(0); // 창 경계에서 잘린 첫 줄
+    }
+    lines
+        .iter()
+        .rev()
+        .filter(|l| !l.trim().is_empty())
+        .find_map(|l| crate::jsonl::RawRecord::parse_line(l).and_then(|r| r.uuid))
 }
 
 /// Compute [`JsonlStat`] over raw transcript bytes. `bytes` is the on-disk
@@ -384,6 +432,8 @@ pub fn write_archive(
     ));
     fs::create_dir_all(&tmp_dir)?;
     let stat = jsonl_stat(jsonl_bytes);
+    // 이 아래의 발견→치환→이월 시퀀스 전체가 backfill_meta와 직렬화된다(F3).
+    let _write_guard = WRITE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     let write_all = (|| -> io::Result<()> {
         fs::write(tmp_dir.join("session.jsonl"), jsonl_bytes)?;
         let json = serde_json::to_string_pretty(session)
@@ -458,7 +508,7 @@ pub fn write_archive(
     for (i, (old, old_meta)) in previous.iter().enumerate() {
         // Decide BEFORE moving: does the old snapshot differ from the new one?
         // (Unreadable old snapshot counts as different — preserve, never drop.)
-        let changed = archived_stat(old, old_meta).is_none_or(|s| s != stat);
+        let changed = archived_stat(old, old_meta).is_none_or(|s| !s.same_content(&stat));
         let history_name = changed.then(|| {
             let ts = old_meta
                 .archived_at
@@ -493,25 +543,37 @@ pub fn write_archive(
         let _ = fs::remove_dir_all(&tmp_dir);
         return Err(e);
     }
-    // Post-land bookkeeping is best-effort: the new archive is already safe. A
-    // failed move here leaves an `.old-*` aside, which the next archive of this
-    // session reclaims (self-healing) — never silent deletion of a version.
+    // Post-land bookkeeping is best-effort: the new archive is already safe.
+    // 단, 버전은 어떤 실패 경로에서도 조용히 지워지면 안 된다(spec §2) — 이월
+    // 못 한 항목이 남은 aside는 삭제하지 않고 `.old-*`로 보존해 다음 아카이브
+    // 가 회수한다(자가치유).
     let history_dir = final_dir.join("history");
     for (_, moved, history_name) in &displaced {
         // Carry the previous folder's own versions forward into the new folder.
+        // 이름 충돌은 seq suffix로 유일화(최상위 버전과 동일 전략) — 스킵하면
+        // 아래 정리 단계에서 그 버전이 사라진다 (리뷰 F2).
         let old_hist = moved.join("history");
         if old_hist.is_dir() {
             let _ = fs::create_dir_all(&history_dir);
             if let Ok(entries) = fs::read_dir(&old_hist) {
                 for e in entries.flatten() {
-                    let dest = history_dir.join(e.file_name());
-                    if !dest.exists() {
-                        let _ = fs::rename(e.path(), dest);
+                    let mut dest = history_dir.join(e.file_name());
+                    if dest.exists() {
+                        dest = history_dir.join(format!(
+                            "{}-{}",
+                            e.file_name().to_string_lossy(),
+                            TMP_SEQ.fetch_add(1, Ordering::Relaxed)
+                        ));
                     }
+                    let _ = fs::rename(e.path(), dest);
                 }
             }
-            let _ = fs::remove_dir_all(&old_hist);
+            // 빈 경우에만 지워진다(remove_dir) — 이월 실패분이 남아 있으면
+            // 디렉토리가 남고, 아래에서 aside 전체가 보존된다.
+            let _ = fs::remove_dir(&old_hist);
         }
+        // 이월이 다 끝났는지 = old history가 더 이상 없는지.
+        let carry_leftover = moved.join("history").is_dir();
         match history_name {
             Some(name) => {
                 let _ = fs::create_dir_all(&history_dir);
@@ -520,10 +582,14 @@ pub fn write_archive(
                     dest = history_dir
                         .join(format!("{name}-{}", TMP_SEQ.fetch_add(1, Ordering::Relaxed)));
                 }
+                // 실패 시 aside 그대로 — 다음 아카이브가 회수.
                 let _ = fs::rename(moved, &dest);
             }
             None => {
-                let _ = fs::remove_dir_all(moved);
+                if !carry_leftover {
+                    let _ = fs::remove_dir_all(moved);
+                }
+                // carry_leftover면 aside를 남긴다 — 미이월 버전을 지키는 유일한 길.
             }
         }
     }
@@ -634,16 +700,27 @@ fn list_history(session_dir: &Path) -> Vec<ArchiveHistoryEntry> {
 pub fn backfill_meta(archive_root: &Path) -> (usize, usize) {
     let mut candidates = 0usize;
     let mut filled = 0usize;
+    let missing = |m: &ArchiveMeta| {
+        m.jsonl_bytes.is_none() || m.jsonl_lines.is_none() || m.archived_at.is_none()
+    };
     for listing in list_archives(archive_root) {
         for s in listing.sessions {
-            let mut meta = s.meta;
-            if meta.jsonl_bytes.is_some()
-                && meta.jsonl_lines.is_some()
-                && meta.archived_at.is_some()
-            {
+            if !missing(&s.meta) {
                 continue;
             }
             candidates += 1;
+            // 재아카이브와 직렬화(F3): 잠금 안에서 meta를 재독해, list 시점
+            // 이후 폴더가 교체됐으면(uuid 바뀜/이미 채워짐) 건드리지 않는다.
+            let _guard = WRITE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+            let Some(mut meta) = fs::read_to_string(s.dir.join("meta.json"))
+                .ok()
+                .and_then(|t| serde_json::from_str::<ArchiveMeta>(&t).ok())
+            else {
+                continue;
+            };
+            if meta.uuid != s.meta.uuid || !missing(&meta) {
+                continue; // 그 사이 새 아카이브가 앉음 — 백필 불필요
+            }
             let jsonl_path = s.dir.join("session.jsonl");
             let Ok(raw) = fs::read(&jsonl_path) else { continue };
             let stat = jsonl_stat(&raw);
@@ -1144,6 +1221,88 @@ mod tests {
         assert_eq!(meta.title, "백필", "기존 필드 보존");
         // 멱등: 두 번째 호출은 후보 0.
         assert_eq!(backfill_meta(&root), (0, 0));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    // F4: 내용 동일성은 라인+uuid가 판별식, uuid 부재 시에만 바이트 폴백.
+    #[test]
+    fn same_content_prefers_uuid_over_bytes() {
+        let a = JsonlStat { bytes: 100, lines: 3, last_uuid: Some("u1".into()) };
+        // 바이트가 달라도(공백 차이 등) 라인+uuid 같으면 같은 내용.
+        let b = JsonlStat { bytes: 101, lines: 3, last_uuid: Some("u1".into()) };
+        assert!(a.same_content(&b));
+        // 길이 같아도 uuid 다르면 다른 내용 (재작성 방어).
+        let c = JsonlStat { bytes: 100, lines: 3, last_uuid: Some("u2".into()) };
+        assert!(!a.same_content(&c));
+        // uuid 없는 전사는 바이트로 보수 판정.
+        let d = JsonlStat { bytes: 100, lines: 3, last_uuid: None };
+        let e = JsonlStat { bytes: 100, lines: 3, last_uuid: None };
+        let f = JsonlStat { bytes: 90, lines: 3, last_uuid: None };
+        assert!(d.same_content(&e));
+        assert!(!d.same_content(&f));
+        // 라인 수가 다르면 무조건 다름.
+        let g = JsonlStat { bytes: 100, lines: 4, last_uuid: Some("u1".into()) };
+        assert!(!a.same_content(&g));
+    }
+
+    #[test]
+    fn tail_last_uuid_reads_only_tail() {
+        let root = temp_root("tail");
+        let p = root.join("s.jsonl");
+        let mut text = String::new();
+        for i in 0..50 {
+            text.push_str(&json!({"type":"user","uuid":format!("u-{i}"),"message":{"role":"user","content":"x"}}).to_string());
+            text.push('\n');
+        }
+        text.push_str("truncated-garbage-tail");
+        fs::write(&p, &text).unwrap();
+        assert_eq!(tail_last_uuid(&p).as_deref(), Some("u-49"), "파싱 불가 꼬리 건너뜀");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    // F2: 이월 대상 history 이름이 충돌해도 버전이 사라지지 않는다 — suffix로
+    // 유일화되어 양쪽 다 보존.
+    #[test]
+    fn carry_forward_name_collision_preserves_both_versions() {
+        let root = temp_root("carry");
+        let v1 = sample_jsonl("일");
+        let out1 = write_archive(&root, "/p", &sample_session("t"), v1.as_bytes()).unwrap();
+        let sessions = out1.dir.parent().unwrap().to_path_buf();
+        // 크래시 leftover 재현: 같은 uuid의 .old- 폴더가 최신 폴더와 같은 이름의
+        // history 항목을 갖고 있다.
+        let mk_hist = |base: &Path| {
+            let h = base.join("history").join("v-111-0");
+            fs::create_dir_all(&h).unwrap();
+            fs::write(h.join("book.html"), "old book").unwrap();
+        };
+        mk_hist(&out1.dir);
+        let leftover = sessions.join(".old-crash-x");
+        fs::create_dir_all(&leftover).unwrap();
+        fs::copy(out1.dir.join("meta.json"), leftover.join("meta.json")).unwrap();
+        fs::write(leftover.join("session.jsonl"), "different-content\n").unwrap();
+        fs::write(leftover.join("book.html"), "b").unwrap();
+        mk_hist(&leftover);
+
+        // 내용이 달라진 재아카이브 — 최신 폴더·leftover 둘 다 치환된다.
+        let v2 = format!("{v1}\n{}", json!({"type":"user","uuid":"u-n","message":{"role":"user","content":"m"}}));
+        let out2 = write_archive(&root, "/p", &sample_session("t"), v2.as_bytes()).unwrap();
+        let hist = out2.dir.join("history");
+        let names: Vec<String> = fs::read_dir(&hist)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .collect();
+        let collided = names.iter().filter(|n| n.starts_with("v-111-0")).count();
+        assert_eq!(collided, 2, "충돌한 이월 항목 양쪽 다 보존: {names:?}");
+        // 치환된 두 이전본(내용 상이)도 버전으로 존재 — 총 4개.
+        assert_eq!(names.len(), 4, "이월 2 + 새 버전 2: {names:?}");
+        assert!(
+            !fs::read_dir(&sessions).unwrap().flatten().any(|e| e
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".old-")),
+            "이월 완료 후 aside 잔존 없음"
+        );
         let _ = fs::remove_dir_all(&root);
     }
 
