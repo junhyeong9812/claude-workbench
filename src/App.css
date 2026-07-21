@@ -438,6 +438,20 @@ body {
   display: flex;
   gap: 4px;
 }
+/* 보존된 과거 버전 행 (버전 N 펼침). */
+.archive-version-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 2px 0 2px 12px;
+  color: var(--fg-dim);
+  font-size: 0.8em;
+}
+.archive-version-label {
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
 .archive-btn {
   background: transparent;
   border: 1px solid var(--border, #333);
