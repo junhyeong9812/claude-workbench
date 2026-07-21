@@ -16,7 +16,7 @@ use std::time::Duration;
 
 use core_lib::claude_cli::ClaudeOpts;
 use serde::Serialize;
-use tauri::{AppHandle, Manager};
+use tauri::{AppHandle, Emitter, Manager};
 
 use super::{io_message, AppError};
 
@@ -31,9 +31,13 @@ fn in_flight() -> &'static Mutex<HashSet<String>> {
 
 /// RAII release of an in-flight key — dropping the command future (window
 /// closed mid-await) must release the slot too, not just the normal return
-/// paths (post-fix P4).
+/// paths (post-fix P4). Release also broadcasts `mt-archive-finished` to every
+/// window (진행중 배지 해제) — in Drop so the dropped-future path clears the
+/// badge too, not only normal returns.
 struct InFlightGuard {
     key: String,
+    cwd: String,
+    app: AppHandle,
 }
 
 impl Drop for InFlightGuard {
@@ -41,6 +45,9 @@ impl Drop for InFlightGuard {
         if let Ok(mut set) = in_flight().lock() {
             set.remove(&self.key);
         }
+        let _ = self
+            .app
+            .emit("mt-archive-finished", serde_json::json!({ "project": self.cwd }));
     }
 }
 
@@ -68,6 +75,9 @@ pub struct ArchiveResult {
     pub knowledge_files: usize,
     /// Why extraction was skipped/failed, when it was (archive itself still ok).
     pub extraction_error: Option<String>,
+    /// The transcript hasn't changed since the last (complete) archive — the
+    /// existing archive was kept as-is and extraction was skipped entirely.
+    pub unchanged: bool,
 }
 
 /// The effective archive root: the workspace-configured directory when set and
@@ -110,10 +120,27 @@ pub async fn archive_session(
             return Err(AppError::new("이 프로젝트는 이미 아카이브 진행 중입니다"));
         }
     }
-    let _guard = InFlightGuard { key };
-    tauri::async_runtime::spawn_blocking(move || archive_session_blocking(app, cwd, uuid))
+    let _guard = InFlightGuard {
+        key,
+        cwd: cwd.clone(),
+        app: app.clone(),
+    };
+    let _ = app.emit("mt-archive-started", serde_json::json!({ "project": cwd }));
+    let app2 = app.clone();
+    tauri::async_runtime::spawn_blocking(move || archive_session_blocking(app2, cwd, uuid))
         .await
         .map_err(|_| AppError::new("Archive task failed to run"))?
+}
+
+/// Whether an archive of `project` is currently running — the picker's
+/// "아카이브 진행중" badge on open (events cover changes after that).
+/// Infallible: any doubt reads as "not in flight" (배지는 정보성).
+#[tauri::command]
+pub fn archive_in_flight(project: String) -> bool {
+    let key = std::fs::canonicalize(&project)
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or(project);
+    in_flight().lock().map(|s| s.contains(&key)).unwrap_or(false)
 }
 
 fn archive_session_blocking(
@@ -153,10 +180,32 @@ fn archive_session_blocking(
     // first write below displaces that folder (감사 A1: 지식만 남고 요약만
     // 사라지는 비대칭 방지). A read failure is reported, not swallowed.
     let mut errors: Vec<String> = Vec::new();
-    let prev_summary = core_lib::archive::list_archives(&root)
+    let prev_entry = core_lib::archive::list_archives(&root)
         .into_iter()
         .flat_map(|p| p.sessions)
-        .find(|s| s.meta.uuid == uuid)
+        .find(|s| s.meta.uuid == uuid);
+
+    // 변경 없음 스킵: 트랜스크립트가 최신 아카이브 스냅샷과 동일하고 그
+    // 아카이브의 추출까지 완료(summary 존재)라면 아무것도 다시 쓰지 않는다 —
+    // 같은 내용에 1~3분짜리 추출을 재실행하지 않기 위해. summary가 없으면
+    // 추출 재시도 목적의 재아카이브일 수 있으므로 그대로 진행한다.
+    if let Some(prev) = &prev_entry {
+        let same = core_lib::archive::archived_stat(&prev.dir, &prev.meta)
+            .is_some_and(|s| s == core_lib::archive::jsonl_stat(&jsonl_bytes));
+        if same && prev.summary_path.is_some() {
+            return Ok(ArchiveResult {
+                dir: prev.dir.to_string_lossy().to_string(),
+                book_path: prev.book_path.to_string_lossy().to_string(),
+                replaced: false,
+                summary_ok: true,
+                knowledge_files: 0,
+                extraction_error: None,
+                unchanged: true,
+            });
+        }
+    }
+
+    let prev_summary = prev_entry
         .and_then(|s| s.summary_path)
         .and_then(|p| match std::fs::read_to_string(&p) {
             Ok(text) => Some(text),
@@ -274,7 +323,17 @@ fn archive_session_blocking(
         summary_ok,
         knowledge_files,
         extraction_error,
+        unchanged: false,
     })
+}
+
+/// One preserved past version of an archived session (browser pane).
+#[derive(Serialize)]
+pub struct ArchiveHistoryItem {
+    pub book_path: String,
+    pub archived_at: Option<u64>,
+    pub title: String,
+    pub turns: usize,
 }
 
 /// One archived session for the browser pane.
@@ -287,6 +346,9 @@ pub struct ArchiveListEntry {
     pub title: String,
     pub date: String,
     pub turns: usize,
+    pub archived_at: Option<u64>,
+    /// Preserved past versions, newest first.
+    pub history: Vec<ArchiveHistoryItem>,
 }
 
 /// One project's archived sessions + its knowledge index.
@@ -329,6 +391,17 @@ pub fn archive_list(app: AppHandle) -> Result<Vec<ArchiveProjectGroup>, AppError
                     title: s.meta.title,
                     date: s.meta.date,
                     turns: s.meta.turns,
+                    archived_at: s.meta.archived_at,
+                    history: s
+                        .history
+                        .into_iter()
+                        .map(|h| ArchiveHistoryItem {
+                            book_path: path_s(h.book_path),
+                            archived_at: h.archived_at,
+                            title: h.title,
+                            turns: h.turns,
+                        })
+                        .collect(),
                 })
                 .collect(),
         })
@@ -363,20 +436,62 @@ pub(super) fn ensure_mcp_registration(app: &AppHandle, project: &str) {
     let _ = core_lib::mcp::register_in_mcp_json(proj, &bin, &kdir);
 }
 
-/// The archived session uuids of one project — the picker marks saved sessions
-/// as 아카이브됨/미아카이브 with this set. Infallible (empty on any failure);
-/// the badge is informational, never load-bearing.
+/// Per-archived-session freshness for one project — the picker groups saved
+/// sessions into 아카이브됨(최신)/아카이브 이후 작업/아카이브 없음 with this.
+#[derive(Serialize)]
+pub struct ArchiveStatusEntry {
+    pub uuid: String,
+    /// The live transcript matches the archived snapshot (byte length — the
+    /// transcript is append-only, so growth is the change mode). A session
+    /// whose live transcript no longer exists counts as up-to-date: the
+    /// archive holds everything there is.
+    pub up_to_date: bool,
+    pub archived_at: Option<u64>,
+    /// Preserved past versions of this session's archive.
+    pub versions: usize,
+}
+
+/// The archived sessions of one project + whether each is still current.
+/// Lazily backfills pre-upgrade metas first (아카이브된 session.jsonl 파싱 —
+/// 멱등, 재추출 없음), so 판별불가 states don't linger. Infallible (empty on
+/// any failure); the grouping is informational, never load-bearing. Runs on
+/// the blocking pool — the first backfill may parse many stored transcripts.
 #[tauri::command]
-pub fn archive_uuids(app: AppHandle, project: String) -> Vec<String> {
+pub async fn archive_status(app: AppHandle, project: String) -> Vec<ArchiveStatusEntry> {
     let Ok(root) = archive_root(&app) else {
         return vec![];
     };
-    core_lib::archive::list_archives(&root)
-        .into_iter()
-        .filter(|p| p.project == project)
-        .flat_map(|p| p.sessions)
-        .map(|s| s.meta.uuid)
-        .collect()
+    tauri::async_runtime::spawn_blocking(move || {
+        core_lib::archive::backfill_meta(&root);
+        let projects_root = core_lib::jsonl::claude_projects_root();
+        core_lib::archive::list_archives(&root)
+            .into_iter()
+            .filter(|p| p.project == project)
+            .flat_map(|p| p.sessions)
+            .map(|s| {
+                let archived = core_lib::archive::archived_stat(&s.dir, &s.meta);
+                let live_len = projects_root
+                    .as_deref()
+                    .and_then(|pr| core_lib::jsonl::find_session_jsonl(pr, &s.meta.uuid).ok().flatten())
+                    .and_then(|p| std::fs::metadata(p).ok())
+                    .map(|m| m.len());
+                let up_to_date = match (&archived, live_len) {
+                    (Some(a), Some(len)) => a.bytes == len,
+                    (_, None) => true,
+                    // 스냅샷 판독 불가 → 최신을 보장할 수 없음 (재아카이브 유도).
+                    (None, Some(_)) => false,
+                };
+                ArchiveStatusEntry {
+                    uuid: s.meta.uuid,
+                    up_to_date,
+                    archived_at: s.meta.archived_at,
+                    versions: s.history.len(),
+                }
+            })
+            .collect()
+    })
+    .await
+    .unwrap_or_default()
 }
 
 /// Open an archived artifact (book.html, a knowledge file, …) with the system
