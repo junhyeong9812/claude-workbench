@@ -189,6 +189,8 @@ export function FolderTree() {
   // state는 버튼 disabled 표시용.
   const dndBusyRef = useRef(false);
   const [dndBusy, setDndBusy] = useState(false);
+  // 드롭 존 창 생성 중 가드 (post-fix P5 — check-then-create race).
+  const dropZoneOpeningRef = useRef(false);
 
   // Parent dir of an absolute path; "/" for a root-level entry (so reloadDir
   // never gets "" → the process cwd).
@@ -489,24 +491,32 @@ export function FolderTree() {
   const openDropZone = (dest: string) => {
     setMenu(null);
     if (!activeProject) return;
-    // label 허용 문자(a-zA-Z0-9-/:_)로 폴더 경로를 안정 해시.
-    let h = 0;
-    for (const c of dest) h = (h * 31 + c.charCodeAt(0)) >>> 0;
-    const label = `dropzone-${h.toString(36)}`;
+    if (dropZoneOpeningRef.current) return; // 연타 create race 방지 (post-fix P5)
+    dropZoneOpeningRef.current = true;
+    // label은 경로 전체를 hex 인코딩 — 해시 충돌로 다른 폴더의 창에 합쳐지는
+    // 일이 없다(post-fix P4). 허용 문자(a-zA-Z0-9-/:_)만 사용.
+    const hex = Array.from(new TextEncoder().encode(dest))
+      .map((b) => b.toString(16).padStart(2, "0"))
+      .join("");
+    const label = `dropzone-${hex}`;
     void (async () => {
-      const existing = await WebviewWindow.getByLabel(label);
-      if (existing) {
-        await existing.setFocus().catch(() => {});
-        return;
+      try {
+        const existing = await WebviewWindow.getByLabel(label);
+        if (existing) {
+          await existing.setFocus().catch(() => {});
+          return;
+        }
+        new WebviewWindow(label, {
+          url: `${window.location.pathname}#dropzone=${encodeURIComponent(dest)}::${encodeURIComponent(activeProject)}`,
+          title: "파일 가져오기 — 드롭 존",
+          width: 420,
+          height: 300,
+          alwaysOnTop: true,
+          dragDropEnabled: true,
+        });
+      } finally {
+        dropZoneOpeningRef.current = false;
       }
-      new WebviewWindow(label, {
-        url: `${window.location.pathname}#dropzone=${encodeURIComponent(dest)}::${encodeURIComponent(activeProject)}`,
-        title: "파일 가져오기 — 드롭 존",
-        width: 420,
-        height: 300,
-        alwaysOnTop: true,
-        dragDropEnabled: true,
-      });
     })();
   };
 

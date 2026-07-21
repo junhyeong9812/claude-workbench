@@ -498,11 +498,12 @@ fn import_paths_blocking(
                 out.errors.push(format!("{src}: {}", io_message("Cannot import", &e)));
                 continue;
             }
-            let md = std::fs::symlink_metadata(&dest).unwrap();
-            let removed = if md.is_dir() {
-                std::fs::remove_dir_all(&dest)
-            } else {
-                std::fs::remove_file(&dest)
+            // 재확인 기반 삭제 — 그 사이 사라졌으면 삭제 불필요(unwrap panic
+            // 금지, post-fix P3).
+            let removed = match std::fs::symlink_metadata(&dest) {
+                Ok(md) if md.is_dir() => std::fs::remove_dir_all(&dest),
+                Ok(_) => std::fs::remove_file(&dest),
+                Err(_) => Ok(()),
             };
             if let Err(e) = removed {
                 remove_any(&tmp);
@@ -512,8 +513,13 @@ fn import_paths_blocking(
             match std::fs::rename(&tmp, &dest) {
                 Ok(()) => out.copied.push(src),
                 Err(e) => {
-                    remove_any(&tmp);
-                    out.errors.push(format!("{src}: {}", io_message("Cannot import", &e)));
+                    // 대상은 이미 삭제됐고 temp에 완전한 복사본이 있다 — 지우면
+                    // 양쪽 다 잃는다. temp를 남기고 경로를 알린다(post-fix P2).
+                    out.errors.push(format!(
+                        "{src}: {} (복사본은 {} 에 남아 있음)",
+                        io_message("Cannot import", &e),
+                        tmp.to_string_lossy()
+                    ));
                 }
             }
             continue;
