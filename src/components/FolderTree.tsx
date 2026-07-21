@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { WebviewWindow } from "@tauri-apps/api/webviewWindow";
 import { errText } from "../utils/error";
@@ -184,6 +184,11 @@ export function FolderTree() {
   const [opErr, setOpErr] = useState<string | null>(null);
   // DnD 드롭 후보 하이라이트: 행 경로, "" = 빈 영역(루트), null = 드래그 없음.
   const [dndHover, setDndHover] = useState<string | null>(null);
+  // DnD 실행 single-flight (리뷰 D2): 덮어쓰기 버튼 중복 클릭이 "삭제→이동
+  // 완료→재삭제"로 원본을 지우는 race 차단. ref는 상태 반영 전 클릭까지 막고,
+  // state는 버튼 disabled 표시용.
+  const dndBusyRef = useRef(false);
+  const [dndBusy, setDndBusy] = useState(false);
 
   // Parent dir of an absolute path; "/" for a root-level entry (so reloadDir
   // never gets "" → the process cwd).
@@ -412,6 +417,9 @@ export function FolderTree() {
   ) => {
     const root = activeProject;
     if (!root) return;
+    if (dndBusyRef.current) return; // single-flight (D2)
+    dndBusyRef.current = true;
+    setDndBusy(true);
     try {
       if (overwrite) await invoke("delete_path", { path: to, root });
       if (copy) await invoke("copy_path", { from, to, root });
@@ -425,6 +433,9 @@ export function FolderTree() {
     } catch (e) {
       if (fromDialog) setOpErr(errText(e, "작업 실패"));
       else alert(errText(e, copy ? "복사 실패" : "이동 실패"));
+    } finally {
+      dndBusyRef.current = false;
+      setDndBusy(false);
     }
   };
 
@@ -472,19 +483,31 @@ export function FolderTree() {
   };
 
   /** OS 파일 반입용 드롭 존 보조 창 — 메인 창은 dragDropEnabled:false(탭
-   * 드래그 보존)라 OS 드롭을 못 받으므로, 이 창만 true로 열어 받는다. */
+   * 드래그 보존)라 OS 드롭을 못 받으므로, 이 창만 true로 열어 받는다.
+   * 대상 폴더별 고정 label — 같은 폴더로 다시 열면 기존 창을 포커스(진행 중
+   * 결과 표시 보존, 리뷰 D8), 다른 폴더면 별도 창. */
   const openDropZone = (dest: string) => {
     setMenu(null);
     if (!activeProject) return;
-    const label = `dropzone-${Date.now().toString(36)}`;
-    new WebviewWindow(label, {
-      url: `${window.location.pathname}#dropzone=${encodeURIComponent(dest)}::${encodeURIComponent(activeProject)}`,
-      title: "파일 가져오기 — 드롭 존",
-      width: 420,
-      height: 300,
-      alwaysOnTop: true,
-      dragDropEnabled: true,
-    });
+    // label 허용 문자(a-zA-Z0-9-/:_)로 폴더 경로를 안정 해시.
+    let h = 0;
+    for (const c of dest) h = (h * 31 + c.charCodeAt(0)) >>> 0;
+    const label = `dropzone-${h.toString(36)}`;
+    void (async () => {
+      const existing = await WebviewWindow.getByLabel(label);
+      if (existing) {
+        await existing.setFocus().catch(() => {});
+        return;
+      }
+      new WebviewWindow(label, {
+        url: `${window.location.pathname}#dropzone=${encodeURIComponent(dest)}::${encodeURIComponent(activeProject)}`,
+        title: "파일 가져오기 — 드롭 존",
+        width: 420,
+        height: 300,
+        alwaysOnTop: true,
+        dragDropEnabled: true,
+      });
+    })();
   };
 
   if (!activeProject) {
@@ -587,6 +610,7 @@ export function FolderTree() {
                   <button onClick={() => setDialog(null)}>취소</button>
                   <button
                     className="tree-menu-danger"
+                    disabled={dndBusy}
                     onClick={() =>
                       void doDnd(
                         dialog.from,
@@ -599,7 +623,7 @@ export function FolderTree() {
                       )
                     }
                   >
-                    덮어쓰기
+                    {dndBusy ? "처리 중…" : "덮어쓰기"}
                   </button>
                 </div>
               </>

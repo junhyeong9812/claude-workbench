@@ -3840,7 +3840,23 @@ body {
   background: var(--bg-alt, #1a1d23);
 }
 .dropzone-target {
+  display: flex;
+  align-items: center;
+  gap: 6px;
   font-size: 14px;
+}
+.dropzone-close {
+  margin-left: auto;
+  font-size: 11px;
+  padding: 2px 8px;
+  color: var(--fg-dim, #8a8f98);
+  background: transparent;
+  border: 1px solid var(--border, #333);
+  border-radius: 3px;
+  cursor: pointer;
+}
+.dropzone-close:hover {
+  color: var(--fg, #d7dae0);
 }
 .dropzone-hint {
   color: var(--fg-dim, #8a8f98);

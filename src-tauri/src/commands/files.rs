@@ -249,11 +249,21 @@ pub fn rename_path(from: String, to: String, root: String) -> Result<(), AppErro
     std::fs::rename(&from, to_p).map_err(|e| AppError::new(io_message("Cannot rename", &e)))
 }
 
+/// 재귀 복사 깊이 상한 — 스택 고갈 방지(감사 D6). 실사용 트리는 수십 레벨
+/// 이내; 초과는 오류로 드러낸다(무음 절단 아님).
+const MAX_COPY_DEPTH: usize = 256;
+
 /// Copy one filesystem node (file / dir tree / symlink) from `from` to `to`.
 /// - 디렉토리는 재귀 복사, 심링크는 **링크 그대로** 재생성(대상 내용 복제 X —
 ///   링크 루프로 인한 무한 재귀·프로젝트 밖 내용 복제 방지).
 /// - `to`는 존재하지 않아야 한다(호출측 no-clobber 검사 전제).
-fn copy_tree(from: &std::path::Path, to: &std::path::Path) -> std::io::Result<()> {
+fn copy_tree(from: &std::path::Path, to: &std::path::Path, depth: usize) -> std::io::Result<()> {
+    if depth > MAX_COPY_DEPTH {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "folder too deep",
+        ));
+    }
     let md = std::fs::symlink_metadata(from)?;
     if md.file_type().is_symlink() {
         let target = std::fs::read_link(from)?;
@@ -267,7 +277,7 @@ fn copy_tree(from: &std::path::Path, to: &std::path::Path) -> std::io::Result<()
         std::fs::create_dir_all(to)?;
         for entry in std::fs::read_dir(from)? {
             let entry = entry?;
-            copy_tree(&entry.path(), &to.join(entry.file_name()))?;
+            copy_tree(&entry.path(), &to.join(entry.file_name()), depth + 1)?;
         }
     } else {
         std::fs::copy(from, to)?;
@@ -275,11 +285,88 @@ fn copy_tree(from: &std::path::Path, to: &std::path::Path) -> std::io::Result<()
     Ok(())
 }
 
+/// 존재하지 않을 수 있는 경로의 **실효 경로**: 존재하는 최심 조상을
+/// canonicalize하고 나머지 구성요소를 붙인다(`ensure_within`과 같은 해석).
+/// root 안 심링크 별칭이 같은 위치를 다른 문자열로 가리키는 것을 정규화해,
+/// lexical starts_with만으로는 뚫리는 자기 하위 판정을 막는다 (리뷰 D4).
+fn effective_path(path: &str) -> Option<std::path::PathBuf> {
+    let mut probe = std::path::PathBuf::from(path);
+    let mut tail: Vec<std::ffi::OsString> = Vec::new();
+    loop {
+        match std::fs::canonicalize(&probe) {
+            Ok(c) => {
+                let mut out = c;
+                for seg in tail.iter().rev() {
+                    out.push(seg);
+                }
+                return Some(out);
+            }
+            Err(_) => match (probe.parent().map(|p| p.to_path_buf()), probe.file_name()) {
+                (Some(parent), Some(name)) if parent != probe => {
+                    tail.push(name.to_os_string());
+                    probe = parent;
+                }
+                _ => return None,
+            },
+        }
+    }
+}
+
+/// symlink는 링크만, 파일/디렉토리는 통째 제거 (temp 정리용 — best-effort).
+fn remove_any(p: &std::path::Path) {
+    match std::fs::symlink_metadata(p) {
+        Ok(md) if md.is_dir() => {
+            let _ = std::fs::remove_dir_all(p);
+        }
+        Ok(_) => {
+            let _ = std::fs::remove_file(p);
+        }
+        Err(_) => {}
+    }
+}
+
+/// D3(부분 실패 잔해 방지): dest 부모의 temp로 복사한 뒤 rename으로 게시한다 —
+/// 중간 실패(권한·ENOSPC)는 temp만 정리되고 최종 위치엔 완전한 결과 아니면
+/// 아무것도 남지 않는다(재시도가 no-clobber 오탐에 막히지 않음).
+fn copy_via_temp(from: &std::path::Path, to: &std::path::Path) -> Result<(), AppError> {
+    let parent = to
+        .parent()
+        .ok_or_else(|| AppError::new("대상 부모 경로가 없습니다"))?;
+    let tmp = parent.join(format!(
+        ".mt-copy-{}-{}.tmp",
+        std::process::id(),
+        SAVE_SEQ.fetch_add(1, Ordering::Relaxed)
+    ));
+    if let Err(e) = copy_tree(from, &tmp, 0) {
+        remove_any(&tmp);
+        return Err(AppError::new(io_message("Cannot copy", &e)));
+    }
+    // 게시 직전 재확인(감사 D3): fs::rename은 기존 *파일*을 소리 없이 교체할
+    // 수 있다 — 복사 중 대상이 생겼으면 게시하지 않는다. (재확인~rename 사이
+    // 미세 창은 단일 사용자 데스크톱 위협모델에서 잔여 리스크로 기록.)
+    if std::fs::symlink_metadata(to).is_ok() {
+        remove_any(&tmp);
+        return Err(AppError::new("대상 경로가 이미 존재합니다"));
+    }
+    std::fs::rename(&tmp, to).map_err(|e| {
+        remove_any(&tmp);
+        AppError::new(io_message("Cannot copy", &e))
+    })
+}
+
 /// Copy `from` to `to` (tree DnD "Ctrl 복사"). Both must live inside `root`;
 /// `to` must not exist (덮어쓰기는 UI가 확인 후 삭제→복사 2단계로 수행). A dir
-/// cannot be copied into itself/its own subtree — 무한 재귀·자기복제 방지.
+/// cannot be copied into itself/its own subtree — 무한 재귀·자기복제 방지
+/// (심링크 별칭 포함 — 실효 경로 기준, 리뷰 D4). Blocking 풀에서 실행 —
+/// 대형 폴더 복사가 UI 스레드를 잡지 않는다 (리뷰 D6).
 #[tauri::command]
-pub fn copy_path(from: String, to: String, root: String) -> Result<(), AppError> {
+pub async fn copy_path(from: String, to: String, root: String) -> Result<(), AppError> {
+    tauri::async_runtime::spawn_blocking(move || copy_path_blocking(from, to, root))
+        .await
+        .map_err(|_| AppError::new("Copy task failed to run"))?
+}
+
+fn copy_path_blocking(from: String, to: String, root: String) -> Result<(), AppError> {
     reject_unsafe_path(&from)?;
     reject_unsafe_path(&to)?;
     ensure_within(&from, &root)?;
@@ -289,8 +376,10 @@ pub fn copy_path(from: String, to: String, root: String) -> Result<(), AppError>
     if std::fs::symlink_metadata(from_p).is_err() {
         return Err(AppError::new("원본 경로가 없습니다"));
     }
-    // `..` 없는 절대 경로 전제(위 가드)라 component 단위 starts_with로 충분.
-    if to_p.starts_with(from_p) {
+    let from_c = std::fs::canonicalize(from_p)
+        .map_err(|_| AppError::new("원본 경로를 확인할 수 없습니다"))?;
+    let to_eff = effective_path(&to).ok_or_else(|| AppError::new("경로를 확인할 수 없습니다"))?;
+    if to_eff == from_c || to_eff.starts_with(&from_c) {
         return Err(AppError::new("자기 자신/하위로는 복사할 수 없습니다"));
     }
     if std::fs::symlink_metadata(to_p).is_ok() {
@@ -300,7 +389,7 @@ pub fn copy_path(from: String, to: String, root: String) -> Result<(), AppError>
         std::fs::create_dir_all(parent)
             .map_err(|e| AppError::new(io_message("Cannot copy", &e)))?;
     }
-    copy_tree(from_p, to_p).map_err(|e| AppError::new(io_message("Cannot copy", &e)))
+    copy_via_temp(from_p, to_p)
 }
 
 /// Per-source results of an external import (드롭 존 보조 창): what landed,
@@ -318,9 +407,23 @@ pub struct ImportOutcome {
 /// Import external OS paths (드롭 존에 떨어진 파일/폴더) into `dest_dir` by
 /// **copy** — 원본은 절대 이동·삭제하지 않는다. `dest_dir`만 containment 검사
 /// (소스는 프로젝트 밖 허용 — 읽기 전용). `overwrite=true`면 충돌 대상(확인
-/// 받은 것)을 삭제 후 복사한다.
+/// 받은 것)을 **temp 복사 완료 후** 삭제→게시한다(감사 D3 — 대상 유실 창
+/// 최소화). Blocking 풀 실행(리뷰 D6).
 #[tauri::command]
-pub fn import_paths(
+pub async fn import_paths(
+    sources: Vec<String>,
+    dest_dir: String,
+    root: String,
+    overwrite: bool,
+) -> Result<ImportOutcome, AppError> {
+    tauri::async_runtime::spawn_blocking(move || {
+        import_paths_blocking(sources, dest_dir, root, overwrite)
+    })
+    .await
+    .map_err(|_| AppError::new("Import task failed to run"))?
+}
+
+fn import_paths_blocking(
     sources: Vec<String>,
     dest_dir: String,
     root: String,
@@ -328,16 +431,21 @@ pub fn import_paths(
 ) -> Result<ImportOutcome, AppError> {
     reject_unsafe_path(&dest_dir)?;
     ensure_within(&dest_dir, &root)?;
-    if !std::path::Path::new(&dest_dir).is_dir() {
+    let dest_dir_p = std::path::Path::new(&dest_dir);
+    if !dest_dir_p.is_dir() {
         return Err(AppError::new("대상 폴더가 없습니다"));
     }
+    let dest_dir_c = std::fs::canonicalize(dest_dir_p)
+        .map_err(|_| AppError::new("대상 폴더를 확인할 수 없습니다"))?;
     let mut out = ImportOutcome {
         copied: vec![],
         conflicts: vec![],
         errors: vec![],
     };
     for src in sources {
+        // D5: 모든 소스가 copied/conflicts/errors 중 하나로 분류된다 — 무음 스킵 없음.
         if src.trim().is_empty() {
+            out.errors.push("(빈 경로)".to_string());
             continue;
         }
         let src_p = std::path::Path::new(&src);
@@ -349,33 +457,70 @@ pub fn import_paths(
             out.errors.push(format!("{src}: 원본 없음"));
             continue;
         }
-        // dest가 소스 폴더 안이면(프로젝트를 소스 하위로 갖는 폴더를 드롭)
-        // 자기 자신 안으로의 복제 — 무한 재귀 방지.
-        if std::path::Path::new(&dest_dir).starts_with(src_p) {
+        // canonical 기준 가드(리뷰 D1·D4 — 심링크 별칭 포함):
+        // ①dest_dir가 소스 안 → 자기 자신 안으로의 복제(무한 재귀) 금지
+        let Ok(src_c) = std::fs::canonicalize(src_p) else {
+            out.errors.push(format!("{src}: 경로 확인 불가"));
+            continue;
+        };
+        if dest_dir_c == src_c || dest_dir_c.starts_with(&src_c) {
             out.errors.push(format!("{src}: 자기 자신 안으로는 가져올 수 없습니다"));
             continue;
         }
-        let dest = std::path::Path::new(&dest_dir).join(name);
+        let dest = dest_dir_c.join(name);
         if std::fs::symlink_metadata(&dest).is_ok() {
-            if overwrite {
-                let md = std::fs::symlink_metadata(&dest).unwrap();
-                let removed = if md.is_dir() {
-                    std::fs::remove_dir_all(&dest)
-                } else {
-                    std::fs::remove_file(&dest)
-                };
-                if let Err(e) = removed {
-                    out.errors.push(format!("{src}: {}", io_message("Cannot overwrite", &e)));
+            // ②대상이 원본과 같은 실체이거나 원본을 담고 있으면 — overwrite
+            // 삭제가 원본을 파괴한다(D1 critical). 충돌이 아니라 즉시 오류.
+            if let Ok(dest_c) = std::fs::canonicalize(&dest) {
+                if dest_c == src_c {
+                    out.errors.push(format!("{src}: 원본과 대상이 같습니다"));
                     continue;
                 }
-            } else {
+                if src_c.starts_with(&dest_c) {
+                    out.errors
+                        .push(format!("{src}: 원본을 담고 있는 항목은 덮어쓸 수 없습니다"));
+                    continue;
+                }
+            }
+            if !overwrite {
                 out.conflicts.push(src);
                 continue;
             }
+            // D3: temp 복사를 먼저 완료 → 기존 대상 삭제 → 게시. 복사 실패
+            // 시 기존 대상은 그대로 남는다.
+            let tmp = dest_dir_c.join(format!(
+                ".mt-import-{}-{}.tmp",
+                std::process::id(),
+                SAVE_SEQ.fetch_add(1, Ordering::Relaxed)
+            ));
+            if let Err(e) = copy_tree(src_p, &tmp, 0) {
+                remove_any(&tmp);
+                out.errors.push(format!("{src}: {}", io_message("Cannot import", &e)));
+                continue;
+            }
+            let md = std::fs::symlink_metadata(&dest).unwrap();
+            let removed = if md.is_dir() {
+                std::fs::remove_dir_all(&dest)
+            } else {
+                std::fs::remove_file(&dest)
+            };
+            if let Err(e) = removed {
+                remove_any(&tmp);
+                out.errors.push(format!("{src}: {}", io_message("Cannot overwrite", &e)));
+                continue;
+            }
+            match std::fs::rename(&tmp, &dest) {
+                Ok(()) => out.copied.push(src),
+                Err(e) => {
+                    remove_any(&tmp);
+                    out.errors.push(format!("{src}: {}", io_message("Cannot import", &e)));
+                }
+            }
+            continue;
         }
-        match copy_tree(src_p, &dest) {
+        match copy_via_temp(src_p, &dest) {
             Ok(()) => out.copied.push(src),
-            Err(e) => out.errors.push(format!("{src}: {}", io_message("Cannot import", &e))),
+            Err(e) => out.errors.push(format!("{src}: {}", e.message)),
         }
     }
     Ok(out)
@@ -455,7 +600,7 @@ mod tests {
 
         let from = format!("{root_s}/src");
         let to = format!("{root_s}/dst");
-        assert!(copy_path(from.clone(), to.clone(), root_s.clone()).is_ok());
+        assert!(copy_path_blocking(from.clone(), to.clone(), root_s.clone()).is_ok());
         assert_eq!(std::fs::read_to_string(root.join("dst/a.txt")).unwrap(), "A");
         assert_eq!(std::fs::read_to_string(root.join("dst/sub/b.txt")).unwrap(), "B");
         // 심링크는 링크로 복사(내용 복제 아님).
@@ -464,11 +609,11 @@ mod tests {
         assert!(root.join("src/a.txt").is_file());
 
         // no-clobber: 대상 존재 시 거부.
-        assert!(copy_path(from.clone(), to, root_s.clone()).is_err());
+        assert!(copy_path_blocking(from.clone(), to, root_s.clone()).is_err());
         // 자기 하위로 복사 거부.
-        assert!(copy_path(from.clone(), format!("{root_s}/src/sub/x"), root_s.clone()).is_err());
+        assert!(copy_path_blocking(from.clone(), format!("{root_s}/src/sub/x"), root_s.clone()).is_err());
         // 프로젝트 밖 대상 거부.
-        assert!(copy_path(from, "/tmp/mt_outside_dnd".into(), root_s).is_err());
+        assert!(copy_path_blocking(from, "/tmp/mt_outside_dnd".into(), root_s).is_err());
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -486,7 +631,7 @@ mod tests {
             ext.join("in.txt").to_string_lossy().to_string(),
             ext.join("d").to_string_lossy().to_string(),
         ];
-        let out = import_paths(srcs.clone(), dest.clone(), root_s.clone(), false).unwrap();
+        let out = import_paths_blocking(srcs.clone(), dest.clone(), root_s.clone(), false).unwrap();
         assert_eq!(out.copied.len(), 2);
         assert!(out.conflicts.is_empty() && out.errors.is_empty());
         assert_eq!(std::fs::read_to_string(root.join("in.txt")).unwrap(), "external");
@@ -496,18 +641,110 @@ mod tests {
 
         // 재반입: 충돌로 분류(무음 덮어쓰기 없음).
         std::fs::write(ext.join("in.txt"), "changed").unwrap();
-        let out2 = import_paths(srcs.clone(), dest.clone(), root_s.clone(), false).unwrap();
+        let out2 = import_paths_blocking(srcs.clone(), dest.clone(), root_s.clone(), false).unwrap();
         assert_eq!(out2.conflicts.len(), 2);
         assert_eq!(std::fs::read_to_string(root.join("in.txt")).unwrap(), "external", "충돌 시 미변경");
 
         // overwrite=true → 교체.
-        let out3 = import_paths(srcs, dest, root_s.clone(), true).unwrap();
+        let out3 = import_paths_blocking(srcs, dest, root_s.clone(), true).unwrap();
         assert_eq!(out3.copied.len(), 2);
         assert_eq!(std::fs::read_to_string(root.join("in.txt")).unwrap(), "changed");
 
         // dest containment: 프로젝트 밖 dest 거부.
-        assert!(import_paths(vec![], "/tmp".into(), root_s, false).is_err());
+        assert!(import_paths_blocking(vec![], "/tmp".into(), root_s, false).is_err());
         let _ = std::fs::remove_dir_all(&root);
         let _ = std::fs::remove_dir_all(&ext);
+    }
+
+    // 리뷰 D1(critical): 소스==대상(같은 폴더 재반입)은 overwrite여도 원본을
+    // 지우지 않는다 — 즉시 오류 분류.
+    #[test]
+    fn import_same_path_never_deletes_source() {
+        let (root, root_s) = temp_root("selfimp");
+        std::fs::write(root.join("f.txt"), "KEEP").unwrap();
+        let src = root.join("f.txt").to_string_lossy().to_string();
+        for ow in [false, true] {
+            let out = import_paths_blocking(vec![src.clone()], root_s.clone(), root_s.clone(), ow).unwrap();
+            assert!(out.copied.is_empty() && out.conflicts.is_empty());
+            assert_eq!(out.errors.len(), 1, "즉시 오류 분류 (overwrite={ow})");
+            assert_eq!(std::fs::read_to_string(root.join("f.txt")).unwrap(), "KEEP");
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // 리뷰 D1 확장: 대상이 원본을 담고 있는 조상이면 overwrite 삭제가 원본을
+    // 파괴한다 — 거부. 재현: 이름이 "d"인 심링크 소스가 root/d/deep을 가리키면
+    // dest(root/d)는 소스 canonical(root/d/deep)의 조상이 된다.
+    #[test]
+    fn import_ancestor_overwrite_rejected() {
+        let (root, root_s) = temp_root("ancimp");
+        std::fs::create_dir_all(root.join("d/deep")).unwrap();
+        std::fs::write(root.join("d/deep/s.txt"), "S").unwrap();
+        let (ext, _) = temp_root("ancimp_ext");
+        std::os::unix::fs::symlink(root.join("d/deep"), ext.join("d")).unwrap();
+        let src = ext.join("d").to_string_lossy().to_string();
+        let out = import_paths_blocking(vec![src], root_s.clone(), root_s.clone(), true).unwrap();
+        assert_eq!(out.errors.len(), 1, "조상 덮어쓰기 거부: {:?}", out.errors);
+        assert_eq!(
+            std::fs::read_to_string(root.join("d/deep/s.txt")).unwrap(),
+            "S",
+            "원본 트리 보존"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&ext);
+    }
+
+    // 리뷰 D4: root 안 심링크 별칭 경유의 자기 하위 복사도 거부된다.
+    #[test]
+    fn copy_into_own_subtree_via_symlink_alias_rejected() {
+        let (root, root_s) = temp_root("alias");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/f.txt"), "F").unwrap();
+        std::os::unix::fs::symlink(root.join("src"), root.join("link")).unwrap();
+        // lexical로는 /link/sub ⊄ /src 지만 실효 경로는 /src/sub — 거부돼야 한다.
+        let err = copy_path_blocking(
+            format!("{root_s}/src"),
+            format!("{root_s}/link/sub"),
+            root_s.clone(),
+        );
+        assert!(err.is_err(), "별칭 경유 자기 하위 복사 거부");
+        assert!(!root.join("src/sub").exists(), "자기복제 잔해 없음");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // 리뷰 D5: 빈 소스도 무음 스킵이 아니라 errors로 분류.
+    #[test]
+    fn import_empty_source_is_classified() {
+        let (root, root_s) = temp_root("empty");
+        let out = import_paths_blocking(vec!["  ".into()], root_s.clone(), root_s, false).unwrap();
+        assert_eq!(out.errors.len(), 1);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // 리뷰 D3: 재귀 복사 중간 실패 시 대상 위치에 부분 잔해가 남지 않는다.
+    #[test]
+    #[cfg(unix)]
+    fn copy_partial_failure_leaves_no_debris() {
+        use std::os::unix::fs::PermissionsExt;
+        let (root, root_s) = temp_root("debris");
+        std::fs::create_dir_all(root.join("src/sub")).unwrap();
+        std::fs::write(root.join("src/a.txt"), "A").unwrap();
+        std::fs::write(root.join("src/sub/locked.txt"), "L").unwrap();
+        // 읽기 불가 파일 → fs::copy 실패 유도.
+        std::fs::set_permissions(root.join("src/sub/locked.txt"), std::fs::Permissions::from_mode(0o000)).unwrap();
+        if std::fs::read(root.join("src/sub/locked.txt")).is_ok() {
+            return; // root 권한 등으로 실패 유도가 안 되는 환경 — 스킵
+        }
+        let res = copy_path_blocking(format!("{root_s}/src"), format!("{root_s}/dst"), root_s.clone());
+        assert!(res.is_err(), "부분 실패는 오류로 드러남");
+        assert!(!root.join("dst").exists(), "최종 위치에 부분 잔해 없음");
+        let leftovers: Vec<_> = std::fs::read_dir(&root)
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().contains(".mt-copy-"))
+            .collect();
+        assert!(leftovers.is_empty(), "temp 잔해도 정리됨");
+        let _ = std::fs::set_permissions(root.join("src/sub/locked.txt"), std::fs::Permissions::from_mode(0o644));
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

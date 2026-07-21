@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import { errText } from "../utils/error";
 import { baseName } from "./treeDnd";
 
@@ -57,6 +58,7 @@ export function DropZoneWindow() {
               overwrite: false,
             });
             let outcome = first;
+            let skipped: string[] = [];
             if (first.conflicts.length > 0) {
               const names = first.conflicts.map(baseName).join(", ");
               if (window.confirm(`이미 존재: ${names}\n기존 항목을 덮어쓸까요?`)) {
@@ -68,15 +70,18 @@ export function DropZoneWindow() {
                 });
                 outcome = {
                   copied: [...first.copied, ...second.copied],
-                  conflicts: second.conflicts,
+                  conflicts: [],
                   errors: [...first.errors, ...second.errors],
                 };
+                skipped = second.conflicts; // overwrite 후에도 남은 충돌(비정상)
               } else {
-                outcome = { ...first, conflicts: [] }; // 사용자가 건너뛰기 선택
+                outcome = { ...first, conflicts: [] };
+                skipped = first.conflicts; // 사용자가 건너뛰기 선택 — 무음 금지(리뷰 D7)
               }
             }
             setLog((prev) => [
               ...outcome.errors.map((e) => `⚠ ${e}`),
+              ...skipped.map((p) => `⏭ 건너뜀: ${baseName(p)}`),
               ...outcome.copied.map((p) => `✓ ${baseName(p)}`),
               ...prev,
             ]);
@@ -102,6 +107,13 @@ export function DropZoneWindow() {
     <div className={`dropzone${hovering ? " dropzone-hover" : ""}`}>
       <div className="dropzone-target" title={params.dest}>
         📥 <b>{baseName(params.dest) || params.dest}</b> 폴더로 복사
+        <button
+          className="dropzone-close"
+          title="드롭 존 닫기"
+          onClick={() => void getCurrentWindow().close()}
+        >
+          ✕ 닫기
+        </button>
       </div>
       <div className="dropzone-hint">
         {busy ? "복사 중…" : "OS 파일매니저에서 파일/폴더를 여기로 끌어다 놓으세요"}
