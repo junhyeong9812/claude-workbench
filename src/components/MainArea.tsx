@@ -744,7 +744,11 @@ export function MainArea() {
         .then((v) => {
           if (archReqRef.current === my) setArchBusy(v);
         })
-        .catch(() => {});
+        .catch(() => {
+          // 최신 요청이 실패하면 이전 응답도 세대 가드에 막혀 배지가 고착될
+          // 수 있다 — 정보성 배지는 미표시가 고착보다 낫다(fail-soft).
+          if (archReqRef.current === my) setArchBusy(false);
+        });
     };
     const un1 = listen("mt-archive-started", refresh);
     const un2 = listen("mt-archive-finished", () => {
