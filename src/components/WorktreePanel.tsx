@@ -2,7 +2,12 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { errText } from "../utils/error";
 import { invoke } from "@tauri-apps/api/core";
 import { useAppStore } from "../state/store";
-import { groupWorktrees, type Worktree, type WorktreeGroup } from "./worktreeGroups";
+import {
+  groupWorktrees,
+  type RepoWorktrees,
+  type Worktree,
+  type WorktreeGroup,
+} from "./worktreeGroups";
 
 /** A discovered git root (path + current branch) — `git_roots` backend shape. */
 interface GitRoot {
@@ -63,27 +68,50 @@ export function WorktreePanel() {
     const myReq = ++reqRef.current;
     const target = cwd;
     try {
-      // 멀티 repo 인식: activeProject 자체가 repo가 아닌 모음 폴더(하위에
-      // repo 여럿)여도 git_roots로 전부 찾아 root별 `git worktree list`를
-      // 모은다. 링크드 워크트리 폴더도 root로 잡히는 중복은 groupWorktrees가
-      // main 경로 기준으로 dedup. 개별 root 실패(비-repo 등)는 빈 목록으로
-      // 넘어간다 — 한 repo의 오류가 전체 패널을 비우지 않는다.
-      const [roots, sess] = await Promise.all([
-        invoke<GitRoot[]>("git_roots", { cwd: target }),
-        invoke<SessionCwd[]>("claude_session_cwds").catch(() => [] as SessionCwd[]),
-      ]);
-      const repos = await Promise.all(
-        roots.map(async (r) => ({
-          root: r.path,
-          worktrees: await invoke<Worktree[]>("git_worktrees", { cwd: r.path }).catch(
-            () => [] as Worktree[],
-          ),
-        })),
-      );
+      const sessP = invoke<SessionCwd[]>("claude_session_cwds").catch(() => [] as SessionCwd[]);
+      // WF2: activeProject 자체가 repo면 기존 단일 repo 동작 그대로 — 그 repo의
+      // 목록 하나만(그룹 1개 불변식, 중첩 repo를 노출하지 않는다). 실패하는
+      // 경우(모음 폴더 등 비-repo)에만 git_roots로 하위 repo를 전부 찾아
+      // repo별 그룹핑한다.
+      let repos: RepoWorktrees[] = [];
+      let failed = 0; // WF1: 개별 repo 읽기 실패는 무음 소실 금지 — 집계해 알림
+      let foundRoots = 1;
+      try {
+        repos = [
+          { root: target, worktrees: await invoke<Worktree[]>("git_worktrees", { cwd: target }) },
+        ];
+      } catch (repoErr) {
+        const roots = await invoke<GitRoot[]>("git_roots", { cwd: target });
+        // target을 감싸는 root가 있다 = target은 repo 안이다. 그런데 위
+        // 조회가 실패했다면 "비-repo"가 아니라 실제 오류(권한·git 실행) —
+        // 하위 탐색으로 숨기지 않고 오류로 드러낸다 (감사 WF2: 폴백은
+        // 비-repo에만. 에러 문자열 매칭은 로케일 의존이라 root 포함 관계로
+        // 판별한다).
+        if (roots.some((r) => r.path === target || target.startsWith(r.path + "/"))) {
+          throw repoErr;
+        }
+        foundRoots = roots.length;
+        // WF3: 링크드 워크트리 폴더도 root로 잡히지만 그 목록은 이미 나온
+        // repo와 동일하다 — 순차 순회 + seen으로 같은 repo에 대한 중복 git
+        // 호출을 건너뛴다(실측 13 root → 6 호출).
+        const seen = new Set<string>();
+        for (const r of roots) {
+          if (seen.has(r.path)) continue;
+          try {
+            const wts = await invoke<Worktree[]>("git_worktrees", { cwd: r.path });
+            for (const w of wts) seen.add(w.path);
+            repos.push({ root: r.path, worktrees: wts });
+          } catch {
+            failed += 1;
+          }
+        }
+      }
+      const sess = await sessP;
       if (reqRef.current === myReq) {
         setGroups(groupWorktrees(repos)); // ignore superseded (project switch)
         setSessions(sess);
-        if (roots.length === 0) setNote("git 저장소를 찾지 못했습니다.");
+        if (foundRoots === 0) setNote("git 저장소를 찾지 못했습니다.");
+        else if (failed > 0) setNote(`${failed}개 저장소의 워크트리를 읽지 못했습니다.`);
         else setNote("");
       }
     } catch (e) {

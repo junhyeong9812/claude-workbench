@@ -16,22 +16,31 @@ const WAS = [
   wt("/m/was-usr-alrt-wt", "feature/usr-alrt"),
 ];
 const FRONT = [wt("/m/front-server", "develop", true), wt("/m/front-feature-wt", "feature/damage")];
+const TEXT = [wt("/m/text-server", "develop", true), wt("/m/text-arch-wt", "refactor/arch")];
 
 describe("groupWorktrees", () => {
-  it("repo별 그룹핑 + 링크드 워크트리 root 중복 제거", () => {
+  // spec acceptance 픽스처: repo 3 · 워크트리 7 · 중복 0 (감사 WF4).
+  it("repo별 그룹핑 + 링크드 워크트리 root 중복 제거 (3 repo·7 wt·중복 0)", () => {
     const groups = groupWorktrees([
       { root: "/m/front-server", worktrees: FRONT },
       { root: "/m/was-server", worktrees: WAS },
+      { root: "/m/text-server", worktrees: TEXT },
       // 링크드 워크트리 폴더도 root로 잡힘 — 같은 repo의 목록을 반환한다.
       { root: "/m/was-authz-guard-wt", worktrees: WAS },
       { root: "/m/was-usr-alrt-wt", worktrees: WAS },
       { root: "/m/front-feature-wt", worktrees: FRONT },
+      { root: "/m/text-arch-wt", worktrees: TEXT },
     ]);
-    expect(groups.map((g) => g.mainPath)).toEqual(["/m/front-server", "/m/was-server"]);
-    expect(groups[1].worktrees).toHaveLength(3);
-    expect(groups[0].worktrees).toHaveLength(2);
+    expect(groups.map((g) => g.mainPath)).toEqual([
+      "/m/front-server",
+      "/m/text-server",
+      "/m/was-server",
+    ]);
+    const flat = groups.flatMap((g) => g.worktrees.map((w) => w.path));
+    expect(flat).toHaveLength(7);
+    expect(new Set(flat).size).toBe(flat.length); // 전체 path 중복 0
     // 그룹 안 순서 = git 출력 순서(main 먼저).
-    expect(groups[1].worktrees[0].is_main).toBe(true);
+    expect(groups[2].worktrees[0].is_main).toBe(true);
   });
 
   it("단일 repo면 그룹 1개 — 기존 동작 보존", () => {
