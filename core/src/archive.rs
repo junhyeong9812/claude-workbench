@@ -14,9 +14,11 @@
 //! Invariants:
 //! - The **source** transcript is never touched here — callers pass its bytes;
 //!   this module only ever writes under `archive_root`.
-//! - Re-archiving the same session is **idempotent**: the previous folder for
-//!   that uuid is replaced (found by its `-<uuid8>` suffix, so a changed title
-//!   or date can't leave duplicates).
+//! - Re-archiving the same session is **idempotent** per uuid: the previous
+//!   folder is replaced (found by its `-<uuid8>` suffix, so a changed title or
+//!   date can't leave duplicates). When the previous snapshot's content
+//!   differs, it is preserved under `<folder>/history/v-<ts>` instead of
+//!   deleted — the latest always sits at the top level, versions inside.
 //! - Conversation text reaches `book.html` **only** inside a JSON payload with
 //!   every `<` escaped to the JSON escape `\\u003c`, and the embedded renderer builds DOM via
 //!   `textContent` only — transcript content can never execute in the viewer.
@@ -99,6 +101,84 @@ pub struct ArchiveMeta {
     pub model: Option<String>,
     /// Conversation turn count (browser subtext).
     pub turns: usize,
+    /// When this archive was written (unix seconds). `None` on pre-upgrade
+    /// metas until backfill fills it from the snapshot's mtime.
+    #[serde(default)]
+    pub archived_at: Option<u64>,
+    /// Snapshot identity of the archived `session.jsonl` — compared against the
+    /// live transcript to tell "아카이브됨(최신)" from "아카이브 이후 작업".
+    #[serde(default)]
+    pub jsonl_bytes: Option<u64>,
+    #[serde(default)]
+    pub jsonl_lines: Option<usize>,
+    /// uuid of the last transcript record that carried one.
+    #[serde(default)]
+    pub last_message_uuid: Option<String>,
+}
+
+/// Content identity of a transcript snapshot: byte length + non-empty line
+/// count + the last record uuid. Two transcripts with equal stats are treated
+/// as the same content (the transcript is append-only, so growth is the only
+/// change mode we distinguish).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JsonlStat {
+    pub bytes: u64,
+    pub lines: usize,
+    pub last_uuid: Option<String>,
+}
+
+/// Compute [`JsonlStat`] over raw transcript bytes. `bytes` is the on-disk
+/// length (so it compares against `fs::metadata().len()` of the live file);
+/// the last uuid comes from the last parseable record that carries one
+/// (records like `summary` lines may not), scanning from the tail so a long
+/// transcript stays cheap.
+pub fn jsonl_stat(bytes: &[u8]) -> JsonlStat {
+    let text = String::from_utf8_lossy(bytes);
+    let lines = text.lines().filter(|l| !l.trim().is_empty()).count();
+    let last_uuid = text
+        .lines()
+        .rev()
+        .filter(|l| !l.trim().is_empty())
+        .find_map(|l| crate::jsonl::RawRecord::parse_line(l).and_then(|r| r.uuid));
+    JsonlStat {
+        bytes: bytes.len() as u64,
+        lines,
+        last_uuid,
+    }
+}
+
+/// The snapshot stats of an archived session folder: the meta fields when all
+/// present, else computed from the stored `session.jsonl` (`None` when that is
+/// unreadable — e.g. a hand-damaged folder).
+pub fn archived_stat(dir: &Path, meta: &ArchiveMeta) -> Option<JsonlStat> {
+    if let (Some(bytes), Some(lines)) = (meta.jsonl_bytes, meta.jsonl_lines) {
+        return Some(JsonlStat {
+            bytes,
+            lines,
+            last_uuid: meta.last_message_uuid.clone(),
+        });
+    }
+    let raw = fs::read(dir.join("session.jsonl")).ok()?;
+    Some(jsonl_stat(&raw))
+}
+
+/// Unix seconds now — meta timestamps only (display + history folder names).
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// One preserved past version of an archived session (`history/v-*`).
+#[derive(Debug, Clone)]
+pub struct ArchiveHistoryEntry {
+    pub dir: PathBuf,
+    pub book_path: PathBuf,
+    /// When that version was archived (its meta, else the folder-name ts).
+    pub archived_at: Option<u64>,
+    pub title: String,
+    pub turns: usize,
 }
 
 /// One archived session as the browser lists it.
@@ -109,6 +189,9 @@ pub struct ArchiveSessionEntry {
     /// `summary.md` path when extraction produced one.
     pub summary_path: Option<PathBuf>,
     pub meta: ArchiveMeta,
+    /// Preserved past versions, newest first (empty when never re-archived
+    /// with changed content).
+    pub history: Vec<ArchiveHistoryEntry>,
 }
 
 /// All archived sessions of one project, plus its knowledge index if any.
@@ -300,6 +383,7 @@ pub fn write_archive(
         TMP_SEQ.fetch_add(1, Ordering::Relaxed)
     ));
     fs::create_dir_all(&tmp_dir)?;
+    let stat = jsonl_stat(jsonl_bytes);
     let write_all = (|| -> io::Result<()> {
         fs::write(tmp_dir.join("session.jsonl"), jsonl_bytes)?;
         let json = serde_json::to_string_pretty(session)
@@ -314,6 +398,10 @@ pub fn write_archive(
             date: session.date.clone(),
             model: session.model.clone(),
             turns: session.turns.len(),
+            archived_at: Some(unix_now()),
+            jsonl_bytes: Some(stat.bytes),
+            jsonl_lines: Some(stat.lines),
+            last_message_uuid: stat.last_uuid.clone(),
         };
         let meta_json = serde_json::to_string_pretty(&meta)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
@@ -332,7 +420,7 @@ pub fn write_archive(
     // from an interrupted replace carry the same meta, so a matching one is
     // reclaimed here too (self-healing cleanup); `.tmp-*` never has final data.
     let suffix = format!("-{short}");
-    let mut previous: Vec<PathBuf> = Vec::new();
+    let mut previous: Vec<(PathBuf, ArchiveMeta)> = Vec::new();
     if let Ok(entries) = fs::read_dir(&sessions_dir) {
         for entry in entries.flatten() {
             let path = entry.path();
@@ -344,46 +432,100 @@ pub fn write_archive(
             if !name.ends_with(&suffix) && !name.starts_with(".old-") {
                 continue;
             }
-            let same_session = fs::read_to_string(path.join("meta.json"))
+            let meta = fs::read_to_string(path.join("meta.json"))
                 .ok()
-                .and_then(|t| serde_json::from_str::<ArchiveMeta>(&t).ok())
-                .is_some_and(|m| m.uuid == session.uuid);
-            if same_session {
-                previous.push(path);
+                .and_then(|t| serde_json::from_str::<ArchiveMeta>(&t).ok());
+            if let Some(m) = meta.filter(|m| m.uuid == session.uuid) {
+                previous.push((path, m));
             }
         }
     }
 
     // Replace without a destructive window: move the previous folder(s) aside,
-    // land the new one, then drop the displaced copies. If the final rename
+    // land the new one, then resolve the displaced copies. If the final rename
     // fails, the displaced folders are moved back — a crash or error never
     // leaves the session with no archive at all (only extra dot-dirs).
+    //
+    // Version history: a displaced previous archive whose transcript snapshot
+    // DIFFERS from the new one is preserved under `<final>/history/v-<ts>[-i]`
+    // instead of deleted (재아카이브가 과거 시점을 지우지 않는다). A previous
+    // archive with the SAME snapshot (retitle re-land, crash-leftover reclaim)
+    // is dropped as before — content-identical copies are not versions. Either
+    // way its own `history/` entries are carried forward first, so versions
+    // survive any number of re-archives.
     let replaced = !previous.is_empty();
-    let mut displaced: Vec<(PathBuf, PathBuf)> = Vec::new();
-    for (i, old) in previous.iter().enumerate() {
+    let mut displaced: Vec<(PathBuf, PathBuf, Option<String>)> = Vec::new();
+    for (i, (old, old_meta)) in previous.iter().enumerate() {
+        // Decide BEFORE moving: does the old snapshot differ from the new one?
+        // (Unreadable old snapshot counts as different — preserve, never drop.)
+        let changed = archived_stat(old, old_meta).is_none_or(|s| s != stat);
+        let history_name = changed.then(|| {
+            let ts = old_meta
+                .archived_at
+                .or_else(|| {
+                    fs::metadata(old.join("session.jsonl"))
+                        .ok()
+                        .and_then(|m| m.modified().ok())
+                        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                        .map(|d| d.as_secs())
+                })
+                .unwrap_or(0);
+            format!("v-{ts}-{i}")
+        });
         let aside = sessions_dir.join(format!(
             ".old-{short}-{}-{}-{i}",
             std::process::id(),
             TMP_SEQ.fetch_add(1, Ordering::Relaxed)
         ));
         if let Err(e) = fs::rename(old, &aside) {
-            for (orig, moved) in &displaced {
+            for (orig, moved, _) in &displaced {
                 let _ = fs::rename(moved, orig);
             }
             let _ = fs::remove_dir_all(&tmp_dir);
             return Err(e);
         }
-        displaced.push((old.clone(), aside));
+        displaced.push((old.clone(), aside, history_name));
     }
     if let Err(e) = fs::rename(&tmp_dir, &final_dir) {
-        for (orig, moved) in &displaced {
+        for (orig, moved, _) in &displaced {
             let _ = fs::rename(moved, orig);
         }
         let _ = fs::remove_dir_all(&tmp_dir);
         return Err(e);
     }
-    for (_, moved) in &displaced {
-        let _ = fs::remove_dir_all(moved);
+    // Post-land bookkeeping is best-effort: the new archive is already safe. A
+    // failed move here leaves an `.old-*` aside, which the next archive of this
+    // session reclaims (self-healing) — never silent deletion of a version.
+    let history_dir = final_dir.join("history");
+    for (_, moved, history_name) in &displaced {
+        // Carry the previous folder's own versions forward into the new folder.
+        let old_hist = moved.join("history");
+        if old_hist.is_dir() {
+            let _ = fs::create_dir_all(&history_dir);
+            if let Ok(entries) = fs::read_dir(&old_hist) {
+                for e in entries.flatten() {
+                    let dest = history_dir.join(e.file_name());
+                    if !dest.exists() {
+                        let _ = fs::rename(e.path(), dest);
+                    }
+                }
+            }
+            let _ = fs::remove_dir_all(&old_hist);
+        }
+        match history_name {
+            Some(name) => {
+                let _ = fs::create_dir_all(&history_dir);
+                let mut dest = history_dir.join(name);
+                if dest.exists() {
+                    dest = history_dir
+                        .join(format!("{name}-{}", TMP_SEQ.fetch_add(1, Ordering::Relaxed)));
+                }
+                let _ = fs::rename(moved, &dest);
+            }
+            None => {
+                let _ = fs::remove_dir_all(moved);
+            }
+        }
     }
     Ok(ArchiveOutcome {
         book_path: final_dir.join("book.html"),
@@ -422,6 +564,7 @@ pub fn list_archives(archive_root: &Path) -> Vec<ArchiveProjectListing> {
                 sessions.push(ArchiveSessionEntry {
                     book_path: dir.join("book.html"),
                     summary_path: summary.is_file().then_some(summary),
+                    history: list_history(&dir),
                     dir,
                     meta,
                 });
@@ -440,6 +583,90 @@ pub fn list_archives(archive_root: &Path) -> Vec<ArchiveProjectListing> {
     }
     out.sort_by(|a, b| a.project.cmp(&b.project));
     out
+}
+
+/// Preserved past versions under `<session>/history/`, newest first. Each is a
+/// full former archive folder; a missing/foreign entry is skipped (a version
+/// row must never break the whole listing).
+fn list_history(session_dir: &Path) -> Vec<ArchiveHistoryEntry> {
+    let mut out = Vec::new();
+    let Ok(entries) = fs::read_dir(session_dir.join("history")) else {
+        return out;
+    };
+    for e in entries.flatten() {
+        let dir = e.path();
+        if !dir.is_dir() {
+            continue;
+        }
+        let meta = fs::read_to_string(dir.join("meta.json"))
+            .ok()
+            .and_then(|t| serde_json::from_str::<ArchiveMeta>(&t).ok());
+        // Folder name `v-<ts>[-i]` is the fallback timestamp for pre-upgrade metas.
+        let name_ts = e
+            .file_name()
+            .to_string_lossy()
+            .strip_prefix("v-")
+            .and_then(|s| s.split('-').next().and_then(|t| t.parse::<u64>().ok()))
+            .filter(|&t| t > 0);
+        let book_path = dir.join("book.html");
+        if !book_path.is_file() {
+            continue;
+        }
+        out.push(ArchiveHistoryEntry {
+            archived_at: meta.as_ref().and_then(|m| m.archived_at).or(name_ts),
+            title: meta.as_ref().map(|m| m.title.clone()).unwrap_or_default(),
+            turns: meta.as_ref().map(|m| m.turns).unwrap_or(0),
+            book_path,
+            dir,
+        });
+    }
+    out.sort_by(|a, b| b.archived_at.cmp(&a.archived_at).then(b.dir.cmp(&a.dir)));
+    out
+}
+
+/// Fill the snapshot-stat meta fields (`archived_at`/`jsonl_bytes`/`jsonl_lines`/
+/// `last_message_uuid`) on every archived session that predates them, computed
+/// from the folder's own stored `session.jsonl` (아카이브 시점 스냅샷이므로
+/// 재추출 없이 정확하다 — `archived_at`은 그 파일의 mtime). Idempotent: metas
+/// that already carry the fields are untouched. Returns `(candidates, filled)`
+/// — folders lacking the fields vs. successfully rewritten. Writes are atomic
+/// (temp + rename), so a crash never leaves a torn `meta.json`.
+pub fn backfill_meta(archive_root: &Path) -> (usize, usize) {
+    let mut candidates = 0usize;
+    let mut filled = 0usize;
+    for listing in list_archives(archive_root) {
+        for s in listing.sessions {
+            let mut meta = s.meta;
+            if meta.jsonl_bytes.is_some()
+                && meta.jsonl_lines.is_some()
+                && meta.archived_at.is_some()
+            {
+                continue;
+            }
+            candidates += 1;
+            let jsonl_path = s.dir.join("session.jsonl");
+            let Ok(raw) = fs::read(&jsonl_path) else { continue };
+            let stat = jsonl_stat(&raw);
+            meta.jsonl_bytes = Some(stat.bytes);
+            meta.jsonl_lines = Some(stat.lines);
+            meta.last_message_uuid = stat.last_uuid;
+            if meta.archived_at.is_none() {
+                meta.archived_at = fs::metadata(&jsonl_path)
+                    .ok()
+                    .and_then(|m| m.modified().ok())
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|d| d.as_secs());
+            }
+            let Ok(json) = serde_json::to_string_pretty(&meta) else { continue };
+            let tmp = s.dir.join(".meta.json.tmp");
+            if fs::write(&tmp, json).is_ok() && fs::rename(&tmp, s.dir.join("meta.json")).is_ok() {
+                filled += 1;
+            } else {
+                let _ = fs::remove_file(&tmp);
+            }
+        }
+    }
+    (candidates, filled)
 }
 
 /// The self-contained reader page. Placeholders: `__TITLE__` (HTML-escaped) and
@@ -806,6 +1033,117 @@ mod tests {
         assert!(again[0].sessions[0].summary_path.is_some());
         // 없는 루트는 빈 목록 (에러 아님).
         assert!(list_archives(&root.join("nope")).is_empty());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    // 명세 load-bearing 가정 1: 아카이브된 session.jsonl의 stat이 원본과 같은
+    // 방식으로 비교 가능하다 — 바이트 그대로 복사이므로 stat도 동일해야 한다.
+    #[test]
+    fn meta_snapshot_stat_matches_source_transcript() {
+        let root = temp_root("stat");
+        let jsonl = sample_jsonl("p");
+        let out = write_archive(&root, "/p", &sample_session("스탯"), jsonl.as_bytes()).unwrap();
+        let meta: ArchiveMeta =
+            serde_json::from_str(&fs::read_to_string(out.dir.join("meta.json")).unwrap()).unwrap();
+        let src = jsonl_stat(jsonl.as_bytes());
+        let archived = fs::read(out.dir.join("session.jsonl")).unwrap();
+        assert_eq!(jsonl_stat(&archived), src, "복사본 stat = 원본 stat");
+        assert_eq!(meta.jsonl_bytes, Some(src.bytes));
+        assert_eq!(meta.jsonl_lines, Some(src.lines));
+        assert_eq!(meta.last_message_uuid, src.last_uuid);
+        assert!(meta.archived_at.is_some_and(|t| t > 0));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn jsonl_stat_counts_lines_and_finds_last_uuid() {
+        let text = format!(
+            "{}\n\n{}\nnot-json\n",
+            json!({"type":"user","uuid":"u-1","message":{"role":"user","content":"a"}}),
+            json!({"type":"assistant","uuid":"u-2","message":{"role":"assistant","content":[]}}),
+        );
+        let s = jsonl_stat(text.as_bytes());
+        assert_eq!(s.lines, 3, "빈 줄 제외");
+        assert_eq!(s.last_uuid.as_deref(), Some("u-2"), "파싱 불가 꼬리는 건너뛰고 마지막 uuid");
+        assert_eq!(s.bytes, text.len() as u64);
+    }
+
+    // 내용이 달라진 재아카이브 → 이전본은 history/로 보존, 또 재아카이브해도
+    // 기존 버전이 최신 폴더로 이월된다.
+    #[test]
+    fn changed_rearchive_preserves_previous_as_history() {
+        let root = temp_root("hist");
+        let v1 = sample_jsonl("첫 작업");
+        let out1 = write_archive(&root, "/p", &sample_session("t"), v1.as_bytes()).unwrap();
+        assert!(list_archives(&root)[0].sessions[0].history.is_empty());
+
+        let v2 = format!("{v1}\n{}", json!({"type":"user","uuid":"u-new","message":{"role":"user","content":"more"}}));
+        let out2 = write_archive(&root, "/p", &sample_session("t"), v2.as_bytes()).unwrap();
+        assert!(out2.replaced);
+        assert_eq!(out1.dir, out2.dir, "같은 제목·날짜 → 같은 최신 경로에 안착");
+        assert_eq!(
+            fs::read(out2.dir.join("session.jsonl")).unwrap(),
+            v2.as_bytes(),
+            "최신 폴더 내용은 새 스냅샷"
+        );
+        let listed = &list_archives(&root)[0].sessions[0];
+        assert_eq!(listed.history.len(), 1, "이전본이 버전으로 보존");
+        assert!(listed.history[0].book_path.is_file());
+        let old_jsonl = fs::read(listed.history[0].dir.join("session.jsonl")).unwrap();
+        assert_eq!(old_jsonl, v1.as_bytes(), "버전 내용 = 이전 스냅샷 그대로");
+
+        // 한 번 더 변경 재아카이브 → 버전 2개, 전부 이월.
+        let v3 = format!("{v2}\n{}", json!({"type":"user","uuid":"u-3","message":{"role":"user","content":"x"}}));
+        write_archive(&root, "/p", &sample_session("t"), v3.as_bytes()).unwrap();
+        let listed = &list_archives(&root)[0].sessions[0];
+        assert_eq!(listed.history.len(), 2, "기존 버전 이월 + 새 버전");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    // 내용이 같은 재아카이브(retitle re-land) → 버전 생성 없음, history는 이월.
+    #[test]
+    fn same_content_rearchive_does_not_stack_versions() {
+        let root = temp_root("same");
+        let v1 = sample_jsonl("작업");
+        write_archive(&root, "/p", &sample_session("가제"), v1.as_bytes()).unwrap();
+        // 내용 변경 1회로 버전 하나 만들어 둠.
+        let v2 = format!("{v1}\n{}", json!({"type":"user","uuid":"u-n","message":{"role":"user","content":"m"}}));
+        write_archive(&root, "/p", &sample_session("가제"), v2.as_bytes()).unwrap();
+        // 같은 내용으로 제목만 바꿔 재land — 버전이 늘면 안 되고 기존 버전은 유지.
+        write_archive(&root, "/p", &sample_session("추출된 제목"), v2.as_bytes()).unwrap();
+        let listed = &list_archives(&root)[0].sessions[0];
+        assert_eq!(listed.meta.title, "추출된 제목");
+        assert_eq!(listed.history.len(), 1, "동일 내용 re-land는 버전을 쌓지 않음");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    // 구버전 메타 백필: 필드 없는 meta.json을 저장된 session.jsonl로 채운다(멱등).
+    #[test]
+    fn backfill_fills_missing_stat_fields_idempotently() {
+        let root = temp_root("backfill");
+        let jsonl = sample_jsonl("p");
+        let out = write_archive(&root, "/p", &sample_session("백필"), jsonl.as_bytes()).unwrap();
+        // 구버전 메타 재현: 새 필드를 벗겨낸 meta.json으로 되돌린다.
+        let mut v: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(out.dir.join("meta.json")).unwrap()).unwrap();
+        let obj = v.as_object_mut().unwrap();
+        for k in ["archived_at", "jsonl_bytes", "jsonl_lines", "last_message_uuid"] {
+            obj.remove(k);
+        }
+        fs::write(out.dir.join("meta.json"), v.to_string()).unwrap();
+
+        let (candidates, filled) = backfill_meta(&root);
+        assert_eq!((candidates, filled), (1, 1));
+        let meta: ArchiveMeta =
+            serde_json::from_str(&fs::read_to_string(out.dir.join("meta.json")).unwrap()).unwrap();
+        let src = jsonl_stat(jsonl.as_bytes());
+        assert_eq!(meta.jsonl_bytes, Some(src.bytes));
+        assert_eq!(meta.jsonl_lines, Some(src.lines));
+        assert_eq!(meta.last_message_uuid, src.last_uuid);
+        assert!(meta.archived_at.is_some(), "mtime 기반 archived_at");
+        assert_eq!(meta.title, "백필", "기존 필드 보존");
+        // 멱등: 두 번째 호출은 후보 0.
+        assert_eq!(backfill_meta(&root), (0, 0));
         let _ = fs::remove_dir_all(&root);
     }
 
