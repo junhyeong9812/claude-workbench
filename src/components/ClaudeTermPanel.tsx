@@ -230,14 +230,19 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
         summary_ok: boolean;
         knowledge_files: number;
         extraction_error?: string | null;
+        unchanged: boolean;
       }>("archive_session", { cwd, uuid });
       // 아카이브 브라우저 탭이 이미 열려 있으면 즉시 갱신되도록 알린다.
       window.dispatchEvent(new CustomEvent("mt-archive-updated"));
-      alert(
-        `아카이브 완료${res.replaced ? " (기존 아카이브 교체)" : ""}\n${res.dir}\n` +
-          `요약: ${res.summary_ok ? "생성됨" : "없음"} · 지식 항목 ${res.knowledge_files}건` +
-          (res.extraction_error ? `\n추출 경고: ${res.extraction_error}` : ""),
-      );
+      if (res.unchanged) {
+        alert(`이미 최신 아카이브입니다 — 마지막 아카이브 이후 새 대화가 없어 그대로 두었습니다.\n${res.dir}`);
+      } else {
+        alert(
+          `아카이브 완료${res.replaced ? " (재아카이브 — 달라진 이전 내용은 버전으로 보존)" : ""}\n${res.dir}\n` +
+            `요약: ${res.summary_ok ? "생성됨" : "없음"} · 지식 항목 ${res.knowledge_files}건` +
+            (res.extraction_error ? `\n추출 경고: ${res.extraction_error}` : ""),
+        );
+      }
     } catch (e) {
       alert(`아카이브 실패: ${errText(e)}`);
     } finally {
