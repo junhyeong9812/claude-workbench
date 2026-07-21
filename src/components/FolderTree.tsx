@@ -506,13 +506,19 @@ export function FolderTree() {
           await existing.setFocus().catch(() => {});
           return;
         }
-        new WebviewWindow(label, {
+        const w = new WebviewWindow(label, {
           url: `${window.location.pathname}#dropzone=${encodeURIComponent(dest)}::${encodeURIComponent(activeProject)}`,
           title: "파일 가져오기 — 드롭 존",
           width: 420,
           height: 300,
           alwaysOnTop: true,
           dragDropEnabled: true,
+        });
+        // 생성은 비동기 — created/error 이벤트까지 가드를 쥔다 (post-fix 2차:
+        // 즉시 해제하면 후속 호출의 getByLabel이 아직 null이라 중복 생성).
+        await new Promise<void>((resolve) => {
+          void w.once("tauri://created", () => resolve());
+          void w.once("tauri://error", () => resolve());
         });
       } finally {
         dropZoneOpeningRef.current = false;
