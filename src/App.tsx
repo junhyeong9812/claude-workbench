@@ -21,6 +21,14 @@ import { SearchPanel } from "./components/SearchPanel";
 import { RunMenu } from "./components/RunMenu";
 import { StudyView } from "./components/StudyView";
 import { PopoutWorkbench } from "./components/PopoutWorkbench";
+import { DropZoneWindow } from "./components/DropZoneWindow";
+import {
+  classifyDrops,
+  decodeStrict,
+  DROP_MAX_BYTES,
+  DROP_MAX_FILES,
+  type DroppedFileView,
+} from "./components/droppedFiles";
 import { WebviewWindow } from "@tauri-apps/api/webviewWindow";
 import { getAllWindows } from "@tauri-apps/api/window";
 import { useAppStore } from "./state/store";
@@ -88,6 +96,9 @@ export default function App() {
   // A popped-out panel window loads the same frontend with the `#popout` hash
   // and renders only the minimal panel workbench (multiwindow).
   if (window.location.hash.startsWith("#popout")) return <PopoutWorkbench />;
+  // OS 파일 반입 드롭 존 보조 창 (파일트리 "파일 가져오기") — 이 창만
+  // dragDropEnabled:true로 열린다.
+  if (window.location.hash.startsWith("#dropzone=")) return <DropZoneWindow />;
   return <AppMain />;
 }
 
@@ -105,6 +116,98 @@ function AppMain() {
 
   const treePanelRef = useRef<ImperativePanelHandle>(null);
   const [collapsed, setCollapsed] = useState(false);
+  // 작업 영역에 드롭된 OS 파일들의 메모리 뷰 (workarea-drop-view — 완전 읽기
+  // 전용, 디스크에 아무것도 쓰지 않음). 첫 파일 활성 + 탭 전환.
+  const [droppedPeek, setDroppedPeek] = useState<{
+    files: DroppedFileView[];
+    active: number;
+  } | null>(null);
+  // 드롭 처리 직렬화 — 연속 드롭이 겹쳐 절반 상태를 만들지 않게.
+  const dropBusyRef = useRef(false);
+
+  // 상호 배타(리뷰 W5): 경로 peek이 어떤 경로(트리 클릭·검색 점프)로든 열리면
+  // 드롭 peek을 닫는다 — 오버레이 이중 적층 방지. (역방향은 드롭 처리부의
+  // setPeekFile(null)이 담당.)
+  useEffect(() => {
+    if (peekFile != null) setDroppedPeek(null);
+  }, [peekFile]);
+
+  // ①전역 네비게이션 가드: OS 파일 드래그가 앱 어디에 떨어져도 웹뷰가 그
+  // 파일로 이동해버리는 기본 동작을 막는다. `Files` 타입에만 개입 — 앱 내부
+  // HTML5 드래그(트리 DnD·탭 정렬·창 분리)는 Files가 없어 무관 (spec §2).
+  // ②작업 영역(.pane-main) 드롭 수집: 내용을 읽어 peek 뷰어로 연다.
+  useEffect(() => {
+    const isFileDrag = (e: DragEvent) => !!e.dataTransfer?.types.includes("Files");
+    const guard = (e: DragEvent) => {
+      if (isFileDrag(e)) e.preventDefault();
+    };
+    const onDrop = (e: DragEvent) => {
+      if (!isFileDrag(e)) return;
+      e.preventDefault();
+      const pane = document.querySelector(".pane-main");
+      if (!pane || !(e.target instanceof Node) || !pane.contains(e.target)) return;
+      const files = Array.from(e.dataTransfer?.files ?? []);
+      if (files.length === 0) return;
+      if (dropBusyRef.current) {
+        alert("이전 드롭을 처리하는 중입니다 — 잠시 후 다시 시도하세요."); // 무음 폐기 금지 (리뷰 W3)
+        return;
+      }
+      dropBusyRef.current = true;
+      void (async () => {
+        try {
+          const plans = classifyDrops(files.map((f) => ({ name: f.name, size: f.size })));
+          const notes: string[] = [];
+          const loaded: DroppedFileView[] = [];
+          for (let i = 0; i < files.length; i++) {
+            const f = files[i];
+            const kind = plans[i].kind;
+            if (kind === "too-large") {
+              notes.push(`${f.name}: ${DROP_MAX_BYTES / 1024 / 1024}MB 초과 — 건너뜀`);
+              continue;
+            }
+            if (kind === "over-limit") {
+              notes.push(`${f.name}: 한 번에 최대 ${DROP_MAX_FILES}개 — 건너뜀`);
+              continue;
+            }
+            try {
+              if (kind === "image") {
+                const url = await new Promise<string>((resolve, reject) => {
+                  const r = new FileReader();
+                  r.onload = () => resolve(r.result as string);
+                  r.onerror = () => reject(r.error);
+                  r.readAsDataURL(f);
+                });
+                loaded.push({ name: f.name, imageUrl: url });
+              } else {
+                // 엄격 디코드 — File.text()는 바이너리도 조용히 치환해버린다 (리뷰 W1).
+                const text = decodeStrict(await f.arrayBuffer());
+                if (text == null) {
+                  notes.push(`${f.name}: 텍스트로 표시할 수 없는 파일 — 건너뜀`);
+                  continue;
+                }
+                loaded.push({ name: f.name, text });
+              }
+            } catch {
+              notes.push(`${f.name}: 읽기 실패`);
+            }
+          }
+          if (loaded.length > 0) {
+            useAppStore.getState().setPeekFile(null); // 경로 기반 peek과 겹치지 않게
+            setDroppedPeek({ files: loaded, active: 0 });
+          }
+          if (notes.length > 0) alert(notes.join("\n"));
+        } finally {
+          dropBusyRef.current = false; // 예기치 못한 throw에도 영구 잠금 금지 (리뷰 W3)
+        }
+      })();
+    };
+    window.addEventListener("dragover", guard);
+    window.addEventListener("drop", onDrop);
+    return () => {
+      window.removeEventListener("dragover", guard);
+      window.removeEventListener("drop", onDrop);
+    };
+  }, []);
   const [sideTab, setSideTab] = useState<"files" | "git" | "worktree" | "archive" | "graph">(
     "files",
   );
@@ -463,6 +566,22 @@ function AppMain() {
               path={peekFile}
               line={peekLine ?? undefined}
               onClose={() => setPeekFile(null)}
+            />
+          )}
+          {droppedPeek && (
+            <FilePeekViewer
+              memory={droppedPeek.files[droppedPeek.active]}
+              tabs={
+                droppedPeek.files.length > 1
+                  ? {
+                      names: droppedPeek.files.map((f) => f.name),
+                      active: droppedPeek.active,
+                      onSelect: (i) =>
+                        setDroppedPeek((prev) => (prev ? { ...prev, active: i } : prev)),
+                    }
+                  : undefined
+              }
+              onClose={() => setDroppedPeek(null)}
             />
           )}
           {gitHistoryFile && (

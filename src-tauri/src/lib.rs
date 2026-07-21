@@ -142,6 +142,8 @@ pub fn run() {
             commands::create_file,
             commands::create_dir,
             commands::rename_path,
+            commands::copy_path,
+            commands::import_paths,
             commands::git_status,
             commands::git_branches,
             commands::git_checkout,
