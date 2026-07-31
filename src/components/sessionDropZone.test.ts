@@ -3,6 +3,7 @@ import {
   decodeSessionDrag,
   encodeSessionDrag,
   resolveDropZone,
+  sameZoneRect,
   zoneHighlight,
 } from "./sessionDropZone";
 
@@ -60,14 +61,41 @@ describe("zoneHighlight", () => {
 
 describe("encode/decodeSessionDrag", () => {
   it("왕복 보존", () => {
-    const p = { uuid: "u-1", project: "/home/x/proj", title: "작업 A" };
+    const p = { uuid: "u-1", project: "/home/x/proj", title: "작업 A", source: "archive" as const };
     expect(decodeSessionDrag(encodeSessionDrag(p))).toEqual(p);
+    const q = { ...p, source: "picker" as const };
+    expect(decodeSessionDrag(encodeSessionDrag(q))).toEqual(q);
   });
   it("손상/외부 payload는 null", () => {
     expect(decodeSessionDrag("not-json")).toBeNull();
     expect(decodeSessionDrag("{}")).toBeNull();
-    expect(decodeSessionDrag(JSON.stringify({ uuid: "", project: "p", title: "t" }))).toBeNull();
-    expect(decodeSessionDrag(JSON.stringify({ uuid: 1, project: "p", title: "t" }))).toBeNull();
+    expect(
+      decodeSessionDrag(JSON.stringify({ uuid: "", project: "p", title: "t", source: "picker" })),
+    ).toBeNull();
+    expect(
+      decodeSessionDrag(JSON.stringify({ uuid: 1, project: "p", title: "t", source: "picker" })),
+    ).toBeNull();
     expect(decodeSessionDrag(JSON.stringify(null))).toBeNull();
+  });
+  it("빈 project는 거부 — activeProject 무음 폴백 차단 (S8)", () => {
+    expect(
+      decodeSessionDrag(JSON.stringify({ uuid: "u", project: "", title: "t", source: "archive" })),
+    ).toBeNull();
+  });
+  it("source 누락/불량은 거부 (S11)", () => {
+    expect(decodeSessionDrag(JSON.stringify({ uuid: "u", project: "p", title: "t" }))).toBeNull();
+    expect(
+      decodeSessionDrag(JSON.stringify({ uuid: "u", project: "p", title: "t", source: "tree" })),
+    ).toBeNull();
+  });
+});
+
+describe("sameZoneRect", () => {
+  it("eps 이내면 같다", () => {
+    expect(sameZoneRect(R, { ...R, left: 100.5 })).toBe(true);
+  });
+  it("width/height만 달라도 다르다 (S4 — left/top만 비교하면 놓친다)", () => {
+    expect(sameZoneRect(R, { ...R, width: 150 })).toBe(false);
+    expect(sameZoneRect(R, { ...R, height: 90 })).toBe(false);
   });
 });

@@ -13,10 +13,14 @@ export const SESSION_DRAG_MIME = "application/x-workbench-session";
 export interface SessionDragPayload {
   /** 세션 UUID (resume 대상 — loadSessionId로 들어간다). */
   uuid: string;
-  /** 세션의 원 project 경로 (cwd pin — activeProject 전환 없음). */
+  /** 세션의 원 project 경로 (cwd pin — activeProject 전환 없음).
+   * 빈 문자열은 디코드 단계에서 거부한다 — 조용히 activeProject로 폴백하면
+   * cross-project resume 의미가 무음으로 깨진다 (리뷰 S8). */
   project: string;
   /** 탭 제목. */
   title: string;
+  /** 드래그 출처 — 드롭 성공 시 피커만 닫기 위한 구분 (리뷰 S11). */
+  source: "picker" | "archive";
 }
 
 export function encodeSessionDrag(p: SessionDragPayload): string {
@@ -34,9 +38,11 @@ export function decodeSessionDrag(raw: string): SessionDragPayload | null {
       typeof v.uuid === "string" &&
       v.uuid.length > 0 &&
       typeof v.project === "string" &&
-      typeof v.title === "string"
+      v.project.length > 0 &&
+      typeof v.title === "string" &&
+      (v.source === "picker" || v.source === "archive")
     ) {
-      return { uuid: v.uuid, project: v.project, title: v.title };
+      return { uuid: v.uuid, project: v.project, title: v.title, source: v.source };
     }
   } catch {
     /* not ours */
@@ -78,6 +84,18 @@ export function resolveDropZone(rect: ZoneRect, x: number, y: number, band = 0.2
     }
   }
   return dist < band ? zone : "center";
+}
+
+/** 두 사각형이 (eps px 이내로) 같은가 — dragover마다의 setState 절약 가드용.
+ * 네 값 전부 비교한다: left/top만 보면 창 리사이즈로 크기만 변한 하이라이트가
+ * 옛 크기로 고정된다 (리뷰 S4). */
+export function sameZoneRect(a: ZoneRect, b: ZoneRect, eps = 1): boolean {
+  return (
+    Math.abs(a.left - b.left) < eps &&
+    Math.abs(a.top - b.top) < eps &&
+    Math.abs(a.width - b.width) < eps &&
+    Math.abs(a.height - b.height) < eps
+  );
 }
 
 /** 존 하이라이트 사각형 (같은 좌표계) — 스플릿 존은 결과 반쪽을, 중앙은 전체를

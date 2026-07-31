@@ -48,6 +48,9 @@
   --z-pane-modal: 20;
   --z-peek: 30;
   --z-peek-above: 31;
+  /* 세션 드래그 배치 프리뷰 — peek 위, 로컬 메뉴 아래. 창간 전송 하이라이트
+     (--z-dnd)와 달리 dock 내부 배치 전용 레이어. */
+  --z-drop-preview: 32;
   --z-local-menu: 40;
   --z-local-menu-fg: 41;
   --z-local-modal: 42;
@@ -1675,7 +1678,7 @@ body {
    칠한다. pointer-events 없음: dragover 히트테스트를 방해하지 않는다. */
 .drop-session-zone {
   position: absolute;
-  z-index: var(--z-peek);
+  z-index: var(--z-drop-preview);
   pointer-events: none;
   background: color-mix(in srgb, var(--accent) 22%, transparent);
   border: 1.5px solid var(--accent-bright);

@@ -250,12 +250,22 @@ export function ArchivePanel() {
                     title={`${s.title}\n${s.dir}\n드래그해서 dock의 원하는 위치에 이어서 열기 (중앙=탭 · 가장자리=스플릿)`}
                     draggable
                     onDragStart={(e) => {
+                      // 행 안의 버튼(이어서·버전·책·요약)에서 시작한 드래그는
+                      // 취소 — 몇 px 움직인 클릭이 드래그로 승격돼 클릭이
+                      // 사라지는 충돌 방지 (S6). project 미상 행은 드래그 불가
+                      // (S8 — 디코더와 같은 기준).
+                      const t = e.target as HTMLElement;
+                      if (t.closest?.("button, input, a") || !g.project) {
+                        e.preventDefault();
+                        return;
+                      }
                       e.dataTransfer.setData(
                         SESSION_DRAG_MIME,
                         encodeSessionDrag({
                           uuid: s.uuid,
                           project: g.project,
                           title: s.title.slice(0, 24) || s.date,
+                          source: "archive",
                         }),
                       );
                       e.dataTransfer.effectAllowed = "copy";
