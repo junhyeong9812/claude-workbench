@@ -882,16 +882,17 @@ export function MainArea() {
   // menu/picker UI and the dockview api live in this component. The handled refs
   // initialize to the CURRENT counter so a project-switch remount never replays
   // the previous window's press (unlike a 0-initialized ref).
+  // All three buttons are disabled in the app toolbar while the dev layer is
+  // front (parity with the pre-move UI, where they lived inside the integrated
+  // layer and were unreachable in dev mode). A request that still arrives with
+  // dev in front is a stale press: drop it — never silently flip the project's
+  // persisted 통합/개발 mode from here (review A3).
   const termMenuRequest = useAppStore((s) => s.termMenuRequest);
   const termMenuHandledRef = useRef(termMenuRequest);
   useEffect(() => {
     if (termMenuRequest === termMenuHandledRef.current) return;
     termMenuHandledRef.current = termMenuRequest;
-    // Dev layer in front → bring integrated forward first (B4 symmetry), else
-    // the menu would open invisibly behind it.
-    if (!integratedIsFront(layerMode) && activeProject) {
-      useAppStore.getState().setProjectMode(activeProject, "integrated");
-    }
+    if (!integratedIsFront(layerMode)) return;
     setPicker(null);
     setTermMenu((v) => !v);
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -902,12 +903,12 @@ export function MainArea() {
   useEffect(() => {
     if (claudePickerRequest === claudePickerHandledRef.current) return;
     claudePickerHandledRef.current = claudePickerRequest;
-    if (!integratedIsFront(layerMode) && activeProject) {
-      useAppStore.getState().setProjectMode(activeProject, "integrated");
-    }
+    if (!integratedIsFront(layerMode)) return;
     setTermMenu(false);
-    if (pickerRef.current !== null) setPicker(null);
-    else void openPicker();
+    // Always (re)open — the pre-move button refetched sessions on every press
+    // rather than toggling closed (review A4: 동작 보존; closing is the 취소
+    // button's job).
+    void openPicker();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [claudePickerRequest]);
 

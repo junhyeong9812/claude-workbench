@@ -426,6 +426,13 @@ function AppMain() {
   // 외관 팝오버 (테마+터미널색+글자크기 통합) — outside-click closes it.
   const [appearanceOpen, setAppearanceOpen] = useState(false);
   const appearanceRef = useRef<HTMLDivElement>(null);
+  const appearanceBtnRef = useRef<HTMLButtonElement>(null);
+  const appearancePopRef = useRef<HTMLDivElement>(null);
+  // 열릴 때 1회만 다이얼로그로 포커스 이동 (A10 감사 보완). 콜백 ref로 하면
+  // 매 렌더 재실행되어 인풋 타이핑 중 포커스를 훔친다.
+  useEffect(() => {
+    if (appearanceOpen) appearancePopRef.current?.focus();
+  }, [appearanceOpen]);
   useEffect(() => {
     if (!appearanceOpen) return;
     const onDoc = (e: MouseEvent) => {
@@ -437,12 +444,14 @@ function AppMain() {
     return () => document.removeEventListener("mousedown", onDoc);
   }, [appearanceOpen]);
   // Font-size input draft: null follows the store; committed on Enter/blur.
-  // A non-numeric draft reverts (no silent reset-to-13 via NaN clamping).
+  // Only a plain integer commits — empty/whitespace/hex/decimal drafts revert
+  // to the previous value (review A1: Number("") is 0, not NaN, so an
+  // isFinite check alone would silently clamp an emptied input to 9px).
   const [fontDraft, setFontDraft] = useState<string | null>(null);
   const commitFontDraft = () => {
     if (fontDraft === null) return;
-    const n = Number(fontDraft.trim());
-    if (Number.isFinite(n)) setFontSize(n);
+    const t = fontDraft.trim();
+    if (/^\d+$/.test(t)) setFontSize(Number(t));
     setFontDraft(null);
   };
 
@@ -454,9 +463,10 @@ function AppMain() {
     <div className="app">
       <ProjectTabs />
       <div className="toolbar">
-        <div className="seg mode-seg" role="group" aria-label="화면 모드">
+        <div className="seg" role="group" aria-label="화면 모드">
           <button
             className={`seg-item${segMode === "study" ? " seg-on" : ""}`}
+            aria-pressed={segMode === "study"}
             title="스터디 모드 — 두 폴더 나란히 읽기/학습"
             onClick={() => pickSegMode("study")}
           >
@@ -464,6 +474,7 @@ function AppMain() {
           </button>
           <button
             className={`seg-item${segMode === "integrated" ? " seg-on" : ""}`}
+            aria-pressed={segMode === "integrated"}
             title="통합 모드 — 기본 워크스페이스"
             onClick={() => pickSegMode("integrated")}
           >
@@ -471,6 +482,7 @@ function AppMain() {
           </button>
           <button
             className={`seg-item${segMode === "dev" ? " seg-on" : ""}`}
+            aria-pressed={segMode === "dev"}
             title={
               activeProject
                 ? "개발 모드 — 트리 파일이 에디터 탭+개발 세션(우측) 레이아웃으로 열립니다 (현재 프로젝트에만 적용)"
@@ -484,16 +496,29 @@ function AppMain() {
         </div>
         {mode === "workspace" && (
           <div className="toolbar-group" role="group" aria-label="세션/실행">
+            {/* 세 버튼 모두 dev 레이어에서는 disabled — 변경 전에도 이 버튼들은
+                통합 레이어 안에 있어 dev 모드에선 접근 불가였다(동작 보존, 리뷰
+                A3: 소비자가 projectModes를 조용히 플립하지 않는다). */}
             <button
               className="toolbar-btn"
-              title="터미널/SSH 세션 열기"
+              title={
+                layerMode === "dev"
+                  ? "터미널 열기는 통합 모드에서 사용할 수 있습니다"
+                  : "터미널/SSH 세션 열기"
+              }
+              disabled={layerMode === "dev"}
               onClick={() => requestTermMenu()}
             >
               <span className="toolbar-ico">▣</span> 터미널 <span className="toolbar-caret">▾</span>
             </button>
             <button
               className="toolbar-btn"
-              title="Claude 세션 열기 (새 세션 또는 저장된 세션)"
+              title={
+                layerMode === "dev"
+                  ? "Claude 세션 열기는 통합 모드에서 사용할 수 있습니다"
+                  : "Claude 세션 열기 (새 세션 또는 저장된 세션)"
+              }
+              disabled={layerMode === "dev"}
               onClick={() => requestClaudePicker()}
             >
               <span className="toolbar-ico">✦</span> Claude
@@ -510,30 +535,52 @@ function AppMain() {
             >
               <span className="toolbar-ico">⤢</span> 분리
             </button>
-            <RunMenu />
           </div>
         )}
-        <div className="appearance-menu" ref={appearanceRef}>
+        <RunMenu />
+        <div
+          className="appearance-menu"
+          ref={appearanceRef}
+          onKeyDown={(e) => {
+            // 키보드 닫기 경로 (리뷰 A10): Escape는 팝오버를 닫고 트리거로
+            // 포커스를 돌린다 — 아웃사이드 클릭만으로는 키보드 사용자가 못 닫는다.
+            if (e.key === "Escape" && appearanceOpen) {
+              setAppearanceOpen(false);
+              appearanceBtnRef.current?.focus();
+            }
+          }}
+        >
           <button
+            ref={appearanceBtnRef}
             className={`toolbar-btn${appearanceOpen ? " toolbar-btn-on" : ""}`}
             title="외관 설정 — 테마 · 글자 크기 · 터미널 색상"
+            aria-haspopup="dialog"
+            aria-expanded={appearanceOpen}
             onClick={() => setAppearanceOpen((v) => !v)}
           >
             <span className="toolbar-ico">◐</span> 외관
           </button>
           {appearanceOpen && (
-            <div className="appearance-pop">
+            <div
+              className="appearance-pop"
+              role="dialog"
+              aria-label="외관 설정"
+              tabIndex={-1}
+              ref={appearancePopRef}
+            >
               <div className="appearance-row">
                 <span className="appearance-label">테마</span>
-                <div className="seg">
+                <div className="seg" role="group" aria-label="테마">
                   <button
                     className={`seg-item${theme === "light" ? " seg-on" : ""}`}
+                    aria-pressed={theme === "light"}
                     onClick={() => setTheme("light")}
                   >
                     ☀ 라이트
                   </button>
                   <button
                     className={`seg-item${theme === "dark" ? " seg-on" : ""}`}
+                    aria-pressed={theme === "dark"}
                     onClick={() => setTheme("dark")}
                   >
                     🌙 다크
@@ -543,10 +590,14 @@ function AppMain() {
               <div className="appearance-row">
                 <span className="appearance-label">글자 크기</span>
                 <div className="font-stepper">
+                  {/* 스테퍼는 스토어 최신값 기준(±1) — 렌더 시점 캡처값을 쓰면
+                      미커밋 인풋 blur 커밋과 경합해 한 스텝을 잃을 수 있다(A9).
+                      9/28은 clampFontSize의 상하한. */}
                   <button
                     className="font-step"
                     title="작게"
-                    onClick={() => setFontSize(fontSize - 1)}
+                    disabled={fontSize <= 9}
+                    onClick={() => setFontSize(useAppStore.getState().fontSize - 1)}
                   >
                     −
                   </button>
@@ -559,14 +610,18 @@ function AppMain() {
                     onBlur={commitFontDraft}
                     onKeyDown={(e) => {
                       if (e.key === "Enter") commitFontDraft();
-                      else if (e.key === "Escape") setFontDraft(null);
+                      else if (e.key === "Escape") {
+                        e.stopPropagation(); // 팝오버 닫힘과 겹치지 않게 draft만 되돌림
+                        setFontDraft(null);
+                      }
                     }}
                   />
                   <span className="font-unit">px</span>
                   <button
                     className="font-step"
                     title="크게"
-                    onClick={() => setFontSize(fontSize + 1)}
+                    disabled={fontSize >= 28}
+                    onClick={() => setFontSize(useAppStore.getState().fontSize + 1)}
                   >
                     +
                   </button>
@@ -599,7 +654,10 @@ function AppMain() {
         {/* IntelliJ-style left activity stripe: the sidebar tabs as vertical
             icons. Clicking the active icon folds the tree panel; the chevron
             toggles it too. Always visible, so a folded sidebar stays reachable. */}
-        <div className="activity-bar" role="tablist" aria-label="사이드바" aria-orientation="vertical">
+        <div className="activity-bar" role="group" aria-label="사이드바">
+          {/* role=toolbar + aria-pressed (탭 패턴 아님 — 리뷰 A6: tablist는
+              tabpanel/roving tabindex 계약을 요구하고 spacer·셰브론이 섞여
+              규격 위반이 된다. 접힌 상태에선 눌린 탭 0개가 정상 표현). */}
           {(
             [
               { key: "files", ico: "🗂", label: "파일" },
@@ -611,8 +669,7 @@ function AppMain() {
           ).map((t) => (
             <button
               key={t.key}
-              role="tab"
-              aria-selected={sideTab === t.key && !collapsed}
+              aria-pressed={sideTab === t.key && !collapsed}
               className={`activity-item${sideTab === t.key && !collapsed ? " activity-on" : ""}`}
               title={
                 sideTab === t.key && !collapsed ? `${t.label} — 클릭해 사이드바 접기` : t.label
