@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { errText } from "../utils/error";
@@ -45,6 +45,9 @@ const baseName = (p: string) => p.split("/").filter(Boolean).pop() ?? p;
 
 export function ArchivePanel() {
   const [groups, setGroups] = useState<ArchiveGroup[]>([]);
+  // 드래그 직전 실제로 눌린 요소 — dragstart의 e.target은 draggable 행 자신
+  // 이라 내부 버튼 판별이 불가능해 mousedown 캡처로 기록한다 (리뷰 S6 감사).
+  const dragPressRef = useRef<EventTarget | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [collapsed, setCollapsed] = useState<Set<string>>(new Set());
   // 과거 버전 목록이 펼쳐진 세션(uuid)들.
@@ -249,13 +252,22 @@ export function ArchivePanel() {
                     className="archive-session"
                     title={`${s.title}\n${s.dir}\n드래그해서 dock의 원하는 위치에 이어서 열기 (중앙=탭 · 가장자리=스플릿)`}
                     draggable
+                    onMouseDownCapture={(e) => {
+                      dragPressRef.current = e.target;
+                    }}
                     onDragStart={(e) => {
                       // 행 안의 버튼(이어서·버전·책·요약)에서 시작한 드래그는
                       // 취소 — 몇 px 움직인 클릭이 드래그로 승격돼 클릭이
-                      // 사라지는 충돌 방지 (S6). project 미상 행은 드래그 불가
-                      // (S8 — 디코더와 같은 기준).
-                      const t = e.target as HTMLElement;
-                      if (t.closest?.("button, input, a") || !g.project) {
+                      // 사라지는 충돌 방지 (S6). dragstart의 e.target은 HTML
+                      // DnD 표준상 draggable 행 자신이라 내부 버튼 판별이
+                      // 안 되므로 mousedown 캡처로 기록한 요소를 본다(감사).
+                      // project 미상 행은 드래그 불가 (S8).
+                      const pressed = dragPressRef.current;
+                      if (
+                        (pressed instanceof HTMLElement &&
+                          pressed.closest("button, input, a")) ||
+                        !g.project
+                      ) {
                         e.preventDefault();
                         return;
                       }

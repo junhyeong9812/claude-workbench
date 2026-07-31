@@ -1002,6 +1002,10 @@ export function MainArea() {
   // relatedTarget이 null일 수 있어(리뷰 S5) 즉시 지우면 60Hz 깜빡인다.
   // 다음 dragover가 취소하고, 진짜 이탈이면 타이머가 지운다.
   const dropLeaveTimerRef = useRef<number | null>(null);
+  // 드래그 직전 실제로 눌린 요소 — dragstart의 e.target은 HTML DnD 표준상
+  // draggable 조상(행)이라 내부 버튼 판별이 불가능하다(리뷰 S6 감사, WHATWG
+  // dnd). mousedown 캡처로 기록해 dragstart에서 판별한다.
+  const dragPressRef = useRef<EventTarget | null>(null);
   const cancelLeaveTimer = () => {
     if (dropLeaveTimerRef.current !== null) {
       window.clearTimeout(dropLeaveTimerRef.current);
@@ -1024,8 +1028,10 @@ export function MainArea() {
     const api = apiRef.current;
     const host = mainAreaRef.current?.getBoundingClientRect();
     if (!api || !host) return null;
-    // 겹치는 그룹(floating 등)은 api.groups 순서의 첫 히트가 이긴다 — 현재
-    // 레이아웃은 타일링뿐이라 겹침이 없고, 생기면 재방문(리뷰 S12 주석).
+    // 겹치는 그룹(저장 레이아웃이 floating group을 복원할 수 있다 — 리뷰 S12
+    // 감사)은 히트한 것 중 **최소 면적**을 고른다: floating은 타일 위에 더
+    // 작게 떠 있으므로 최상단(가장 안쪽)을 근사한다.
+    let best: { ref: string; rect: DOMRect; zone: DropZone; area: number } | null = null;
     for (const g of api.groups) {
       // 빈 그룹(activePanel도 panels[0]도 없음)은 프리뷰-결과 계약을 지킬 수
       // 없어 대상에서 제외한다 (리뷰 S3).
@@ -1033,19 +1039,22 @@ export function MainArea() {
       if (!ref) continue;
       const r = g.element.getBoundingClientRect();
       const zone = resolveDropZone(r, x, y);
-      if (zone !== null) {
-        const hl = zoneHighlight(r, zone);
-        return {
-          referencePanel: ref.id,
-          zone,
-          hl: {
-            left: hl.left - host.left,
-            top: hl.top - host.top,
-            width: hl.width,
-            height: hl.height,
-          },
-        };
-      }
+      if (zone === null) continue;
+      const area = r.width * r.height;
+      if (!best || area < best.area) best = { ref: ref.id, rect: r, zone, area };
+    }
+    if (best) {
+      const hl = zoneHighlight(best.rect, best.zone);
+      return {
+        referencePanel: best.ref,
+        zone: best.zone,
+        hl: {
+          left: hl.left - host.left,
+          top: hl.top - host.top,
+          width: hl.width,
+          height: hl.height,
+        },
+      };
     }
     if (api.panels.length === 0) {
       return {
@@ -1285,12 +1294,21 @@ export function MainArea() {
                   className="claude-picker-row"
                   draggable
                   title="드래그해서 dock의 원하는 위치에 열기 (중앙=탭 · 가장자리=스플릿)"
+                  onMouseDownCapture={(e) => {
+                    dragPressRef.current = e.target;
+                  }}
                   onDragStart={(e) => {
                     // 삭제 ×에서 시작한 드래그만 취소 (S6) — 행의 주 클릭 면이
                     // 버튼(claude-picker-item)이라 버튼 전체를 막으면 드래그
-                    // 자체가 불가능해진다. project 미상 행은 드래그 불가 (S8).
-                    const t = e.target as HTMLElement;
-                    if (t.closest?.(".claude-tab-x, input") || !s.project) {
+                    // 자체가 불가능해진다. dragstart의 e.target은 행 자신이므로
+                    // mousedown 캡처로 기록한 실제 눌린 요소를 본다(S6 감사).
+                    // project 미상 행은 드래그 불가 (S8).
+                    const pressed = dragPressRef.current;
+                    if (
+                      (pressed instanceof HTMLElement &&
+                        pressed.closest(".claude-tab-x, input")) ||
+                      !s.project
+                    ) {
                       e.preventDefault();
                       return;
                     }
