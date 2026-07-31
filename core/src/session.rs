@@ -181,6 +181,20 @@ impl SessionManager {
         self.create_seeded(cmd, cwd, cols, rows, None)
     }
 
+    /// Like [`create`], but with extra environment variables on the child
+    /// (hook-status: 세션별 수신기 포트/토큰 — argv 노출 회피). 후방호환
+    /// 확장: 기존 create/create_seeded 시그니처는 그대로다.
+    pub fn create_with_env(
+        &self,
+        cmd: Option<Vec<String>>,
+        cwd: Option<String>,
+        cols: u16,
+        rows: u16,
+        env: Vec<(String, String)>,
+    ) -> Result<SessionId, String> {
+        self.create_seeded_env(cmd, cwd, cols, rows, None, env)
+    }
+
     /// Like [`create`], but seed the scrollback with restored bytes (opt-in
     /// persistence — P4). `seed` is shown as backfill on the first snapshot.
     pub fn create_seeded(
@@ -190,6 +204,19 @@ impl SessionManager {
         cols: u16,
         rows: u16,
         seed: Option<Vec<u8>>,
+    ) -> Result<SessionId, String> {
+        self.create_seeded_env(cmd, cwd, cols, rows, seed, Vec::new())
+    }
+
+    /// 공통 구현 — `env`는 TERM 강제 이후 적용된다(충돌 키는 나중 값 우선).
+    pub fn create_seeded_env(
+        &self,
+        cmd: Option<Vec<String>>,
+        cwd: Option<String>,
+        cols: u16,
+        rows: u16,
+        seed: Option<Vec<u8>>,
+        env: Vec<(String, String)>,
     ) -> Result<SessionId, String> {
         let pty_system = native_pty_system();
         let size = PtySize {
@@ -218,6 +245,9 @@ impl SessionManager {
         // SSH transport, which already requests an "xterm-256color" pty.
         builder.env("TERM", "xterm-256color");
         builder.env("COLORTERM", "truecolor");
+        for (k, v) in &env {
+            builder.env(k, v);
+        }
 
         let mut child = pair
             .slave
