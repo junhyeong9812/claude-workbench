@@ -16,6 +16,16 @@ import { installDragOut, movePanelToNewWindow } from "../state/windowTransfer";
 import { DropTargetOverlay } from "./DropTargetOverlay";
 import { installTransferTarget } from "../state/panelTransferTarget";
 import { components, AppTab, type PanelKind } from "./panelRegistry";
+import {
+  SESSION_DRAG_MIME,
+  decodeSessionDrag,
+  encodeSessionDrag,
+  resolveDropZone,
+  zoneHighlight,
+  type DropZone,
+  type SessionDragPayload,
+  type ZoneRect,
+} from "./sessionDropZone";
 import { resolveLayerMode, integratedIsFront } from "../state/layerRouting";
 import { getAllWindows, getCurrentWindow } from "@tauri-apps/api/window";
 import { fileName } from "./cmLang";
@@ -323,7 +333,11 @@ export function MainArea() {
       seed?: string;
       runCmd?: string;
       cwd?: string;
-      position?: { referencePanel: string; direction: "right" | "left" | "above" | "below" };
+      /** "within" = referencePanel의 그룹에 탭으로 추가 (드롭 존 중앙). */
+      position?: {
+        referencePanel: string;
+        direction: "right" | "left" | "above" | "below" | "within";
+      };
     },
   ) => {
     const api = apiRef.current;
@@ -925,6 +939,136 @@ export function MainArea() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [detachPanelRequest]);
 
+  /** Resume a saved session — already open (live uuid or resume id) → activate
+   * that panel; otherwise open a claudeterm pinned to the session's own project
+   * (activeProject 전환 없음 — spec §2 resume 의미 보존). `position`은 드롭 존
+   * 배치(중앙='within'=그 그룹 탭, 가장자리=그 방향 스플릿). */
+  const openOrActivateSession = (
+    p: SessionDragPayload,
+    position?: { referencePanel: string; direction: "right" | "left" | "above" | "below" | "within" },
+  ) => {
+    const api = apiRef.current;
+    if (!api) return;
+    const existing = api.panels.find((pl) => {
+      const prm = pl.params as { sessionUuid?: string; loadSessionId?: string } | undefined;
+      return prm?.sessionUuid === p.uuid || prm?.loadSessionId === p.uuid;
+    });
+    if (existing) {
+      existing.api.setActive();
+      return;
+    }
+    addPanel("claudeterm", {
+      loadSessionId: p.uuid,
+      ...(p.project ? { project: p.project } : {}),
+      ...(p.title ? { title: p.title } : {}),
+      ...(position ? { position } : {}),
+    });
+  };
+
+  // 아카이브 "이어서" 소비 (spec task 04) — claudeOpenRequest와 같은 keep-until-
+  // consumable 계약: dev 레이어가 앞이면 요청을 남겨 두고(유실≠소비), 통합 복귀
+  // 시 소비한다. 프로젝트 게이트는 없다(세션의 원 project를 pin해서 연다).
+  const sessionResumeRequest = useAppStore((s) => s.sessionResumeRequest);
+  const requestSessionResume = useAppStore((s) => s.requestSessionResume);
+  useEffect(() => {
+    if (!integratedIsFront(layerMode)) return;
+    if (!sessionResumeRequest) return;
+    const api = apiRef.current;
+    if (!api) return; // dock not ready — keep the request; apiReady re-runs
+    const { uuid, project, title } = sessionResumeRequest;
+    requestSessionResume(null); // consume only once we can actually act
+    openOrActivateSession({ uuid, project, title });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [sessionResumeRequest, apiReady, layerMode]);
+
+  // ---- 세션 드래그 배치 (spec task 03) ------------------------------------
+  // 아카이브/피커 행 드래그가 dock 위를 지날 때: 마우스가 올라간 그룹의 존
+  // (중앙/가장자리 20%)을 계산해 하이라이트하고, 드롭 시 그 위치로 연다.
+  // 전용 MIME에만 반응 — 트리 DnD·탭 창간 전송·OS Files와 무간섭 (spec §2).
+  const mainAreaRef = useRef<HTMLDivElement>(null);
+  const [sessionDrop, setSessionDrop] = useState<{
+    /** 대상 그룹의 활성 패널 id (referencePanel), 빈 dock이면 null. */
+    referencePanel: string | null;
+    zone: DropZone;
+    /** .main-area 로컬 좌표의 하이라이트 사각형. */
+    hl: ZoneRect;
+  } | null>(null);
+
+  const isSessionDrag = (e: React.DragEvent) =>
+    e.dataTransfer.types.includes(SESSION_DRAG_MIME);
+
+  const onSessionDragOver = (e: React.DragEvent) => {
+    if (!isSessionDrag(e)) return;
+    if (!integratedIsFront(layerMode)) return;
+    const api = apiRef.current;
+    const host = mainAreaRef.current?.getBoundingClientRect();
+    if (!api || !host) return;
+    e.preventDefault();
+    e.dataTransfer.dropEffect = "copy";
+    let next: typeof sessionDrop = null;
+    for (const g of api.groups) {
+      const r = g.element.getBoundingClientRect();
+      const zone = resolveDropZone(r, e.clientX, e.clientY);
+      if (zone) {
+        const hl = zoneHighlight(r, zone);
+        next = {
+          referencePanel: g.activePanel?.id ?? null,
+          zone,
+          hl: { left: hl.left - host.left, top: hl.top - host.top, width: hl.width, height: hl.height },
+        };
+        break;
+      }
+    }
+    // dock 위지만 그룹 밖(빈 dock 등): 전체 영역 = 기본 배치.
+    if (!next) {
+      next = {
+        referencePanel: null,
+        zone: "center",
+        hl: { left: 0, top: 0, width: host.width, height: host.height },
+      };
+    }
+    // dragover는 초당 수십 회 — 동일 존이면 setState를 생략해 리렌더를 줄인다.
+    setSessionDrop((prev) =>
+      prev &&
+      prev.referencePanel === next!.referencePanel &&
+      prev.zone === next!.zone &&
+      Math.abs(prev.hl.left - next!.hl.left) < 1 &&
+      Math.abs(prev.hl.top - next!.hl.top) < 1
+        ? prev
+        : next,
+    );
+  };
+
+  const onSessionDragLeave = (e: React.DragEvent) => {
+    // main-area 서브트리 안에서의 이동은 무시 — 진짜 밖으로 나갈 때만 클리어.
+    const rt = e.relatedTarget as Node | null;
+    if (rt && mainAreaRef.current?.contains(rt)) return;
+    setSessionDrop(null);
+  };
+
+  const onSessionDrop = (e: React.DragEvent) => {
+    if (!isSessionDrag(e)) return;
+    e.preventDefault();
+    e.stopPropagation();
+    const target = sessionDrop;
+    setSessionDrop(null);
+    if (!integratedIsFront(layerMode)) return;
+    const payload = decodeSessionDrag(e.dataTransfer.getData(SESSION_DRAG_MIME));
+    if (!payload) return;
+    // 피커에서 끌었으면 드롭 성공 시 닫는다 (spec §2).
+    setPicker(null);
+    setTermMenu(false);
+    openOrActivateSession(
+      payload,
+      target?.referencePanel
+        ? {
+            referencePanel: target.referencePanel,
+            direction: target.zone === "center" ? "within" : target.zone,
+          }
+        : undefined,
+    );
+  };
+
   // Attention roll-up cycle: activate the panel for the requested session uuid.
   // Matched by the panel's live `sessionUuid` or its resume `loadSessionId` (a
   // fresh session's uuid == its loadSessionId). No-op if no panel here owns it —
@@ -950,8 +1094,25 @@ export function MainArea() {
   }, [focusSessionRequest]);
 
   return (
-    <div className="main-area">
+    <div
+      className="main-area"
+      ref={mainAreaRef}
+      onDragOver={onSessionDragOver}
+      onDragLeave={onSessionDragLeave}
+      onDrop={onSessionDrop}
+    >
       <DropTargetOverlay />
+      {sessionDrop && (
+        <div
+          className="drop-session-zone"
+          style={{
+            left: sessionDrop.hl.left,
+            top: sessionDrop.hl.top,
+            width: sessionDrop.hl.width,
+            height: sessionDrop.hl.height,
+          }}
+        />
+      )}
       {/* Zero-height anchor for the dropdowns that used to hang off the removed
           main-toolbar row — the "+ Terminal"/"+ Claude" buttons now live in the
           app toolbar and drive these via store request counters (task 01). */}
@@ -1046,7 +1207,23 @@ export function MainArea() {
               const rows = pickerRows();
               if (rows.length === 0) return null;
               const renderRow = (s: SessionSummary) => (
-                <div key={`${s.project}:${s.id}`} className="claude-picker-row">
+                <div
+                  key={`${s.project}:${s.id}`}
+                  className="claude-picker-row"
+                  draggable
+                  title="드래그해서 dock의 원하는 위치에 열기 (중앙=탭 · 가장자리=스플릿)"
+                  onDragStart={(e) => {
+                    e.dataTransfer.setData(
+                      SESSION_DRAG_MIME,
+                      encodeSessionDrag({
+                        uuid: s.id,
+                        project: s.project,
+                        title: s.name || s.title?.slice(0, 24) || s.date,
+                      }),
+                    );
+                    e.dataTransfer.effectAllowed = "copy";
+                  }}
+                >
                   <button
                     className="claude-picker-item"
                     onClick={() => {
