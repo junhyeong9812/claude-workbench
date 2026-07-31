@@ -312,6 +312,15 @@ interface AppState {
    * same uuid is requested twice in a row. Transient. No-op if that session has
    * no panel in this window's dock (another window's session). */
   focusSessionRequest: { uuid: string; nonce: number } | null;
+  /** App-toolbar "+ Terminal" click → MainArea toggles its terminal menu (the
+   * menu/dialog UI stays in MainArea, which owns the dockview api). Counter so
+   * every press re-fires. Transient. */
+  termMenuRequest: number;
+  /** App-toolbar "+ Claude" click → MainArea opens its session picker. Counter. */
+  claudePickerRequest: number;
+  /** App-toolbar "⤢ 분리" click → MainArea pops the active panel out to a new
+   * window. Counter. Consumed only while the integrated layer is front. */
+  detachPanelRequest: number;
   /** Color theme (persisted to localStorage). Drives CSS vars + xterm palette. */
   theme: "dark" | "light";
   /** Code font size in px (terminals + editor/viewer), persisted. */
@@ -456,6 +465,12 @@ interface AppState {
   requestFocusMain: () => void;
   /** Ask MainArea to activate the panel for `uuid` (attention roll-up cycle). */
   requestFocusSession: (uuid: string) => void;
+  /** Ask MainArea to toggle the "+ Terminal" menu (app-toolbar button). */
+  requestTermMenu: () => void;
+  /** Ask MainArea to open the "+ Claude" session picker (app-toolbar button). */
+  requestClaudePicker: () => void;
+  /** Ask MainArea to detach the active panel to a new window (app-toolbar button). */
+  requestDetachPanel: () => void;
   /** Switch the color theme. */
   setTheme: (theme: "dark" | "light") => void;
   /** Set the code font size (clamped 9–28). */
@@ -524,6 +539,9 @@ export const useAppStore = create<AppState>((set, get) => ({
   runRequest: null,
   focusMainRequest: 0,
   focusSessionRequest: null,
+  termMenuRequest: 0,
+  claudePickerRequest: 0,
+  detachPanelRequest: 0,
   theme: (localStorage.getItem("theme") as "dark" | "light") || "dark",
   fontSize: clampFontSize(Number(localStorage.getItem("fontSize")) || 13),
   termColors: loadTermColors(),
@@ -711,6 +729,9 @@ export const useAppStore = create<AppState>((set, get) => ({
     set((s) => ({
       focusSessionRequest: { uuid, nonce: (s.focusSessionRequest?.nonce ?? 0) + 1 },
     })),
+  requestTermMenu: () => set((s) => ({ termMenuRequest: s.termMenuRequest + 1 })),
+  requestClaudePicker: () => set((s) => ({ claudePickerRequest: s.claudePickerRequest + 1 })),
+  requestDetachPanel: () => set((s) => ({ detachPanelRequest: s.detachPanelRequest + 1 })),
   setTheme: (theme) => set({ theme }),
   setFontSize: (n) => set({ fontSize: clampFontSize(n) }),
   setTermColors: (c) => {
