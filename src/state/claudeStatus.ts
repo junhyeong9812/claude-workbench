@@ -298,6 +298,11 @@ export interface SessionEntry {
    * `seenNow:false` can't un-see the completion — the hold confirms as *seen*
    * (unseen:false). Reset when real work resumes (S7). */
   seenDuringHold: boolean;
+  /** hook-status: 이 세션이 hook 이벤트를 한 번이라도 보냈다 — 그때부터
+   * 화면 스캔(screenBlocked)은 표시 판정에서 무시된다(hook 우선/스캔 폴백). */
+  hookBacked: boolean;
+  /** hook Notification(입력 대기) 이후 UserPromptSubmit/Stop 전 — blocked. */
+  hookBlocked: boolean;
 }
 
 /** Payload the panel feeds updateFromTimeline on each `claude-timeline` tick. */
@@ -321,7 +326,28 @@ function emptyEntry(): SessionEntry {
     screenBlocked: false,
     seen: false,
     seenDuringHold: false,
+    hookBacked: false,
+    hookBlocked: false,
   };
+}
+
+// --- hook-status: 이벤트 이름 → 상태 전이 종류 (순수 — vitest 대상) ---------
+
+export type HookEventKind = "stop" | "notification" | "prompt-submit";
+
+/** `claude-hook-status` payload의 이벤트 이름(수신기 화이트리스트와 1:1)을
+ * 전이 종류로 매핑. 모르는 이름 = null(무시 — 전이 없음). */
+export function mapHookEvent(name: string): HookEventKind | null {
+  switch (name) {
+    case "Stop":
+      return "stop";
+    case "Notification":
+      return "notification";
+    case "UserPromptSubmit":
+      return "prompt-submit";
+    default:
+      return null;
+  }
 }
 
 // --- attention event bus (S11: incremental notification) ---------------------
@@ -373,10 +399,11 @@ function emitAttention(ev: AttentionEvent): void {
   }
 }
 
-/** Recompute the display status from the internal fields. Blocked (question or
- * screen) wins; otherwise mirror the (hold-confirmed) activity. */
+/** Recompute the display status from the internal fields. Blocked wins; a
+ * hook-backed session ignores the screen-scan heuristic (hook이 정본 — 스캔은
+ * hook 미수신 세션의 폴백일 뿐이다, hook-status spec §2). */
 function statusOf(e: SessionEntry): SessionStatus {
-  if (e.questionBlocked || e.screenBlocked) return "blocked";
+  if (e.questionBlocked || e.hookBlocked || (e.screenBlocked && !e.hookBacked)) return "blocked";
   return e.activity === "working" ? "working" : "idle";
 }
 
@@ -407,6 +434,12 @@ const uuidToNumeric = new Map<string, number>();
 /** Resolve a numeric session id to its uuid (global listener reverse lookup). */
 export function lookupSessionUuid(numericId: number): string | undefined {
   return numericToUuid.get(numericId);
+}
+
+/** 이 창이 이 세션을 등록했는가 (hook-status: 전 창 브로드캐스트를 자기
+ * 세션으로 거르는 필터 — registerSession이 만든 매핑 존재 여부). */
+export function hasSessionMapping(uuid: string): boolean {
+  return uuidToNumeric.has(uuid);
 }
 
 interface StatusStore {
@@ -440,6 +473,9 @@ interface StatusStore {
    * `origin` marks a restore-replay scan as `snapshot` (silent notifier seed —
    * S4a); defaults to `live`. */
   setScreenBlocked: (uuid: string, blocked: boolean, origin?: TimelineOrigin) => void;
+  /** hook-status: 수신기가 중계한 hook 이벤트를 적용한다 (항상 live —
+   * hook은 실이벤트에만 발화하므로 restore 재생이 없다). */
+  applyHookEvent: (uuid: string, kind: HookEventKind) => void;
   /** The user looked: clear unseen and remember seen. */
   markSeen: (uuid: string) => void;
   /** Panel unmounted / session ended — drop the entry and any hold timer. */
@@ -558,6 +594,32 @@ export const useClaudeStatus = create<StatusStore>((set, get) => {
       const e: SessionEntry = { ...prev, screenBlocked: blocked };
       e.status = statusOf(e);
       commit(uuid, e, prevEntry, origin ?? "live");
+    },
+
+    applyHookEvent: (uuid, kind) => {
+      const prevEntry = get().entries[uuid];
+      const prev = prevEntry ?? emptyEntry();
+      const e: SessionEntry = { ...prev, hookBacked: true };
+      if (kind === "notification") {
+        // 입력 대기 — 즉시 blocked (질문/권한 프롬프트).
+        e.hookBlocked = true;
+      } else if (kind === "prompt-submit") {
+        // 작업 재개 — working 틱과 동일한 epoch 정리(S7 규칙 재사용).
+        clearHold(uuid);
+        e.hookBlocked = false;
+        e.activity = "working";
+        e.unseen = false;
+        e.seenDuringHold = false;
+      } else {
+        // stop: 턴 종료 — blocked 해제, working→quiet 확정은 기존 HOLD·unseen
+        // 규칙을 그대로 거친다(즉시 quiet로 꺾으면 micro-pause 오탐 재발).
+        e.hookBlocked = false;
+        if (prev.activity === "working" && !holdTimers.has(uuid)) {
+          scheduleHold(uuid, "live");
+        }
+      }
+      e.status = statusOf(e);
+      commit(uuid, e, prevEntry, "live");
     },
 
     markSeen: (uuid) => {
