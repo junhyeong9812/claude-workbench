@@ -38,8 +38,11 @@ const ALLOWED_EVENTS: [&str; 3] = ["Stop", "Notification", "UserPromptSubmit"];
 /// 요청 헤더/바디 상한 — hook stdin JSON은 수백 바이트 수준.
 const MAX_HEAD: usize = 8 * 1024;
 const MAX_BODY: usize = 64 * 1024;
-/// 커넥션당 read() 호출 상한 — 타임아웃과 함께 slowloris의 절대 상한.
-const MAX_READS: usize = 64;
+/// 커넥션당 read() 호출 상한 — 타임아웃(500ms)과 함께 slowloris의 절대 상한
+/// (커넥션당 최악 ~16s, 동시 8 상한). 동일 UID 악성 프로세스의 고의 점유는
+/// 위협모델 밖(그 권한이면 앱 종료·파일 읽기가 이미 가능) — 이 상한은
+/// 버그성 슬로우 클라이언트 방어용이다.
+const MAX_READS: usize = 32;
 /// 동시 처리 커넥션 상한 — 초과분은 즉시 닫는다(hook은 저빈도·재발화 가능).
 const MAX_CONNS: usize = 8;
 
@@ -67,11 +70,22 @@ fn random_token() -> Option<String> {
         .map(|s| s.trim().to_string())
 }
 
+/// 파일명에 쓰이는 uuid의 엄격 검증 (감사 신규 P1 — 경로 조작 차단).
+/// 커널 UUID 형식(hex + '-')만 허용: `..`·`/`·절대경로가 원천 배제된다.
+pub fn is_safe_uuid(uuid: &str) -> bool {
+    !uuid.is_empty()
+        && uuid.len() <= 64
+        && uuid.chars().all(|c| c.is_ascii_hexdigit() || c == '-')
+}
+
 impl HookServer {
     /// 세션 스폰 시 호출: 세션 전용 토큰을 발급·등록하고 0600 헤더 파일
     /// 경로를 돌려준다(env `WORKBENCH_HOOK_HDR`로 전달). 같은 uuid의 재스폰
     /// (resume)은 이전 토큰을 대체한다. 실패 = None(주입 생략).
     pub fn register_session(&self, uuid: &str) -> Option<String> {
+        if !is_safe_uuid(uuid) {
+            return None; // 경로 조작 가능 문자열 — 주입 생략(감사 P1)
+        }
         let token = random_token()?;
         {
             let mut reg = self.registry.lock().ok()?;
@@ -135,7 +149,12 @@ pub fn read_request<R: Read>(r: &mut R) -> Result<(String, Vec<u8>), u16> {
             if cl.is_some() {
                 return Err(400); // 중복
             }
-            cl = Some(v.trim().parse::<usize>().map_err(|_| 400u16)?);
+            let t = v.trim();
+            // 숫자만 — parse::<usize>는 "+1"도 허용한다(감사 H2 부분).
+            if t.is_empty() || !t.bytes().all(|b| b.is_ascii_digit()) {
+                return Err(400);
+            }
+            cl = Some(t.parse::<usize>().map_err(|_| 400u16)?);
         }
     }
     let content_length = cl.ok_or(400u16)?;
@@ -181,10 +200,10 @@ pub fn parse_hook_request(head: &str, body: &[u8]) -> Result<(String, String, St
         if k.eq_ignore_ascii_case("x-workbench-token") {
             token = Some(v.trim());
         } else if k.eq_ignore_ascii_case("host") {
-            // 심층 방어(H13): 로컬 주소 이외의 Host는 거부 (DNS rebinding —
-            // 커스텀 헤더 요구 + CORS 미허용이 1차 방어, 이것은 2차).
-            let h = v.trim();
-            if !(h.starts_with("127.0.0.1") || h.starts_with("localhost")) {
+            // 심층 방어(H13): 호스트부 **정확 일치**만 허용 — starts_with는
+            // `localhost.evil`을 통과시킨다(감사 H13 부분).
+            let hpart = v.trim().split(':').next().unwrap_or("");
+            if hpart != "127.0.0.1" && hpart != "localhost" {
                 return Err(400);
             }
         }
@@ -216,7 +235,7 @@ fn respond(stream: &mut TcpStream, code: u16) {
 /// 커넥션 하나 처리 — framing → 해석 → 토큰↔uuid 대조 → 중계.
 fn handle(app: &AppHandle, registry: &Registry, stream: &mut TcpStream) {
     // 짧은 per-read 타임아웃 + read 회수 상한(read_request) = 절대 지연 상한.
-    let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(1)));
+    let _ = stream.set_read_timeout(Some(std::time::Duration::from_millis(500)));
     let (head, body) = match read_request(stream) {
         Ok(hb) => hb,
         Err(code) => {
@@ -244,9 +263,23 @@ pub fn ensure_started(app: &AppHandle) -> Option<&'static HookServer> {
     SERVER
         .get_or_init(|| {
             let init = || -> Option<HookServer> {
-                let hdr_dir = app.path().app_data_dir().ok()?.join("hook-hdrs");
-                // 앱 시작마다 초기화 — 지난 실행의 토큰 파일은 전부 무효.
-                let _ = std::fs::remove_dir_all(&hdr_dir);
+                // 프로세스별 하위 디렉토리(감사 신규 P2): 전체 remove_dir_all은
+                // 두 번째 인스턴스가 첫 인스턴스의 활성 헤더를 지운다 — 자기
+                // 디렉토리(`<pid>`)만 만들고, 죽은 pid의 잔여 디렉토리만 청소.
+                let base = app.path().app_data_dir().ok()?.join("hook-hdrs");
+                std::fs::create_dir_all(&base).ok()?;
+                if let Ok(entries) = std::fs::read_dir(&base) {
+                    for ent in entries.flatten() {
+                        let name = ent.file_name();
+                        let Some(pid) = name.to_str().and_then(|s| s.parse::<u32>().ok()) else {
+                            continue;
+                        };
+                        if !std::path::Path::new(&format!("/proc/{pid}")).exists() {
+                            let _ = std::fs::remove_dir_all(ent.path());
+                        }
+                    }
+                }
+                let hdr_dir = base.join(std::process::id().to_string());
                 std::fs::create_dir_all(&hdr_dir).ok()?;
                 #[cfg(unix)]
                 {
@@ -391,8 +424,10 @@ mod tests {
         // content-length 중복 — 400
         let raw = req("/hook/Stop", Some(TOKEN), body, "Content-Length: 5\r\n");
         assert_eq!(framed(&raw, raw.len()), Err(400));
-        // 비숫자 — 400
+        // 비숫자·부호 — 400 (parse::<usize>는 "+1"을 허용하므로 digits-only 검사)
         let raw = b"POST /x HTTP/1.1\r\nContent-Length: abc\r\n\r\n".to_vec();
+        assert_eq!(framed(&raw, raw.len()), Err(400));
+        let raw = b"POST /x HTTP/1.1\r\nContent-Length: +2\r\n\r\n{}".to_vec();
         assert_eq!(framed(&raw, raw.len()), Err(400));
         // content-length 부재 — 400
         let raw = b"POST /x HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n{}".to_vec();
@@ -429,12 +464,24 @@ mod tests {
         let raw = b"GET /hook/Stop HTTP/1.1\r\nContent-Length: 2\r\n\r\n{}".to_vec();
         let (h, b) = framed(&raw, raw.len()).unwrap();
         assert_eq!(parse_hook_request(&h, &b), Err(405));
-        // 비로컬 Host — 400 (H13)
-        let raw = req("/hook/Stop", Some(TOKEN), body, "");
-        let s = String::from_utf8(raw).unwrap().replace("Host: 127.0.0.1:9", "Host: evil.test");
-        let raw = s.into_bytes();
-        let (h, b) = framed(&raw, raw.len()).unwrap();
-        assert_eq!(parse_hook_request(&h, &b), Err(400));
+        // 비로컬 Host — 400 (H13, 정확 일치: localhost.evil도 거부)
+        for bad in ["Host: evil.test", "Host: localhost.evil", "Host: 127.0.0.1.evil"] {
+            let raw = req("/hook/Stop", Some(TOKEN), body, "");
+            let s = String::from_utf8(raw).unwrap().replace("Host: 127.0.0.1:9", bad);
+            let raw = s.into_bytes();
+            let (h, b) = framed(&raw, raw.len()).unwrap();
+            assert_eq!(parse_hook_request(&h, &b), Err(400), "{bad}");
+        }
+    }
+
+    #[test]
+    fn safe_uuid_rejects_path_tricks() {
+        assert!(is_safe_uuid("73cb4040-741c-4f19-9142-2715b218fb47"));
+        assert!(!is_safe_uuid(""));
+        assert!(!is_safe_uuid("../../etc/passwd"));
+        assert!(!is_safe_uuid("/tmp/x"));
+        assert!(!is_safe_uuid("a/b"));
+        assert!(!is_safe_uuid(&"a".repeat(65)));
     }
 
     #[test]

@@ -614,8 +614,12 @@ export const useClaudeStatus = create<StatusStore>((set, get) => {
         e.hookBlocked = true;
       } else if (kind === "prompt-submit") {
         // 작업 재개 — working 틱과 동일한 epoch 정리(S7 규칙 재사용).
+        // 프롬프트가 제출됐다는 것은 열려 있던 질문이 방금 답변됐다는 뜻 —
+        // 타임라인 지연으로 남은 stale questionBlocked도 함께 해제한다(감사
+        // H5a 이의 반영; 실제로 열려 있으면 다음 타임라인 틱이 되살린다).
         clearHold(uuid);
         e.hookBlocked = false;
+        e.questionBlocked = false;
         e.activity = "working";
         e.unseen = false;
         e.seenDuringHold = false;
@@ -628,6 +632,10 @@ export const useClaudeStatus = create<StatusStore>((set, get) => {
         if (!holdTimers.has(uuid)) {
           e.activity = "working"; // hold 확정 경로 진입용 일시 상태
           scheduleHold(uuid, "live");
+        } else {
+          // 이미 도는 hold가 snapshot origin이면 live로 승격 — Stop은 진짜
+          // 완료 신호라 done 알림이 침묵되면 안 된다(감사 H5b 부분).
+          holdOrigins.set(uuid, "live");
         }
       }
       e.status = statusOf(e);

@@ -90,6 +90,13 @@ describe("applyHookEvent", () => {
     expect(st().entries[uuid].status).toBe("blocked");
   });
 
+  it("prompt-submit은 stale questionBlocked도 해제한다 (감사 H5a 보완)", () => {
+    st().updateFromTimeline(uuid, { activity: "quiet", questionBlocked: true, seenNow: false });
+    expect(st().entries[uuid].status).toBe("blocked");
+    st().applyHookEvent(uuid, "prompt-submit");
+    expect(st().entries[uuid].status).toBe("working");
+  });
+
   it("live 타임라인 working 틱은 hookBlocked를 해제한다 (H5c — 권한 승인 후 재개)", () => {
     st().applyHookEvent(uuid, "notification");
     st().updateFromTimeline(uuid, {
