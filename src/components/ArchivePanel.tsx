@@ -4,6 +4,7 @@ import { listen } from "@tauri-apps/api/event";
 import { errText } from "../utils/error";
 import { fmtUnix } from "../utils/time";
 import { useAppStore } from "../state/store";
+import { SESSION_DRAG_MIME, encodeSessionDrag } from "./sessionDropZone";
 
 /** 추출 모델 선택지 — claude CLI에 목록 명령이 없어 별칭을 큐레이션한다.
  * "custom"은 자유 입력(전체 모델명 등). null(기본) = opus. */
@@ -49,6 +50,7 @@ export function ArchivePanel() {
   // 과거 버전 목록이 펼쳐진 세션(uuid)들.
   const [versionsOpen, setVersionsOpen] = useState<Set<string>>(new Set());
   const setPeekFile = useAppStore((s) => s.setPeekFile);
+  const requestSessionResume = useAppStore((s) => s.requestSessionResume);
   const archiveRoot = useAppStore((s) => s.archiveRoot);
   const archiveModel = useAppStore((s) => s.archiveModel);
   const archiveEffort = useAppStore((s) => s.archiveEffort);
@@ -242,7 +244,23 @@ export function ArchivePanel() {
               </div>
               {!closed &&
                 g.sessions.map((s) => (
-                  <div key={s.uuid} className="archive-session" title={`${s.title}\n${s.dir}`}>
+                  <div
+                    key={s.uuid}
+                    className="archive-session"
+                    title={`${s.title}\n${s.dir}\n드래그해서 dock의 원하는 위치에 이어서 열기 (중앙=탭 · 가장자리=스플릿)`}
+                    draggable
+                    onDragStart={(e) => {
+                      e.dataTransfer.setData(
+                        SESSION_DRAG_MIME,
+                        encodeSessionDrag({
+                          uuid: s.uuid,
+                          project: g.project,
+                          title: s.title.slice(0, 24) || s.date,
+                        }),
+                      );
+                      e.dataTransfer.effectAllowed = "copy";
+                    }}
+                  >
                     <div className="archive-session-title">{s.title}</div>
                     <div className="archive-session-meta">
                       <span>
@@ -266,6 +284,19 @@ export function ArchivePanel() {
                             {versionsOpen.has(s.uuid) ? "▾" : "▸"} 버전 {s.history.length + 1}
                           </button>
                         )}
+                        <button
+                          className="archive-btn"
+                          title="이 세션을 이어서 열기 (Claude resume — 이미 열려 있으면 그 탭으로)"
+                          onClick={() =>
+                            requestSessionResume({
+                              uuid: s.uuid,
+                              project: g.project,
+                              title: s.title.slice(0, 24) || s.date,
+                            })
+                          }
+                        >
+                          이어서
+                        </button>
                         <button
                           className="archive-btn"
                           title="책(book.html)을 시스템 브라우저로 열기 — 처음부터 단계별 넘겨보기"
