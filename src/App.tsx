@@ -610,8 +610,11 @@ function AppMain() {
                     onBlur={commitFontDraft}
                     onKeyDown={(e) => {
                       if (e.key === "Enter") commitFontDraft();
-                      else if (e.key === "Escape") {
-                        e.stopPropagation(); // 팝오버 닫힘과 겹치지 않게 draft만 되돌림
+                      else if (e.key === "Escape" && fontDraft !== null) {
+                        // draft가 있을 때만: 1차 Esc = 되돌림(전파 차단), draft
+                        // 없으면 버블시켜 팝오버 닫힘(post-fix A10 — 항상
+                        // 차단하면 인풋 포커스에서 Esc로 못 닫는다).
+                        e.stopPropagation();
                         setFontDraft(null);
                       }
                     }}
