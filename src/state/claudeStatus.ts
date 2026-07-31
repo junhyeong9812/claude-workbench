@@ -563,6 +563,12 @@ export const useClaudeStatus = create<StatusStore>((set, get) => {
       const prevEntry = get().entries[uuid];
       const prev = prevEntry ?? emptyEntry();
       const e: SessionEntry = { ...prev, questionBlocked: d.questionBlocked, seen: d.seenNow };
+      // hook Notification은 "그 순간" 신호다 — 권한 승인 후에는 UserPromptSubmit
+      // 없이 작업이 재개되므로, live 타임라인이 실작업을 보고하면 hookBlocked를
+      // 해제한다(H5c: 승인 후 blocked 고착 방지).
+      if (prev.hookBlocked && d.activity === "working" && (d.origin ?? "live") === "live") {
+        e.hookBlocked = false;
+      }
       if (d.activity === "working") {
         // Real work (again) — cancel any pending hold, drop stale done-unseen,
         // and reset the seen latch so this fresh epoch starts clean (S7).
@@ -598,6 +604,9 @@ export const useClaudeStatus = create<StatusStore>((set, get) => {
 
     applyHookEvent: (uuid, kind) => {
       const prevEntry = get().entries[uuid];
+      // 리듀서 자체 가드(H6): 이 창이 모르는(또는 이미 remove된) 세션의 늦은
+      // hook은 유령 엔트리를 되살리지 않는다 — 리스너 필터에만 기대지 않음.
+      if (!prevEntry && !hasSessionMapping(uuid)) return;
       const prev = prevEntry ?? emptyEntry();
       const e: SessionEntry = { ...prev, hookBacked: true };
       if (kind === "notification") {
@@ -611,10 +620,13 @@ export const useClaudeStatus = create<StatusStore>((set, get) => {
         e.unseen = false;
         e.seenDuringHold = false;
       } else {
-        // stop: 턴 종료 — blocked 해제, working→quiet 확정은 기존 HOLD·unseen
-        // 규칙을 그대로 거친다(즉시 quiet로 꺾으면 micro-pause 오탐 재발).
+        // stop: 턴이 방금 끝났다는 정본 신호 — blocked 해제 + 완료 전이를
+        // **항상** 보장한다(H5b: 타임라인 지연으로 working이 안 잡혔어도
+        // done 판정이 소실되면 안 됨). 확정은 기존 HOLD·unseen 규칙 경유
+        // (즉시 quiet로 꺾으면 micro-pause 오탐 재발).
         e.hookBlocked = false;
-        if (prev.activity === "working" && !holdTimers.has(uuid)) {
+        if (!holdTimers.has(uuid)) {
+          e.activity = "working"; // hold 확정 경로 진입용 일시 상태
           scheduleHold(uuid, "live");
         }
       }

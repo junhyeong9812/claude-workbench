@@ -146,15 +146,18 @@ fn spawn_claude(
     let mut cmd = vec!["claude".to_string(), flag.to_string(), session_uuid.clone()];
 
     // hook-status: 수신기가 살아 있으면 세션 한정 hook 설정을 주입한다
-    // (--settings 인자 — 사용자 ~/.claude 무수정, spec §2). 포트/토큰은
-    // argv가 아니라 env로 전달(cmdline 노출 회피). 수신기 기동 실패는
-    // 주입 생략 = 프론트 화면 스캔 폴백 (기능 저하, 세션은 정상).
+    // (--settings 인자 — 사용자 ~/.claude 무수정, spec §2). 세션별 토큰은
+    // 0600 헤더 파일로 쓰고 경로만 env로 전달 — claude/curl 어느 쪽 argv에도
+    // 토큰 값이 실리지 않는다(리뷰 H1·H4). 수신기 기동/등록 실패는 주입
+    // 생략 = 프론트 화면 스캔 폴백 (기능 저하, 세션은 정상).
     let mut envs: Vec<(String, String)> = Vec::new();
     if let Some(hook) = super::hookserver::ensure_started(app) {
-        cmd.push("--settings".to_string());
-        cmd.push(super::hookserver::hook_settings_json());
-        envs.push(("WORKBENCH_HOOK_PORT".to_string(), hook.port.to_string()));
-        envs.push(("WORKBENCH_HOOK_TOKEN".to_string(), hook.token.clone()));
+        if let Some(hdr_path) = hook.register_session(&session_uuid) {
+            cmd.push("--settings".to_string());
+            cmd.push(super::hookserver::hook_settings_json());
+            envs.push(("WORKBENCH_HOOK_PORT".to_string(), hook.port.to_string()));
+            envs.push(("WORKBENCH_HOOK_HDR".to_string(), hdr_path));
+        }
     }
 
     let id = mgr

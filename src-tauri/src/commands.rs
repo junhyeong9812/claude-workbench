@@ -18,9 +18,9 @@ use tauri::{AppHandle, Manager};
 mod archive;
 mod claude;
 mod files;
-mod hookserver;
 mod git;
 mod graph;
+mod hookserver;
 mod ssh;
 mod terminal;
 

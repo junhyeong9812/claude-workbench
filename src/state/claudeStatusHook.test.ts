@@ -10,6 +10,8 @@ let uuid = "";
 beforeEach(() => {
   vi.useFakeTimers();
   uuid = `hook-test-${++n}`;
+  // H6 리듀서 가드: 이 창이 아는 세션만 hook을 적용한다 — 테스트 세션을 등록.
+  st().registerSession(uuid, 90000 + n);
 });
 afterEach(() => {
   st().remove(uuid);
@@ -66,5 +68,45 @@ describe("applyHookEvent", () => {
     expect(st().entries[uuid].status).toBe("blocked");
     st().setScreenBlocked(uuid, false);
     expect(st().entries[uuid].status).toBe("idle");
+  });
+
+  it("Stop이 첫 hook(quiet 상태)이어도 완료 전이가 보장된다 (H5b)", () => {
+    st().registerSession(uuid, 90001); // 매핑만 있고 엔트리 없음 → 가드 통과
+    st().applyHookEvent(uuid, "stop");
+    vi.advanceTimersByTime(HOLD_MS + 10);
+    const e = st().entries[uuid];
+    expect(e.status).toBe("idle");
+    expect(e.unseen).toBe(true);
+  });
+
+  it("remove된(매핑 없는) 세션의 늦은 hook은 유령 엔트리를 만들지 않는다 (H6)", () => {
+    st().applyHookEvent("ghost-uuid", "notification");
+    expect(st().entries["ghost-uuid"]).toBeUndefined();
+  });
+
+  it("타임라인 quiet 틱은 hookBlocked를 보존한다", () => {
+    st().applyHookEvent(uuid, "notification");
+    st().updateFromTimeline(uuid, { activity: "quiet", questionBlocked: false, seenNow: false });
+    expect(st().entries[uuid].status).toBe("blocked");
+  });
+
+  it("live 타임라인 working 틱은 hookBlocked를 해제한다 (H5c — 권한 승인 후 재개)", () => {
+    st().applyHookEvent(uuid, "notification");
+    st().updateFromTimeline(uuid, {
+      activity: "working",
+      questionBlocked: false,
+      seenNow: false,
+      origin: "live",
+    });
+    expect(st().entries[uuid].status).toBe("working");
+    // snapshot 틱은 해제하지 않는다(restore 재생 — 재알림 억제 계열).
+    st().applyHookEvent(uuid, "notification");
+    st().updateFromTimeline(uuid, {
+      activity: "working",
+      questionBlocked: false,
+      seenNow: false,
+      origin: "snapshot",
+    });
+    expect(st().entries[uuid].status).toBe("blocked");
   });
 });
