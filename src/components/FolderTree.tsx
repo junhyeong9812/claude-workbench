@@ -3,6 +3,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { WebviewWindow } from "@tauri-apps/api/webviewWindow";
 import { errText } from "../utils/error";
 import { useAppStore } from "../state/store";
+import { expandedSetOf } from "../state/treeSelectors";
 import type { DirEntry } from "../types";
 import { TypeBadges } from "./TypeBadges";
 import {
@@ -58,10 +59,10 @@ function TreeNode({
   parentIgnored?: boolean;
   dnd: TreeDndHandlers;
 }) {
-  const expanded = useAppStore((s) => {
-    const active = s.projects.find((p) => p.path === s.activeProject);
-    return active?.tree_state.expanded.includes(entry.path) ?? false;
-  });
+  // P2 F1: expanded 배열 identity 메모 Set의 O(1) 조회 — 기존 노드당
+  // find+includes O(P+E)가 store set마다 전 노드에서 돌던 비용 제거(동치는
+  // treeSelectors 특성테스트).
+  const expanded = useAppStore((s) => expandedSetOf(s).has(entry.path));
   const children = useAppStore((s) => s.childrenCache[entry.path]);
   const isCursor = useAppStore((s) => s.treeCursor === entry.path);
   const isPeeked = useAppStore((s) => s.peekFile === entry.path);
@@ -144,12 +145,12 @@ function visibleNodes(): DirEntry[] {
   const s = useAppStore.getState();
   const ap = s.activeProject;
   if (!ap) return [];
-  const expanded = s.projects.find((p) => p.path === ap)?.tree_state.expanded ?? [];
+  const expanded = expandedSetOf(s);
   const out: DirEntry[] = [];
   const walk = (entries: DirEntry[] | undefined) => {
     for (const e of entries ?? []) {
       out.push(e);
-      if (e.is_dir && expanded.includes(e.path)) walk(s.childrenCache[e.path]);
+      if (e.is_dir && expanded.has(e.path)) walk(s.childrenCache[e.path]);
     }
   };
   walk(s.childrenCache[ap]);
@@ -294,12 +295,7 @@ export function FolderTree() {
     return () => clearInterval(t);
   }, [activeProject, reloadActiveTree]);
 
-  const isExpanded = (p: string): boolean => {
-    const s = useAppStore.getState();
-    return (
-      s.projects.find((pr) => pr.path === s.activeProject)?.tree_state.expanded.includes(p) ?? false
-    );
-  };
+  const isExpanded = (p: string): boolean => expandedSetOf(useAppStore.getState()).has(p);
 
   // Move the cursor to a node; when the peek viewer is open, follow it onto files
   // (so ↑/↓ reads through the tree). Keep the moved row in view.

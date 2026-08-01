@@ -1,7 +1,10 @@
 //! Project-type detection from filesystem marker files.
 
 use serde::{Deserialize, Serialize};
-use std::path::Path;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+use std::time::SystemTime;
 
 /// Marker files that identify a directory as a project root. Mirrors the
 /// ecosystem probes in [`detect_project_types`] (kept as a flat list so the
@@ -69,7 +72,58 @@ const DISPLAY_ORDER: [ProjectType; 7] = [
 /// Results are sorted by [`DISPLAY_ORDER`]. An empty/marker-less directory
 /// yields an empty `Vec`. This function never panics.
 pub fn detect_project_types<P: AsRef<Path>>(path: P) -> Vec<ProjectType> {
-    let dir = path.as_ref();
+    detect_project_types_uncached(path.as_ref())
+}
+
+/// P2: (dir mtime, package.json mtime) 키 캐시 — 트리 폴링이 4초마다 펼친
+/// 디렉토리의 모든 하위 dir에 마커 stat ~10회씩을 반복하던 것을 재사용한다.
+/// 무효화: 마커 파일 추가/삭제 = dir mtime 변경, JS flavor(React/Vue/JS)는
+/// package.json **내용** 의존 = 그 파일 mtime 변경. 알려진 잔존 구멍(리뷰
+/// ledger 기록·수용): ①dir 밖을 가리키는 심링크 마커의 타깃만 생기고/사라지는
+/// 경우(dir mtime 불변) ②mtime 해상도가 초 단위인 FS(exFAT·SMB)에서 같은 tick
+/// 내 마커 변경 — 둘 다 배지 표시에 한정되고 로컬 dev FS(ns 해상도)에선 발생
+/// 하지 않는다. 키 조회 실패(mtime 불가)는 캐시 미사용(항상 재계산).
+const TYPE_CACHE_MAX: usize = 4096;
+type TypeCacheKey = (PathBuf, SystemTime, Option<SystemTime>);
+static TYPE_CACHE: Mutex<Option<HashMap<PathBuf, (TypeCacheKey, Vec<ProjectType>)>>> =
+    Mutex::new(None);
+
+/// [`detect_project_types`]와 결과 동일(캐시 히트 시 재계산 생략). 트리 폴링
+/// 경로([`crate::list_dir`])가 사용한다.
+pub fn detect_project_types_cached(dir: &Path) -> Vec<ProjectType> {
+    let Ok(dir_mtime) = std::fs::metadata(dir).and_then(|m| m.modified()) else {
+        return detect_project_types(dir); // 키 불가 — 캐시 우회
+    };
+    let pkg_mtime = std::fs::metadata(dir.join("package.json"))
+        .and_then(|m| m.modified())
+        .ok();
+    let key: TypeCacheKey = (dir.to_path_buf(), dir_mtime, pkg_mtime);
+    if let Ok(mut guard) = TYPE_CACHE.lock() {
+        let cache = guard.get_or_insert_with(HashMap::new);
+        if let Some((k, v)) = cache.get(&key.0) {
+            if *k == key {
+                return v.clone();
+            }
+        }
+    }
+    let types = detect_project_types(dir);
+    if let Ok(mut guard) = TYPE_CACHE.lock() {
+        let cache = guard.get_or_insert_with(HashMap::new);
+        if cache.len() >= TYPE_CACHE_MAX {
+            // 절반만 축출(임의 순서) — 전체 clear는 상한 근처 워크로드에서 매
+            // 폴링 재구축 thrash가 된다(리뷰 P3). 정확성 무관(키 재검증).
+            let doomed: Vec<PathBuf> =
+                cache.keys().take(TYPE_CACHE_MAX / 2).cloned().collect();
+            for k in doomed {
+                cache.remove(&k);
+            }
+        }
+        cache.insert(key.0.clone(), (key, types.clone()));
+    }
+    types
+}
+
+fn detect_project_types_uncached(dir: &Path) -> Vec<ProjectType> {
     let has = |marker: &str| dir.join(marker).exists();
 
     let mut types: Vec<ProjectType> = Vec::new();
@@ -294,5 +348,53 @@ mod tests {
     fn nonexistent_path_is_empty_not_panic() {
         let p = PathBuf::from("/this/path/should/not/exist/claude-workbench-xyz");
         assert_eq!(detect_project_types(&p), Vec::<ProjectType>::new());
+    }
+
+    // ---- P2 캐시 특성테스트: cached ≡ uncached + 무효화 반증 ----
+
+    /// mtime 해상도(코스 FS)보다 확실히 지나가도록 잠깐 대기.
+    fn tick() {
+        std::thread::sleep(std::time::Duration::from_millis(15));
+    }
+
+    #[test]
+    fn cached_equals_uncached_and_hits_do_not_stale() {
+        let d = temp_dir("eq");
+        std::fs::write(d.join("Cargo.toml"), "[package]").unwrap();
+        assert_eq!(detect_project_types_cached(&d), detect_project_types(&d));
+        // 2회째(히트)도 동일 — 캐시가 결과를 바꾸지 않는다.
+        assert_eq!(detect_project_types_cached(&d), vec![ProjectType::Rust]);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// 반증①: 마커 추가/삭제(dir mtime 변경)가 즉시 반영되나 — 캐시 동결 금지.
+    #[test]
+    fn marker_change_invalidates_cache() {
+        let d = temp_dir("marker");
+        std::fs::write(d.join("Cargo.toml"), "[package]").unwrap();
+        assert_eq!(detect_project_types_cached(&d), vec![ProjectType::Rust]);
+        tick();
+        std::fs::write(d.join("pyproject.toml"), "").unwrap(); // dir mtime 변경
+        assert_eq!(
+            detect_project_types_cached(&d),
+            vec![ProjectType::Rust, ProjectType::Python]
+        );
+        tick();
+        std::fs::remove_file(d.join("Cargo.toml")).unwrap();
+        assert_eq!(detect_project_types_cached(&d), vec![ProjectType::Python]);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// 반증②: package.json **내용**만 바뀌어도(JS flavor — dir mtime 불변)
+    /// package.json mtime 키가 무효화한다.
+    #[test]
+    fn package_json_content_change_invalidates_cache() {
+        let d = temp_dir("flavor");
+        std::fs::write(d.join("package.json"), r#"{"dependencies":{}}"#).unwrap();
+        assert_eq!(detect_project_types_cached(&d), vec![ProjectType::JavaScript]);
+        tick();
+        std::fs::write(d.join("package.json"), r#"{"dependencies":{"react":"18"}}"#).unwrap();
+        assert_eq!(detect_project_types_cached(&d), vec![ProjectType::React]);
+        let _ = std::fs::remove_dir_all(&d);
     }
 }
