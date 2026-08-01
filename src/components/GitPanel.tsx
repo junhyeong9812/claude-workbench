@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { errText } from "../utils/error";
 import { invoke } from "@tauri-apps/api/core";
 import { useAppStore } from "../state/store";
@@ -345,6 +345,12 @@ export function GitPanel() {
   const conflicted = status?.changes.filter((c) => c.conflicted) ?? [];
   const staged = status?.changes.filter((c) => c.staged && !c.conflicted) ?? [];
   const unstaged = status?.changes.filter((c) => !c.staged && !c.conflicted) ?? [];
+  // 커밋 그래프 레인 계산은 commits 변경 시에만 (P0 F4) — 결과 불변.
+  const graphMemo = useMemo(() => {
+    const rows = computeGraph(commits);
+    const maxLanes = rows.reduce((m, r) => Math.max(m, r.before.length, r.after.length), 1);
+    return { rows, maxLanes };
+  }, [commits]);
   const merging = status?.merging ?? false;
   const reverting = status?.reverting ?? false;
   // During a merge, conclude via the banner's '계속'(merge --continue) instead of
@@ -423,10 +429,14 @@ export function GitPanel() {
     return out;
   };
 
+  // 트리 빌드는 changes 변경 시에만 (P0 F4) — 커밋 메시지 타이핑 등 무관한
+  // state 변화마다 렌더 IIFE에서 재계산되던 것을 메모화. 계산 결과 불변.
+  const stagedTree = useMemo(() => buildTree(staged), [status]);
+  const unstagedTree = useMemo(() => buildTree(unstaged), [status]);
   const renderGroup = (list: FileChange[], kind: "staged" | "unstaged"): ReactNode =>
     view === "flat"
       ? list.map((c) => fileRow(c, c.path, 0, kind))
-      : renderNode(buildTree(list), 0, kind);
+      : renderNode(kind === "staged" ? stagedTree : unstagedTree, 0, kind);
 
   // Root selector: only meaningful when nested repos exist under the project.
   return (
@@ -817,8 +827,7 @@ export function GitPanel() {
         </div>
         <div className="git-graph">
           {(() => {
-            const rows = computeGraph(commits);
-            const maxLanes = rows.reduce((m, r) => Math.max(m, r.before.length, r.after.length), 1);
+            const { rows, maxLanes } = graphMemo;
             return rows.map((row) => {
               const c = row.commit;
               const refs = parseRefs(c.refs);
