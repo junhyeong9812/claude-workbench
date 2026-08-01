@@ -4,7 +4,7 @@ import { emit, listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import type { ITheme } from "@xterm/xterm";
 import type { DirEntry, Project, ProjectType, SshConnection, WorkspaceState } from "../types";
-import { pruneTreeCache, sameEntries } from "./treeSelectors";
+import { pruneTreeCache, sameEntries, underRoot } from "./treeSelectors";
 
 /** Clamp a font size to the allowed range (also normalizes NaN). */
 export const clampFontSize = (n: number): number => Math.max(9, Math.min(28, Math.round(n) || 13));
@@ -562,6 +562,21 @@ let treeCacheEpoch = 0;
  * 무한 누적하던 경로 차단). 나머지 dir는 계속 갱신된다. */
 const treeDirInFlight = new Set<string>();
 
+/** 열린 프로젝트·스터디 폴더 아래만 트리 캐시 쓰기 허용 — epoch는 close
+ * **이전** 발주를, 이 검사는 close **이후** stale 경로의 발주(늦게 완료된
+ * 파일 작업의 reloadDir 등)를 막는다(재점검: 둘을 병행해야 고아 캐시 부활이
+ * 완전 차단). */
+function treeWriteAllowed(
+  s: { projects: { path: string }[]; studyFolders: { left: string | null; right: string | null } },
+  dir: string,
+): boolean {
+  return (
+    s.projects.some((p) => underRoot(dir, p.path)) ||
+    (!!s.studyFolders.left && underRoot(dir, s.studyFolders.left)) ||
+    (!!s.studyFolders.right && underRoot(dir, s.studyFolders.right))
+  );
+}
+
 export const useAppStore = create<AppState>((set, get) => ({
   projects: [],
   activeProject: null,
@@ -934,7 +949,7 @@ export const useAppStore = create<AppState>((set, get) => ({
     try {
       const entries = await invoke<DirEntry[]>("read_dir", { path: dirPath });
       set((s) =>
-        epoch === treeCacheEpoch
+        epoch === treeCacheEpoch && treeWriteAllowed(s, dirPath)
           ? { childrenCache: { ...s.childrenCache, [dirPath]: entries } }
           : s,
       );
@@ -942,7 +957,7 @@ export const useAppStore = create<AppState>((set, get) => ({
       // Surface as an empty (but resolved) listing; do not crash the tree.
       console.error("read_dir failed", err);
       set((s) =>
-        epoch === treeCacheEpoch
+        epoch === treeCacheEpoch && treeWriteAllowed(s, dirPath)
           ? { childrenCache: { ...s.childrenCache, [dirPath]: [] } }
           : s,
       );
@@ -963,7 +978,9 @@ export const useAppStore = create<AppState>((set, get) => ({
       // 리뷰: `{}` 반환은 merge로 새 루트 state를 만들어 전 리스너를 깨운다).
       // 축출(epoch 증가) 뒤 늦은 응답은 쓰지 않는다.
       set((s) =>
-        epoch !== treeCacheEpoch || sameEntries(s.childrenCache[dirPath], entries)
+        epoch !== treeCacheEpoch ||
+        !treeWriteAllowed(s, dirPath) ||
+        sameEntries(s.childrenCache[dirPath], entries)
           ? s
           : { childrenCache: { ...s.childrenCache, [dirPath]: entries } },
       );
@@ -1023,6 +1040,7 @@ export const useAppStore = create<AppState>((set, get) => ({
               // 배치 시작 후 다른 경로(runOp reloadDir·loadChildren)가 이
               // dir를 이미 갱신했다면 그쪽이 더 새 데이터 — 덮지 않는다.
               if (s.childrenCache[d] !== before[d]) continue;
+              if (!treeWriteAllowed(s, d)) continue;
               if (!sameEntries(next[d], entries)) {
                 next[d] = entries;
                 changed = true;
