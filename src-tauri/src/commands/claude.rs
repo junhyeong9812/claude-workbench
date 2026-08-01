@@ -114,6 +114,39 @@ struct ClaudeTimelinePayload {
 /// 언급하는 아이템). 자기 transcript는 제외 — 자기 id 에코가 self-parent가
 /// 되어 트리에서 사라지는 회귀 방지(codex B1 F1). 동작 보존: 기존 인라인
 /// 체인 스캔과 동일한 순회 순서·판정(특성테스트 subagent_parent_*).
+/// P0 B2: 완료된 서브에이전트의 보존 프레임 — tail(파서·버퍼)은 드롭하고
+/// payload에 계속 실릴 items만 남긴다. `len`은 완료 판정 시점의 파일 크기로,
+/// 파일이 다시 자라면(len 초과) tail을 재생성해 재개한다(가정② 무해화).
+pub(crate) struct DoneSub {
+    pub(crate) turn: u64,
+    pub(crate) len: u64,
+    pub(crate) items: Vec<TimelineItem>,
+    pub(crate) rev: u32,
+}
+
+/// 파일 길이 안정 스트릭 전이 — 순수 (P0 B2 특성테스트 대상).
+/// 같은 길이면 스트릭 +1, 변하면 리셋.
+pub(crate) fn advance_stability(prev: (u64, u32), len: u64) -> (u64, u32) {
+    if prev.0 == len {
+        (len, prev.1 + 1)
+    } else {
+        (len, 0)
+    }
+}
+
+/// 활성 + 완료 서브에이전트 프레임 병합 — 순수. 보존 계약: 완료된 에이전트의
+/// (aid, turn, items)가 payload에 **계속 포함**된다(스냅샷·트리 표시 불변).
+/// 순서는 원래도 HashMap 순회라 비결정적이었으므로 집합 동일성만이 계약.
+pub(crate) fn merge_sub_frames(
+    mut active: Vec<(String, u64, Vec<TimelineItem>)>,
+    done: &HashMap<String, DoneSub>,
+) -> Vec<(String, u64, Vec<TimelineItem>)> {
+    for (aid, d) in done {
+        active.push((aid.clone(), d.turn, d.items.clone()));
+    }
+    active
+}
+
 pub(crate) fn subagent_parent(
     aid: &str,
     main_items: &[TimelineItem],
@@ -529,6 +562,13 @@ fn run_timeline_poll(
     let mut subagent_turn: HashMap<String, u64> = HashMap::new();
     // P0 B1: agent id → 확정된 부모 tool_call_id (Some만 저장 — 불변 링크 캐시).
     let mut parent_cache: HashMap<String, Option<String>> = HashMap::new();
+    // P0 B2: 완료 서브에이전트(파일 길이 DONE_STREAK 연속 안정) — tail은
+    // 드롭하고 items만 보존. 재성장 시 재생성.
+    let mut sub_done: HashMap<String, DoneSub> = HashMap::new();
+    let mut sub_stable: HashMap<String, (u64, u32)> = HashMap::new();
+    let mut sub_path: HashMap<String, PathBuf> = HashMap::new();
+    /// ~6초(150ms×40) 연속 무성장 = 완료로 간주.
+    const DONE_STREAK: u32 = 40;
     // Cheap fingerprint of the last emitted state (incl. subagent item count). A
     // prompt- or answer-only record advances turns/answers without touching any
     // tool item, so we can't key off `poll`'s touched indices alone.
@@ -578,9 +618,26 @@ fn run_timeline_poll(
                     else {
                         continue;
                     };
+                    // P0 B2: 완료 처리된 에이전트는 파일이 다시 자랄 때만
+                    // tail을 재생성(전체 재파싱 — mapper는 결정적이라 동일
+                    // items 재구성), 아니면 폴링을 건너뛴다.
+                    if let Some(d) = sub_done.get(&aid) {
+                        let len = entry.metadata().map(|m| m.len()).unwrap_or(0);
+                        if len > d.len {
+                            sub_done.remove(&aid);
+                            sub_stable.remove(&aid);
+                            subagents.insert(
+                                aid.clone(),
+                                core_lib::jsonl::SessionTail::new(cwd.clone(), aid.clone(), f.clone()),
+                            );
+                            sub_path.insert(aid, f);
+                        }
+                        continue;
+                    }
                     if !subagents.contains_key(&aid) {
                         subagent_turn.insert(aid.clone(), t.current_turn());
                     }
+                    sub_path.insert(aid.clone(), f.clone());
                     let st = subagents.entry(aid.clone()).or_insert_with(|| {
                         core_lib::jsonl::SessionTail::new(cwd.clone(), aid.clone(), f)
                     });
@@ -588,11 +645,41 @@ fn run_timeline_poll(
                 }
             }
         }
+        // P0 B2: 완료 전이 스윕 — 파일 길이가 DONE_STREAK 연속 무성장이면
+        // tail을 드롭하고 items만 보존한다(빈 tail은 계속 활성 — 곧 자랄 수
+        // 있는 신생 파일).
+        let mut newly_done: Vec<String> = Vec::new();
+        for (aid, st) in subagents.iter() {
+            let Some(p) = sub_path.get(aid) else { continue };
+            let len = std::fs::metadata(p).map(|m| m.len()).unwrap_or(0);
+            let prev = sub_stable.get(aid).copied().unwrap_or((len, 0));
+            let next = advance_stability(prev, len);
+            sub_stable.insert(aid.clone(), next);
+            if next.1 >= DONE_STREAK && !st.timeline().items().is_empty() {
+                newly_done.push(aid.clone());
+            }
+        }
+        for aid in newly_done {
+            if let Some(st) = subagents.remove(&aid) {
+                let items = st.timeline().items().to_vec();
+                let rev: u32 = items.iter().map(|i| i.revision).sum();
+                let len = sub_stable.remove(&aid).map(|e| e.0).unwrap_or(0);
+                let turn = *subagent_turn.get(&aid).unwrap_or(&0);
+                sub_done.insert(aid, DoneSub { turn, len, items, rev });
+            }
+        }
+
+        // fingerprint·카운트는 활성+완료 합산 — 완료 전이가 payload 내용을
+        // 바꾸지 않으므로 fp도 불변이어야 한다(전이 자체로 재-emit 없음).
+        let done_rev: u32 = sub_done.values().map(|d| d.rev).sum();
+        let done_count: usize = sub_done.values().map(|d| d.items.len()).sum();
         let sub_rev: u32 = subagents
             .values()
             .flat_map(|st| st.timeline().items().iter().map(|i| i.revision))
-            .sum();
-        let sub_count: usize = subagents.values().map(|st| st.timeline().items().len()).sum();
+            .sum::<u32>()
+            + done_rev;
+        let sub_count: usize =
+            subagents.values().map(|st| st.timeline().items().len()).sum::<usize>() + done_count;
 
         let items = t.timeline().items();
         // Token/model/usage changes can land without any item/answer change (a
@@ -632,7 +719,7 @@ fn run_timeline_poll(
         let tokens_v: Vec<(u64, TokenUsage)> = t.tokens().iter().map(|(k, v)| (*k, *v)).collect();
         let model_v: Option<String> = t.model().map(str::to_string);
         let last_usage_v: Option<TokenUsage> = t.last_usage();
-        let sub_raw: Vec<(String, u64, Vec<TimelineItem>)> = subagents
+        let active_frames: Vec<(String, u64, Vec<TimelineItem>)> = subagents
             .iter()
             .filter(|(_, st)| !st.timeline().items().is_empty())
             .map(|(aid, st)| {
@@ -643,6 +730,9 @@ fn run_timeline_poll(
                 )
             })
             .collect();
+        // P0 B2: 완료 프레임 병합 — payload/스냅샷 내용 보존(특성테스트
+        // merge_sub_frames_*).
+        let sub_raw = merge_sub_frames(active_frames, &sub_done);
         // Link each agent to the timeline item (the spawning `Agent`/`Task` call)
         // whose result mentions the agent id — that item, in main or in a parent
         // agent, is its parent (recursive tree). `None` ⇒ nest under its turn.
@@ -843,6 +933,32 @@ mod tests {
 
     fn agent(aid: &str, items: Vec<TimelineItem>) -> (String, u64, Vec<TimelineItem>) {
         (aid.to_string(), 1, items)
+    }
+
+    // P0 B2 특성테스트 — 기대값 손계산.
+    #[test]
+    fn stability_streak_advances_and_resets() {
+        assert_eq!(advance_stability((100, 0), 100), (100, 1)); // 무성장 → +1
+        assert_eq!(advance_stability((100, 5), 100), (100, 6));
+        assert_eq!(advance_stability((100, 5), 150), (150, 0)); // 성장 → 리셋
+    }
+
+    #[test]
+    fn merge_keeps_done_agent_frames_in_payload() {
+        let active = vec![agent("agent-live", vec![item("l-1", None)])];
+        let mut done: HashMap<String, DoneSub> = HashMap::new();
+        done.insert(
+            "agent-done".into(),
+            DoneSub { turn: 7, len: 42, items: vec![item("d-1", None)], rev: 1 },
+        );
+        let merged = merge_sub_frames(active, &done);
+        // 완료 에이전트가 (원 turn과 함께) payload에 계속 포함된다 — 보존 계약.
+        assert_eq!(merged.len(), 2);
+        let d = merged.iter().find(|(aid, _, _)| aid == "agent-done").expect("done frame");
+        assert_eq!(d.1, 7);
+        assert_eq!(d.2[0].tool_call_id, "d-1");
+        let l = merged.iter().find(|(aid, _, _)| aid == "agent-live").expect("live frame");
+        assert_eq!(l.2[0].tool_call_id, "l-1");
     }
 
     // P0 B1 특성테스트 — 기대값 손계산 (자기참조 금지).
