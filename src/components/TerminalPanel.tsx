@@ -159,19 +159,22 @@ export function TerminalPanel(props: IDockviewPanelProps<TerminalParams>) {
     };
     // pending 드롭이 있었으면 drain 직전 스냅샷을 다시 떠 갭을 잇는다(리뷰
     // P1/P2 — 스냅샷 이후 도착분 드롭은 상단 소실이 아니라 중간 절단이 된다).
-    // 화면 중복 방지 위해 reset 후 전체 재도장. 재스냅샷 동안 도착분은 계속
-    // pending에 쌓인다(ready 아직 false; 그 사이 재드롭은 잔존 창 — 두 번째
-    // 스냅샷 왕복 안에 다시 512KB가 필요해 실질 무시).
+    // 중복 방지 초기화는 term.reset()이 아니라 RIS(ESC c)를 **write 큐로**
+    // 보낸다 — reset()은 동기라 큐에 남은 이전 도장분이 reset 뒤에 그려져
+    // 순서가 깨진다(감사 B1). heal 왕복 중 재드롭이 나면 신호가 사라질 때까지
+    // 반복(감사 B2 — 상한은 연속 홍수 방어, 각 반복이 더 새 스냅샷으로 전진).
     const healDroppedGap = async () => {
-      if (!pendingDropped || sessionId == null) return;
-      try {
-        const snap = await invoke<SnapshotResult>("terminal_snapshot", { id: sessionId });
-        if (disposed) return;
-        term.reset();
-        write(decodePtyData(snap.data));
-        lastApplied = snap.last_seq;
-      } catch {
-        /* 세션 소멸 — drain이 남은 pending을 seq 게이트로 처리 */
+      for (let i = 0; i < 10 && pendingDropped && sessionId != null && !disposed; i++) {
+        pendingDropped = false;
+        try {
+          const snap = await invoke<SnapshotResult>("terminal_snapshot", { id: sessionId });
+          if (disposed) return;
+          write(new TextEncoder().encode("\x1bc")); // RIS — 큐 순서로 전체 초기화
+          write(decodePtyData(snap.data));
+          lastApplied = snap.last_seq;
+        } catch {
+          return; /* 세션 소멸 — drain이 남은 pending을 seq 게이트로 처리 */
+        }
       }
     };
 
@@ -266,21 +269,20 @@ export function TerminalPanel(props: IDockviewPanelProps<TerminalParams>) {
         }
         if (disposed) return; // create await 중 언마운트 — 구독/파라미터 갱신 불필요
         props.api.updateParameters({ ...props.params, sessionId, runCmd: undefined });
-        // 2) Fresh session: subscribe now the id exists. persist 복원(F11 —
-        // 디스크 seed는 seq를 소비하지 않는 순수 backfill이라 스냅샷으로만
-        // 나온다)일 때만 스냅샷을 떠 과거 출력을 그린다. 비영속 신생 세션은
-        // 스냅샷 생략 — 생성 직후 청크는 pending+seq 게이트가 잇고, 드롭 시
-        // healDroppedGap이 회수한다(리뷰: 무기록 동작 확장 방지 + IPC 절약).
+        // 2) Fresh session: subscribe now the id exists, then snapshot-backfill.
+        // 백엔드 relay는 create 반환 **전**부터 돌므로 생성~구독 사이 초기
+        // 청크(프롬프트)는 이벤트로 안 오고 스냅샷에만 있다 — 구 전역 리스너
+        // 시절에도 sessionId 미할당으로 동일 유실이던 갭을 여기서 회수(감사
+        // B3). 부수: F11 디스크 seed(스냅샷으로만 나옴)가 이 경로로 처음
+        // 실제 도장된다(ledger #4 — 의도된 동작 변경으로 기록).
         if (sessionId != null) {
           await subscribeOutput(sessionId);
-          if (persistKey != null) {
-            try {
-              const snap = await invoke<SnapshotResult>("terminal_snapshot", { id: sessionId });
-              write(decodePtyData(snap.data));
-              lastApplied = snap.last_seq;
-            } catch {
-              /* no scrollback yet */
-            }
+          try {
+            const snap = await invoke<SnapshotResult>("terminal_snapshot", { id: sessionId });
+            write(decodePtyData(snap.data));
+            lastApplied = snap.last_seq;
+          } catch {
+            /* no scrollback yet */
           }
         }
       }

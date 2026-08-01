@@ -709,18 +709,20 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
       unlistenTerm = un;
     };
     // pending 드롭 시 drain 직전 재스냅샷으로 갭을 잇는다(리뷰 P1/P2 — 중간
-    // 절단 방지). reset 후 전체 재도장(중복 방지); 재스냅샷 중 도착분은
-    // pending에 계속 쌓인다(ready 아직 false).
+    // 절단 방지). 초기화는 RIS(ESC c)를 write 큐로 — 동기 reset()은 큐 잔여
+    // 도장분과 순서가 깨진다(감사 B1). 재드롭 시 신호 소진까지 반복(감사 B2).
     const healDroppedGap = async () => {
-      if (!pendingDropped || sessionId == null) return;
-      try {
-        const snap = await invoke<SnapshotResult>("terminal_snapshot", { id: sessionId });
-        if (disposed) return;
-        term.reset();
-        write(decodePtyData(snap.data));
-        lastApplied = snap.last_seq;
-      } catch {
-        /* 세션 소멸 — drain이 seq 게이트로 처리 */
+      for (let i = 0; i < 10 && pendingDropped && sessionId != null && !disposed; i++) {
+        pendingDropped = false;
+        try {
+          const snap = await invoke<SnapshotResult>("terminal_snapshot", { id: sessionId });
+          if (disposed) return;
+          write(new TextEncoder().encode("\x1bc")); // RIS — 큐 순서로 전체 초기화
+          write(decodePtyData(snap.data));
+          lastApplied = snap.last_seq;
+        } catch {
+          return; /* 세션 소멸 — drain이 seq 게이트로 처리 */
+        }
       }
     };
 
