@@ -116,6 +116,21 @@ function AppMain() {
 
   const treePanelRef = useRef<ImperativePanelHandle>(null);
   const [collapsed, setCollapsed] = useState(false);
+  // project-dual-surface: 우측 분할에 열린 프로젝트 + 정리 규칙 2개.
+  const projects = useAppStore((s) => s.projects);
+  const dualProject = useAppStore((s) => s.dualProject);
+  const setDualProject = useAppStore((s) => s.setDualProject);
+  // ① 동일 프로젝트 양쪽 금지(spec §2): activeProject가 우측 프로젝트가 되는
+  //    순간 우측을 닫는다 — 같은 layout을 두 dock이 쓰면 저장 경합·이중 attach.
+  useEffect(() => {
+    if (dualProject && dualProject === activeProject) setDualProject(null);
+  }, [dualProject, activeProject, setDualProject]);
+  // ② 복원 가드: 열린 탭 목록에 없는 프로젝트(닫혔거나 복원 무효)는 정리.
+  useEffect(() => {
+    if (dualProject && projects.length > 0 && !projects.some((p) => p.path === dualProject)) {
+      setDualProject(null);
+    }
+  }, [dualProject, projects, setDualProject]);
   // 작업 영역에 드롭된 OS 파일들의 메모리 뷰 (workarea-drop-view — 완전 읽기
   // 전용, 디스크에 아무것도 쓰지 않음). 첫 파일 활성 + 탭 전환.
   const [droppedPeek, setDroppedPeek] = useState<{
@@ -755,7 +770,40 @@ function AppMain() {
               measured size. DevView only mounts once its project has entered dev
               (mount latch, 불변식 ④). */}
           <div className={`main-layer${layerMode === "dev" ? " main-layer-back" : ""}`}>
-            <MainArea />
+            {/* project-dual-surface: 주 dock + (열려 있으면) 우측 수동 dock.
+                주 Panel은 항상 마운트 — 분할 토글이 주 dock을 리마운트하지
+                않도록 조건부는 우측 쌍에만 둔다. */}
+            <PanelGroup direction="horizontal" autoSaveId="dual-surface" className="dual-row">
+              <Panel id="dual-primary" order={1} minSize={25}>
+                <MainArea />
+              </Panel>
+              {dualProject && (
+                <>
+                  <PanelResizeHandle className="resize-handle" />
+                  <Panel id="dual-secondary" order={2} minSize={20} defaultSize={40}>
+                    <div className="dual-secondary">
+                      <div className="dual-secondary-head">
+                        <span className="dual-secondary-name" title={dualProject}>
+                          {projects.find((p) => p.path === dualProject)?.name ?? dualProject}
+                        </span>
+                        <button
+                          className="dual-secondary-close"
+                          title="우측 분할 닫기"
+                          onClick={() => setDualProject(null)}
+                        >
+                          ×
+                        </button>
+                      </div>
+                      <div className="dual-secondary-body">
+                        {/* keyed: 다른 프로젝트로 교체 시 dock 리마운트 → 그
+                            프로젝트 레이아웃 복원 (주 surface와 같은 원리) */}
+                        <MainArea key={dualProject} project={dualProject} secondary />
+                      </div>
+                    </div>
+                  </Panel>
+                </>
+              )}
+            </PanelGroup>
           </div>
           {devMounted && activeProject && (
             <div className={`main-layer${layerMode === "dev" ? "" : " main-layer-back"}`}>

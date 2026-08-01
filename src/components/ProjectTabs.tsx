@@ -10,6 +10,10 @@ export function ProjectTabs() {
   const addProject = useAppStore((s) => s.addProject);
   const closeProject = useAppStore((s) => s.closeProject);
   const reorderProject = useAppStore((s) => s.reorderProject);
+  const dualProject = useAppStore((s) => s.dualProject);
+  const setDualProject = useAppStore((s) => s.setDualProject);
+  // 탭 우클릭 컨텍스트 메뉴 (project-dual-surface 진입점).
+  const [ctxMenu, setCtxMenu] = useState<{ path: string; x: number; y: number } | null>(null);
 
   // HTML5 drag-drop reorder state (transient, view-only).
   const [draggedPath, setDraggedPath] = useState<string | null>(null);
@@ -73,6 +77,10 @@ export function ProjectTabs() {
               setOverPath(null);
             }}
             onClick={() => setActive(p.path)}
+            onContextMenu={(e) => {
+              e.preventDefault();
+              setCtxMenu({ path: p.path, x: e.clientX, y: e.clientY });
+            }}
             title={p.path}
             style={{
               opacity: isDragged ? 0.4 : 1,
@@ -102,6 +110,47 @@ export function ProjectTabs() {
       <button className="tab-add" onClick={handleAdd} title="Open folder">
         +
       </button>
+      {ctxMenu && (
+        <>
+          <div
+            className="tab-ctx-backdrop"
+            onClick={() => setCtxMenu(null)}
+            onContextMenu={(e) => {
+              e.preventDefault();
+              setCtxMenu(null);
+            }}
+          />
+          <div className="tab-ctx-menu" style={{ left: ctxMenu.x, top: ctxMenu.y }}>
+            {dualProject === ctxMenu.path ? (
+              <button
+                className="tab-ctx-item"
+                onClick={() => {
+                  setDualProject(null);
+                  setCtxMenu(null);
+                }}
+              >
+                우측 분할 닫기
+              </button>
+            ) : (
+              <button
+                className="tab-ctx-item"
+                disabled={ctxMenu.path === activeProject}
+                title={
+                  ctxMenu.path === activeProject
+                    ? "활성 프로젝트는 이미 왼쪽에 열려 있습니다 — 다른 프로젝트를 분할로 여세요"
+                    : "이 프로젝트의 작업 영역을 우측 분할로 나란히 엽니다"
+                }
+                onClick={() => {
+                  setDualProject(ctxMenu.path);
+                  setCtxMenu(null);
+                }}
+              >
+                우측 분할로 열기
+              </button>
+            )}
+          </div>
+        </>
+      )}
     </div>
   );
 }
