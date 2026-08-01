@@ -2356,6 +2356,31 @@ body {
   line-height: 1.5;
   margin: 0;
 }
+/* P1: 32KB 절단 안내 배너 — 원문 lazy 로딩 중/실패(재시도) 상태 표시. */
+.claudeterm-trunc-note {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 6px;
+  padding: 4px 8px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: var(--bg-alt);
+  color: var(--fg-dim);
+  font-size: 0.8em;
+}
+.claudeterm-trunc-retry {
+  padding: 1px 8px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: transparent;
+  color: var(--fg);
+  cursor: pointer;
+  font-size: 1em;
+}
+.claudeterm-trunc-retry:hover {
+  background: var(--bg-hover);
+}
 .claudeterm-viewer-x {
   cursor: pointer;
   padding: 0 4px;
@@ -2482,6 +2507,23 @@ body {
   background: var(--sel-bg);
   outline: 1px solid var(--accent);
 }
+/* P1: 렌더 캡 "이전 N턴 더 보기" — 목록 최상단 버튼. */
+.timeline-more {
+  display: block;
+  width: 100%;
+  padding: 6px 8px;
+  background: var(--bg-alt);
+  border: 1px dashed var(--border);
+  border-radius: 6px;
+  color: var(--fg-dim);
+  font-size: 11px;
+  cursor: pointer;
+}
+.timeline-more:hover {
+  color: var(--fg);
+  background: var(--bg-hover);
+}
+
 .timeline-empty {
   padding: 12px 8px;
   font-size: 12px;

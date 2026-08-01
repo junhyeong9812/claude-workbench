@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { buildItemIndex, groupItemsByTurn } from "./timelineIndex";
+import { buildItemIndex, groupItemsByTurn, sliceRecentTurns } from "./timelineIndex";
 
 /** P0 F1 특성테스트 — 기대값은 손계산(자기참조 금지). 추가로 기존 렌더
  * 경로의 naive filter+sort와의 동치를 같은 픽스처로 검증한다. */
@@ -42,6 +42,23 @@ describe("groupItemsByTurn", () => {
 
   it("빈 입력 → 빈 인덱스", () => {
     expect(groupItemsByTurn([]).size).toBe(0);
+  });
+});
+
+describe("sliceRecentTurns", () => {
+  it("상한 이하는 전체·hidden 0", () => {
+    expect(sliceRecentTurns([1, 2, 3], 30)).toEqual({ visible: [1, 2, 3], hiddenCount: 0 });
+  });
+  it("초과 시 최근 N턴만 + hidden 수", () => {
+    const nos = Array.from({ length: 50 }, (_, i) => i + 1);
+    const r = sliceRecentTurns(nos, 30);
+    expect(r.visible.length).toBe(30);
+    expect(r.visible[0]).toBe(21); // 오래된 20턴이 숨김
+    expect(r.visible[29]).toBe(50);
+    expect(r.hiddenCount).toBe(20);
+  });
+  it("limit<=0은 전체(방어)", () => {
+    expect(sliceRecentTurns([1, 2], 0).visible).toEqual([1, 2]);
   });
 });
 

@@ -124,6 +124,12 @@ pub struct TimelineItem {
     /// Text the tool produced — a read's content, a search/exec output, an
     /// explanation — for the detail view (B4). Concatenated text content.
     pub content_text: Option<String>,
+    /// P1: 표시 계층(payload·스냅샷)에서 `content_text`가 상한으로 절단됐음 —
+    /// 뷰어가 원문을 `claude_item_detail`로 lazy 조회한다. 원본 JSONL·아카이브
+    /// 정규화는 전문 유지(절단은 commands 층에서만 적용). 구 스냅샷 호환을
+    /// 위해 serde default.
+    #[serde(default)]
+    pub content_truncated: bool,
     /// Raw tool input (the command, the path, …), for the detail view (B4).
     pub raw_input: Option<serde_json::Value>,
     pub agent_status: AgentStatus,
@@ -149,6 +155,7 @@ impl TimelineItem {
             cwd: None,
             diffs: Vec::new(),
             content_text: None,
+            content_truncated: false,
             raw_input: None,
             agent_status: AgentStatus::Pending,
             write_status: WriteStatus::None,
