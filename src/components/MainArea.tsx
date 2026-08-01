@@ -140,8 +140,17 @@ function focusActivePanelContent(area?: PanelArea) {
  * again and restores *that* project's saved layout (or an empty layout). Layout
  * changes are persisted back to the store via `onDidLayoutChange`.
  */
-export function MainArea() {
+export function MainArea({
+  project,
+  secondary = false,
+}: { project?: string; secondary?: boolean } = {}) {
   const activeProject = useAppStore((s) => s.activeProject);
+  // 이 surface가 소유한 프로젝트: 주(primary)는 activeProject, 부(secondary)는
+  // prop 고정(project-dual-surface). 부 surface는 **수동적 dock** — 전역 요청
+  // 버스·window 리스너·창 수명 훅·메뉴/모달을 일절 소비/등록하지 않는다
+  // (spec §2 단일 소비자 불변식). 아래 각 지점이 isPrimary로 게이트된다.
+  const isPrimary = !secondary;
+  const surfaceProject = secondary ? (project ?? null) : activeProject;
   const theme = useAppStore((s) => s.theme);
   const projects = useAppStore((s) => s.projects);
   const projectModes = useAppStore((s) => s.projectModes);
@@ -206,7 +215,7 @@ export function MainArea() {
   const [apiReady, setApiReady] = useState(false);
 
   // The layout for the project this mount belongs to (read once at onReady).
-  const savedLayout = projects.find((p) => p.path === activeProject)?.layout;
+  const savedLayout = projects.find((p) => p.path === surfaceProject)?.layout;
 
   const onReady = (event: DockviewReadyEvent) => {
     const api = event.api;
@@ -225,8 +234,8 @@ export function MainArea() {
 
     // Persist after restore so the restore itself does not redundantly re-save.
     api.onDidLayoutChange(() => {
-      if (activeProject) {
-        setLayout(activeProject, api.toJSON());
+      if (surfaceProject) {
+        setLayout(surfaceProject, api.toJSON());
       }
     });
 
@@ -254,7 +263,9 @@ export function MainArea() {
     // (review P3/P4). Shared wiring with popouts. Dispose any prior gesture from
     // an earlier (project-keyed) mount before re-installing (review P4-impl #5).
     dragSubRef.current?.dispose();
-    dragSubRef.current = installDragOut(api);
+    // 창 분리 드래그는 주 surface만 — 전송 envelope가 activeProject 기준이라
+    // 부 surface에서 끌면 프로젝트가 뒤바뀐다 (spec §2).
+    if (isPrimary) dragSubRef.current = installDragOut(api);
   };
 
   // Tear down the drag gesture wiring on unmount.
@@ -266,6 +277,7 @@ export function MainArea() {
   // to main (review P4). apiRef is read per-event so a project-keyed remount
   // never leaves a stale dock.
   useEffect(() => {
+    if (!isPrimary) return; // 창당 수신자 1개 — 부 surface 등록 시 이중 처리
     const label = getCurrentWindow().label;
     let un: (() => void) | undefined;
     installTransferTarget(label, () => apiRef.current, transferProcessedRef.current)
@@ -280,6 +292,7 @@ export function MainArea() {
   // their acks (with a fallback timeout) before destroying them, so nothing
   // leaks — destroy() may skip a popout's own close handler (review P4-impl #2).
   useEffect(() => {
+    if (!isPrimary) return; // 창 수명 훅은 주 surface만 등록(이중 등록 방지)
     const win = getCurrentWindow();
     if (win.label !== "main") return;
     const unP = win.onCloseRequested(async (event) => {
@@ -518,6 +531,7 @@ export function MainArea() {
   // `ssh-status` event, so handling it globally guarantees it's never silent
   // (review P3-R1).
   useEffect(() => {
+    if (!isPrimary) return; // 전역 알림/모달은 주 surface 1곳만
     const unPrompt = listen<HostKeyPrompt>("ssh-hostkey-prompt", (e) => {
       setHostKeyQueue((q) => [...q, e.payload]);
     });
@@ -553,6 +567,7 @@ export function MainArea() {
   // 않고 그대로 두어 DevView가 소비하게 한다: 유실≠소비. layerMode를 deps에 넣어
   // 같은 틱 모드 전환에도 재평가된다.)
   useEffect(() => {
+    if (!isPrimary) return; // 부 surface는 요청 버스 비소비 (spec §2)
     if (!integratedIsFront(layerMode)) return; // dev layer's request — leave it
     if (!editorOpenRequest) return;
     const api = apiRef.current;
@@ -578,6 +593,7 @@ export function MainArea() {
   // (통합·개발 두 레이어가 동시 마운트되므로 앞 레이어인 통합 모드일 때만 소비한다 —
   // 개발 모드면 요청을 클리어하지 않고 남겨 두어 통합 복귀 시 소비된다: 유실≠소비.)
   useEffect(() => {
+    if (!isPrimary) return; // 부 surface는 요청 버스 비소비 (spec §2)
     if (!integratedIsFront(layerMode)) return; // dev layer in front — leave the request
     if (!diffRequest) return;
     const api = apiRef.current;
@@ -610,6 +626,7 @@ export function MainArea() {
   // (통합·개발 두 레이어가 동시 마운트되므로 앞 레이어인 통합 모드일 때만 소비한다 —
   // 개발 모드면 요청을 클리어하지 않고 남겨 두어 통합 복귀 시 소비된다: 유실≠소비.)
   useEffect(() => {
+    if (!isPrimary) return; // 부 surface는 요청 버스 비소비 (spec §2)
     if (!integratedIsFront(layerMode)) return; // dev layer in front — leave the request
     if (!claudeOpenRequest) return;
     const { project, seed, title: reqTitle, referencePanelId } = claudeOpenRequest;
@@ -642,6 +659,7 @@ export function MainArea() {
   // (통합·개발 두 레이어가 동시 마운트되므로 앞 레이어인 통합 모드일 때만 소비한다 —
   // 개발 모드면 요청을 클리어하지 않고 남겨 두어 통합 복귀 시 소비된다: 유실≠소비.)
   useEffect(() => {
+    if (!isPrimary) return; // 부 surface는 요청 버스 비소비 (spec §2)
     if (!integratedIsFront(layerMode)) return; // dev layer in front — leave the request
     if (!runRequest) return;
     if (runRequest.project !== activeProject) return;
@@ -750,6 +768,7 @@ export function MainArea() {
   // 에 취약하므로, 이벤트는 트리거로만 쓰고 판정은 백엔드 in_flight 재조회로
   // 한다 (리뷰 F7 — 백엔드가 canonicalize로 동일성을 판정).
   useEffect(() => {
+    if (!isPrimary) return; // 피커는 주 surface 전용
     const refresh = () => {
       if (!activeProject) return;
       // started/finished 연속 발생 시 응답 역전으로 낡은 true가 나중에 도착해
@@ -809,6 +828,7 @@ export function MainArea() {
   // Ctrl+←/→ pane focus. (The newly-active panel focuses its own content on the
   // onlyWhenVisible remount — no focus call here, which would race the xterm.)
   useEffect(() => {
+    if (!isPrimary) return; // window 단축키는 주 surface만 (이중 처리 방지)
     const onKey = (e: KeyboardEvent) => {
       if (!e.altKey) return;
       const dir =
@@ -876,6 +896,7 @@ export function MainArea() {
   // input lands there. Skip the initial 0 so a fresh mount doesn't steal focus.
   const lastFocusHandledRef = useRef(0);
   useEffect(() => {
+    if (!isPrimary) return; // 부 surface는 포커스 요청 비소비
     // Claim each distinct request once; a layerMode-only re-fire (deps) must not
     // replay an already-handled focus. Skip the initial 0 (fresh-mount steal).
     if (focusMainRequest === 0 || focusMainRequest === lastFocusHandledRef.current) return;
@@ -905,6 +926,7 @@ export function MainArea() {
   const termMenuRequest = useAppStore((s) => s.termMenuRequest);
   const termMenuHandledRef = useRef(termMenuRequest);
   useEffect(() => {
+    if (!isPrimary) return;
     if (termMenuRequest === termMenuHandledRef.current) return;
     termMenuHandledRef.current = termMenuRequest;
     if (!integratedIsFront(layerMode)) return;
@@ -916,6 +938,7 @@ export function MainArea() {
   const claudePickerRequest = useAppStore((s) => s.claudePickerRequest);
   const claudePickerHandledRef = useRef(claudePickerRequest);
   useEffect(() => {
+    if (!isPrimary) return;
     if (claudePickerRequest === claudePickerHandledRef.current) return;
     claudePickerHandledRef.current = claudePickerRequest;
     if (!integratedIsFront(layerMode)) return;
@@ -930,6 +953,7 @@ export function MainArea() {
   const detachPanelRequest = useAppStore((s) => s.detachPanelRequest);
   const detachHandledRef = useRef(detachPanelRequest);
   useEffect(() => {
+    if (!isPrimary) return;
     if (detachPanelRequest === detachHandledRef.current) return;
     detachHandledRef.current = detachPanelRequest;
     // Only the front (integrated) dock detaches — the App button is disabled in
@@ -974,6 +998,7 @@ export function MainArea() {
   const sessionResumeRequest = useAppStore((s) => s.sessionResumeRequest);
   const requestSessionResume = useAppStore((s) => s.requestSessionResume);
   useEffect(() => {
+    if (!isPrimary) return; // 부 surface는 resume 요청 비소비
     if (!integratedIsFront(layerMode)) return;
     if (!sessionResumeRequest) return;
     const api = apiRef.current;
@@ -1067,6 +1092,7 @@ export function MainArea() {
   };
 
   const onSessionDragOver = (e: React.DragEvent) => {
+    if (!isPrimary) return; // 드롭 존은 주 surface 전용 (부는 수동적 dock)
     if (!isSessionDrag(e)) return;
     if (!integratedIsFront(layerMode)) return;
     cancelLeaveTimer();
@@ -1106,6 +1132,7 @@ export function MainArea() {
   };
 
   const onSessionDrop = (e: React.DragEvent) => {
+    if (!isPrimary) return;
     if (!isSessionDrag(e)) return;
     e.preventDefault();
     e.stopPropagation();
@@ -1135,6 +1162,7 @@ export function MainArea() {
   // (onSessionDrop은 state가 아니라 드롭 좌표 재계산을 쓰므로, 캡처 단계에서
   // 먼저 지워져도 무해하다.)
   useEffect(() => {
+    if (!isPrimary) return;
     const clear = () => {
       cancelLeaveTimer();
       setSessionDrop(null);
@@ -1156,6 +1184,7 @@ export function MainArea() {
   // fresh session's uuid == its loadSessionId). No-op if no panel here owns it —
   // it lives in another window's dock (a documented limitation of the roll-up).
   useEffect(() => {
+    if (!isPrimary) return; // 롤업 포커스는 주 surface만
     if (!focusSessionRequest) return;
     const api = apiRef.current;
     if (!api) return;
@@ -1183,7 +1212,7 @@ export function MainArea() {
       onDragLeave={onSessionDragLeave}
       onDrop={onSessionDrop}
     >
-      <DropTargetOverlay />
+      {isPrimary && <DropTargetOverlay />}
       {sessionDrop && (
         <div
           className="drop-session-zone"
@@ -1198,6 +1227,7 @@ export function MainArea() {
       {/* Zero-height anchor for the dropdowns that used to hang off the removed
           main-toolbar row — the "+ Terminal"/"+ Claude" buttons now live in the
           app toolbar and drive these via store request counters (task 01). */}
+      {isPrimary && (
       <div className="main-menus">
         {termMenu && (
           <div className="claude-picker" onMouseLeave={() => setTermMenu(false)}>
@@ -1383,15 +1413,18 @@ export function MainArea() {
           </div>
         )}
       </div>
+      )}
       <DockviewReact
-        key={activeProject ?? "none"}
-        className={`dockview-theme-${theme === "light" ? "light" : "dark"} main-dock`}
+        key={surfaceProject ?? "none"}
+        className={`dockview-theme-${theme === "light" ? "light" : "dark"} ${isPrimary ? "main-dock" : "secondary-dock"}`}
         components={components}
         defaultTabComponent={AppTab}
         onReady={onReady}
       />
 
-      {closeRequest && (
+      {/* 닫기 모달은 요청된 패널을 **소유한** surface만 띄운다 — 두 mount가
+          같은 closeRequest를 이중 소비하지 않게 (project-dual-surface). */}
+      {closeRequest && apiRef.current?.getPanel(closeRequest.panelId) && (
         <div className="claude-modal-backdrop" onClick={() => clearClose()}>
           <div className="claude-modal" onClick={(e) => e.stopPropagation()}>
             <div className="claude-modal-title">이 Claude 세션을 어떻게 할까요?</div>
@@ -1411,7 +1444,7 @@ export function MainArea() {
         </div>
       )}
 
-      {sshForm && (
+      {isPrimary && sshForm && (
         <div className="claude-modal-backdrop" onClick={() => setSshForm(null)}>
           <div className="claude-modal ssh-dialog" onClick={(e) => e.stopPropagation()}>
             <div className="claude-modal-title">새 SSH 연결</div>
@@ -1519,7 +1552,7 @@ export function MainArea() {
         </div>
       )}
 
-      {hostKeyQueue[0] && (
+      {isPrimary && hostKeyQueue[0] && (
         <div className="claude-modal-backdrop">
           <div className="claude-modal" onClick={(e) => e.stopPropagation()}>
             <div className="claude-modal-title">처음 접속하는 호스트입니다</div>
