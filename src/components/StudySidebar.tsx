@@ -3,7 +3,7 @@ import { open } from "@tauri-apps/plugin-dialog";
 import { useAppStore } from "../state/store";
 import { StudyTree } from "./StudyTree";
 
-const basename = (p: string): string => p.split(/[\\/]/).filter(Boolean).pop() ?? p;
+import { basename } from "../utils/path";
 
 /** A study sidebar: pick a root folder, then browse it (mouse or keyboard). The
  * 뷰어/에디터 toggle controls how files open — viewer follows the tree cursor

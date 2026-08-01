@@ -3,7 +3,7 @@ import { useAppStore } from "../state/store";
 import { StudyFileView } from "./StudyFileView";
 import { ContextMenu, copyText } from "./ContextMenu";
 
-const basename = (p: string): string => p.split(/[\\/]/).filter(Boolean).pop() ?? p;
+import { basename } from "../utils/path";
 
 /**
  * A study viewer: multi-tab read-only file view for one side. Tabs are MRU
