@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { errText } from "../utils/error";
 import type { TerminalOutputEvent, SnapshotResult } from "../types";
 import type { IDockviewPanelProps } from "dockview-react";
@@ -390,22 +390,43 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [props.api]);
   // Drag the terminal|viewer splitter to resize the viewer (timeline stays 360px).
+  /** 스플리터 드래그 공통 (P0 F3): mousemove(>60Hz)마다 setState → 패널 전체
+   * 재렌더가 프레임 드랍의 원인이라, rAF로 프레임당 1회로 합친다. 보존 계약:
+   * 드래그 중 시각 추종(프레임 단위) + 종료 시 마지막 좌표 반영 + 클램프 동일. */
+  const dragWithRaf = (compute: (clientX: number) => number, set: (w: number) => void) => {
+    let raf = 0;
+    let lastX = 0;
+    let moved = false; // move 없는 클릭은 기존처럼 아무 set도 하지 않는다
+    const onMove = (ev: MouseEvent) => {
+      lastX = ev.clientX;
+      moved = true;
+      if (raf) return;
+      raf = requestAnimationFrame(() => {
+        raf = 0;
+        set(compute(lastX));
+      });
+    };
+    const onUp = () => {
+      if (raf) cancelAnimationFrame(raf);
+      raf = 0;
+      if (moved) set(compute(lastX)); // 마지막 좌표 확정 커밋 — 최종 폭 보존
+      window.removeEventListener("mousemove", onMove);
+      window.removeEventListener("mouseup", onUp);
+    };
+    window.addEventListener("mousemove", onMove);
+    window.addEventListener("mouseup", onUp);
+  };
+
   const startDrag = (e: React.MouseEvent) => {
     e.preventDefault();
     const container = containerRef.current;
     if (!container) return;
     const rect = container.getBoundingClientRect();
     const TIMELINE_W = 360;
-    const onMove = (ev: MouseEvent) => {
-      const w = rect.right - TIMELINE_W - ev.clientX;
-      setViewerWidth(Math.max(240, Math.min(rect.width - TIMELINE_W - 240, w)));
-    };
-    const onUp = () => {
-      window.removeEventListener("mousemove", onMove);
-      window.removeEventListener("mouseup", onUp);
-    };
-    window.addEventListener("mousemove", onMove);
-    window.addEventListener("mouseup", onUp);
+    dragWithRaf(
+      (x) => Math.max(240, Math.min(rect.width - TIMELINE_W - 240, rect.right - TIMELINE_W - x)),
+      setViewerWidth,
+    );
   };
   // Drag the timeline splitter to resize the timeline column.
   const startDragAgents = (e: React.MouseEvent) => {
@@ -420,15 +441,7 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
     // render) — over-reserving when a selection has no item is harmless.
     const others = timelineWidth + (selectedId != null || textView != null ? viewerWidth : 0);
     const max = Math.max(220, container.getBoundingClientRect().width - others - 240);
-    const onMove = (ev: MouseEvent) => {
-      setAgentsWidth(Math.max(220, Math.min(max, right - ev.clientX)));
-    };
-    const onUp = () => {
-      window.removeEventListener("mousemove", onMove);
-      window.removeEventListener("mouseup", onUp);
-    };
-    window.addEventListener("mousemove", onMove);
-    window.addEventListener("mouseup", onUp);
+    dragWithRaf((x) => Math.max(220, Math.min(max, right - x)), setAgentsWidth);
   };
 
   const startDragTimeline = (e: React.MouseEvent) => {
@@ -436,15 +449,10 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
     const container = containerRef.current;
     if (!container) return;
     const rect = container.getBoundingClientRect();
-    const onMove = (ev: MouseEvent) => {
-      setTimelineWidth(Math.max(220, Math.min(rect.width - 240, rect.right - ev.clientX)));
-    };
-    const onUp = () => {
-      window.removeEventListener("mousemove", onMove);
-      window.removeEventListener("mouseup", onUp);
-    };
-    window.addEventListener("mousemove", onMove);
-    window.addEventListener("mouseup", onUp);
+    dragWithRaf(
+      (x) => Math.max(220, Math.min(rect.width - 240, rect.right - x)),
+      setTimelineWidth,
+    );
   };
 
   // Live-update the xterm palette when the app theme or custom colors change.
@@ -897,11 +905,18 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  const selectedItem = selectedId
-    ? ([items, ...subagents.map(([, , , its]) => its)]
-        .flat()
-        .find((it) => it.tool_call_id === selectedId) ?? null)
-    : null;
+  // tool_call_id → item 인덱스 (P0 F2) — 기존 flat().find와 동일한 우선순위
+  // (본 items 먼저, 그다음 서브에이전트 순서·각 배열 순서)를 "먼저 넣은 것
+  // 유지"로 보존한다. 렌더마다 전체 배열 재할당+선형 탐색 → 변경 시 1회 빌드.
+  const itemIndex = useMemo(() => {
+    const m = new Map<string, TimelineItem>();
+    for (const it of items) if (!m.has(it.tool_call_id)) m.set(it.tool_call_id, it);
+    for (const [, , , its] of subagents) {
+      for (const it of its) if (!m.has(it.tool_call_id)) m.set(it.tool_call_id, it);
+    }
+    return m;
+  }, [items, subagents]);
+  const selectedItem = selectedId ? (itemIndex.get(selectedId) ?? null) : null;
 
   return (
     <div className="claudeterm" ref={containerRef} onKeyDown={onContainerKey}>
