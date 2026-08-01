@@ -106,9 +106,44 @@ fn dir(base: &Path, project: &str) -> PathBuf {
     base.join("projects").join(project_key(project)).join("claude")
 }
 
+/// P1: 목록용 요약 사이드카(`<uuid>.meta.json`) — `list()`가 본문(수 MB)을
+/// 전문 파싱하지 않고 O(1) 조회한다. 파생 캐시: 본문과 함께 쓰고, 부재/낡음
+/// (meta mtime < body mtime)이면 전문 파싱 폴백 + 자가 치유 재생성.
+#[derive(Serialize, Deserialize)]
+struct SnapshotMeta {
+    name: String,
+    title: String,
+    date: String,
+    count: usize,
+}
+
+fn meta_of(snap: &SessionSnapshot) -> SnapshotMeta {
+    SnapshotMeta {
+        name: snap.name.clone(),
+        title: snap
+            .turns
+            .iter()
+            .min_by_key(|(t, _)| *t)
+            .map(|(_, p)| p.clone())
+            .unwrap_or_default(),
+        date: snap.date.clone(),
+        count: snap.items.len(),
+    }
+}
+
+fn write_meta(dir: &Path, uuid: &str, meta: &SnapshotMeta) -> io::Result<()> {
+    let json = serde_json::to_string(meta)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    let tmp = unique_tmp(dir, &format!("{uuid}.meta.json"));
+    fs::write(&tmp, json)?;
+    fs::rename(&tmp, dir.join(format!("{uuid}.meta.json")))
+}
+
 /// Write (overwrite) a session snapshot **body** atomically (unique temp +
 /// rename). The display name is kept in a separate `.name` file (see
 /// [`save_name`]) so a rename and the poll thread never clobber each other.
+/// P1: 본문 **다음에** meta 사이드카를 쓴다(가정①: 순서+mtime 비교로 낡은
+/// meta는 list()가 무시).
 pub fn save(base: &Path, project: &str, snap: &SessionSnapshot) -> io::Result<()> {
     if !is_safe_uuid(&snap.uuid) {
         return Err(io::Error::new(io::ErrorKind::InvalidInput, "unsafe session id"));
@@ -119,7 +154,9 @@ pub fn save(base: &Path, project: &str, snap: &SessionSnapshot) -> io::Result<()
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
     let tmp_path = unique_tmp(&dir, &format!("{}.json", snap.uuid));
     fs::write(&tmp_path, json)?;
-    fs::rename(&tmp_path, dir.join(format!("{}.json", snap.uuid)))
+    fs::rename(&tmp_path, dir.join(format!("{}.json", snap.uuid)))?;
+    let _ = write_meta(&dir, &snap.uuid, &meta_of(snap)); // 파생 캐시 — 실패해도 본문이 정본
+    Ok(())
 }
 
 /// Override a session's display name without touching its timeline body
@@ -278,12 +315,44 @@ pub fn list(base: &Path, project: &str) -> Vec<SnapshotSummary> {
         if path.extension().and_then(|e| e.to_str()) != Some("json") {
             continue; // skip *.json.tmp and strays
         }
+        let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        if stem.ends_with(".meta") {
+            continue; // 사이드카 자신은 세션 본문이 아니다
+        }
+        // P1: 신선한 meta 사이드카(본문보다 새것)가 있으면 전문 파싱을 건너뛴다
+        // — 피커 오픈마다 수십 MB 역직렬화하던 병목 제거. 낡거나 손상이면
+        // 폴백(전문 파싱)이 정확성을 보장하고 meta를 재생성한다(자가 치유).
+        let meta_path = path.with_file_name(format!("{stem}.meta.json"));
+        let body_mtime = entry.metadata().and_then(|m| m.modified()).ok();
+        let meta_fresh = match (fs::metadata(&meta_path).and_then(|m| m.modified()).ok(), body_mtime)
+        {
+            (Some(mm), Some(bm)) => mm >= bm,
+            _ => false,
+        };
+        if meta_fresh {
+            if let Ok(mtext) = fs::read_to_string(&meta_path) {
+                if let Ok(meta) = serde_json::from_str::<SnapshotMeta>(&mtext) {
+                    let name = read_name(base, project, stem).unwrap_or(meta.name);
+                    out.push(SnapshotSummary {
+                        uuid: stem.to_string(),
+                        name,
+                        title: meta.title,
+                        date: meta.date,
+                        count: meta.count,
+                    });
+                    continue;
+                }
+            }
+        }
         let Ok(text) = fs::read_to_string(&path) else {
             continue;
         };
         let Ok(snap) = serde_json::from_str::<SessionSnapshot>(&text) else {
             continue;
         };
+        let _ = write_meta(&dir(base, project), &snap.uuid, &meta_of(&snap)); // 자가 치유
         let title = snap
             .turns
             .iter()
@@ -563,5 +632,83 @@ mod tests {
         delete(&base, "/p", "u1").unwrap();
         assert!(read_task_meta(&base, "/p", "u1").is_none());
         let _ = fs::remove_dir_all(&base);
+    }
+}
+
+#[cfg(test)]
+mod meta_tests {
+    use super::*;
+
+    fn temp_base(tag: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("mt-meta-{}-{tag}", std::process::id()));
+        let _ = fs::remove_dir_all(&d);
+        fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    fn snap(uuid: &str, name: &str, date: &str) -> SessionSnapshot {
+        SessionSnapshot {
+            uuid: uuid.into(),
+            name: name.into(),
+            date: date.into(),
+            items: Vec::new(),
+            turns: vec![(2, "둘째 질문".into()), (1, "첫 질문".into())],
+            answers: Vec::new(),
+            dates: Vec::new(),
+            tokens: Vec::new(),
+            model: None,
+            last_usage: None,
+            prev_uuid: None,
+            summary_path: None,
+            title: None,
+            summary: None,
+        }
+    }
+
+    /// P1 특성: 신선한 meta 경로와 전문 파싱 폴백이 같은 요약을 낸다.
+    #[test]
+    fn list_via_meta_equals_full_parse_fallback() {
+        let base = &temp_base("eq");
+        save(base, "/p", &snap("aaaa-1111", "세션A", "2026-08-01")).unwrap();
+        let via_meta = list(base, "/p");
+        assert_eq!(via_meta.len(), 1);
+        assert_eq!(via_meta[0].title, "첫 질문"); // 최저 턴 프롬프트 = title
+        // meta 삭제 → 전문 파싱 폴백이 같은 결과 + 자가 치유로 meta 재생성.
+        let meta = base.join("projects").join(project_key("/p")).join("claude").join("aaaa-1111.meta.json");
+        fs::remove_file(&meta).unwrap();
+        let via_body = list(base, "/p");
+        assert_eq!(via_meta[0].uuid, via_body[0].uuid);
+        assert_eq!(via_meta[0].title, via_body[0].title);
+        assert_eq!(via_meta[0].date, via_body[0].date);
+        assert_eq!(via_meta[0].count, via_body[0].count);
+        assert!(meta.exists(), "list() 폴백이 meta를 재생성해야 한다");
+    }
+
+    /// P1 특성: 낡은 meta(본문이 더 새것)는 무시되고 폴백이 정확성을 지킨다.
+    #[test]
+    fn stale_meta_falls_back_to_body() {
+        let base = &temp_base("stale");
+        save(base, "/p", &snap("bbbb-2222", "옛이름", "2026-01-01")).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(15));
+        // 본문만 직접 갱신(meta는 낡은 채) — save()를 우회한 외부 쓰기 시뮬레이션.
+        let d = base.join("projects").join(project_key("/p")).join("claude");
+        let newer = snap("bbbb-2222", "새이름", "2026-08-01");
+        fs::write(d.join("bbbb-2222.json"), serde_json::to_string(&newer).unwrap()).unwrap();
+        let out = list(base, "/p");
+        assert_eq!(out[0].date, "2026-08-01", "낡은 meta가 아니라 본문이 이겨야 한다");
+        assert_eq!(out[0].name, "새이름");
+    }
+
+    /// 손상 meta → 폴백 (무음 오류 금지: 결과는 항상 정확).
+    #[test]
+    fn corrupt_meta_falls_back() {
+        let base = &temp_base("corrupt");
+        save(base, "/p", &snap("cccc-3333", "이름", "2026-08-01")).unwrap();
+        let d = base.join("projects").join(project_key("/p")).join("claude");
+        std::thread::sleep(std::time::Duration::from_millis(15));
+        fs::write(d.join("cccc-3333.meta.json"), "not-json").unwrap(); // meta가 더 새것 + 손상
+        let out = list(base, "/p");
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].name, "이름");
     }
 }
