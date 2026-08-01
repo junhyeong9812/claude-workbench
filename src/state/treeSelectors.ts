@@ -56,10 +56,12 @@ export function sameEntries(a: DirEntry[] | undefined, b: DirEntry[]): boolean {
   return true;
 }
 
-/** key가 root 자신이거나 그 아래인가 (구분자 `/`·`\` 둘 다 — Windows 경로
- * 캐시 키 대비, 리뷰 #7). */
-export const underRoot = (key: string, root: string) =>
-  key === root || key.startsWith(`${root}/`) || key.startsWith(`${root}\\`);
+/** key가 root 자신이거나 그 아래인가 (구분자 `/`·`\` 둘 다 + root의 후행
+ * 구분자 정규화 — Windows·"C:\\"·"/xx/" 형태 대비, 리뷰 #7·감사 개선). */
+export const underRoot = (key: string, root: string) => {
+  const r = root.replace(/[\\/]+$/, "");
+  return key === root || key === r || key.startsWith(`${r}/`) || key.startsWith(`${r}\\`);
+};
 
 /** 닫힌 프로젝트 루트 아래의 캐시 키를 제거한다(F3 축출). keepRoots(남은
  * 프로젝트·스터디 폴더) 아래 키는 보존 — 중첩 프로젝트가 같은 경로를 공유할
