@@ -114,39 +114,73 @@ struct ClaudeTimelinePayload {
 /// 언급하는 아이템). 자기 transcript는 제외 — 자기 id 에코가 self-parent가
 /// 되어 트리에서 사라지는 회귀 방지(codex B1 F1). 동작 보존: 기존 인라인
 /// 체인 스캔과 동일한 순회 순서·판정(특성테스트 subagent_parent_*).
-/// P0 B2: 완료된 서브에이전트의 보존 프레임 — tail(파서·버퍼)은 드롭하고
-/// payload에 계속 실릴 items만 남긴다. `len`은 완료 판정 시점의 파일 크기로,
-/// 파일이 다시 자라면(len 초과) tail을 재생성해 재개한다(가정② 무해화).
+/// 파일 서명 (len, mtime ns) — 완료 판정·재활성 감지 입력 (P0 B2, 리뷰
+/// 재수정: len 단독은 truncate·동일 길이 재작성·mtime-only 변경을 놓친다).
+pub(crate) type FileSig = (u64, u128);
+
+fn file_sig(p: &std::path::Path) -> Option<FileSig> {
+    let m = std::fs::metadata(p).ok()?;
+    let mt = m
+        .modified()
+        .ok()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_nanos();
+    Some((m.len(), mt))
+}
+
+/// P0 B2: 완료된 서브에이전트의 보존 프레임 — tail(파서·버퍼·폴링)은 드롭하고
+/// payload에 계속 실릴 items만 남긴다. `sig`는 완료 판정 시점의 파일 서명 —
+/// 서명이 달라지면(성장·축소·재작성) tail을 재생성해 재개한다.
 pub(crate) struct DoneSub {
     pub(crate) turn: u64,
-    pub(crate) len: u64,
+    pub(crate) sig: FileSig,
     pub(crate) items: Vec<TimelineItem>,
     pub(crate) rev: u32,
 }
 
-/// 파일 길이 안정 스트릭 전이 — 순수 (P0 B2 특성테스트 대상).
-/// 같은 길이면 스트릭 +1, 변하면 리셋.
-pub(crate) fn advance_stability(prev: (u64, u32), len: u64) -> (u64, u32) {
-    if prev.0 == len {
-        (len, prev.1 + 1)
-    } else {
-        (len, 0)
+/// 파일 서명 안정 스트릭 전이 — 순수 (P0 B2 특성테스트 대상).
+/// 서명 동일 → +1 · 서명 변화 → 리셋 · **metadata 실패(None) → 진행하지
+/// 않고 리셋**(리뷰: 실패 40회 누적으로 완료 오판하던 경로 차단).
+pub(crate) fn advance_stability(
+    prev: (Option<FileSig>, u32),
+    sig: Option<FileSig>,
+) -> (Option<FileSig>, u32) {
+    match (prev.0, sig) {
+        (Some(a), Some(b)) if a == b => (Some(a), prev.1 + 1),
+        (_, Some(b)) => (Some(b), 0),
+        (_, None) => (prev.0, 0),
     }
 }
 
-/// 활성 + 완료 서브에이전트 프레임 병합 — 순수. 보존 계약: 완료된 에이전트의
-/// (aid, turn, items)가 payload에 **계속 포함**된다(스냅샷·트리 표시 불변).
-/// 순서는 원래도 HashMap 순회라 비결정적이었으므로 집합 동일성만이 계약.
-pub(crate) fn merge_sub_frames(
-    mut active: Vec<(String, u64, Vec<TimelineItem>)>,
+/// 활성 + 완료 프레임을 **발견 순서**로 조립 — 순수 (P0 B2, 리뷰 재수정:
+/// active-뒤-done 병합은 순회 순서를 바꿔 미확정 부모의 first-match 후보
+/// 순위를 흔든다. 발견 순서는 결정적이며 기존 HashMap 비결정 순회의 유효한
+/// 정밀화 — spec §2 B2 순서 명세는 log에 기록).
+/// 보존 계약: 완료 에이전트의 (aid, turn, items)가 계속 포함되고, 재활성
+/// 재파싱이 끝나 active items가 비어 있지 않으면 active가 우선한다.
+pub(crate) fn ordered_frames(
+    order: &[String],
+    mut active: HashMap<String, (u64, Vec<TimelineItem>)>,
     done: &HashMap<String, DoneSub>,
 ) -> Vec<(String, u64, Vec<TimelineItem>)> {
-    for (aid, d) in done {
-        active.push((aid.clone(), d.turn, d.items.clone()));
+    let mut out = Vec::new();
+    for aid in order {
+        if let Some((turn, items)) = active.remove(aid) {
+            if !items.is_empty() {
+                out.push((aid.clone(), turn, items));
+                continue;
+            }
+            // 활성이지만 아직 빈 tail(재활성 재파싱 전 등) — done 폴백 시도.
+        }
+        if let Some(d) = done.get(aid) {
+            out.push((aid.clone(), d.turn, d.items.clone()));
+        }
     }
-    active
+    out
 }
 
+#[cfg_attr(not(test), allow(dead_code))] // 특성테스트의 naive 기준 구현(메모판과 동치 검증용)
 pub(crate) fn subagent_parent(
     aid: &str,
     main_items: &[TimelineItem],
@@ -162,6 +196,52 @@ pub(crate) fn subagent_parent(
         )
         .find(|it| it.content_text.as_deref().is_some_and(|ct| ct.contains(aid)))
         .map(|it| it.tool_call_id.clone())
+}
+
+/// P0 B1(리뷰 재수정 — Some-동결 캐시는 "늦게 채워진 상위 후보로의 부모
+/// 교체"라는 원본 동작을 잃는다): first-match를 **매 변경 틱 그대로 재계산**
+/// 하되, 아이템별 `contains(aid)` 판정만 `(revision)` 키로 메모한다.
+/// contains는 content_text에만 의존하고 content_text 변경은 revision bump를
+/// 동반하므로(TimelineItem.revision: "Bumped on every merged update"),
+/// 결과는 naive 스캔과 **완전 동일**하고 비용만 변경된 아이템으로 국한된다
+/// (특성테스트: memo vs naive 동치·revision bump 반영).
+pub(crate) fn subagent_parent_memo(
+    aid: &str,
+    main_items: &[TimelineItem],
+    sub_raw: &[(String, u64, Vec<TimelineItem>)],
+    memo: &mut HashMap<(String, String), (u32, bool)>,
+) -> Option<String> {
+    fn mentions(
+        aid: &str,
+        it: &TimelineItem,
+        memo: &mut HashMap<(String, String), (u32, bool)>,
+    ) -> bool {
+        let key = (aid.to_string(), it.tool_call_id.clone());
+        if let Some((rev, m)) = memo.get(&key) {
+            if *rev == it.revision {
+                return *m;
+            }
+        }
+        let m = it.content_text.as_deref().is_some_and(|ct| ct.contains(aid));
+        memo.insert(key, (it.revision, m));
+        m
+    }
+    for it in main_items {
+        if mentions(aid, it, memo) {
+            return Some(it.tool_call_id.clone());
+        }
+    }
+    for (other, _, its) in sub_raw {
+        if other == aid {
+            continue;
+        }
+        for it in its {
+            if mentions(aid, it, memo) {
+                return Some(it.tool_call_id.clone());
+            }
+        }
+    }
+    None
 }
 
 /// Generate a fresh session UUID for `--session-id`. Linux-only (the app's
@@ -514,24 +594,31 @@ pub fn claude_session_cwds(claude: State<'_, ClaudeState>) -> Vec<SessionCwd> {
                 .collect()
         })
         .unwrap_or_default();
-    // P0 B3: cwd → worktree root 캐시. 세션 cwd는 스폰 시 고정이고 root도
-    // 세션 수명 동안 불변(spec 가정①)인데, 4초 폴링마다 세션 수만큼
-    // `git rev-parse` 서브프로세스를 띄우던 것을 첫 조회 후 재사용한다.
+    // P0 B3(리뷰 재수정): cwd → worktree root 캐시. 세션 수명 동안 불변이
+    // 전제(spec 가정①)이므로 ①**성공(Some) 결과만** 캐시(비-repo 폴백을
+    // 캐시하면 이후 git init을 영구히 못 본다 — B1과 대칭) ②라이브 세션에
+    // 없는 cwd 엔트리는 매 호출 prune — 캐시 수명이 세션 수명을 넘지 않는다.
     static ROOT_CACHE: std::sync::OnceLock<Mutex<HashMap<String, String>>> =
         std::sync::OnceLock::new();
     let cache = ROOT_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let live: std::collections::HashSet<&String> = cwds.iter().map(|(_, c)| c).collect();
+    if let Ok(mut c) = cache.lock() {
+        c.retain(|k, _| live.contains(k));
+    }
     cwds.into_iter()
         .map(|(uuid, cwd)| {
             let cached = cache.lock().ok().and_then(|c| c.get(&cwd).cloned());
             let root = match cached {
                 Some(r) => r,
-                None => {
-                    let r = core_lib::git::worktree_root(&cwd).unwrap_or_else(|| cwd.clone());
-                    if let Ok(mut c) = cache.lock() {
-                        c.insert(cwd.clone(), r.clone());
+                None => match core_lib::git::worktree_root(&cwd) {
+                    Some(r) => {
+                        if let Ok(mut c) = cache.lock() {
+                            c.insert(cwd.clone(), r.clone());
+                        }
+                        r
                     }
-                    r
-                }
+                    None => cwd.clone(), // 비-repo/실패 — 캐시하지 않고 매번 재시도
+                },
             };
             SessionCwd { uuid, cwd, root }
         })
@@ -576,15 +663,19 @@ fn run_timeline_poll(
     let mut sub_dir: Option<PathBuf> = None;
     let mut subagents: HashMap<String, core_lib::jsonl::SessionTail> = HashMap::new();
     let mut subagent_turn: HashMap<String, u64> = HashMap::new();
-    // P0 B1: agent id → 확정된 부모 tool_call_id (Some만 저장 — 불변 링크 캐시).
-    let mut parent_cache: HashMap<String, Option<String>> = HashMap::new();
-    // P0 B2: 완료 서브에이전트(파일 길이 DONE_STREAK 연속 안정) — tail은
-    // 드롭하고 items만 보존. 재성장 시 재생성.
+    // P0 B1: 아이템별 contains(aid) 메모 — (aid, tool_call_id) → (revision, 결과).
+    let mut mention_memo: HashMap<(String, String), (u32, bool)> = HashMap::new();
+    // P0 B2: 완료 서브에이전트(파일 서명 DONE_STREAK 연속 안정) — tail 드롭,
+    // items 보존. 서명 변화 시 같은 틱에 재파싱까지 마쳐 원자 교체.
     let mut sub_done: HashMap<String, DoneSub> = HashMap::new();
-    let mut sub_stable: HashMap<String, (u64, u32)> = HashMap::new();
+    let mut sub_stable: HashMap<String, (Option<FileSig>, u32)> = HashMap::new();
     let mut sub_path: HashMap<String, PathBuf> = HashMap::new();
-    /// ~6초(150ms×40) 연속 무성장 = 완료로 간주.
-    const DONE_STREAK: u32 = 40;
+    // 서브에이전트 최초 발견 순서 — 프레임 조립·부모 탐색 순서의 결정적 기준
+    // (기존 HashMap 비결정 순회의 정밀화, 리뷰 재수정).
+    let mut sub_order: Vec<String> = Vec::new();
+    // 60초(150ms×400) 연속 무변화 = 완료로 간주 — 리뷰: 6초는 긴 툴 실행
+    // 대기(cargo test 등)마다 완료↔재활성 churn + 전체 재파싱을 유발한다.
+    const DONE_STREAK: u32 = 400;
     // Cheap fingerprint of the last emitted state (incl. subagent item count). A
     // prompt- or answer-only record advances turns/answers without touching any
     // tool item, so we can't key off `poll`'s touched indices alone.
@@ -634,24 +725,36 @@ fn run_timeline_poll(
                     else {
                         continue;
                     };
-                    // P0 B2: 완료 처리된 에이전트는 파일이 다시 자랄 때만
-                    // tail을 재생성(전체 재파싱 — mapper는 결정적이라 동일
-                    // items 재구성), 아니면 폴링을 건너뛴다.
+                    // P0 B2: 완료 처리된 에이전트는 파일 서명이 달라질 때만
+                    // (성장·축소·재작성) tail을 재생성한다. **같은 틱에 전체
+                    // 재파싱(poll)까지 마치고**, 재파싱이 items를 만들었을
+                    // 때에만 done을 지운다 — 전이 틱에 프레임이 payload에서
+                    // 사라지는 공백 없음(리뷰 P1 반증 반영, ordered_frames의
+                    // done 폴백과 한 쌍).
                     if let Some(d) = sub_done.get(&aid) {
-                        let len = entry.metadata().map(|m| m.len()).unwrap_or(0);
-                        if len > d.len {
-                            sub_done.remove(&aid);
-                            sub_stable.remove(&aid);
-                            subagents.insert(
-                                aid.clone(),
-                                core_lib::jsonl::SessionTail::new(cwd.clone(), aid.clone(), f.clone()),
-                            );
-                            sub_path.insert(aid, f);
+                        if let Some(sig) = file_sig(&f) {
+                            if sig != d.sig {
+                                let mut st = core_lib::jsonl::SessionTail::new(
+                                    cwd.clone(),
+                                    aid.clone(),
+                                    f.clone(),
+                                );
+                                let _ = st.poll();
+                                if !st.timeline().items().is_empty() {
+                                    sub_done.remove(&aid);
+                                }
+                                sub_stable.remove(&aid);
+                                sub_path.insert(aid.clone(), f);
+                                subagents.insert(aid, st);
+                            }
                         }
                         continue;
                     }
                     if !subagents.contains_key(&aid) {
                         subagent_turn.insert(aid.clone(), t.current_turn());
+                        if !sub_order.contains(&aid) {
+                            sub_order.push(aid.clone());
+                        }
                     }
                     sub_path.insert(aid.clone(), f.clone());
                     let st = subagents.entry(aid.clone()).or_insert_with(|| {
@@ -661,27 +764,36 @@ fn run_timeline_poll(
                 }
             }
         }
-        // P0 B2: 완료 전이 스윕 — 파일 길이가 DONE_STREAK 연속 무성장이면
-        // tail을 드롭하고 items만 보존한다(빈 tail은 계속 활성 — 곧 자랄 수
-        // 있는 신생 파일).
-        let mut newly_done: Vec<String> = Vec::new();
+        // P0 B2: 완료 전이 스윕 — 파일 서명이 DONE_STREAK 연속 무변화면
+        // tail을 드롭하고 items만 보존한다(빈 tail·metadata 실패는 완료
+        // 후보 아님). 재활성 재파싱이 items를 만든 에이전트의 잔여 done은
+        // 정리(active 우선).
+        sub_done.retain(|aid, _| {
+            !subagents
+                .get(aid)
+                .map(|st| !st.timeline().items().is_empty())
+                .unwrap_or(false)
+        });
+        let mut newly_done: Vec<(String, FileSig)> = Vec::new();
         for (aid, st) in subagents.iter() {
             let Some(p) = sub_path.get(aid) else { continue };
-            let len = std::fs::metadata(p).map(|m| m.len()).unwrap_or(0);
-            let prev = sub_stable.get(aid).copied().unwrap_or((len, 0));
-            let next = advance_stability(prev, len);
+            let sig = file_sig(p);
+            let prev = sub_stable.get(aid).copied().unwrap_or((None, 0));
+            let next = advance_stability(prev, sig);
             sub_stable.insert(aid.clone(), next);
             if next.1 >= DONE_STREAK && !st.timeline().items().is_empty() {
-                newly_done.push(aid.clone());
+                if let Some(s) = next.0 {
+                    newly_done.push((aid.clone(), s));
+                }
             }
         }
-        for aid in newly_done {
+        for (aid, sig) in newly_done {
             if let Some(st) = subagents.remove(&aid) {
                 let items = st.timeline().items().to_vec();
                 let rev: u32 = items.iter().map(|i| i.revision).sum();
-                let len = sub_stable.remove(&aid).map(|e| e.0).unwrap_or(0);
+                sub_stable.remove(&aid);
                 let turn = *subagent_turn.get(&aid).unwrap_or(&0);
-                sub_done.insert(aid, DoneSub { turn, len, items, rev });
+                sub_done.insert(aid, DoneSub { turn, sig, items, rev });
             }
         }
 
@@ -735,20 +847,18 @@ fn run_timeline_poll(
         let tokens_v: Vec<(u64, TokenUsage)> = t.tokens().iter().map(|(k, v)| (*k, *v)).collect();
         let model_v: Option<String> = t.model().map(str::to_string);
         let last_usage_v: Option<TokenUsage> = t.last_usage();
-        let active_frames: Vec<(String, u64, Vec<TimelineItem>)> = subagents
+        // P0 B2: 발견 순서로 활성+완료 프레임 조립(특성테스트 ordered_frames_*)
+        // — 완료 프레임 보존 + active(재파싱 완료) 우선 + 결정적 순서.
+        let active_map: HashMap<String, (u64, Vec<TimelineItem>)> = subagents
             .iter()
-            .filter(|(_, st)| !st.timeline().items().is_empty())
             .map(|(aid, st)| {
                 (
                     aid.clone(),
-                    *subagent_turn.get(aid).unwrap_or(&0),
-                    st.timeline().items().to_vec(),
+                    (*subagent_turn.get(aid).unwrap_or(&0), st.timeline().items().to_vec()),
                 )
             })
             .collect();
-        // P0 B2: 완료 프레임 병합 — payload/스냅샷 내용 보존(특성테스트
-        // merge_sub_frames_*).
-        let sub_raw = merge_sub_frames(active_frames, &sub_done);
+        let sub_raw = ordered_frames(&sub_order, active_map, &sub_done);
         // Link each agent to the timeline item (the spawning `Agent`/`Task` call)
         // whose result mentions the agent id — that item, in main or in a parent
         // agent, is its parent (recursive tree). `None` ⇒ nest under its turn.
@@ -758,16 +868,7 @@ fn run_timeline_poll(
         let subagents_v: Vec<(String, Option<String>, u64, Vec<TimelineItem>)> = sub_raw
             .iter()
             .map(|(aid, turn, its)| {
-                let parent = match parent_cache.get(aid) {
-                    Some(p) => p.clone(),
-                    None => {
-                        let p = subagent_parent(aid, &items_v, &sub_raw);
-                        if p.is_some() {
-                            parent_cache.insert(aid.clone(), p.clone());
-                        }
-                        p
-                    }
-                };
+                let parent = subagent_parent_memo(aid, &items_v, &sub_raw, &mut mention_memo);
                 (aid.clone(), parent, *turn, its.clone())
             })
             .collect();
@@ -952,29 +1053,80 @@ mod tests {
     }
 
     // P0 B2 특성테스트 — 기대값 손계산.
+    const SIG_A: FileSig = (100, 1);
+    const SIG_B: FileSig = (150, 2);
+
     #[test]
-    fn stability_streak_advances_and_resets() {
-        assert_eq!(advance_stability((100, 0), 100), (100, 1)); // 무성장 → +1
-        assert_eq!(advance_stability((100, 5), 100), (100, 6));
-        assert_eq!(advance_stability((100, 5), 150), (150, 0)); // 성장 → 리셋
+    fn stability_streak_advances_resets_and_skips_metadata_failure() {
+        assert_eq!(advance_stability((Some(SIG_A), 0), Some(SIG_A)), (Some(SIG_A), 1));
+        assert_eq!(advance_stability((Some(SIG_A), 5), Some(SIG_A)), (Some(SIG_A), 6));
+        assert_eq!(advance_stability((Some(SIG_A), 5), Some(SIG_B)), (Some(SIG_B), 0)); // 변화 → 리셋
+        // 같은 len·다른 mtime = 재작성 감지 (len 단독 판정 회귀 방지)
+        assert_eq!(advance_stability((Some((100, 1)), 5), Some((100, 9))), (Some((100, 9)), 0));
+        // metadata 실패 → 스트릭 진행 금지(리셋), 마지막 서명 유지
+        assert_eq!(advance_stability((Some(SIG_A), 39), None), (Some(SIG_A), 0));
+        assert_eq!(advance_stability((None, 0), None), (None, 0));
+    }
+
+    fn done(turn: u64, items: Vec<TimelineItem>) -> DoneSub {
+        let rev = items.iter().map(|i| i.revision).sum();
+        DoneSub { turn, sig: SIG_A, items, rev }
     }
 
     #[test]
-    fn merge_keeps_done_agent_frames_in_payload() {
-        let active = vec![agent("agent-live", vec![item("l-1", None)])];
-        let mut done: HashMap<String, DoneSub> = HashMap::new();
-        done.insert(
-            "agent-done".into(),
-            DoneSub { turn: 7, len: 42, items: vec![item("d-1", None)], rev: 1 },
+    fn ordered_frames_keeps_done_in_discovery_order_and_prefers_reparsed_active() {
+        let order = vec!["a1".to_string(), "a2".to_string(), "a3".to_string()];
+        let mut active: HashMap<String, (u64, Vec<TimelineItem>)> = HashMap::new();
+        active.insert("a1".into(), (1, vec![item("l-1", None)])); // 활성
+        active.insert("a3".into(), (3, vec![])); // 재활성 재파싱 전(빈 tail)
+        let mut d: HashMap<String, DoneSub> = HashMap::new();
+        d.insert("a2".into(), done(7, vec![item("d-2", None)])); // 완료
+        d.insert("a3".into(), done(9, vec![item("d-3", None)])); // 전이 중 — done 폴백
+        let out = ordered_frames(&order, active, &d);
+        // 발견 순서 유지 + 완료 프레임 보존 + 빈 active는 done 폴백(공백 없음).
+        assert_eq!(
+            out.iter().map(|(aid, turn, its)| (aid.as_str(), *turn, its[0].tool_call_id.as_str())).collect::<Vec<_>>(),
+            vec![("a1", 1, "l-1"), ("a2", 7, "d-2"), ("a3", 9, "d-3")]
         );
-        let merged = merge_sub_frames(active, &done);
-        // 완료 에이전트가 (원 turn과 함께) payload에 계속 포함된다 — 보존 계약.
-        assert_eq!(merged.len(), 2);
-        let d = merged.iter().find(|(aid, _, _)| aid == "agent-done").expect("done frame");
-        assert_eq!(d.1, 7);
-        assert_eq!(d.2[0].tool_call_id, "d-1");
-        let l = merged.iter().find(|(aid, _, _)| aid == "agent-live").expect("live frame");
-        assert_eq!(l.2[0].tool_call_id, "l-1");
+    }
+
+    #[test]
+    fn ordered_frames_active_wins_over_stale_done_after_reparse() {
+        let order = vec!["a1".to_string()];
+        let mut active: HashMap<String, (u64, Vec<TimelineItem>)> = HashMap::new();
+        active.insert("a1".into(), (1, vec![item("new-1", None)]));
+        let mut d: HashMap<String, DoneSub> = HashMap::new();
+        d.insert("a1".into(), done(1, vec![item("old-1", None)]));
+        let out = ordered_frames(&order, active, &d);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].2[0].tool_call_id, "new-1"); // 재파싱된 active 우선
+    }
+
+    // P0 B1(재수정) — 메모 스캔이 naive와 완전 동치인지 + revision bump 반영.
+    #[test]
+    fn parent_memo_matches_naive_and_tracks_revision_updates() {
+        let mut memo: HashMap<(String, String), (u32, bool)> = HashMap::new();
+        let mut main = vec![item("call-1", Some("nothing")), item("call-2", Some("spawn agent-A"))];
+        let subs = vec![agent("agent-A", vec![])];
+        assert_eq!(
+            subagent_parent_memo("agent-A", &main, &subs, &mut memo),
+            subagent_parent("agent-A", &main, &subs)
+        );
+        // 더 이른 아이템(call-1)의 content_text가 나중에 갱신되어(revision bump)
+        // aid를 언급하면 — naive처럼 부모가 call-1로 "승격"되어야 한다(동결 금지).
+        main[0] = {
+            let mut it = item("call-1", Some("late mention of agent-A"));
+            it.revision = 2;
+            it
+        };
+        assert_eq!(
+            subagent_parent_memo("agent-A", &main, &subs, &mut memo),
+            Some("call-1".to_string())
+        );
+        assert_eq!(
+            subagent_parent_memo("agent-A", &main, &subs, &mut memo),
+            subagent_parent("agent-A", &main, &subs)
+        );
     }
 
     // P0 B1 특성테스트 — 기대값 손계산 (자기참조 금지).

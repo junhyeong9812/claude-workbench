@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { groupItemsByTurn } from "./timelineIndex";
+import { buildItemIndex, groupItemsByTurn } from "./timelineIndex";
 
 /** P0 F1 특성테스트 — 기대값은 손계산(자기참조 금지). 추가로 기존 렌더
  * 경로의 naive filter+sort와의 동치를 같은 픽스처로 검증한다. */
@@ -42,5 +42,23 @@ describe("groupItemsByTurn", () => {
 
   it("빈 입력 → 빈 인덱스", () => {
     expect(groupItemsByTurn([]).size).toBe(0);
+  });
+});
+
+describe("buildItemIndex", () => {
+  interface P {
+    tool_call_id: string;
+    tag: string;
+  }
+  const p = (tool_call_id: string, tag: string): P => ({ tool_call_id, tag });
+
+  it("flat().find 동치 — 중복 id는 main이 승리, 서브는 목록 순서", () => {
+    const main = [p("dup", "main"), p("m2", "main")];
+    const subs = [[p("dup", "subA"), p("s1", "subA")], [p("s1", "subB"), p("s2", "subB")]];
+    const idx = buildItemIndex(main, subs);
+    expect(idx.get("dup")?.tag).toBe("main"); // 기존 flat 순서상 main 먼저
+    expect(idx.get("s1")?.tag).toBe("subA"); // 서브 간에도 먼저 온 목록 승리
+    expect(idx.get("s2")?.tag).toBe("subB");
+    expect(idx.get("none")).toBeUndefined();
   });
 });
