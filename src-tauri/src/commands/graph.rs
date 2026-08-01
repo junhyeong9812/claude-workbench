@@ -54,7 +54,7 @@ struct GraphGenerated {
 /// empty here; [`core_lib::graph::generate_project_graph`] adds the target project
 /// and every sub-project root itself.
 fn graph_opts(app: &AppHandle) -> ClaudeOpts {
-    let ws = super::load_state(app.clone());
+    let ws = super::files::load_state(app.clone());
     ClaudeOpts {
         model: Some(ws.graph_model.filter(|m| !m.trim().is_empty()).unwrap_or_else(|| "opus".into())),
         effort: Some(ws.graph_effort.filter(|e| !e.trim().is_empty()).unwrap_or_else(|| "xhigh".into())),

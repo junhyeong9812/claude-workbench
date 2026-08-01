@@ -54,7 +54,7 @@ impl Drop for InFlightGuard {
 /// The archive-extraction model/effort: workspace settings when set, else the
 /// app default **opus + xhigh** (사용자 결정 — 추출 품질 우선).
 fn extraction_opts(app: &AppHandle) -> ClaudeOpts {
-    let ws = super::load_state(app.clone());
+    let ws = super::files::load_state(app.clone());
     ClaudeOpts {
         model: Some(ws.archive_model.filter(|m| !m.trim().is_empty()).unwrap_or_else(|| "opus".into())),
         effort: Some(ws.archive_effort.filter(|e| !e.trim().is_empty()).unwrap_or_else(|| "xhigh".into())),
@@ -84,7 +84,7 @@ pub struct ArchiveResult {
 /// non-blank, else `<app_data_dir>/archive`. `pub(super)` so sibling command
 /// modules (e.g. the graph viewer) resolve the identical root — single source.
 pub(super) fn archive_root(app: &AppHandle) -> Result<PathBuf, AppError> {
-    let configured = super::load_state(app.clone()).archive_root;
+    let configured = super::files::load_state(app.clone()).archive_root;
     if let Some(root) = configured {
         let trimmed = root.trim();
         if !trimmed.is_empty() {

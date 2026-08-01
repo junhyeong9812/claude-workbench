@@ -15,22 +15,19 @@ use core_lib::SessionManager;
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager};
 
-mod archive;
-mod claude;
-mod files;
-mod git;
-mod graph;
+pub mod archive;
+pub mod claude;
+pub mod files;
+pub mod git;
+pub mod graph;
 mod hookserver;
-mod ssh;
-mod terminal;
+pub mod ssh;
+pub mod terminal;
 
-pub use archive::*;
-pub use claude::*;
-pub use files::*;
-pub use git::*;
-pub use graph::*;
-pub use ssh::*;
-pub use terminal::*;
+// P4 U3: 글롭 재수출 제거 — 커맨드는 lib.rs generate_handler가 모듈 경로
+// (`commands::files::read_dir` 등)로 직접 참조한다(tauri 매크로의 숨은
+// `__cmd__*` 항목까지 함께 해소되는 관용형). 평평한 재수출 표면 109개를
+// 없애 소유를 모듈 경로로 드러내고 이름 충돌의 조용한 shadow를 차단.
 
 /// A single, consistent error type shared by all commands.
 #[derive(Debug, Serialize)]

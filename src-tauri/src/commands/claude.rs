@@ -423,7 +423,7 @@ pub fn claude_open_or_attach(
 
     // 이 프로젝트에 아카이브 지식이 있으면 .mcp.json 등록을 보장 — 새로 뜨는
     // claude가 지식 서버(search_knowledge)를 바로 쓸 수 있게 (best-effort).
-    super::ensure_mcp_registration(&app, &cwd);
+    super::archive::ensure_mcp_registration(&app, &cwd);
 
     // Driver: start a fresh PTY (lock held so a concurrent open can't double-start).
     let (id, session_uuid, stop) = spawn_claude(
