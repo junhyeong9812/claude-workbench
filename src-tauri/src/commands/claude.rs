@@ -734,36 +734,48 @@ fn run_timeline_poll(
                     else {
                         continue;
                     };
-                    // P0 B2: 완료 처리된 에이전트는 파일 서명이 달라질 때만
-                    // (성장·축소·재작성) tail을 재생성한다. **같은 틱에 전체
-                    // 재파싱(poll)까지 마치고**, 재파싱이 items를 만들었을
-                    // 때에만 done을 지운다 — 전이 틱에 프레임이 payload에서
-                    // 사라지는 공백 없음(리뷰 P1 반증 반영, ordered_frames의
-                    // done 폴백과 한 쌍).
-                    if let Some(d) = sub_done.get(&aid) {
-                        if let Some(sig) = file_sig(&f) {
-                            if sig != d.sig {
-                                let mut st = core_lib::jsonl::SessionTail::new(
-                                    cwd.clone(),
-                                    aid.clone(),
-                                    f.clone(),
-                                );
-                                let _ = st.poll();
-                                if !st.timeline().items().is_empty() {
-                                    sub_done.remove(&aid);
+                    // P0 B2: 완료 처리된 에이전트(활성 tail 없음)는 파일 서명이
+                    // 달라질 때만 tail을 재생성한다. **같은 틱에 전체 재파싱
+                    // (poll)까지 마치고**, items가 생겼을 때에만 done을 지운다
+                    // — 전이 틱 프레임 공백 없음. 이미 재활성된(활성 tail 존재)
+                    // 에이전트는 이 분기를 타지 않는다 — 빈 재파싱이 틱마다
+                    // 재생성·재-emit 루프를 돌던 경로 차단(재점검 2차 P1).
+                    if !subagents.contains_key(&aid) {
+                        if let Some(d) = sub_done.get(&aid) {
+                            if let Some(sig) = file_sig(&f) {
+                                if sig != d.sig {
+                                    // N1-2(재수정): 재구축은 revision을 리셋한다
+                                    // — 옛 items의 (session_id, tool_call_id)
+                                    // 메모 키를 정확히 무효화(레코드 sessionId가
+                                    // 생성자 id보다 우선하므로 sid==aid 가정
+                                    // 불가 — 실코드 확인 map.rs L79-81).
+                                    mention_memo.retain(|(_, sid, tcid), _| {
+                                        !d.items.iter().any(|it| {
+                                            &it.session_id == sid && &it.tool_call_id == tcid
+                                        })
+                                    });
+                                    let mut st = core_lib::jsonl::SessionTail::new(
+                                        cwd.clone(),
+                                        aid.clone(),
+                                        f.clone(),
+                                    );
+                                    let _ = st.poll();
+                                    if !st.timeline().items().is_empty() {
+                                        sub_done.remove(&aid);
+                                        // N2: done 실제 제거(교체 확정) 시점에만
+                                        // 세대 증가 — 빈 재파싱은 증가 없음.
+                                        sub_gen += 1;
+                                    }
+                                    sub_stable.remove(&aid);
+                                    sub_path.insert(aid.clone(), f);
+                                    subagents.insert(aid, st);
                                 }
-                                sub_stable.remove(&aid);
-                                sub_path.insert(aid.clone(), f);
-                                // N1-2: 재구축된 Timeline은 revision이 리셋된다
-                                // — 이 소스의 멘션 메모를 통째로 무효화.
-                                mention_memo.retain(|(_, sid, _), _| sid != &aid);
-                                // N2: 내용이 달라도 revision 합·개수가 같을 수
-                                // 있다 — 세대 카운터로 fp 변화를 보장.
-                                sub_gen += 1;
-                                subagents.insert(aid, st);
                             }
+                            continue;
                         }
-                        continue;
+                    } else if sub_done.contains_key(&aid) {
+                        // 재활성 후 아직 빈 tail — 아래 정상 poll 경로가 계속
+                        // 증분을 시도한다(재생성 없음).
                     }
                     if !subagents.contains_key(&aid) {
                         subagent_turn.insert(aid.clone(), t.current_turn());
@@ -783,12 +795,16 @@ fn run_timeline_poll(
         // tail을 드롭하고 items만 보존한다(빈 tail·metadata 실패는 완료
         // 후보 아님). 재활성 재파싱이 items를 만든 에이전트의 잔여 done은
         // 정리(active 우선).
+        let done_before = sub_done.len();
         sub_done.retain(|aid, _| {
             !subagents
                 .get(aid)
                 .map(|st| !st.timeline().items().is_empty())
                 .unwrap_or(false)
         });
+        if sub_done.len() != done_before {
+            sub_gen += 1; // 지연 교체 확정(빈 tail → 증분으로 items 도달) — N2
+        }
         let mut newly_done: Vec<(String, FileSig)> = Vec::new();
         for (aid, st) in subagents.iter() {
             let Some(p) = sub_path.get(aid) else { continue };
