@@ -111,8 +111,12 @@ impl Scrollback {
     fn push(&mut self, data: &[u8]) -> u64 {
         self.last_seq += 1;
         self.buf.extend(data.iter().copied());
-        while self.buf.len() > self.cap {
-            self.buf.pop_front();
+        // P0 B4: 초과분을 한 번에 드레인 — 바이트당 pop_front 루프(8KB 청크
+        // = 8192회)의 상수 비용 제거. cap·tail 보존 계약은 기존 특성테스트
+        // (scrollback_is_byte_capped_keeping_the_tail)가 고정.
+        let overflow = self.buf.len().saturating_sub(self.cap);
+        if overflow > 0 {
+            self.buf.drain(..overflow);
         }
         self.last_seq
     }

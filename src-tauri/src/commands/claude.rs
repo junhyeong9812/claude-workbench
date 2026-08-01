@@ -514,9 +514,25 @@ pub fn claude_session_cwds(claude: State<'_, ClaudeState>) -> Vec<SessionCwd> {
                 .collect()
         })
         .unwrap_or_default();
+    // P0 B3: cwd → worktree root 캐시. 세션 cwd는 스폰 시 고정이고 root도
+    // 세션 수명 동안 불변(spec 가정①)인데, 4초 폴링마다 세션 수만큼
+    // `git rev-parse` 서브프로세스를 띄우던 것을 첫 조회 후 재사용한다.
+    static ROOT_CACHE: std::sync::OnceLock<Mutex<HashMap<String, String>>> =
+        std::sync::OnceLock::new();
+    let cache = ROOT_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
     cwds.into_iter()
         .map(|(uuid, cwd)| {
-            let root = core_lib::git::worktree_root(&cwd).unwrap_or_else(|| cwd.clone());
+            let cached = cache.lock().ok().and_then(|c| c.get(&cwd).cloned());
+            let root = match cached {
+                Some(r) => r,
+                None => {
+                    let r = core_lib::git::worktree_root(&cwd).unwrap_or_else(|| cwd.clone());
+                    if let Ok(mut c) = cache.lock() {
+                        c.insert(cwd.clone(), r.clone());
+                    }
+                    r
+                }
+            };
             SessionCwd { uuid, cwd, root }
         })
         .collect()
