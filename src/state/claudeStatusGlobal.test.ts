@@ -29,7 +29,7 @@ describe("initClaudeStatusGlobal — async race + retry (S3)", () => {
   });
 
   it("a listen() that resolves AFTER dispose is immediately unlistened (no leak)", async () => {
-    const dispose = initClaudeStatusGlobal(); // registers 2 deferred listens
+    const dispose = initClaudeStatusGlobal(); // registers 3 deferred listens
     dispose(); // tear down before either resolves
 
     // The two registrations land late — each must self-unlisten at once.
@@ -110,7 +110,7 @@ describe("initClaudeStatusGlobal — async race + retry (S3)", () => {
     listenImpl = () => new Promise<() => void>((res) => resolvers.push(res));
     (listen as ReturnType<typeof vi.fn>).mockClear();
     const dispose = initClaudeStatusGlobal();
-    expect(listen).toHaveBeenCalledTimes(2); // both listeners re-registered
+    expect(listen).toHaveBeenCalledTimes(3); // all listeners re-registered (timeline·closed·hook)
     const spies = resolvers.map(() => vi.fn());
     resolvers.forEach((r, i) => r(spies[i]));
     await flush();

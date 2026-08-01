@@ -20,6 +20,7 @@ mod claude;
 mod files;
 mod git;
 mod graph;
+mod hookserver;
 mod ssh;
 mod terminal;
 

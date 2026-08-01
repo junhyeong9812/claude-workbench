@@ -4,6 +4,8 @@ import {
   deriveSessionActivity,
   hasOpenQuestion,
   lookupSessionUuid,
+  hasSessionMapping,
+  mapHookEvent,
 } from "./claudeStatus";
 import type { TimelineItem } from "../components/TimelineView";
 
@@ -106,6 +108,25 @@ export function initClaudeStatusGlobal(): () => void {
       if (gen !== generation) return; // stale generation — ignore
       const uuid = lookupSessionUuid(e.payload);
       if (uuid) useClaudeStatus.getState().remove(uuid);
+    }),
+    gen,
+  );
+
+  // hook-status: 수신기가 중계한 세션 hook 이벤트. payload가 uuid를 직접
+  // 갖고 있어 역매핑이 필요 없고, 패널은 이 이벤트를 처리하지 않으므로
+  // attached 스킵도 없다(단일 소비자 — 이중 갱신 없음). 이 창이 모르는
+  // uuid(다른 창 세션)도 무해 — attentionUuids 롤업은 창별이지만 hook은
+  // 전 창 브로드캐스트라, 등록된 세션만 반영하도록 entries/numeric 매핑
+  // 존재 여부로 거른다.
+  track(
+    listen<{ uuid: string; event: string }>("claude-hook-status", (e) => {
+      if (gen !== generation) return; // stale generation — ignore
+      const kind = mapHookEvent(e.payload.event);
+      if (!kind) return;
+      const st = useClaudeStatus.getState();
+      // 이 창이 아는 세션만: 엔트리가 있거나 numeric 매핑이 등록된 uuid.
+      if (!(e.payload.uuid in st.entries) && !hasSessionMapping(e.payload.uuid)) return;
+      st.applyHookEvent(e.payload.uuid, kind);
     }),
     gen,
   );
