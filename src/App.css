@@ -191,33 +191,197 @@ body {
   letter-spacing: 0.03em;
 }
 
-/* ---- Toolbar ---- */
+/* ---- Toolbar (전면 리스타일 — toolbar-mode-ui-redesign) ---- */
 .toolbar {
   display: flex;
   align-items: center;
-  gap: 12px;
-  padding: 4px 10px;
+  gap: 10px;
+  padding: 5px 10px;
   background: var(--bg-alt);
   border-bottom: 1px solid var(--border);
 }
 
 .toolbar-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  height: 26px;
+  padding: 0 10px;
   background: var(--bg);
   color: var(--fg);
   border: 1px solid var(--border);
-  border-radius: 3px;
-  padding: 2px 8px;
+  border-radius: 6px;
+  font-size: 12px;
+  line-height: 1;
   cursor: pointer;
+  transition:
+    background 0.12s ease,
+    border-color 0.12s ease,
+    color 0.12s ease;
 }
 
 .toolbar-btn:hover {
   background: var(--bg-hover);
+  border-color: color-mix(in srgb, var(--accent-bright) 45%, var(--border));
+}
+.toolbar-btn:focus-visible {
+  outline: 2px solid var(--accent-bright);
+  outline-offset: 1px;
+}
+.toolbar-btn:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+.toolbar-btn:disabled:hover {
+  background: var(--bg);
+  border-color: var(--border);
 }
 
-/* Active/engaged toolbar toggle (e.g. the project's 개발 모드 on). */
+/* Active/engaged toolbar toggle (e.g. the 외관 팝오버 열림). */
 .toolbar-btn-on {
   color: var(--accent-bright);
   border-color: var(--accent-bright);
+}
+
+/* Button glyph accents (restyle: text icons, no icon font). */
+.toolbar-ico {
+  font-size: 11px;
+  opacity: 0.85;
+}
+.toolbar-caret {
+  font-size: 9px;
+  opacity: 0.7;
+}
+
+/* Session/run action cluster between the mode segment and the appearance menu. */
+.toolbar-group {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 0 10px;
+  border-left: 1px solid var(--border);
+  border-right: 1px solid var(--border);
+}
+
+/* Segmented control (모드 3택 + 팝오버의 테마 2택). */
+.seg {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  padding: 2px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 7px;
+}
+.seg-item {
+  height: 22px;
+  padding: 0 10px;
+  border: none;
+  border-radius: 5px;
+  background: transparent;
+  color: var(--fg-dim);
+  font-size: 12px;
+  line-height: 1;
+  cursor: pointer;
+  transition:
+    background 0.12s ease,
+    color 0.12s ease;
+}
+.seg-item:hover {
+  background: var(--bg-hover);
+  color: var(--fg);
+}
+.seg-item:focus-visible {
+  outline: 2px solid var(--accent-bright);
+  outline-offset: 1px;
+}
+.seg-item:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+.seg-item:disabled:hover {
+  background: transparent;
+  color: var(--fg-dim);
+}
+.seg-on,
+.seg-item.seg-on:hover {
+  background: var(--accent);
+  color: #ffffff;
+}
+
+/* 외관 팝오버 (테마 · 글자 크기 · 터미널 색상). */
+.appearance-menu {
+  position: relative;
+}
+.appearance-pop {
+  position: absolute;
+  top: 100%;
+  left: 0;
+  z-index: var(--z-dropdown);
+  margin-top: 4px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  min-width: 250px;
+  padding: 10px 12px;
+  background: var(--bg-alt);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.45);
+}
+.appearance-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+.appearance-label {
+  font-size: 12px;
+  color: var(--fg-dim);
+}
+.font-stepper {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+.font-step {
+  width: 22px;
+  height: 22px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--bg);
+  color: var(--fg);
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  font-size: 13px;
+  line-height: 1;
+  cursor: pointer;
+  transition:
+    background 0.12s ease,
+    border-color 0.12s ease;
+}
+.font-step:hover {
+  background: var(--bg-hover);
+  border-color: color-mix(in srgb, var(--accent-bright) 45%, var(--border));
+}
+.font-input {
+  width: 40px;
+  height: 22px;
+  text-align: center;
+  background: var(--bg);
+  color: var(--fg);
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  font-size: 12px;
+}
+.font-input:focus {
+  outline: none;
+  border-color: var(--accent-bright);
+}
+.font-unit {
+  font-size: 11px;
+  color: var(--fg-dim);
 }
 
 /* Attention roll-up (agent-status-badges P3): red `●n` blocked + blue `●n`
@@ -251,14 +415,45 @@ body {
 .toolbar-rollup-item.is-blocked {
   border-color: color-mix(in srgb, var(--st-fail) 45%, var(--border));
 }
+/* Motion badges (redesign): the dot itself animates — a ping ring for blocked
+   (input needed now) and a soft breathe for done-unseen. Static fallback under
+   prefers-reduced-motion below. */
 .toolbar-rollup-item.is-blocked .toolbar-rollup-dot {
   background: var(--st-fail);
+  animation: rollup-ping 1.4s ease-in-out infinite;
 }
 .toolbar-rollup-item.is-done {
   border-color: color-mix(in srgb, var(--st-info) 45%, var(--border));
 }
 .toolbar-rollup-item.is-done .toolbar-rollup-dot {
   background: var(--st-info);
+  animation: rollup-breathe 2.2s ease-in-out infinite;
+}
+@keyframes rollup-ping {
+  0%,
+  100% {
+    box-shadow: 0 0 0 0 color-mix(in srgb, var(--st-fail) 55%, transparent);
+  }
+  50% {
+    box-shadow: 0 0 0 4px color-mix(in srgb, var(--st-fail) 0%, transparent);
+  }
+}
+@keyframes rollup-breathe {
+  0%,
+  100% {
+    box-shadow: 0 0 0 0 color-mix(in srgb, var(--st-info) 45%, transparent);
+    opacity: 1;
+  }
+  50% {
+    box-shadow: 0 0 0 3px color-mix(in srgb, var(--st-info) 0%, transparent);
+    opacity: 0.75;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .toolbar-rollup-dot,
+  .claude-tab-badge {
+    animation: none !important;
+  }
 }
 
 .toolbar-title {
@@ -270,9 +465,89 @@ body {
 }
 
 /* ---- Panels ---- */
+/* Workspace row: the left activity stripe + the resizable panes beside it. */
+.workspace-row {
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+}
 .panes {
   flex: 1;
+  min-width: 0;
   min-height: 0;
+}
+
+/* IntelliJ-style left activity bar — the sidebar tabs as a vertical icon
+   stripe. Always visible so a folded sidebar stays one click away. */
+.activity-bar {
+  flex: 0 0 46px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 6px 4px;
+  background: var(--bg-alt);
+  border-right: 1px solid var(--border);
+  overflow: hidden;
+}
+.activity-item {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 2px;
+  padding: 6px 0 5px;
+  background: none;
+  border: none;
+  border-radius: 6px;
+  color: var(--fg-dim);
+  cursor: pointer;
+  transition:
+    background 0.12s ease,
+    color 0.12s ease;
+}
+.activity-item:hover {
+  background: var(--bg-hover);
+  color: var(--fg);
+}
+.activity-item:focus-visible {
+  outline: 2px solid var(--accent-bright);
+  outline-offset: -2px;
+}
+.activity-on {
+  color: var(--accent-bright);
+  background: color-mix(in srgb, var(--accent) 18%, transparent);
+}
+/* Active indicator: a slim accent bar hugging the stripe's left edge. */
+.activity-on::before {
+  content: "";
+  position: absolute;
+  left: 0;
+  top: 6px;
+  bottom: 6px;
+  width: 2px;
+  border-radius: 2px;
+  background: var(--accent-bright);
+}
+.activity-ico {
+  font-size: 15px;
+  line-height: 1;
+}
+.activity-label {
+  font-size: 9px;
+  line-height: 1;
+  letter-spacing: -0.02em;
+}
+.activity-spacer {
+  flex: 1;
+  min-height: 0;
+}
+.activity-chevron {
+  padding: 8px 0;
+}
+.activity-chevron .activity-ico {
+  font-size: 12px;
+  opacity: 0.8;
 }
 
 .pane-left {
@@ -280,27 +555,6 @@ body {
   display: flex;
   flex-direction: column;
   overflow: hidden;
-}
-/* Sidebar tabs (Files / Git) at the top of the left pane. */
-.sidebar-tabs {
-  flex: 0 0 auto;
-  display: flex;
-  border-bottom: 1px solid var(--border, #333);
-}
-.sidebar-tab {
-  flex: 1 1 0;
-  min-width: 0;
-  padding: 4px 8px;
-  background: transparent;
-  border: none;
-  border-bottom: 2px solid transparent;
-  color: var(--fg-dim);
-  cursor: pointer;
-  font-size: 0.8em;
-}
-.sidebar-tab.active {
-  color: var(--fg, #cdd6f4);
-  border-bottom-color: var(--accent-bright);
 }
 .sidebar-content {
   flex: 1 1 0;
@@ -1412,14 +1666,13 @@ body {
   min-height: 0;
 }
 
-.main-toolbar {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  padding: 4px 8px;
-  background: var(--bg-alt);
-  border-bottom: 1px solid var(--border);
+/* Zero-height dropdown anchor at the top of the main area — the old
+   main-toolbar row is gone (its buttons live in the app toolbar now), but the
+   "+ Terminal" menu and the Claude picker still hang here (.claude-picker is
+   position:absolute against this). */
+.main-menus {
   position: relative;
+  height: 0;
 }
 
 /* Custom Claude tab with ×→닫기/삭제 menu (B3-1) */

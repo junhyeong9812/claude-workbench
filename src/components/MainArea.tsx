@@ -877,6 +877,54 @@ export function MainArea() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [focusMainRequest, layerMode]);
 
+  // App-toolbar remote buttons (the main-toolbar row was absorbed into the app
+  // toolbar — spec task 01): each is a bump counter consumed here because the
+  // menu/picker UI and the dockview api live in this component. The handled refs
+  // initialize to the CURRENT counter so a project-switch remount never replays
+  // the previous window's press (unlike a 0-initialized ref).
+  // All three buttons are disabled in the app toolbar while the dev layer is
+  // front (parity with the pre-move UI, where they lived inside the integrated
+  // layer and were unreachable in dev mode). A request that still arrives with
+  // dev in front is a stale press: drop it — never silently flip the project's
+  // persisted 통합/개발 mode from here (review A3).
+  const termMenuRequest = useAppStore((s) => s.termMenuRequest);
+  const termMenuHandledRef = useRef(termMenuRequest);
+  useEffect(() => {
+    if (termMenuRequest === termMenuHandledRef.current) return;
+    termMenuHandledRef.current = termMenuRequest;
+    if (!integratedIsFront(layerMode)) return;
+    setPicker(null);
+    setTermMenu((v) => !v);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [termMenuRequest]);
+
+  const claudePickerRequest = useAppStore((s) => s.claudePickerRequest);
+  const claudePickerHandledRef = useRef(claudePickerRequest);
+  useEffect(() => {
+    if (claudePickerRequest === claudePickerHandledRef.current) return;
+    claudePickerHandledRef.current = claudePickerRequest;
+    if (!integratedIsFront(layerMode)) return;
+    setTermMenu(false);
+    // Always (re)open — the pre-move button refetched sessions on every press
+    // rather than toggling closed (review A4: 동작 보존; closing is the 취소
+    // button's job).
+    void openPicker();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [claudePickerRequest]);
+
+  const detachPanelRequest = useAppStore((s) => s.detachPanelRequest);
+  const detachHandledRef = useRef(detachPanelRequest);
+  useEffect(() => {
+    if (detachPanelRequest === detachHandledRef.current) return;
+    detachHandledRef.current = detachPanelRequest;
+    // Only the front (integrated) dock detaches — the App button is disabled in
+    // dev mode, so a request here while dev is front is a stale press: drop it.
+    if (!integratedIsFront(layerMode)) return;
+    const api = apiRef.current;
+    if (api?.activePanel) void movePanelToNewWindow(api, api.activePanel.id);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [detachPanelRequest]);
+
   // Attention roll-up cycle: activate the panel for the requested session uuid.
   // Matched by the panel's live `sessionUuid` or its resume `loadSessionId` (a
   // fresh session's uuid == its loadSessionId). No-op if no panel here owns it —
@@ -904,10 +952,10 @@ export function MainArea() {
   return (
     <div className="main-area">
       <DropTargetOverlay />
-      <div className="main-toolbar">
-        <button className="toolbar-btn" onClick={() => setTermMenu((v) => !v)}>
-          + Terminal ▾
-        </button>
+      {/* Zero-height anchor for the dropdowns that used to hang off the removed
+          main-toolbar row — the "+ Terminal"/"+ Claude" buttons now live in the
+          app toolbar and drive these via store request counters (task 01). */}
+      <div className="main-menus">
         {termMenu && (
           <div className="claude-picker" onMouseLeave={() => setTermMenu(false)}>
             <button
@@ -971,19 +1019,6 @@ export function MainArea() {
             </button>
           </div>
         )}
-        <button className="toolbar-btn" onClick={() => openPicker()}>
-          + Claude
-        </button>
-        <button
-          className="toolbar-btn"
-          title="활성 패널을 새 창으로 분리 (또는 탭을 창 밖으로 드래그)"
-          onClick={() => {
-            const api = apiRef.current;
-            if (api?.activePanel) void movePanelToNewWindow(api, api.activePanel.id);
-          }}
-        >
-          ⤢ 분리
-        </button>
         {picker !== null && (
           <div className="claude-picker">
             <div className="claude-picker-new-row">
