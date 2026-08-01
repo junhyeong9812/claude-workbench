@@ -11,26 +11,26 @@
  * 호출 컴포넌트에 남는다(주입 지점, 조사 워커 #8).
  */
 import { invoke } from "@tauri-apps/api/core";
+import type { ClaudeCloseRequest } from "../state/claudeUi";
 
-export interface CloseRequestLike {
-  kind: string;
-  panelId: string;
-  ptyId?: number | null;
-  sessionId?: string | null;
-  project?: string | null;
-}
+/** invoke 주입 지점 — 테스트가 호출 순서(close → delete → 패널)를 고정한다.
+ * 순서 역전(히스토리 먼저 삭제)은 poll 스레드의 스냅샷 재생성 회귀(리뷰). */
+type Invoke = (cmd: string, args?: Record<string, unknown>) => Promise<unknown>;
 
 export async function resolveCloseRequest(
-  req: CloseRequestLike,
+  // 스토어의 리터럴 유니온 타입 그대로 — kind 리네임이 여기 분기를 조용히
+  // false로 만드는 회귀(삭제→닫기 전락)를 컴파일 에러로(리뷰 지적).
+  req: ClaudeCloseRequest,
   activeProject: string | null,
   deleteHistory: boolean,
   closePanel: (panelId: string) => void,
+  call: Invoke = invoke,
 ): Promise<void> {
   const project = req.project ?? activeProject;
   if (req.kind === "claudeterm" && deleteHistory && typeof req.ptyId === "number") {
-    await invoke("claude_close", { id: req.ptyId }).catch(() => {});
+    await call("claude_close", { id: req.ptyId }).catch(() => {});
     if (req.sessionId && project) {
-      await invoke("claude_delete", { project, uuid: req.sessionId }).catch(() => {});
+      await call("claude_delete", { project, uuid: req.sessionId }).catch(() => {});
     }
   }
   closePanel(req.panelId);

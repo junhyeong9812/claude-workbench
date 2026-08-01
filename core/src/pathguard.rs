@@ -40,7 +40,9 @@ pub fn contained_existing(root: &Path, path: &str) -> Result<PathBuf, ContainErr
 /// **미존재 허용** 봉쇄: `path` 자체가 아직 없으면 가장 깊은 **존재하는
 /// 조상**을 canonicalize해 `root` 아래인지 확인한다 — 새 중첩 파일/폴더
 /// 생성을 실제 디스크 위치 기준으로 검증(생성류 보안 요건).
-pub fn contained_prospective(path: &str, root: &str) -> Result<(), ContainErr> {
+/// 인자 순서·타입은 [`contained_existing`]과 동일(root: &Path 먼저) —
+/// &str 2개로 두면 뒤바뀐 호출이 컴파일돼 봉쇄가 무력화된다(리뷰 지적).
+pub fn contained_prospective(root: &Path, path: &str) -> Result<(), ContainErr> {
     let root_c = fs::canonicalize(root).map_err(|_| ContainErr::Root)?;
     let mut probe = PathBuf::from(path);
     let resolved = loop {
@@ -116,12 +118,12 @@ mod tests {
         let root = temp_root("pro");
         // 아직 없는 중첩 경로 — 가장 깊은 존재 조상(root)이 안이면 통과.
         let unborn = root.join("sub/dir/new.txt");
-        assert!(contained_prospective(unborn.to_str().unwrap(), root.to_str().unwrap()).is_ok());
+        assert!(contained_prospective(&root, unborn.to_str().unwrap()).is_ok());
         // 밖의 미존재 경로 — 존재 조상이 root 밖이면 거부.
         let other = temp_root("pro-out");
         let outside = other.join("new.txt");
         assert_eq!(
-            contained_prospective(outside.to_str().unwrap(), root.to_str().unwrap()),
+            contained_prospective(&root, outside.to_str().unwrap()),
             Err(ContainErr::Outside)
         );
         let _ = fs::remove_dir_all(&root);
@@ -141,10 +143,7 @@ mod tests {
             Err(ContainErr::Outside)
         );
         assert_eq!(
-            contained_prospective(
-                root.join("link/new.txt").to_str().unwrap(),
-                root.to_str().unwrap()
-            ),
+            contained_prospective(&root, root.join("link/new.txt").to_str().unwrap()),
             Err(ContainErr::Outside)
         );
         let _ = fs::remove_dir_all(&root);

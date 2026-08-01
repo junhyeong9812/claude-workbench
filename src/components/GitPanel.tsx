@@ -275,13 +275,13 @@ export function GitPanel() {
   const renderRootNodes = (node: RootNode, depth: number): ReactNode[] => {
     const out: ReactNode[] = [];
     const entries = [...node.children.values()].sort((a, b) => {
-      const af = !a.leaf; // folders first (leaf = repo)
-      const bf = !b.leaf;
+      const af = a.leaf === undefined; // folders first (leaf = repo)
+      const bf = b.leaf === undefined;
       if (af !== bf) return af ? -1 : 1;
       return a.name.localeCompare(b.name);
     });
     for (const child of entries) {
-      if (child.leaf) {
+      if (child.leaf !== undefined) {
         const full = child.leaf.path;
         const sel = selectedRoot === full;
         // The selected root is the one `status` reflects, so show its live branch
@@ -403,8 +403,8 @@ export function GitPanel() {
       return a.name.localeCompare(b.name);
     });
     for (const child of entries) {
-      if (child.leaf && child.children.size === 0) {
-        out.push(fileRow(child.leaf, child.name, depth, kind));
+      if (child.leaf !== undefined && child.children.size === 0) {
+        out.push(fileRow(child.leaf!, child.name, depth, kind));
       } else {
         out.push(
           <div key={`d:${child.path}`} className="git-dir" style={{ paddingLeft: 8 + depth * 12 }}>
