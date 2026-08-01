@@ -4,8 +4,9 @@
  * that splits the chat area (left), keeping this list as a single column.
  * Presentational; ClaudeTermPanel feeds it the items/turns for *its* session. */
 
-import { Fragment, useEffect, useRef, useState } from "react";
+import { Fragment, useEffect, useMemo, useRef, useState } from "react";
 import { isMarkdownPath, Markdown } from "./markdown";
+import { groupItemsByTurn } from "./timelineIndex";
 import { useFileText } from "../hooks/useFileText";
 
 /** Sanitized markdown for tool/session 뷰모드. Media tags are blocked here (unlike
@@ -256,6 +257,11 @@ export function TimelineView({
     ...new Set<number>([...turns.keys(), ...answers.keys(), ...items.map((it) => it.turn)]),
   ].sort((a, b) => a - b);
 
+  // 턴 → 아이템(seq 오름차순) 인덱스 — nav 경로와 렌더 경로가 공유한다.
+  // 기존의 턴별 filter+sort(렌더마다 O(T×I)×2)와 결과 동일(특성테스트
+  // timelineIndex.test.ts), items 변경 시에만 1회 O(I) 재빌드 (P0 F1).
+  const itemsByTurn = useMemo(() => groupItemsByTurn(items), [items]);
+
   // Collapsed date groups (B8): clicking a date header folds/unfolds its turns.
   const [collapsedDates, setCollapsedDates] = useState<Set<string>>(new Set());
   const toggleDate = (date: string) =>
@@ -296,7 +302,7 @@ export function TimelineView({
     if (collapsedDates.has(dates.get(turn) ?? "")) continue;
     navEntries.push({ kind: "turn", turn });
     if (collapsedTurns.has(turn)) continue; // folded turn: head is the only stop
-    for (const it of items.filter((x) => x.turn === turn).sort((a, b) => a.seq - b.seq)) {
+    for (const it of itemsByTurn.get(turn) ?? []) {
       pushItemTree(it);
     }
     for (const [aid, its] of orphanAgentsByTurn.get(turn) ?? []) pushAgentItems(aid, its);
@@ -415,7 +421,7 @@ export function TimelineView({
       )}
       {turnRows.map(({ turn, date, showDate }) => {
         const collapsed = collapsedDates.has(date);
-        const turnItems = items.filter((it) => it.turn === turn).sort((a, b) => a.seq - b.seq);
+        const turnItems = itemsByTurn.get(turn) ?? [];
         const prompt = turns.get(turn);
         const answer = answers.get(turn);
         return (

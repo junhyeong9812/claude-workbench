@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { errText } from "../utils/error";
 import { invoke } from "@tauri-apps/api/core";
 import { useAppStore } from "../state/store";
@@ -239,6 +239,36 @@ export function GitPanel() {
   // project root itself isn't a repo but has nested ones (codex P1).
   // Nested repos strictly under the project (the enclosing root is the "현재" row).
   const nestedRoots = roots.filter((r) => !!activeProject && r.path.startsWith(activeProject + "/"));
+  // ---- P0 F4 메모들: 모든 조기 return(!cwd 포함) **이전**에 — 훅 수가 렌더마다
+  // 달라지면 "Rendered fewer hooks" 크래시(리뷰 반증 확인). staged/unstaged를
+  // 먼저 고정하고 트리 deps를 그 배열로 잡는다(넓은 [status] 대신).
+  const conflicted = useMemo(() => status?.changes.filter((c) => c.conflicted) ?? [], [status]);
+  const staged = useMemo(
+    () => status?.changes.filter((c) => c.staged && !c.conflicted) ?? [],
+    [status],
+  );
+  const unstaged = useMemo(
+    () => status?.changes.filter((c) => !c.staged && !c.conflicted) ?? [],
+    [status],
+  );
+  // 커밋 그래프 레인 계산은 commits 변경 시에만 — 결과 불변.
+  const graphMemo = useMemo(() => {
+    const rows = computeGraph(commits);
+    const maxLanes = rows.reduce((m, r) => Math.max(m, r.before.length, r.after.length), 1);
+    return { rows, maxLanes };
+  }, [commits]);
+  // 트리는 tree 뷰에서만 계산(리뷰: flat 뷰 eager 계산 제거). buildTree는
+  // 모듈 스코프 순수 함수라 deps는 입력 배열이면 충분.
+  const stagedTree = useMemo(
+    () => (view === "tree" ? buildTree(staged) : null),
+    [staged, view],
+  );
+  const unstagedTree = useMemo(
+    () => (view === "tree" ? buildTree(unstaged) : null),
+    [unstaged, view],
+  );
+
+
   const showRootSelect = nestedRoots.length > 0;
   const projBase = (activeProject ?? "").split("/").pop() || (activeProject ?? "");
   // The enclosing repo of the project — `activeProject` itself when it's a repo
@@ -341,10 +371,6 @@ export function GitPanel() {
         </div>
       </div>
     );
-
-  const conflicted = status?.changes.filter((c) => c.conflicted) ?? [];
-  const staged = status?.changes.filter((c) => c.staged && !c.conflicted) ?? [];
-  const unstaged = status?.changes.filter((c) => !c.staged && !c.conflicted) ?? [];
   const merging = status?.merging ?? false;
   const reverting = status?.reverting ?? false;
   // During a merge, conclude via the banner's '계속'(merge --continue) instead of
@@ -423,10 +449,17 @@ export function GitPanel() {
     return out;
   };
 
-  const renderGroup = (list: FileChange[], kind: "staged" | "unstaged"): ReactNode =>
+  // 트리는 값으로 받는다(리뷰: kind로 조회하면 list 인자가 tree 경로에서
+  // 죽은 파라미터가 되어 향후 호출부(예: conflicted)에서 다른 목록을 그리는
+  // 함정). tree 미제공 목록은 즉석 계산 폴백 — 동작 보존.
+  const renderGroup = (
+    list: FileChange[],
+    tree: TreeNode | null,
+    kind: "staged" | "unstaged",
+  ): ReactNode =>
     view === "flat"
       ? list.map((c) => fileRow(c, c.path, 0, kind))
-      : renderNode(buildTree(list), 0, kind);
+      : renderNode(tree ?? buildTree(list), 0, kind);
 
   // Root selector: only meaningful when nested repos exist under the project.
   return (
@@ -734,7 +767,7 @@ export function GitPanel() {
               </button>
             )}
           </div>
-          {renderGroup(staged, "staged")}
+          {renderGroup(staged, stagedTree, "staged")}
 
           <div className="git-section-head">
             변경됨 ({unstaged.length})
@@ -744,7 +777,7 @@ export function GitPanel() {
               </button>
             )}
           </div>
-          {renderGroup(unstaged, "unstaged")}
+          {renderGroup(unstaged, unstagedTree, "unstaged")}
           {status?.changes.length === 0 && <div className="git-clean">변경 사항 없음 (clean)</div>}
         </div>
 
@@ -817,8 +850,7 @@ export function GitPanel() {
         </div>
         <div className="git-graph">
           {(() => {
-            const rows = computeGraph(commits);
-            const maxLanes = rows.reduce((m, r) => Math.max(m, r.before.length, r.after.length), 1);
+            const { rows, maxLanes } = graphMemo;
             return rows.map((row) => {
               const c = row.commit;
               const refs = parseRefs(c.refs);
