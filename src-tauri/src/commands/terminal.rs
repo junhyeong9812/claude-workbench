@@ -9,9 +9,9 @@ use std::thread;
 
 use core_lib::SessionManager;
 use serde::Serialize;
-use tauri::{AppHandle, Emitter, State};
+use tauri::{AppHandle, State};
 
-use super::{scrollback_dir, spawn_scrollback_flush, AppError, ScrollbackState, TerminalOutput};
+use super::{scrollback_dir, spawn_scrollback_flush, AppError, ScrollbackState};
 
 /// Scrollback snapshot returned to a (re)attaching panel: recent raw bytes plus
 /// the seq of the last chunk they cover (backfill contract — see core::session).
@@ -48,14 +48,7 @@ pub fn terminal_create(
         let app = app.clone();
         thread::spawn(move || {
             while let Ok(chunk) = rx.recv() {
-                let _ = app.emit(
-                    "terminal-output",
-                    TerminalOutput {
-                        session_id: id,
-                        seq: chunk.seq,
-                        data: chunk.bytes,
-                    },
-                );
+                super::emit_terminal_output(&app, id, chunk.seq, &chunk.bytes);
             }
         });
     }

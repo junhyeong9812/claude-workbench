@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { buildItemIndex } from "./timelineIndex";
+import { decodePtyData, ptyEventName, pushPendingCapped } from "./pty";
 import { errText } from "../utils/error";
 import type { TerminalOutputEvent, SnapshotResult } from "../types";
 import type { IDockviewPanelProps } from "dockview-react";
@@ -498,7 +499,8 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
       lineHeight: 1.15,
       cursorBlink: true,
       cursorStyle: "block",
-      scrollback: 10000,
+      // P3: 10000행(≈19MB/패널 × 동시 마운트 3 = 창당 ~60MB) → 3000행 상한.
+      scrollback: 3000,
       // Follows the app theme (Catppuccin Mocha/Latte); updated live below.
       theme: xtermTheme(useAppStore.getState().theme, useAppStore.getState().termColors),
     });
@@ -670,9 +672,9 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
     };
     const blockedScanner = makeDebouncedScanner(runBlockedScan, 300);
 
-    const write = (bytes: number[]) => {
+    const write = (bytes: Uint8Array | number[]) => {
       if (!disposed) {
-        term.write(new Uint8Array(bytes));
+        term.write(bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes));
         blockedScanner.trigger(scanOrigin);
       }
     };
@@ -680,18 +682,24 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
       if (ev.session_id === sessionId && ev.seq > lastApplied) {
         // Genuinely new PTY output — from here on, scans report live edges (S4a).
         scanOrigin = "live";
-        write(ev.data);
+        write(decodePtyData(ev.data));
         lastApplied = ev.seq;
       }
     };
-
-    (async () => {
-      // Listeners first (buffer terminal output until ready), so nothing is missed.
-      unlistenTerm = await listen<TerminalOutputEvent>("terminal-output", (e) => {
-        if (sessionId == null || e.payload.session_id !== sessionId) return;
-        if (!ready) pending.push(e.payload);
+    // P3: 세션별 PTY 이벤트 구독(전 패널 K배 역직렬화 제거). open이 id를 준
+    // 직후·스냅샷 **전**에 구독한다(R1-1 계약 유지 — 구독~스냅샷 사이 청크는
+    // pending 버퍼(상한부) + seq 게이트가 정확히 잇는다).
+    let pendingTotal = 0;
+    const subscribeOutput = async (id: number) => {
+      if (unlistenTerm) unlistenTerm();
+      unlistenTerm = await listen<TerminalOutputEvent>(ptyEventName(id), (e) => {
+        if (!ready) pendingTotal = pushPendingCapped(pending, e.payload, pendingTotal);
         else applyLive(e.payload);
       });
+    };
+
+    (async () => {
+      // Listeners first (buffer until ready), so nothing is missed.
       unlistenTl = await listen<ClaudeTimelineEvent>("claude-timeline", (e) => {
         if (sessionId == null || e.payload.id !== sessionId) return;
         gotLive = true;
@@ -788,11 +796,11 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
         sessionId = null; // open failed (no project, etc.)
       }
       if (disposed) return;
-      // Backfill scrollback. `sessionId` is set BEFORE the snapshot so the live
-      // listener buffers matching chunks into `pending` from the first frame and
-      // the `seq > last_seq` drain skips snapshot-included dups (review R1-1/R7-8);
-      // a fresh start just returns empty scrollback.
+      // Backfill scrollback. 구독(세션별 이벤트)이 스냅샷보다 먼저이므로 live
+      // 청크는 pending에 쌓이고 `seq > last_seq` drain이 스냅샷 중복을 걸러
+      // 잇는다(review R1-1/R7-8); a fresh start just returns empty scrollback.
       if (sessionId != null) {
+        await subscribeOutput(sessionId);
         try {
           const snap = await invoke<SnapshotResult>("terminal_snapshot", { id: sessionId });
           write(snap.data);

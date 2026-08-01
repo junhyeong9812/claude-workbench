@@ -21,6 +21,8 @@ tauri-plugin-dialog = "2"
 tauri-plugin-notification = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# PTY 출력 payload 인코딩 (P3 — JSON number[] 3-4배 팽창 대신 base64 ~1.33배).
+base64 = "0.22"
 # Local calendar date for timeline persistence folders (YYYY-MM-DD).
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 # Renamed to `core_lib` in code to avoid shadowing the std `core` crate.

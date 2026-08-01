@@ -8,6 +8,7 @@ import "@xterm/xterm/css/xterm.css";
 import { useAppStore } from "../state/store";
 import { xtermTheme } from "./xtermTheme";
 import type { TerminalOutputEvent, SnapshotResult } from "../types";
+import { decodePtyData, ptyEventName, pushPendingCapped } from "./pty";
 
 /** Params attached to a terminal panel. `sessionId` is persisted into the
  * dockview layout so a remount (tab/project switch) re-attaches the same PTY.
@@ -122,26 +123,30 @@ export function TerminalPanel(props: IDockviewPanelProps<TerminalParams>) {
     const pending: TerminalOutputEvent[] = [];
     const isSsh = props.params.kind === "ssh";
 
-    const write = (bytes: number[]) => {
-      if (!disposed) term.write(new Uint8Array(bytes));
+    const write = (bytes: Uint8Array | number[]) => {
+      if (!disposed) term.write(bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes));
     };
     const writeText = (s: string) => {
       if (!disposed) term.write(s);
     };
     const applyLive = (ev: TerminalOutputEvent) => {
       if (ev.session_id === sessionId && ev.seq > lastApplied) {
-        write(ev.data);
+        write(decodePtyData(ev.data));
         lastApplied = ev.seq;
       }
     };
-
-    (async () => {
-      // 1) Listener first (buffer until ready) so nothing is missed.
-      unlisten = await listen<TerminalOutputEvent>("terminal-output", (e) => {
-        if (sessionId == null || e.payload.session_id !== sessionId) return;
-        if (!ready) pending.push(e.payload);
+    // P3: 세션별 이벤트 구독 — 전역 단일 이벤트를 전 패널이 역직렬화하던
+    // 것을 제거. 구독 → 스냅샷 → drain 순서(R1-1 계약)는 아래에서 유지.
+    let pendingTotal = 0;
+    const subscribeOutput = async (id: number) => {
+      if (unlisten) unlisten();
+      unlisten = await listen<TerminalOutputEvent>(ptyEventName(id), (e) => {
+        if (!ready) pendingTotal = pushPendingCapped(pending, e.payload, pendingTotal);
         else applyLive(e.payload);
       });
+    };
+
+    (async () => {
       // SSH status: show a "closed" line in-terminal. Connect/auth **failures**
       // are surfaced by MainArea's global listener (it can't be missed by a
       // not-yet-mounted panel — review P3-R1), so we don't duplicate them here.
@@ -162,16 +167,17 @@ export function TerminalPanel(props: IDockviewPanelProps<TerminalParams>) {
         return;
       }
 
-      // 2) Re-attach to a persisted session, else create a fresh one.
+      // 1) Re-attach to a persisted session, else create a fresh one.
       const existing = props.params.sessionId;
       if (existing != null) {
-        // Claim the id BEFORE snapshotting so the live listener buffers matching
+        // Subscribe BEFORE snapshotting so the live listener buffers matching
         // chunks into `pending` from the first frame. Otherwise chunks emitted
-        // between the backend computing the snapshot and this assignment are
-        // dropped (sessionId still null) AND absent from the snapshot → lost
-        // (review R1-1, relied on by cross-window transfer). The `seq > last_seq`
-        // drain below skips any chunk already included in the snapshot.
+        // between the backend computing the snapshot and this point are missed
+        // AND absent from the snapshot → lost (review R1-1, relied on by
+        // cross-window transfer). The `seq > last_seq` drain below skips any
+        // chunk already included in the snapshot.
         sessionId = existing;
+        await subscribeOutput(existing);
         try {
           const snap = await invoke<SnapshotResult>("terminal_snapshot", { id: existing });
           write(snap.data);
@@ -230,6 +236,19 @@ export function TerminalPanel(props: IDockviewPanelProps<TerminalParams>) {
           }, 400);
         }
         props.api.updateParameters({ ...props.params, sessionId, runCmd: undefined });
+        // 2) Fresh session: subscribe now the id exists, then backfill via
+        // snapshot — 생성~구독 사이에 나온 초기 청크(프롬프트 등)도 스냅샷이
+        // 회수한다(구 전역 리스너 시절엔 id 미할당 청크가 그냥 유실됐다).
+        if (sessionId != null) {
+          await subscribeOutput(sessionId);
+          try {
+            const snap = await invoke<SnapshotResult>("terminal_snapshot", { id: sessionId });
+            write(snap.data);
+            lastApplied = snap.last_seq;
+          } catch {
+            /* no scrollback yet */
+          }
+        }
       }
 
       // 3) Drain buffered chunks (skipping any already in the snapshot), go live.

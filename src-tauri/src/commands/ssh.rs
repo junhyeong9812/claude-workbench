@@ -16,7 +16,7 @@ use core_lib::SessionManager;
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager, State};
 
-use super::{scrollback_dir, spawn_scrollback_flush, AppError, TerminalOutput};
+use super::{scrollback_dir, spawn_scrollback_flush, AppError};
 
 /// Pending host-key decisions, keyed by session id. The prompt relay inserts the
 /// reply sender on a challenge; `ssh_hostkey_decision` takes it out and answers.
@@ -112,14 +112,7 @@ pub fn ssh_create(
         let app = app.clone();
         thread::spawn(move || {
             while let Ok(chunk) = rx.recv() {
-                let _ = app.emit(
-                    "terminal-output",
-                    TerminalOutput {
-                        session_id: id,
-                        seq: chunk.seq,
-                        data: chunk.bytes,
-                    },
-                );
+                super::emit_terminal_output(&app, id, chunk.seq, &chunk.bytes);
             }
         });
     }
