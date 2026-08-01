@@ -325,6 +325,12 @@ interface AppState {
    * own `project` (no activeProject switch; MainArea consumes without a project
    * gate and clears with null). Already-open session → activate that panel. */
   sessionResumeRequest: { uuid: string; project: string; title: string; nonce: number } | null;
+  /** 우측 분할 surface에 열린 프로젝트 경로 (null=닫힘). 수동적 dock —
+   * 전역 요청 버스는 주(좌) surface만 소비한다. localStorage 복원(project-
+   * dual-surface). App이 activeProject와의 충돌·닫힌 프로젝트를 정리한다. */
+  dualProject: string | null;
+  /** 우측 분할 열기/닫기(null) — persist. */
+  setDualProject: (path: string | null) => void;
   /** Color theme (persisted to localStorage). Drives CSS vars + xterm palette. */
   theme: "dark" | "light";
   /** Code font size in px (terminals + editor/viewer), persisted. */
@@ -549,6 +555,7 @@ export const useAppStore = create<AppState>((set, get) => ({
   claudePickerRequest: 0,
   detachPanelRequest: 0,
   sessionResumeRequest: null,
+  dualProject: localStorage.getItem("dualProject") || null,
   theme: (localStorage.getItem("theme") as "dark" | "light") || "dark",
   fontSize: clampFontSize(Number(localStorage.getItem("fontSize")) || 13),
   termColors: loadTermColors(),
@@ -739,6 +746,11 @@ export const useAppStore = create<AppState>((set, get) => ({
   requestTermMenu: () => set((s) => ({ termMenuRequest: s.termMenuRequest + 1 })),
   requestClaudePicker: () => set((s) => ({ claudePickerRequest: s.claudePickerRequest + 1 })),
   requestDetachPanel: () => set((s) => ({ detachPanelRequest: s.detachPanelRequest + 1 })),
+  setDualProject: (path) => {
+    if (path) localStorage.setItem("dualProject", path);
+    else localStorage.removeItem("dualProject");
+    set({ dualProject: path });
+  },
   requestSessionResume: (req) =>
     set((s) =>
       req === null

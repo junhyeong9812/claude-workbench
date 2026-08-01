@@ -1699,6 +1699,105 @@ body {
   height: 0;
 }
 
+/* ---- 우측 분할 surface (project-dual-surface) ---- */
+.dual-row {
+  height: 100%;
+  min-height: 0;
+}
+.dual-secondary {
+  height: 100%;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  border-left: 1px solid var(--border);
+  background: var(--bg);
+}
+.dual-secondary-head {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 8px;
+  background: var(--bg-alt);
+  border-bottom: 1px solid var(--border);
+  font-size: 12px;
+  color: var(--fg-dim);
+}
+.dual-secondary-name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+/* "이 dock은 수동(보조)"임을 알리는 미니 배지 — 전역 버튼/단축키가 좌측
+   기준인 이유를 시각적으로 예고 (리뷰 D12). */
+.dual-secondary-hint {
+  flex: 0 0 auto;
+  font-size: 10px;
+  padding: 1px 6px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  color: var(--fg-dim);
+}
+.dual-secondary-close {
+  border: none;
+  background: none;
+  color: var(--fg-dim);
+  cursor: pointer;
+  font-size: 14px;
+  line-height: 1;
+  padding: 0 4px;
+  border-radius: 4px;
+}
+.dual-secondary-close:hover {
+  color: var(--fg);
+  background: var(--bg-hover);
+}
+.dual-secondary-body {
+  flex: 1;
+  min-height: 0;
+}
+
+/* 프로젝트 탭 우클릭 메뉴 (dual-surface 진입점) */
+.tab-ctx-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: var(--z-ctx-menu);
+}
+.tab-ctx-menu {
+  position: fixed;
+  z-index: var(--z-ctx-menu);
+  display: flex;
+  flex-direction: column;
+  min-width: 160px;
+  background: var(--bg-alt);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.4);
+  overflow: hidden;
+}
+.tab-ctx-item {
+  padding: 7px 12px;
+  background: none;
+  border: none;
+  color: var(--fg);
+  font-size: 12px;
+  text-align: left;
+  cursor: pointer;
+}
+.tab-ctx-item:hover {
+  background: var(--bg-hover);
+}
+.tab-ctx-item:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+.tab-ctx-item:disabled:hover {
+  background: none;
+}
+
 /* Custom Claude tab with ×→닫기/삭제 menu (B3-1) */
 .claude-tab {
   display: flex;
