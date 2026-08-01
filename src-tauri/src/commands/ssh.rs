@@ -106,16 +106,9 @@ pub fn ssh_create(
         .and_then(|k| scrollback_dir(&app).and_then(|d| core_lib::scrollback_store::load(&d, k)));
     let (id, channels) = mgr.create_ssh(config, known_hosts, cols, rows, seed);
 
-    // (a) Output relay -> `terminal-output`, identical to `terminal_create`.
+    // (a) Output relay — identical to `terminal_create` (공용 헬퍼, P4).
     let rx = mgr.subscribe(id).map_err(AppError::new)?;
-    {
-        let app = app.clone();
-        thread::spawn(move || {
-            while let Ok(chunk) = rx.recv() {
-                super::emit_terminal_output(&app, id, chunk.seq, &chunk.bytes);
-            }
-        });
-    }
+    super::spawn_output_relay(app.clone(), id, rx, None);
 
     // (b) Status relay -> `ssh-status`.
     {

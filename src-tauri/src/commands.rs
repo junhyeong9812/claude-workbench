@@ -69,6 +69,25 @@ struct TerminalOutput {
     data: String,
 }
 
+/// P4: PTY 출력 relay 스레드 공용화 — 세 생성 경로(터미널·SSH·Claude)가
+/// 문자단위 동일하던 spawn 블록의 단일 출처. `on_end`는 수신 채널이 닫힌 뒤
+/// (세션 종료) 1회 호출 — Claude가 타임라인 poll 정지 플래그를 세우는 데 쓴다.
+fn spawn_output_relay(
+    app: AppHandle,
+    session_id: u64,
+    rx: std::sync::mpsc::Receiver<core_lib::OutputChunk>,
+    on_end: Option<Box<dyn FnOnce() + Send>>,
+) {
+    thread::spawn(move || {
+        while let Ok(chunk) = rx.recv() {
+            emit_terminal_output(&app, session_id, chunk.seq, &chunk.bytes);
+        }
+        if let Some(f) = on_end {
+            f();
+        }
+    });
+}
+
 /// Emit one PTY chunk to its session-scoped event. 모든 PTY relay(터미널·SSH·
 /// Claude)가 이 헬퍼를 지나므로 이벤트명·인코딩 계약이 한 곳에 있다.
 fn emit_terminal_output(app: &AppHandle, session_id: u64, seq: u64, bytes: &[u8]) {

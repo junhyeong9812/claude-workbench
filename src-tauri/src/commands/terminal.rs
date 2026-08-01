@@ -5,7 +5,6 @@
 // in `terminal_create`, which forwards core output chunks to a webview event.
 
 use std::sync::atomic::Ordering;
-use std::thread;
 
 use core_lib::SessionManager;
 use serde::Serialize;
@@ -46,14 +45,7 @@ pub fn terminal_create(
     let rx = mgr.subscribe(id).map_err(AppError::new)?;
     // Relay core output chunks -> webview event until the session is removed
     // (sender dropped -> recv errors -> thread ends; no leak).
-    {
-        let app = app.clone();
-        thread::spawn(move || {
-            while let Ok(chunk) = rx.recv() {
-                super::emit_terminal_output(&app, id, chunk.seq, &chunk.bytes);
-            }
-        });
-    }
+    super::spawn_output_relay(app.clone(), id, rx, None);
     if let Some(key) = persist_key {
         spawn_scrollback_flush(app, id, key);
     }

@@ -334,18 +334,17 @@ fn spawn_claude(
     };
     let stop = Arc::new(AtomicBool::new(false));
 
-    // (a) Relay PTY output -> webview (global emit; every attached window filters
-    // by id). When the PTY dies the sender drops, the loop ends, and `stop` is
-    // set so the poll thread stops tailing.
+    // (a) Relay PTY output -> webview (공용 헬퍼, P4). When the PTY dies the
+    // sender drops, the loop ends, and `on_end`가 `stop`을 세워 poll 스레드를
+    // 멈춘다.
     {
-        let app = app.clone();
         let stop = stop.clone();
-        thread::spawn(move || {
-            while let Ok(chunk) = rx.recv() {
-                super::emit_terminal_output(&app, id, chunk.seq, &chunk.bytes);
-            }
-            stop.store(true, Ordering::Relaxed);
-        });
+        super::spawn_output_relay(
+            app.clone(),
+            id,
+            rx,
+            Some(Box::new(move || stop.store(true, Ordering::Relaxed))),
+        );
     }
     // (b) Tail the JSONL -> claude-timeline + persist snapshot.
     {
