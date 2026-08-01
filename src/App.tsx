@@ -148,6 +148,20 @@ function AppMain() {
   // 드롭 처리 직렬화 — 연속 드롭이 겹쳐 절반 상태를 만들지 않게.
   const dropBusyRef = useRef(false);
 
+  // P3: droppedPeek 이미지의 objectURL 수명 관리 — 뷰가 교체/닫힐 때 이전
+  // URL들을 revoke(누수 방지). 표시 중 URL은 절대 revoke하지 않는다(집합
+  // 차이만 해제 — 조기 revoke 금지 불변식).
+  const droppedUrlsRef = useRef<string[]>([]);
+  useEffect(() => {
+    const current = (droppedPeek?.files ?? [])
+      .map((f) => f.imageUrl)
+      .filter((u): u is string => !!u && u.startsWith("blob:"));
+    for (const u of droppedUrlsRef.current) {
+      if (!current.includes(u)) URL.revokeObjectURL(u);
+    }
+    droppedUrlsRef.current = current;
+  }, [droppedPeek]);
+
   // 상호 배타(리뷰 W5): 경로 peek이 어떤 경로(트리 클릭·검색 점프)로든 열리면
   // 드롭 peek을 닫는다 — 오버레이 이중 적층 방지. (역방향은 드롭 처리부의
   // setPeekFile(null)이 담당.)
@@ -194,13 +208,10 @@ function AppMain() {
             }
             try {
               if (kind === "image") {
-                const url = await new Promise<string>((resolve, reject) => {
-                  const r = new FileReader();
-                  r.onload = () => resolve(r.result as string);
-                  r.onerror = () => reject(r.error);
-                  r.readAsDataURL(f);
-                });
-                loaded.push({ name: f.name, imageUrl: url });
+                // P3: base64 data URL(파일 크기 ×1.33이 상태에 상주 — 최대
+                // 수십 MB) 대신 objectURL — Blob은 브라우저가 관리, 뷰가
+                // 바뀔 때 revoke(아래 effect)로 즉시 해제.
+                loaded.push({ name: f.name, imageUrl: URL.createObjectURL(f) });
               } else {
                 // 엄격 디코드 — File.text()는 바이너리도 조용히 치환해버린다 (리뷰 W1).
                 const text = decodeStrict(await f.arrayBuffer());
