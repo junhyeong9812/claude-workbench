@@ -4,7 +4,7 @@
  * that splits the chat area (left), keeping this list as a single column.
  * Presentational; ClaudeTermPanel feeds it the items/turns for *its* session. */
 
-import { Fragment, useEffect, useMemo, useRef, useState } from "react";
+import { Fragment, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { isMarkdownPath, Markdown } from "./markdown";
 import { groupItemsByTurn, sliceRecentTurns } from "./timelineIndex";
 import { useFileText } from "../hooks/useFileText";
@@ -266,7 +266,30 @@ export function TimelineView({
   // P1 렌더 캡: 장세션 DOM 폭증(1만+ 노드) 방지 — 최근 N턴만 그리고 "이전
   // 더 보기"로 확장. nav와 렌더가 같은 visible 목록을 쓴다(화면 일치 원칙).
   const [turnLimit, setTurnLimit] = useState(TURN_RENDER_CAP);
+  // 세션이 바뀌면 확장분 리셋(spec §2 — 듀얼 리뷰 #12). 인스턴스는 현재 세션당
+  // 패널 1개(실확인)지만, 패널 재사용으로 scope/sessionCwd가 바뀌는 미래
+  // 경로에서 이전 세션의 확장이 새 장세션에 이월되는 것을 방어한다.
+  useEffect(() => {
+    setTurnLimit(TURN_RENDER_CAP);
+  }, [scope, sessionCwd]);
   const { visible: visibleTurnNos, hiddenCount } = sliceRecentTurns(turnNos, turnLimit);
+  // 선택(아이템/턴 헤드)이 캡 밖으로 밀리면 그 턴까지 자동 확장(#13) — 창이
+  // "최근 N턴"이라 새 턴 유입만으로 선택이 미렌더 되면 하이라이트·↑/↓ 앵커가
+  // 화면과 어긋난다. 수렴 조건: needed > turnLimit일 때만 set(1회로 안정).
+  useEffect(() => {
+    const turn =
+      selectedId != null
+        ? itemTurn(selectedId)
+        : selectedScope === scope
+          ? (selectedTurn ?? null)
+          : null;
+    if (turn == null) return;
+    const idx = turnNos.indexOf(turn);
+    if (idx < 0) return;
+    const needed = turnNos.length - idx;
+    if (needed > turnLimit) setTurnLimit(needed);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedId, selectedTurn, selectedScope, scope, turnNos.length, turnLimit]);
 
   // 턴 → 아이템(seq 오름차순) 인덱스 — nav 경로와 렌더 경로가 공유한다.
   // 기존의 턴별 filter+sort(렌더마다 O(T×I)×2)와 결과 동일(특성테스트
@@ -391,6 +414,33 @@ export function TimelineView({
     return () => ro.disconnect();
   }, [followBottom]);
 
+  // "더 보기"는 목록 위쪽에 DOM을 prepend한다 — 브라우저는 scrollTop을 유지해
+  // 보던 위치가 아래로 점프하고, followBottom이 살아 있으면 다음 emit에서 즉시
+  // 하단 복귀해 버튼이 무효처럼 보인다(#14). 확장 전 scrollHeight를 기록해
+  // 높이차만큼 보정하고, 하단 추종은 해제한다(위 히스토리를 보려는 조작).
+  const moreAnchorRef = useRef<{ el: HTMLElement; h: number; top: number } | null>(null);
+  const findScroller = (): HTMLElement | null => {
+    let sc: HTMLElement | null = listRef.current?.parentElement ?? null;
+    while (sc) {
+      const oy = getComputedStyle(sc).overflowY;
+      if (oy === "auto" || oy === "scroll") break;
+      sc = sc.parentElement;
+    }
+    return sc;
+  };
+  const showMore = () => {
+    const el = findScroller();
+    if (el) moreAnchorRef.current = { el, h: el.scrollHeight, top: el.scrollTop };
+    stickBottomRef.current = false;
+    setTurnLimit((l) => l + TURN_RENDER_CAP);
+  };
+  useLayoutEffect(() => {
+    const a = moreAnchorRef.current;
+    if (!a) return;
+    moreAnchorRef.current = null;
+    a.el.scrollTop = a.top + (a.el.scrollHeight - a.h);
+  }, [turnLimit]);
+
   const onKeyDown = (e: React.KeyboardEvent<HTMLDivElement>) => {
     // Enter/Space folds the selected turn head (keyboard reach for the caret).
     if (e.key === "Enter" || e.key === " ") {
@@ -434,7 +484,7 @@ export function TimelineView({
         <button
           className="timeline-more"
           title="오래된 턴은 성능을 위해 접혀 있습니다 — 클릭해 더 렌더"
-          onClick={() => setTurnLimit((l) => l + TURN_RENDER_CAP)}
+          onClick={showMore}
         >
           이전 {Math.min(TURN_RENDER_CAP, hiddenCount)}턴 더 보기 (숨김 {hiddenCount})
         </button>

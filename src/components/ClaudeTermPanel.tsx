@@ -923,39 +923,80 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
   const selectedItem = selectedId ? (itemIndex.get(selectedId) ?? null) : null;
 
   // P1: 절단(content_truncated) 아이템 선택 시 원문을 lazy 조회해 뷰어에
-  // 전문을 보여준다. 실패는 절단본 유지(read-only 조회 — 무해).
-  const [fullDetail, setFullDetail] = useState<Map<string, string>>(new Map());
+  // 전문을 보여준다. 듀얼 리뷰 수정(#4·#11): 캐시 키는 `${uuid}:${tool_call_id}`
+  // (세션 결속 — 패널 재사용/합성 id 충돌 방지), effect 의존성은 키 문자열
+  // (selectedItem 객체는 emit마다 새 참조 — 객체 dep이면 invoke 폭주), 실패도
+  // null sentinel로 캐시(무한 재시도 방지) + in-flight 가드 + LRU 상한(원문
+  // 수 MB가 힙에 무한 상주하지 않게).
+  const DETAIL_CACHE_MAX = 8;
+  const [fullDetail, setFullDetail] = useState<Map<string, string | null>>(new Map());
+  const detailInFlight = useRef<Set<string>>(new Set());
+  const [detailRetry, setDetailRetry] = useState(0);
+  const detailUuid = props.params.sessionUuid ?? props.params.loadSessionId ?? null;
+  const detailProject = props.params.project ?? useAppStore.getState().activeProject ?? null;
+  const detailKey =
+    selectedItem?.content_truncated && detailUuid
+      ? `${detailUuid}:${selectedItem.tool_call_id}`
+      : null;
+  const cacheDetail = (key: string, text: string | null) =>
+    setFullDetail((prev) => {
+      const next = new Map(prev);
+      next.delete(key); // 재삽입으로 최신화(Map 삽입 순서 = LRU 순서)
+      next.set(key, text);
+      while (next.size > DETAIL_CACHE_MAX) {
+        const oldest = next.keys().next().value;
+        if (oldest === undefined) break;
+        next.delete(oldest);
+      }
+      return next;
+    });
   useEffect(() => {
-    const it = selectedItem;
-    if (!it?.content_truncated || fullDetail.has(it.tool_call_id)) return;
-    const uuid = props.params.sessionUuid ?? props.params.loadSessionId;
-    const project = props.params.project ?? useAppStore.getState().activeProject ?? "";
-    if (!uuid) return;
+    if (!detailKey || !detailUuid || !detailProject) return;
+    if (fullDetail.has(detailKey) || detailInFlight.current.has(detailKey)) return;
+    const key = detailKey;
+    const tcid = key.slice(detailUuid.length + 1);
+    detailInFlight.current.add(key);
     let alive = true;
     invoke<{ content_text: string | null }>("claude_item_detail", {
-      project,
-      uuid,
-      toolCallId: it.tool_call_id,
+      project: detailProject,
+      uuid: detailUuid,
+      toolCallId: tcid,
     })
       .then((d) => {
-        if (!alive || d.content_text == null) return;
-        const text = d.content_text;
-        setFullDetail((prev) => new Map(prev).set(it.tool_call_id, text));
+        if (alive) cacheDetail(key, d.content_text);
       })
-      .catch(() => {});
+      .catch(() => {
+        if (alive) cacheDetail(key, null); // 실패 sentinel — 배너가 재시도 제공
+      })
+      .finally(() => {
+        detailInFlight.current.delete(key);
+      });
     return () => {
       alive = false;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [selectedItem]);
+  }, [detailKey, detailProject, detailRetry]);
+  const cachedFull = detailKey != null ? fullDetail.get(detailKey) : undefined;
   const hydratedItem =
-    selectedItem && fullDetail.has(selectedItem.tool_call_id)
+    selectedItem && typeof cachedFull === "string"
       ? {
           ...selectedItem,
-          content_text: fullDetail.get(selectedItem.tool_call_id)!,
+          content_text: cachedFull,
           content_truncated: false,
         }
       : selectedItem;
+  // 절단 상태 안내(#5, spec §2 "실패 시 절단본+안내"): hydrated가 여전히 절단
+  // = 원문 미도착 — 로딩 중이거나 실패(sentinel null).
+  const detailFailed = detailKey != null && cachedFull === null;
+  const retryDetail = () => {
+    if (!detailKey) return;
+    setFullDetail((prev) => {
+      const next = new Map(prev);
+      next.delete(detailKey);
+      return next;
+    });
+    setDetailRetry((r) => r + 1);
+  };
 
   return (
     <div className="claudeterm" ref={containerRef} onKeyDown={onContainerKey}>
@@ -1149,6 +1190,20 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
               </span>
             </div>
             <div className="claudeterm-viewer-body">
+              {!textView && hydratedItem?.content_truncated && (
+                <div className="claudeterm-trunc-note">
+                  {detailFailed ? (
+                    <>
+                      원문 조회 실패 — 32KB 절단본 표시 중
+                      <button className="claudeterm-trunc-retry" onClick={retryDetail}>
+                        재시도
+                      </button>
+                    </>
+                  ) : (
+                    <>절단본 표시 중 — 원문 불러오는 중…</>
+                  )}
+                </div>
+              )}
               {textView ? (
                 detailMarkdown ? (
                   <MarkdownText text={textView.text} />

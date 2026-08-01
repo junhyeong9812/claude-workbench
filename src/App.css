@@ -2356,6 +2356,31 @@ body {
   line-height: 1.5;
   margin: 0;
 }
+/* P1: 32KB 절단 안내 배너 — 원문 lazy 로딩 중/실패(재시도) 상태 표시. */
+.claudeterm-trunc-note {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 6px;
+  padding: 4px 8px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: var(--bg-alt);
+  color: var(--fg-dim);
+  font-size: 0.8em;
+}
+.claudeterm-trunc-retry {
+  padding: 1px 8px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: transparent;
+  color: var(--fg);
+  cursor: pointer;
+  font-size: 1em;
+}
+.claudeterm-trunc-retry:hover {
+  background: var(--bg-hover);
+}
 .claudeterm-viewer-x {
   cursor: pointer;
   padding: 0 4px;
