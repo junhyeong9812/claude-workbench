@@ -120,7 +120,14 @@ export function ProjectTabs() {
               setCtxMenu(null);
             }}
           />
-          <div className="tab-ctx-menu" style={{ left: ctxMenu.x, top: ctxMenu.y }}>
+          <div
+            className="tab-ctx-menu"
+            style={{
+              // 뷰포트 클램프 (리뷰 D6) — 메뉴 예상 크기(200×56)로 가장자리 보정.
+              left: Math.min(ctxMenu.x, window.innerWidth - 208),
+              top: Math.min(ctxMenu.y, window.innerHeight - 64),
+            }}
+          >
             {dualProject === ctxMenu.path ? (
               <button
                 className="tab-ctx-item"

@@ -13,6 +13,12 @@ import { recallArea, forgetArea, type PanelArea } from "../state/panelFocus";
 import { isTransferring } from "../state/panelTransfer";
 import { closePanelSession } from "../state/panelSession";
 import { installDragOut, movePanelToNewWindow } from "../state/windowTransfer";
+import {
+  findPanelById,
+  findSessionPanel,
+  registerSurface,
+  unregisterSurface,
+} from "../state/surfaceRegistry";
 import { DropTargetOverlay } from "./DropTargetOverlay";
 import { installTransferTarget } from "../state/panelTransferTarget";
 import { components, AppTab, type PanelKind } from "./panelRegistry";
@@ -151,6 +157,7 @@ export function MainArea({
   // (spec §2 단일 소비자 불변식). 아래 각 지점이 isPrimary로 게이트된다.
   const isPrimary = !secondary;
   const surfaceProject = secondary ? (project ?? null) : activeProject;
+  const surfaceKey = isPrimary ? "primary" : "secondary";
   const theme = useAppStore((s) => s.theme);
   const projects = useAppStore((s) => s.projects);
   const projectModes = useAppStore((s) => s.projectModes);
@@ -221,6 +228,9 @@ export function MainArea({
     const api = event.api;
     apiRef.current = api;
     setApiReady(true);
+    // surface 레지스트리 등록 (D3·D4) — 세션 중복 attach 방지·closeRequest
+    // 소유 조회가 두 dock을 모두 본다. 키 리마운트 시 새 api가 덮어쓴다.
+    registerSurface(surfaceKey, api);
 
     // Restore the saved layout first; a corrupt/incompatible blob must never
     // crash — fall back to an empty layout.
@@ -234,9 +244,12 @@ export function MainArea({
 
     // Persist after restore so the restore itself does not redundantly re-save.
     api.onDidLayoutChange(() => {
-      if (surfaceProject) {
-        setLayout(surfaceProject, api.toJSON());
-      }
+      if (!surfaceProject) return;
+      // 부 surface가 주와 같은 프로젝트를 가리키는 전이 순간(교체 직전 프레임
+      // ·teardown 이벤트)의 저장을 차단 — 부가 마지막에 부분 layout을 써서
+      // 주 복원본을 덮으면 레이아웃 소실이다 (리뷰 D2).
+      if (secondary && useAppStore.getState().activeProject === surfaceProject) return;
+      setLayout(surfaceProject, api.toJSON());
     });
 
     // Real panel removal (close) -> close the backing session (spec §0.1). Tab/
@@ -268,9 +281,13 @@ export function MainArea({
     if (isPrimary) dragSubRef.current = installDragOut(api);
   };
 
-  // Tear down the drag gesture wiring on unmount.
+  // Tear down the drag gesture wiring on unmount + surface 레지스트리 해제.
   useEffect(() => {
-    return () => dragSubRef.current?.dispose();
+    return () => {
+      dragSubRef.current?.dispose();
+      unregisterSurface(surfaceKey, apiRef.current ?? undefined);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   // Receive panels docked INTO this (main) window from popouts — re-dock back
@@ -370,7 +387,8 @@ export function MainArea({
             : "placeholder";
     // Counter suffix: two same-kind panels in one millisecond (rapid dev-mode
     // opens) must not collide — dockview requires unique ids.
-    const id = `${kind}-${Date.now()}-${n}`;
+    // surface 접두사(m/s): 두 dock의 id 충돌 방지 (closeRequest 소유 판정 D3).
+    const id = `${kind}-${isPrimary ? "m" : "s"}-${Date.now()}-${n}`;
     api.addPanel({
       id,
       component,
@@ -674,6 +692,20 @@ export function MainArea({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [runRequest, apiReady, activeProject, layerMode]);
 
+  // 고아 closeRequest 백스톱 (리뷰 D3): 어느 surface도 패널을 소유하지 않으면
+  // (전이 타이밍·이미 닫힌 패널) 요청이 영구 잔류해 ×가 먹통이 된다 — 주
+  // surface가 1초 뒤 전 surface 조회로 확인하고 정리한다.
+  useEffect(() => {
+    if (!isPrimary || !closeRequest) return;
+    const t = setTimeout(() => {
+      if (useClaudeUi.getState().closeRequest === closeRequest && !findPanelById(closeRequest.panelId)) {
+        clearClose();
+      }
+    }, 1000);
+    return () => clearTimeout(t);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [closeRequest]);
+
   // Resolve a close request from a Claude tab's × (B3-1): 닫기 keeps the saved
   // history, 삭제 also removes it; both close the panel.
   const resolveClose = async (deleteHistory: boolean) => {
@@ -974,10 +1006,9 @@ export function MainArea({
   ) => {
     const api = apiRef.current;
     if (!api) return;
-    const existing = api.panels.find((pl) => {
-      const prm = pl.params as { sessionUuid?: string; loadSessionId?: string } | undefined;
-      return prm?.sessionUuid === p.uuid || prm?.loadSessionId === p.uuid;
-    });
+    // 중복 판정은 **전 surface** 조회 (D4) — 우측 dock에 열린 세션을 좌측에서
+    // resume하면 같은 uuid 이중 attach가 되므로, 소유 패널을 활성화한다.
+    const existing = findSessionPanel(p.uuid);
     if (existing) {
       existing.api.setActive();
       return;
@@ -1121,6 +1152,7 @@ export function MainArea({
   };
 
   const onSessionDragLeave = (e: React.DragEvent) => {
+    if (!isPrimary) return; // 드롭 존 핸들러 3종 동일 게이트 (D10)
     if (!isSessionDrag(e)) return;
     const rt = e.relatedTarget;
     if (rt instanceof Node && mainAreaRef.current?.contains(rt)) return; // 내부 이동
@@ -1184,7 +1216,9 @@ export function MainArea({
   // fresh session's uuid == its loadSessionId). No-op if no panel here owns it —
   // it lives in another window's dock (a documented limitation of the roll-up).
   useEffect(() => {
-    if (!isPrimary) return; // 롤업 포커스는 주 surface만
+    // 소유 기반 처리 (리뷰 D8): 화면에 보이는 우측 세션의 롤업 클릭도 동작해야
+    // 한다 — 각 surface는 자기 dock이 소유한 uuid만 처리(중복 없음: D4 dedupe로
+    // 한 세션은 한 surface에만 존재).
     if (!focusSessionRequest) return;
     const api = apiRef.current;
     if (!api) return;
@@ -1193,11 +1227,11 @@ export function MainArea({
       const prm = p.params as { sessionUuid?: string; loadSessionId?: string } | undefined;
       return prm?.sessionUuid === uuid || prm?.loadSessionId === uuid;
     });
-    if (!panel) return;
+    if (!panel) return; // 다른 surface(또는 다른 창) 소유 — 그쪽이 처리
     // 레이어 스왑 접합: the target tab lives in this (integrated) dock — if the
     // dev layer is in front, bring integrated forward first so the activated tab
     // is actually visible (같은 원칙: 뷰-행 요청의 대칭 전환, layerRouting 참조).
-    if (!integratedIsFront(layerMode) && activeProject) {
+    if (isPrimary && !integratedIsFront(layerMode) && activeProject) {
       useAppStore.getState().setProjectMode(activeProject, "integrated");
     }
     panel.api.setActive();
@@ -1423,8 +1457,10 @@ export function MainArea({
       />
 
       {/* 닫기 모달은 요청된 패널을 **소유한** surface만 띄운다 — 두 mount가
-          같은 closeRequest를 이중 소비하지 않게 (project-dual-surface). */}
-      {closeRequest && apiRef.current?.getPanel(closeRequest.panelId) && (
+          같은 closeRequest를 이중 소비하지 않게. apiReady를 조건에 넣어
+          판정이 리액티브하고(마운트 직후 ref null 창), id는 surface 접두사로
+          유일하다 (리뷰 D3). */}
+      {closeRequest && apiReady && apiRef.current?.getPanel(closeRequest.panelId) && (
         <div className="claude-modal-backdrop" onClick={() => clearClose()}>
           <div className="claude-modal" onClick={(e) => e.stopPropagation()}>
             <div className="claude-modal-title">이 Claude 세션을 어떻게 할까요?</div>

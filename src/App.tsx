@@ -41,6 +41,7 @@ import {
 import { initClaudeStatusGlobal } from "./state/claudeStatusGlobal";
 import { initNotify } from "./state/notify";
 import { resolveLayerMode, devLayerMounted, shouldFlipToIntegrated } from "./state/layerRouting";
+import { resolveVisibleDual } from "./state/dualSurface";
 import "./App.css";
 
 /**
@@ -116,16 +117,23 @@ function AppMain() {
 
   const treePanelRef = useRef<ImperativePanelHandle>(null);
   const [collapsed, setCollapsed] = useState(false);
-  // project-dual-surface: 우측 분할에 열린 프로젝트 + 정리 규칙 2개.
+  // project-dual-surface: 우측 분할에 열린 프로젝트.
   const projects = useAppStore((s) => s.projects);
   const dualProject = useAppStore((s) => s.dualProject);
   const setDualProject = useAppStore((s) => s.setDualProject);
-  // ① 동일 프로젝트 양쪽 금지(spec §2): activeProject가 우측 프로젝트가 되는
-  //    순간 우측을 닫는다 — 같은 layout을 두 dock이 쓰면 저장 경합·이중 attach.
+  // **렌더는 파생값으로 그린다** (리뷰 D1): 이펙트(커밋 후) 정리에만 맡기면
+  // setActive 직후 1프레임 동안 같은 프로젝트 dock 두 개가 공존한다. 파생값은
+  // 동일 프로젝트·비멤버십(닫힘/hydration 전)을 렌더 시점에 즉시 숨긴다.
+  const visibleDual = resolveVisibleDual(
+    dualProject,
+    activeProject,
+    projects.map((p) => p.path),
+  );
+  // 이펙트는 persist 정리만: ① 동일 프로젝트로 전환되면 dual 해제 ② 닫힌
+  // 프로젝트 정리(hydration 전 오판 방지로 목록이 채워진 뒤에만).
   useEffect(() => {
     if (dualProject && dualProject === activeProject) setDualProject(null);
   }, [dualProject, activeProject, setDualProject]);
-  // ② 복원 가드: 열린 탭 목록에 없는 프로젝트(닫혔거나 복원 무효)는 정리.
   useEffect(() => {
     if (dualProject && projects.length > 0 && !projects.some((p) => p.path === dualProject)) {
       setDualProject(null);
@@ -777,15 +785,19 @@ function AppMain() {
               <Panel id="dual-primary" order={1} minSize={25}>
                 <MainArea />
               </Panel>
-              {dualProject && (
+              {visibleDual && (
                 <>
                   <PanelResizeHandle className="resize-handle" />
                   <Panel id="dual-secondary" order={2} minSize={20} defaultSize={40}>
                     <div className="dual-secondary">
-                      <div className="dual-secondary-head">
-                        <span className="dual-secondary-name" title={dualProject}>
-                          {projects.find((p) => p.path === dualProject)?.name ?? dualProject}
+                      <div
+                        className="dual-secondary-head"
+                        title={`${visibleDual}\n수동 dock — 툴바 버튼·단축키·요청은 좌측(주) 작업 영역 기준입니다`}
+                      >
+                        <span className="dual-secondary-name">
+                          {projects.find((p) => p.path === visibleDual)?.name ?? visibleDual}
                         </span>
+                        <span className="dual-secondary-hint">보조</span>
                         <button
                           className="dual-secondary-close"
                           title="우측 분할 닫기"
@@ -795,9 +807,9 @@ function AppMain() {
                         </button>
                       </div>
                       <div className="dual-secondary-body">
-                        {/* keyed: 다른 프로젝트로 교체 시 dock 리마운트 → 그
-                            프로젝트 레이아웃 복원 (주 surface와 같은 원리) */}
-                        <MainArea key={dualProject} project={dualProject} secondary />
+                        {/* 내부 DockviewReact가 surfaceProject로 키잉되어
+                            프로젝트 교체 시 dock만 리마운트된다(외부 key 불요 — D11). */}
+                        <MainArea project={visibleDual} secondary />
                       </div>
                     </div>
                   </Panel>

@@ -1731,6 +1731,16 @@ body {
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+/* "이 dock은 수동(보조)"임을 알리는 미니 배지 — 전역 버튼/단축키가 좌측
+   기준인 이유를 시각적으로 예고 (리뷰 D12). */
+.dual-secondary-hint {
+  flex: 0 0 auto;
+  font-size: 10px;
+  padding: 1px 6px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  color: var(--fg-dim);
+}
 .dual-secondary-close {
   border: none;
   background: none;
