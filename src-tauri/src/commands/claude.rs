@@ -784,7 +784,12 @@ fn run_timeline_poll(
                     title: None,
                     summary: None,
                 };
-                if core_lib::snapshot::save(&base, &cwd, &snap).is_ok() {
+                // save 직전 stop 재검사 — close→delete와의 경합 창을 syscall
+                // 하나로 좁힌다(구 구현과 동급 이하). 완전 봉쇄는 delete와의
+                // 락 공유가 필요해 P6(session 락 정리) 후보로 기록(고유 잔존).
+                if !stop.load(Ordering::Relaxed)
+                    && core_lib::snapshot::save(&base, &cwd, &snap).is_ok()
+                {
                     snap_dirty = false;
                 }
             }

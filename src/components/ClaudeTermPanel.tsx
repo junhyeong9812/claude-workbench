@@ -973,8 +973,11 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
       .finally(() => {
         detailInFlight.current.delete(key);
       });
+    // fullDetail dep: 늦게 도착한 다른 키의 캐시가 상한 축출로 **현재** 키를
+    // 밀어내면 재조회할 상태 변화가 없어 로딩 고착 — 캐시 변화마다 재평가해
+    // 미스면 재발주한다(현재 키가 캐시되면 has() 가드로 즉시 반환 — 루프 없음).
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [detailKey, detailProject, detailRetry]);
+  }, [detailKey, detailProject, detailRetry, fullDetail]);
   const cachedFull = detailKey != null ? fullDetail.get(detailKey) : undefined;
   const hydratedItem =
     selectedItem && typeof cachedFull === "string"
