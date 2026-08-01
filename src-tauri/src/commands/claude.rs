@@ -109,6 +109,28 @@ struct ClaudeTimelinePayload {
     subagents: Vec<(String, Option<String>, u64, Vec<TimelineItem>)>,
 }
 
+/// 서브에이전트의 부모(스폰한 `Agent`/`Task` 툴콜) 추론 — 순수 (P0 B1).
+/// main 타임라인 → *다른* 에이전트 순으로 첫 매치(결과 텍스트가 agent id를
+/// 언급하는 아이템). 자기 transcript는 제외 — 자기 id 에코가 self-parent가
+/// 되어 트리에서 사라지는 회귀 방지(codex B1 F1). 동작 보존: 기존 인라인
+/// 체인 스캔과 동일한 순회 순서·판정(특성테스트 subagent_parent_*).
+pub(crate) fn subagent_parent(
+    aid: &str,
+    main_items: &[TimelineItem],
+    sub_raw: &[(String, u64, Vec<TimelineItem>)],
+) -> Option<String> {
+    main_items
+        .iter()
+        .chain(
+            sub_raw
+                .iter()
+                .filter(|(other, _, _)| other != aid)
+                .flat_map(|(_, _, x)| x.iter()),
+        )
+        .find(|it| it.content_text.as_deref().is_some_and(|ct| ct.contains(aid)))
+        .map(|it| it.tool_call_id.clone())
+}
+
 /// Generate a fresh session UUID for `--session-id`. Linux-only (the app's
 /// platform): reads the kernel's random UUID source.
 fn new_session_uuid() -> Result<String, AppError> {
@@ -505,6 +527,8 @@ fn run_timeline_poll(
     let mut sub_dir: Option<PathBuf> = None;
     let mut subagents: HashMap<String, core_lib::jsonl::SessionTail> = HashMap::new();
     let mut subagent_turn: HashMap<String, u64> = HashMap::new();
+    // P0 B1: agent id → 확정된 부모 tool_call_id (Some만 저장 — 불변 링크 캐시).
+    let mut parent_cache: HashMap<String, Option<String>> = HashMap::new();
     // Cheap fingerprint of the last emitted state (incl. subagent item count). A
     // prompt- or answer-only record advances turns/answers without touching any
     // tool item, so we can't key off `poll`'s touched indices alone.
@@ -622,27 +646,22 @@ fn run_timeline_poll(
         // Link each agent to the timeline item (the spawning `Agent`/`Task` call)
         // whose result mentions the agent id — that item, in main or in a parent
         // agent, is its parent (recursive tree). `None` ⇒ nest under its turn.
+        // P0 B1: 링크는 한 번 확정되면 불변인데 매 틱 O(A×C) 전문 스캔을
+        // 반복하던 것을 Some 결과만 캐시한다(None은 다음 틱 재탐색 — 스폰
+        // 아이템의 content_text가 늦게 도착하는 기존 동작 보존).
         let subagents_v: Vec<(String, Option<String>, u64, Vec<TimelineItem>)> = sub_raw
             .iter()
             .map(|(aid, turn, its)| {
-                // Find the spawning item (its result mentions the agent id) in the
-                // main timeline or in *other* agents — never in this agent's own
-                // transcript, so a child echoing its id can't self-parent and
-                // vanish from the tree (codex B1 F1).
-                let parent = items_v
-                    .iter()
-                    .chain(
-                        sub_raw
-                            .iter()
-                            .filter(|(other, _, _)| other != aid)
-                            .flat_map(|(_, _, x)| x.iter()),
-                    )
-                    .find(|it| {
-                        it.content_text
-                            .as_deref()
-                            .is_some_and(|ct| ct.contains(aid.as_str()))
-                    })
-                    .map(|it| it.tool_call_id.clone());
+                let parent = match parent_cache.get(aid) {
+                    Some(p) => p.clone(),
+                    None => {
+                        let p = subagent_parent(aid, &items_v, &sub_raw);
+                        if p.is_some() {
+                            parent_cache.insert(aid.clone(), p.clone());
+                        }
+                        p
+                    }
+                };
                 (aid.clone(), parent, *turn, its.clone())
             })
             .collect();
@@ -795,4 +814,67 @@ pub fn claude_close(
     // (review P6-impl #2).
     let _ = app.emit("claude-session-closed", id);
     res
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// serde로 최소 필드 TimelineItem 픽스처 생성 (shell()은 pub(crate) of core).
+    fn item(tool_call_id: &str, content_text: Option<&str>) -> TimelineItem {
+        serde_json::from_value(serde_json::json!({
+            "session_id": "s",
+            "tool_call_id": tool_call_id,
+            "turn": 1,
+            "seq": 1,
+            "kind": "execute",
+            "title": "t",
+            "locations": [],
+            "project_label": null,
+            "diffs": [],
+            "content_text": content_text,
+            "raw_input": null,
+            "agent_status": "completed",
+            "write_status": "none",
+            "revision": 1
+        }))
+        .expect("fixture")
+    }
+
+    fn agent(aid: &str, items: Vec<TimelineItem>) -> (String, u64, Vec<TimelineItem>) {
+        (aid.to_string(), 1, items)
+    }
+
+    // P0 B1 특성테스트 — 기대값 손계산 (자기참조 금지).
+    #[test]
+    fn subagent_parent_prefers_main_timeline_first_match() {
+        let main = vec![
+            item("call-1", Some("no mention")),
+            item("call-2", Some("spawned agent-A here")),
+            item("call-3", Some("agent-A again later")),
+        ];
+        let subs = vec![agent("agent-A", vec![])];
+        // 첫 매치(call-2)가 이긴다 — call-3이 아니라.
+        assert_eq!(subagent_parent("agent-A", &main, &subs), Some("call-2".into()));
+    }
+
+    #[test]
+    fn subagent_parent_excludes_own_transcript_but_scans_others() {
+        // 자기 transcript가 자기 id를 에코해도 self-parent가 되면 안 된다.
+        let main = vec![item("m-1", Some("nothing"))];
+        let subs = vec![
+            agent("agent-A", vec![item("a-1", Some("I am agent-A"))]),
+            agent("agent-B", vec![item("b-1", Some("delegating to agent-A"))]),
+        ];
+        // main 무매치 → 다른 에이전트(B)의 아이템이 부모.
+        assert_eq!(subagent_parent("agent-A", &main, &subs), Some("b-1".into()));
+        // B 자신은 어디에도 언급이 없으니 None.
+        assert_eq!(subagent_parent("agent-B", &main, &subs), None);
+    }
+
+    #[test]
+    fn subagent_parent_none_when_unmentioned_or_no_content() {
+        let main = vec![item("m-1", None)];
+        assert_eq!(subagent_parent("agent-X", &main, &[]), None);
+    }
 }
