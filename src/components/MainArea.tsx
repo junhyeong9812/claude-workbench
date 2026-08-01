@@ -1216,22 +1216,20 @@ export function MainArea({
   // fresh session's uuid == its loadSessionId). No-op if no panel here owns it —
   // it lives in another window's dock (a documented limitation of the roll-up).
   useEffect(() => {
-    // 소유 기반 처리 (리뷰 D8): 화면에 보이는 우측 세션의 롤업 클릭도 동작해야
-    // 한다 — 각 surface는 자기 dock이 소유한 uuid만 처리(중복 없음: D4 dedupe로
-    // 한 세션은 한 surface에만 존재).
+    // 단일 소비자(주 surface)가 **전 surface 조회**로 소유 패널을 찾아 활성화
+    // (감사 N1: 부 surface가 전역 요청을 직접 구독하면 spec §2 단일 소비자
+    // 불변식 위반 — 레지스트리 조회면 우측 세션 포커스와 원칙을 동시 충족).
+    if (!isPrimary) return;
     if (!focusSessionRequest) return;
-    const api = apiRef.current;
-    if (!api) return;
     const { uuid } = focusSessionRequest;
-    const panel = api.panels.find((p) => {
-      const prm = p.params as { sessionUuid?: string; loadSessionId?: string } | undefined;
-      return prm?.sessionUuid === uuid || prm?.loadSessionId === uuid;
-    });
-    if (!panel) return; // 다른 surface(또는 다른 창) 소유 — 그쪽이 처리
+    const panel = findSessionPanel(uuid);
+    if (!panel) return; // 이 창 어느 surface도 소유하지 않음 — 다른 창(기존 한계)
     // 레이어 스왑 접합: the target tab lives in this (integrated) dock — if the
     // dev layer is in front, bring integrated forward first so the activated tab
     // is actually visible (같은 원칙: 뷰-행 요청의 대칭 전환, layerRouting 참조).
-    if (isPrimary && !integratedIsFront(layerMode) && activeProject) {
+    // 대상이 어느 surface든 integrated 레이어(dual 포함)를 앞으로 — dev 레이어
+    // 뒤에서 activate되면 보이지 않는다 (기존 대칭 전환 원칙).
+    if (!integratedIsFront(layerMode) && activeProject) {
       useAppStore.getState().setProjectMode(activeProject, "integrated");
     }
     panel.api.setActive();

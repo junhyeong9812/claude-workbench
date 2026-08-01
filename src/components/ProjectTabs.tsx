@@ -1,4 +1,4 @@
-import { useState, type DragEvent } from "react";
+import { useEffect, useState, type DragEvent } from "react";
 import { open } from "@tauri-apps/plugin-dialog";
 import { useAppStore } from "../state/store";
 import { TypeBadges } from "./TypeBadges";
@@ -14,6 +14,20 @@ export function ProjectTabs() {
   const setDualProject = useAppStore((s) => s.setDualProject);
   // 탭 우클릭 컨텍스트 메뉴 (project-dual-surface 진입점).
   const [ctxMenu, setCtxMenu] = useState<{ path: string; x: number; y: number } | null>(null);
+  // 리사이즈 시 클램프 재계산 대신 닫기(D6) + Escape 닫기.
+  useEffect(() => {
+    if (!ctxMenu) return;
+    const close = () => setCtxMenu(null);
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") close();
+    };
+    window.addEventListener("resize", close);
+    window.addEventListener("keydown", onKey);
+    return () => {
+      window.removeEventListener("resize", close);
+      window.removeEventListener("keydown", onKey);
+    };
+  }, [ctxMenu]);
 
   // HTML5 drag-drop reorder state (transient, view-only).
   const [draggedPath, setDraggedPath] = useState<string | null>(null);
@@ -123,9 +137,10 @@ export function ProjectTabs() {
           <div
             className="tab-ctx-menu"
             style={{
-              // 뷰포트 클램프 (리뷰 D6) — 메뉴 예상 크기(200×56)로 가장자리 보정.
-              left: Math.min(ctxMenu.x, window.innerWidth - 208),
-              top: Math.min(ctxMenu.y, window.innerHeight - 64),
+              // 뷰포트 클램프 (리뷰 D6) — 메뉴 예상 크기(200×56)로 가장자리
+              // 보정, 좁은 창에서 음수 좌표 방지(하한 0).
+              left: Math.max(0, Math.min(ctxMenu.x, window.innerWidth - 208)),
+              top: Math.max(0, Math.min(ctxMenu.y, window.innerHeight - 64)),
             }}
           >
             {dualProject === ctxMenu.path ? (
