@@ -97,15 +97,18 @@ export interface WorkspaceState {
   archive_effort?: string | null;
 }
 
-/** PTY output event pushed from Rust (`*_output` listen) — incremental bytes. */
+/** PTY output event pushed from Rust — incremental bytes. P3: 세션별 이벤트
+ * `terminal-output-{id}`(pty.ts ptyEventName)로 수신하며 `data`는 base64
+ * (decodePtyData로 원시 바이트 복원 — number[] JSON 3-4배 팽창 제거). */
 export interface TerminalOutputEvent {
   session_id: number;
   seq: number;
-  data: number[];
+  data: string;
 }
 
-/** Snapshot of a PTY's scrollback on attach (`*_snapshot`) — full bytes + seq. */
+/** Snapshot of a PTY's scrollback on attach (`*_snapshot`) — full bytes
+ * (base64, decodePtyData로 복원) + seq. */
 export interface SnapshotResult {
-  data: number[];
+  data: string;
   last_seq: number;
 }

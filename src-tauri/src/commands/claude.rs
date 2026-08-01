@@ -18,7 +18,7 @@ use core_lib::{SessionManager, TimelineItem, TokenUsage};
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager, State, Window};
 
-use super::{io_message, AppError, TerminalOutput};
+use super::{io_message, AppError};
 
 /// One live Claude session shared across windows (multiwindow mirror, P6). A
 /// session is ONE PTY (`id`) + JSONL (`uuid`); multiple windows can render it,
@@ -342,10 +342,7 @@ fn spawn_claude(
         let stop = stop.clone();
         thread::spawn(move || {
             while let Ok(chunk) = rx.recv() {
-                let _ = app.emit(
-                    "terminal-output",
-                    TerminalOutput { session_id: id, seq: chunk.seq, data: chunk.bytes },
-                );
+                super::emit_terminal_output(&app, id, chunk.seq, &chunk.bytes);
             }
             stop.store(true, Ordering::Relaxed);
         });

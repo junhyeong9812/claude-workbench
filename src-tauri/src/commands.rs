@@ -13,7 +13,7 @@ use std::io;
 
 use core_lib::SessionManager;
 use serde::Serialize;
-use tauri::{AppHandle, Manager};
+use tauri::{AppHandle, Emitter, Manager};
 
 mod archive;
 mod claude;
@@ -57,13 +57,30 @@ fn io_message(action: &str, err: &io::Error) -> String {
     format!("{action}: {reason}")
 }
 
-/// One chunk of PTY output, emitted as the `terminal-output` event. `data` is
-/// raw bytes (serialized as a JSON byte array); the frontend feeds it to xterm.
+/// One chunk of PTY output, emitted as the **session-scoped**
+/// `terminal-output-{id}` event (P3 — 전역 단일 이벤트는 모든 패널이 전 세션
+/// 청크를 역직렬화하게 만든다). `data` is the raw bytes **base64-encoded**
+/// (JSON number[] 직렬화가 3-4배 팽창하던 것을 ~1.33배로); the frontend
+/// decodes with `decodePtyData` and feeds xterm.
 #[derive(Clone, Serialize)]
 struct TerminalOutput {
     session_id: u64,
     seq: u64,
-    data: Vec<u8>,
+    data: String,
+}
+
+/// Emit one PTY chunk to its session-scoped event. 모든 PTY relay(터미널·SSH·
+/// Claude)가 이 헬퍼를 지나므로 이벤트명·인코딩 계약이 한 곳에 있다.
+fn emit_terminal_output(app: &AppHandle, session_id: u64, seq: u64, bytes: &[u8]) {
+    use base64::Engine as _;
+    let _ = app.emit(
+        &format!("terminal-output-{session_id}"),
+        TerminalOutput {
+            session_id,
+            seq,
+            data: base64::engine::general_purpose::STANDARD.encode(bytes),
+        },
+    );
 }
 
 /// Runtime toggle for scrollback disk persistence (opt-in — review F11/P4-R3). A

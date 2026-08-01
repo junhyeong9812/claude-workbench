@@ -9,15 +9,17 @@ use std::thread;
 
 use core_lib::SessionManager;
 use serde::Serialize;
-use tauri::{AppHandle, Emitter, State};
+use tauri::{AppHandle, State};
 
-use super::{scrollback_dir, spawn_scrollback_flush, AppError, ScrollbackState, TerminalOutput};
+use super::{scrollback_dir, spawn_scrollback_flush, AppError, ScrollbackState};
 
-/// Scrollback snapshot returned to a (re)attaching panel: recent raw bytes plus
-/// the seq of the last chunk they cover (backfill contract — see core::session).
+/// Scrollback snapshot returned to a (re)attaching panel: recent raw bytes
+/// (**base64** — P3, 링 상한 1MB가 number[] JSON으로 ~4MB까지 팽창하던 것)
+/// plus the seq of the last chunk they cover (backfill contract — see
+/// core::session). 프론트는 `decodePtyData`로 복원(live 청크와 동일 인코딩).
 #[derive(Serialize)]
 pub struct TerminalSnapshot {
-    data: Vec<u8>,
+    data: String,
     last_seq: u64,
 }
 
@@ -48,14 +50,7 @@ pub fn terminal_create(
         let app = app.clone();
         thread::spawn(move || {
             while let Ok(chunk) = rx.recv() {
-                let _ = app.emit(
-                    "terminal-output",
-                    TerminalOutput {
-                        session_id: id,
-                        seq: chunk.seq,
-                        data: chunk.bytes,
-                    },
-                );
+                super::emit_terminal_output(&app, id, chunk.seq, &chunk.bytes);
             }
         });
     }
@@ -93,7 +88,11 @@ pub fn terminal_snapshot(
     id: u64,
 ) -> Result<TerminalSnapshot, AppError> {
     let (data, last_seq) = mgr.snapshot(id).map_err(AppError::new)?;
-    Ok(TerminalSnapshot { data, last_seq })
+    use base64::Engine as _;
+    Ok(TerminalSnapshot {
+        data: base64::engine::general_purpose::STANDARD.encode(&data),
+        last_seq,
+    })
 }
 
 /// Close a session: kill the PTY, join its reader thread, free resources
