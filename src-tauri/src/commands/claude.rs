@@ -749,10 +749,13 @@ fn run_timeline_poll(
                                     // 메모 키를 정확히 무효화(레코드 sessionId가
                                     // 생성자 id보다 우선하므로 sid==aid 가정
                                     // 불가 — 실코드 확인 map.rs L79-81).
+                                    let stale: std::collections::HashSet<(&str, &str)> = d
+                                        .items
+                                        .iter()
+                                        .map(|it| (it.session_id.as_str(), it.tool_call_id.as_str()))
+                                        .collect();
                                     mention_memo.retain(|(_, sid, tcid), _| {
-                                        !d.items.iter().any(|it| {
-                                            &it.session_id == sid && &it.tool_call_id == tcid
-                                        })
+                                        !stale.contains(&(sid.as_str(), tcid.as_str()))
                                     });
                                     let mut st = core_lib::jsonl::SessionTail::new(
                                         cwd.clone(),
@@ -773,10 +776,9 @@ fn run_timeline_poll(
                             }
                             continue;
                         }
-                    } else if sub_done.contains_key(&aid) {
-                        // 재활성 후 아직 빈 tail — 아래 정상 poll 경로가 계속
-                        // 증분을 시도한다(재생성 없음).
                     }
+                    // (재활성 후 아직 빈 tail인 done 병존 에이전트는 아래 정상
+                    // poll 경로가 증분을 잇는다 — 재생성 없음.)
                     if !subagents.contains_key(&aid) {
                         subagent_turn.insert(aid.clone(), t.current_turn());
                         if !sub_order.contains(&aid) {
