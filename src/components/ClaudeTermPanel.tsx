@@ -922,6 +922,41 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
   );
   const selectedItem = selectedId ? (itemIndex.get(selectedId) ?? null) : null;
 
+  // P1: 절단(content_truncated) 아이템 선택 시 원문을 lazy 조회해 뷰어에
+  // 전문을 보여준다. 실패는 절단본 유지(read-only 조회 — 무해).
+  const [fullDetail, setFullDetail] = useState<Map<string, string>>(new Map());
+  useEffect(() => {
+    const it = selectedItem;
+    if (!it?.content_truncated || fullDetail.has(it.tool_call_id)) return;
+    const uuid = props.params.sessionUuid ?? props.params.loadSessionId;
+    const project = props.params.project ?? useAppStore.getState().activeProject ?? "";
+    if (!uuid) return;
+    let alive = true;
+    invoke<{ content_text: string | null }>("claude_item_detail", {
+      project,
+      uuid,
+      toolCallId: it.tool_call_id,
+    })
+      .then((d) => {
+        if (!alive || d.content_text == null) return;
+        const text = d.content_text;
+        setFullDetail((prev) => new Map(prev).set(it.tool_call_id, text));
+      })
+      .catch(() => {});
+    return () => {
+      alive = false;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedItem]);
+  const hydratedItem =
+    selectedItem && fullDetail.has(selectedItem.tool_call_id)
+      ? {
+          ...selectedItem,
+          content_text: fullDetail.get(selectedItem.tool_call_id)!,
+          content_truncated: false,
+        }
+      : selectedItem;
+
   return (
     <div className="claudeterm" ref={containerRef} onKeyDown={onContainerKey}>
       <div className="claudeterm-pane claudeterm-term-pane">
@@ -1121,7 +1156,7 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
                   <pre className="claudeterm-text">{textView.text}</pre>
                 )
               ) : (
-                <ItemDetail item={selectedItem!} markdown={detailMarkdown} />
+                <ItemDetail item={hydratedItem!} markdown={detailMarkdown} />
               )}
             </div>
           </div>

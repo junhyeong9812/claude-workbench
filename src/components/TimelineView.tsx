@@ -6,8 +6,11 @@
 
 import { Fragment, useEffect, useMemo, useRef, useState } from "react";
 import { isMarkdownPath, Markdown } from "./markdown";
-import { groupItemsByTurn } from "./timelineIndex";
+import { groupItemsByTurn, sliceRecentTurns } from "./timelineIndex";
 import { useFileText } from "../hooks/useFileText";
+
+/** P1: 한 번에 렌더하는 최근 턴 수 (더 보기로 확장). */
+const TURN_RENDER_CAP = 30;
 
 /** Sanitized markdown for tool/session 뷰모드. Media tags are blocked here (unlike
  * the study viewer, which renders local images) — tool output may contain remote
@@ -30,6 +33,9 @@ export interface TimelineItem {
   cwd?: string | null;
   diffs: { path: string; old_text: string | null; new_text: string }[];
   content_text: string | null;
+  /** P1: 표시 계층에서 content_text가 상한(32KB)으로 절단됨 — 뷰어가
+   * claude_item_detail로 원문을 lazy 조회한다. 구 스냅샷엔 없음(optional). */
+  content_truncated?: boolean;
   raw_input: unknown;
   agent_status: string;
   write_status: string;
@@ -257,6 +263,11 @@ export function TimelineView({
     ...new Set<number>([...turns.keys(), ...answers.keys(), ...items.map((it) => it.turn)]),
   ].sort((a, b) => a - b);
 
+  // P1 렌더 캡: 장세션 DOM 폭증(1만+ 노드) 방지 — 최근 N턴만 그리고 "이전
+  // 더 보기"로 확장. nav와 렌더가 같은 visible 목록을 쓴다(화면 일치 원칙).
+  const [turnLimit, setTurnLimit] = useState(TURN_RENDER_CAP);
+  const { visible: visibleTurnNos, hiddenCount } = sliceRecentTurns(turnNos, turnLimit);
+
   // 턴 → 아이템(seq 오름차순) 인덱스 — nav 경로와 렌더 경로가 공유한다.
   // 기존의 턴별 filter+sort(렌더마다 O(T×I)×2)와 결과 동일(특성테스트
   // timelineIndex.test.ts), items 변경 시에만 1회 O(I) 재빌드 (P0 F1).
@@ -298,7 +309,7 @@ export function TimelineView({
     seenAgent.add(aid);
     for (const it of its) pushItemTree(it);
   }
-  for (const turn of turnNos) {
+  for (const turn of visibleTurnNos) {
     if (collapsedDates.has(dates.get(turn) ?? "")) continue;
     navEntries.push({ kind: "turn", turn });
     if (collapsedTurns.has(turn)) continue; // folded turn: head is the only stop
@@ -407,7 +418,7 @@ export function TimelineView({
   // Insert a date divider whenever the date changes between turns (B6). Turns
   // are oldest-first, so dates read oldest→newest down the list.
   let prevDate: string | null = null;
-  const turnRows = turnNos.map((turn) => {
+  const turnRows = visibleTurnNos.map((turn) => {
     const date = dates.get(turn) ?? "";
     const showDate = date !== "" && date !== prevDate;
     prevDate = date;
@@ -418,6 +429,15 @@ export function TimelineView({
     <div className="timeline-list" ref={listRef} tabIndex={0} onKeyDown={onKeyDown}>
       {turnNos.length === 0 && (
         <div className="timeline-empty">Claude에게 질문하면 여기에 쌓입니다.</div>
+      )}
+      {hiddenCount > 0 && (
+        <button
+          className="timeline-more"
+          title="오래된 턴은 성능을 위해 접혀 있습니다 — 클릭해 더 렌더"
+          onClick={() => setTurnLimit((l) => l + TURN_RENDER_CAP)}
+        >
+          이전 {Math.min(TURN_RENDER_CAP, hiddenCount)}턴 더 보기 (숨김 {hiddenCount})
+        </button>
       )}
       {turnRows.map(({ turn, date, showDate }) => {
         const collapsed = collapsedDates.has(date);

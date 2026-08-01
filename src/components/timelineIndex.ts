@@ -31,6 +31,21 @@ export function groupItemsByTurn<T extends { turn: number; seq: number }>(
  * 그다음 서브 목록 순서·각 배열 순서. "먼저 넣은 것 유지"가 first-match와
  * 동치(특성테스트: 중복 id는 main 승리).
  */
+/**
+ * 최근 N턴만 렌더 (P1 렌더 캡 — 전체 가상화의 전 단계). 잘린 턴은 "접힘"이
+ * 아니라 미렌더 — nav도 화면과 일치해야 하므로 nav·렌더가 같은 목록을 쓴다.
+ * turnNos는 오름차순 전제(호출부 sort).
+ */
+export function sliceRecentTurns(
+  turnNos: readonly number[],
+  limit: number,
+): { visible: number[]; hiddenCount: number } {
+  if (limit <= 0 || turnNos.length <= limit) {
+    return { visible: [...turnNos], hiddenCount: 0 };
+  }
+  return { visible: turnNos.slice(-limit), hiddenCount: turnNos.length - limit };
+}
+
 export function buildItemIndex<T extends { tool_call_id: string }>(
   items: readonly T[],
   subItemLists: readonly (readonly T[])[],

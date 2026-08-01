@@ -2482,6 +2482,23 @@ body {
   background: var(--sel-bg);
   outline: 1px solid var(--accent);
 }
+/* P1: 렌더 캡 "이전 N턴 더 보기" — 목록 최상단 버튼. */
+.timeline-more {
+  display: block;
+  width: 100%;
+  padding: 6px 8px;
+  background: var(--bg-alt);
+  border: 1px dashed var(--border);
+  border-radius: 6px;
+  color: var(--fg-dim);
+  font-size: 11px;
+  cursor: pointer;
+}
+.timeline-more:hover {
+  color: var(--fg);
+  background: var(--bg-hover);
+}
+
 .timeline-empty {
   padding: 12px 8px;
   font-size: 12px;
