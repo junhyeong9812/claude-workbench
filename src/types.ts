@@ -106,8 +106,9 @@ export interface TerminalOutputEvent {
   data: string;
 }
 
-/** Snapshot of a PTY's scrollback on attach (`*_snapshot`) — full bytes + seq. */
+/** Snapshot of a PTY's scrollback on attach (`*_snapshot`) — full bytes
+ * (base64, decodePtyData로 복원) + seq. */
 export interface SnapshotResult {
-  data: number[];
+  data: string;
   last_seq: number;
 }

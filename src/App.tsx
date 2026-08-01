@@ -161,6 +161,15 @@ function AppMain() {
     }
     droppedUrlsRef.current = current;
   }, [droppedPeek]);
+  // 언마운트(팝아웃 창 닫힘 등) 시 잔여 revoke — 위 diff effect에 cleanup을
+  // 달면 매 실행 전에 표시 중 URL을 조기 revoke하므로 mount-only로 분리(리뷰).
+  useEffect(
+    () => () => {
+      for (const u of droppedUrlsRef.current) URL.revokeObjectURL(u);
+      droppedUrlsRef.current = [];
+    },
+    [],
+  );
 
   // 상호 배타(리뷰 W5): 경로 peek이 어떤 경로(트리 클릭·검색 점프)로든 열리면
   // 드롭 peek을 닫는다 — 오버레이 이중 적층 방지. (역방향은 드롭 처리부의

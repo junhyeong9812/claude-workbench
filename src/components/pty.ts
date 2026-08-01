@@ -10,9 +10,16 @@
 /** 세션별 PTY 출력 이벤트명 — 백엔드 emit과 한 쌍. */
 export const ptyEventName = (sessionId: number): string => `terminal-output-${sessionId}`;
 
-/** base64 → 원시 바이트 (xterm write 입력). */
+/** base64 → 원시 바이트 (xterm write 입력). 손상 payload는 빈 배열 + 경고
+ * (리스너 콜백 내부 throw로 청크 처리 자체가 죽는 것 방지 — 방어선). */
 export function decodePtyData(b64: string): Uint8Array {
-  const bin = atob(b64);
+  let bin: string;
+  try {
+    bin = atob(b64);
+  } catch {
+    console.warn("decodePtyData: invalid base64 payload dropped");
+    return new Uint8Array(0);
+  }
   const out = new Uint8Array(bin.length);
   for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
   return out;
@@ -23,19 +30,25 @@ export function decodePtyData(b64: string): Uint8Array {
  * ready 전 한정이라 스냅샷 backfill(seq 게이트)이 정확성을 지킨다. */
 export const PENDING_MAX_CHARS = 700 * 1024; // ≈ 512KB 원시 바이트
 
-/** pending에 ev를 넣고 상한 초과분을 앞에서 드롭한다. 반환 = 새 총 문자수.
- * (호출부가 러닝 토탈을 유지 — 매 push O(n) 재계산 방지.) */
+/** pending에 ev를 넣고 상한 초과분을 앞에서 드롭한다. 반환 = 새 총 문자수와
+ * 드롭 발생 여부. **드롭이 있었으면 호출부(패널)는 drain 직전 스냅샷을 다시
+ * 떠야 한다** — 스냅샷 시각 이후 도착분이 드롭되면 "상단 소실"이 아니라
+ * 스트림 중간 갭(ESC 절단 → 화면 손상)이 되기 때문(리뷰 P1/P2). 재스냅샷이
+ * 갭을 잇는 전제라 단일 대형 청크도 전부 드롭 가능(0개까지). 호출부가 러닝
+ * 토탈을 유지한다(매 push O(n) 재계산 방지). */
 export function pushPendingCapped<T extends { data: string }>(
   pending: T[],
   ev: T,
   total: number,
   maxChars: number = PENDING_MAX_CHARS,
-): number {
+): { total: number; dropped: boolean } {
   pending.push(ev);
   let next = total + ev.data.length;
-  while (next > maxChars && pending.length > 1) {
-    const dropped = pending.shift()!;
-    next -= dropped.data.length;
+  let dropped = false;
+  while (next > maxChars && pending.length > 0) {
+    const evicted = pending.shift()!;
+    next -= evicted.data.length;
+    dropped = true;
   }
-  return next;
+  return { total: next, dropped };
 }

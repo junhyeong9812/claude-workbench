@@ -33,28 +33,26 @@ describe("ptyEventName", () => {
 
 describe("pushPendingCapped", () => {
   const ev = (data: string) => ({ data });
-  it("상한 이하 — 전부 유지, 토탈 누적", () => {
+  it("상한 이하 — 전부 유지·dropped=false·토탈 누적", () => {
     const p: { data: string }[] = [];
-    let t = 0;
-    t = pushPendingCapped(p, ev("aaaa"), t, 10);
-    t = pushPendingCapped(p, ev("bbbb"), t, 10);
+    let r = pushPendingCapped(p, ev("aaaa"), 0, 10);
+    r = pushPendingCapped(p, ev("bbbb"), r.total, 10);
     expect(p.map((x) => x.data)).toEqual(["aaaa", "bbbb"]);
-    expect(t).toBe(8);
+    expect(r).toEqual({ total: 8, dropped: false });
   });
-  it("초과 시 오래된 것부터 드롭 (손계산)", () => {
+  it("초과 시 오래된 것부터 드롭 + dropped 신호 (손계산)", () => {
     const p: { data: string }[] = [];
-    let t = 0;
-    t = pushPendingCapped(p, ev("aaaa"), t, 10); // 4
-    t = pushPendingCapped(p, ev("bbbb"), t, 10); // 8
-    t = pushPendingCapped(p, ev("cccc"), t, 10); // 12 → "aaaa" 드롭 → 8
+    let r = pushPendingCapped(p, ev("aaaa"), 0, 10); // 4
+    r = pushPendingCapped(p, ev("bbbb"), r.total, 10); // 8
+    r = pushPendingCapped(p, ev("cccc"), r.total, 10); // 12 → "aaaa" 드롭 → 8
     expect(p.map((x) => x.data)).toEqual(["bbbb", "cccc"]);
-    expect(t).toBe(8);
+    expect(r).toEqual({ total: 8, dropped: true });
   });
-  it("단일 대형 청크는 상한 초과여도 남긴다(최소 1개 보장)", () => {
+  it("단일 대형 청크도 전부 드롭 가능(상한 엄격 — 재스냅샷이 회수 전제)", () => {
     const p: { data: string }[] = [];
-    const t = pushPendingCapped(p, ev("x".repeat(20)), 0, 10);
-    expect(p.length).toBe(1);
-    expect(t).toBe(20);
+    const r = pushPendingCapped(p, ev("x".repeat(20)), 0, 10);
+    expect(p.length).toBe(0);
+    expect(r).toEqual({ total: 0, dropped: true });
   });
   it("기본 상한 상수 노출", () => {
     expect(PENDING_MAX_CHARS).toBeGreaterThan(0);

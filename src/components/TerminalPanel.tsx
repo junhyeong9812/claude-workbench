@@ -138,12 +138,41 @@ export function TerminalPanel(props: IDockviewPanelProps<TerminalParams>) {
     // P3: 세션별 이벤트 구독 — 전역 단일 이벤트를 전 패널이 역직렬화하던
     // 것을 제거. 구독 → 스냅샷 → drain 순서(R1-1 계약)는 아래에서 유지.
     let pendingTotal = 0;
+    let pendingDropped = false;
     const subscribeOutput = async (id: number) => {
       if (unlisten) unlisten();
-      unlisten = await listen<TerminalOutputEvent>(ptyEventName(id), (e) => {
-        if (!ready) pendingTotal = pushPendingCapped(pending, e.payload, pendingTotal);
-        else applyLive(e.payload);
+      unlisten = undefined;
+      const un = await listen<TerminalOutputEvent>(ptyEventName(id), (e) => {
+        if (!ready) {
+          const r = pushPendingCapped(pending, e.payload, pendingTotal);
+          pendingTotal = r.total;
+          pendingDropped ||= r.dropped;
+        } else applyLive(e.payload);
       });
+      // await 중 언마운트됐으면 즉시 해제 — cleanup은 이미 지나갔다(리뷰 P1,
+      // 구 코드의 P3-R5 방어선 복원).
+      if (disposed) {
+        un();
+        return;
+      }
+      unlisten = un;
+    };
+    // pending 드롭이 있었으면 drain 직전 스냅샷을 다시 떠 갭을 잇는다(리뷰
+    // P1/P2 — 스냅샷 이후 도착분 드롭은 상단 소실이 아니라 중간 절단이 된다).
+    // 화면 중복 방지 위해 reset 후 전체 재도장. 재스냅샷 동안 도착분은 계속
+    // pending에 쌓인다(ready 아직 false; 그 사이 재드롭은 잔존 창 — 두 번째
+    // 스냅샷 왕복 안에 다시 512KB가 필요해 실질 무시).
+    const healDroppedGap = async () => {
+      if (!pendingDropped || sessionId == null) return;
+      try {
+        const snap = await invoke<SnapshotResult>("terminal_snapshot", { id: sessionId });
+        if (disposed) return;
+        term.reset();
+        write(decodePtyData(snap.data));
+        lastApplied = snap.last_seq;
+      } catch {
+        /* 세션 소멸 — drain이 남은 pending을 seq 게이트로 처리 */
+      }
     };
 
     (async () => {
@@ -180,7 +209,7 @@ export function TerminalPanel(props: IDockviewPanelProps<TerminalParams>) {
         await subscribeOutput(existing);
         try {
           const snap = await invoke<SnapshotResult>("terminal_snapshot", { id: existing });
-          write(snap.data);
+          write(decodePtyData(snap.data));
           lastApplied = snap.last_seq;
         } catch {
           sessionId = null; // session gone (e.g. after restart) -> recreate
@@ -235,26 +264,34 @@ export function TerminalPanel(props: IDockviewPanelProps<TerminalParams>) {
             }).catch(() => {});
           }, 400);
         }
+        if (disposed) return; // create await 중 언마운트 — 구독/파라미터 갱신 불필요
         props.api.updateParameters({ ...props.params, sessionId, runCmd: undefined });
-        // 2) Fresh session: subscribe now the id exists, then backfill via
-        // snapshot — 생성~구독 사이에 나온 초기 청크(프롬프트 등)도 스냅샷이
-        // 회수한다(구 전역 리스너 시절엔 id 미할당 청크가 그냥 유실됐다).
+        // 2) Fresh session: subscribe now the id exists. persist 복원(F11 —
+        // 디스크 seed는 seq를 소비하지 않는 순수 backfill이라 스냅샷으로만
+        // 나온다)일 때만 스냅샷을 떠 과거 출력을 그린다. 비영속 신생 세션은
+        // 스냅샷 생략 — 생성 직후 청크는 pending+seq 게이트가 잇고, 드롭 시
+        // healDroppedGap이 회수한다(리뷰: 무기록 동작 확장 방지 + IPC 절약).
         if (sessionId != null) {
           await subscribeOutput(sessionId);
-          try {
-            const snap = await invoke<SnapshotResult>("terminal_snapshot", { id: sessionId });
-            write(snap.data);
-            lastApplied = snap.last_seq;
-          } catch {
-            /* no scrollback yet */
+          if (persistKey != null) {
+            try {
+              const snap = await invoke<SnapshotResult>("terminal_snapshot", { id: sessionId });
+              write(decodePtyData(snap.data));
+              lastApplied = snap.last_seq;
+            } catch {
+              /* no scrollback yet */
+            }
           }
         }
       }
 
       // 3) Drain buffered chunks (skipping any already in the snapshot), go live.
+      await healDroppedGap();
       ready = true;
       for (const ev of pending) applyLive(ev);
       pending.length = 0;
+      pendingTotal = 0;
+      pendingDropped = false;
     })();
 
     const onData = term.onData((d) => {

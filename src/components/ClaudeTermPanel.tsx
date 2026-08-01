@@ -690,12 +690,38 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
     // 직후·스냅샷 **전**에 구독한다(R1-1 계약 유지 — 구독~스냅샷 사이 청크는
     // pending 버퍼(상한부) + seq 게이트가 정확히 잇는다).
     let pendingTotal = 0;
+    let pendingDropped = false;
     const subscribeOutput = async (id: number) => {
       if (unlistenTerm) unlistenTerm();
-      unlistenTerm = await listen<TerminalOutputEvent>(ptyEventName(id), (e) => {
-        if (!ready) pendingTotal = pushPendingCapped(pending, e.payload, pendingTotal);
-        else applyLive(e.payload);
+      unlistenTerm = undefined;
+      const un = await listen<TerminalOutputEvent>(ptyEventName(id), (e) => {
+        if (!ready) {
+          const r = pushPendingCapped(pending, e.payload, pendingTotal);
+          pendingTotal = r.total;
+          pendingDropped ||= r.dropped;
+        } else applyLive(e.payload);
       });
+      // await 중 언마운트 — cleanup은 이미 지나갔으므로 즉시 해제(리뷰 P1).
+      if (disposed) {
+        un();
+        return;
+      }
+      unlistenTerm = un;
+    };
+    // pending 드롭 시 drain 직전 재스냅샷으로 갭을 잇는다(리뷰 P1/P2 — 중간
+    // 절단 방지). reset 후 전체 재도장(중복 방지); 재스냅샷 중 도착분은
+    // pending에 계속 쌓인다(ready 아직 false).
+    const healDroppedGap = async () => {
+      if (!pendingDropped || sessionId == null) return;
+      try {
+        const snap = await invoke<SnapshotResult>("terminal_snapshot", { id: sessionId });
+        if (disposed) return;
+        term.reset();
+        write(decodePtyData(snap.data));
+        lastApplied = snap.last_seq;
+      } catch {
+        /* 세션 소멸 — drain이 seq 게이트로 처리 */
+      }
     };
 
     (async () => {
@@ -803,7 +829,7 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
         await subscribeOutput(sessionId);
         try {
           const snap = await invoke<SnapshotResult>("terminal_snapshot", { id: sessionId });
-          write(snap.data);
+          write(decodePtyData(snap.data));
           lastApplied = snap.last_seq;
         } catch {
           /* fresh session — no scrollback yet */
@@ -811,9 +837,12 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
       }
 
       sessionIdRef.current = sessionId;
+      await healDroppedGap();
       ready = true;
       for (const ev of pending) applyLive(ev);
       pending.length = 0;
+      pendingTotal = 0;
+      pendingDropped = false;
 
       // Mount rescan (S1): the scrollback `write()` above already triggers the
       // debounced scanner, but a fresh reopen with no new scrollback wouldn't —
