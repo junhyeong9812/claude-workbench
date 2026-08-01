@@ -10,7 +10,7 @@ use std::ffi::OsStr;
 use std::io;
 use std::path::Path;
 
-use crate::project_type::{detect_project_types, ProjectType};
+use crate::project_type::ProjectType;
 
 /// One entry in a directory listing, sent to the webview.
 ///

@@ -72,17 +72,17 @@ const DISPLAY_ORDER: [ProjectType; 7] = [
 /// Results are sorted by [`DISPLAY_ORDER`]. An empty/marker-less directory
 /// yields an empty `Vec`. This function never panics.
 pub fn detect_project_types<P: AsRef<Path>>(path: P) -> Vec<ProjectType> {
-    let dir = path.as_ref();
-    let has = |marker: &str| dir.join(marker).exists();
-    detect_project_types_uncached(dir, has)
+    detect_project_types_uncached(path.as_ref())
 }
 
 /// P2: (dir mtime, package.json mtime) 키 캐시 — 트리 폴링이 4초마다 펼친
-/// 디렉토리의 모든 하위 dir에 마커 stat ~10회씩을 반복하던 것을, 무효화 조건이
-/// 정확한 키로 재사용한다. 마커 파일 추가/삭제 = dir mtime 변경, JS flavor
-/// (React/Vue/JS)는 package.json **내용** 의존 = package.json mtime 변경 —
-/// 두 키가 관측 가능한 출력의 입력 전부를 덮는다(특성테스트로 동치 고정).
-/// 키 조회 실패(mtime 불가)는 캐시 미사용(항상 재계산) — stale 금지 우선.
+/// 디렉토리의 모든 하위 dir에 마커 stat ~10회씩을 반복하던 것을 재사용한다.
+/// 무효화: 마커 파일 추가/삭제 = dir mtime 변경, JS flavor(React/Vue/JS)는
+/// package.json **내용** 의존 = 그 파일 mtime 변경. 알려진 잔존 구멍(리뷰
+/// ledger 기록·수용): ①dir 밖을 가리키는 심링크 마커의 타깃만 생기고/사라지는
+/// 경우(dir mtime 불변) ②mtime 해상도가 초 단위인 FS(exFAT·SMB)에서 같은 tick
+/// 내 마커 변경 — 둘 다 배지 표시에 한정되고 로컬 dev FS(ns 해상도)에선 발생
+/// 하지 않는다. 키 조회 실패(mtime 불가)는 캐시 미사용(항상 재계산).
 const TYPE_CACHE_MAX: usize = 4096;
 type TypeCacheKey = (PathBuf, SystemTime, Option<SystemTime>);
 static TYPE_CACHE: Mutex<Option<HashMap<PathBuf, (TypeCacheKey, Vec<ProjectType>)>>> =
@@ -110,14 +110,21 @@ pub fn detect_project_types_cached(dir: &Path) -> Vec<ProjectType> {
     if let Ok(mut guard) = TYPE_CACHE.lock() {
         let cache = guard.get_or_insert_with(HashMap::new);
         if cache.len() >= TYPE_CACHE_MAX {
-            cache.clear(); // 단순 전체 축출 — 정확성 무관(키 재검증), 상한만 보장
+            // 절반만 축출(임의 순서) — 전체 clear는 상한 근처 워크로드에서 매
+            // 폴링 재구축 thrash가 된다(리뷰 P3). 정확성 무관(키 재검증).
+            let doomed: Vec<PathBuf> =
+                cache.keys().take(TYPE_CACHE_MAX / 2).cloned().collect();
+            for k in doomed {
+                cache.remove(&k);
+            }
         }
         cache.insert(key.0.clone(), (key, types.clone()));
     }
     types
 }
 
-fn detect_project_types_uncached(dir: &Path, has: impl Fn(&str) -> bool) -> Vec<ProjectType> {
+fn detect_project_types_uncached(dir: &Path) -> Vec<ProjectType> {
+    let has = |marker: &str| dir.join(marker).exists();
 
     let mut types: Vec<ProjectType> = Vec::new();
 

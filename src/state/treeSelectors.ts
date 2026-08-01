@@ -23,7 +23,9 @@ let memoSet: ReadonlySet<string> = new Set();
 
 /** 활성 프로젝트의 expanded 목록을 lookup Set으로 (배열 identity 메모 — 같은
  * 배열이면 같은 Set 인스턴스). 셀렉터 안에서 매 store set마다 호출돼도 toggle
- * 시에만 재구축된다. */
+ * 시에만 재구축된다.
+ * 계약: expanded 배열은 **절대 in-place 변경 금지**(toggleExpanded는 항상 새
+ * 배열 생성) — push 한 줄이면 이 메모가 조용히 stale해진다(리뷰 P3). */
 export function expandedSetOf(s: TreeStateSlice): ReadonlySet<string> {
   const arr =
     s.projects.find((p) => p.path === s.activeProject)?.tree_state.expanded ?? EMPTY_EXPANDED;
@@ -54,7 +56,10 @@ export function sameEntries(a: DirEntry[] | undefined, b: DirEntry[]): boolean {
   return true;
 }
 
-const under = (key: string, root: string) => key === root || key.startsWith(`${root}/`);
+/** key가 root 자신이거나 그 아래인가 (구분자 `/`·`\` 둘 다 — Windows 경로
+ * 캐시 키 대비, 리뷰 #7). */
+export const underRoot = (key: string, root: string) =>
+  key === root || key.startsWith(`${root}/`) || key.startsWith(`${root}\\`);
 
 /** 닫힌 프로젝트 루트 아래의 캐시 키를 제거한다(F3 축출). keepRoots(남은
  * 프로젝트·스터디 폴더) 아래 키는 보존 — 중첩 프로젝트가 같은 경로를 공유할
@@ -66,7 +71,7 @@ export function pruneTreeCache<T>(
 ): Record<string, T> {
   const keeps = keepRoots.filter((r): r is string => !!r);
   const doomed = Object.keys(cache).filter(
-    (k) => under(k, closedRoot) && !keeps.some((r) => under(k, r)),
+    (k) => underRoot(k, closedRoot) && !keeps.some((r) => underRoot(k, r)),
   );
   if (doomed.length === 0) return cache;
   const next = { ...cache };

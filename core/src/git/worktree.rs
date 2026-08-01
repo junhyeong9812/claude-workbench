@@ -221,7 +221,32 @@ fn read_head_branch(root: &Path) -> Option<String> {
     let head = std::fs::read_to_string(gitdir.join("HEAD")).ok()?;
     let head = head.trim();
     if let Some(r) = head.strip_prefix("ref: ") {
-        return r.trim().strip_prefix("refs/heads/").map(str::to_string);
+        let branch = r.trim().strip_prefix("refs/heads/")?;
+        // unborn HEAD(커밋 0개 — ref 미존재) 판별: 기존 rev-parse 계약은 이때
+        // exit 128 → 빈 라벨이었다(리뷰 실측). loose ref 파일 또는 packed-refs
+        // 에 실재할 때만 브랜치로 인정, 아니면 None → spawn 폴백(→ "" 보존).
+        // 워크트리 gitdir는 refs가 commondir에 있다.
+        let common = match std::fs::read_to_string(gitdir.join("commondir")) {
+            Ok(c) => {
+                let p = Path::new(c.trim());
+                if p.is_absolute() {
+                    p.to_path_buf()
+                } else {
+                    gitdir.join(p)
+                }
+            }
+            Err(_) => gitdir.clone(),
+        };
+        let loose = common.join("refs/heads").join(branch);
+        let packed = || {
+            std::fs::read_to_string(common.join("packed-refs"))
+                .map(|t| t.lines().any(|l| l.ends_with(&format!(" refs/heads/{branch}"))))
+                .unwrap_or(false)
+        };
+        if loose.exists() || packed() {
+            return Some(branch.to_string());
+        }
+        return None;
     }
     if head.len() >= 40 && head.bytes().all(|b| b.is_ascii_hexdigit()) {
         return Some("(detached)".to_string());
@@ -367,21 +392,24 @@ mod tests {
     #[test]
     fn head_branch_symbolic_detached_and_gitlink() {
         let d = temp_root("head");
-        // 일반 repo: .git/HEAD 심볼릭 ref (슬래시 브랜치 포함).
+        // 일반 repo: .git/HEAD 심볼릭 ref (슬래시 브랜치 포함, loose ref 실재).
         let a = d.join("a");
-        std::fs::create_dir_all(a.join(".git")).unwrap();
+        std::fs::create_dir_all(a.join(".git/refs/heads/feature")).unwrap();
         std::fs::write(a.join(".git/HEAD"), "ref: refs/heads/feature/x\n").unwrap();
+        std::fs::write(a.join(".git/refs/heads/feature/x"), "a".repeat(40)).unwrap();
         assert_eq!(read_head_branch(&a), Some("feature/x".to_string()));
         // detached: 40자 hex.
         let b = d.join("b");
         std::fs::create_dir_all(b.join(".git")).unwrap();
         std::fs::write(b.join(".git/HEAD"), format!("{}\n", "a".repeat(40))).unwrap();
         assert_eq!(read_head_branch(&b), Some("(detached)".to_string()));
-        // gitlink(워크트리): .git 파일 → 상대 gitdir의 HEAD.
+        // gitlink(워크트리): .git 파일 → 상대 gitdir의 HEAD, refs는 commondir.
         let w = d.join("w");
         std::fs::create_dir_all(&w).unwrap();
         std::fs::create_dir_all(a.join(".git/worktrees/w")).unwrap();
         std::fs::write(a.join(".git/worktrees/w/HEAD"), "ref: refs/heads/wt-branch\n").unwrap();
+        std::fs::write(a.join(".git/worktrees/w/commondir"), "../..\n").unwrap();
+        std::fs::write(a.join(".git/refs/heads/wt-branch"), "b".repeat(40)).unwrap();
         std::fs::write(w.join(".git"), "gitdir: ../a/.git/worktrees/w\n").unwrap();
         assert_eq!(read_head_branch(&w), Some("wt-branch".to_string()));
         // 비정형(refs/heads 밖 심볼릭 ref) → None(spawn 폴백 대상).
@@ -394,13 +422,37 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
     }
 
+    /// unborn HEAD(커밋 0개 — ref 미실재)는 None → spawn 폴백이 기존 계약
+    /// (rev-parse exit 128 → 빈 라벨)을 보존한다(리뷰 P2 실측 반증 반영).
+    #[test]
+    fn unborn_head_falls_back_to_spawn_contract() {
+        let d = temp_root("unborn");
+        let u = d.join("u");
+        std::fs::create_dir_all(u.join(".git")).unwrap();
+        std::fs::write(u.join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
+        // loose ref도 packed-refs도 없음 = unborn.
+        assert_eq!(read_head_branch(&u), None);
+        // packed-refs에만 있는 브랜치는 인정된다.
+        let p = d.join("p");
+        std::fs::create_dir_all(p.join(".git")).unwrap();
+        std::fs::write(p.join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
+        std::fs::write(
+            p.join(".git/packed-refs"),
+            format!("# pack-refs with: peeled fully-peeled sorted\n{} refs/heads/main\n", "c".repeat(40)),
+        )
+        .unwrap();
+        assert_eq!(read_head_branch(&p), Some("main".to_string()));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
     /// git_roots 스캔 + HEAD 직독 통합 — spawn 없이(비-repo cwd) 브랜치 라벨.
     #[test]
     fn git_roots_labels_branch_from_head_file() {
         let d = temp_root("roots");
         let a = d.join("repo-a");
-        std::fs::create_dir_all(a.join(".git")).unwrap();
+        std::fs::create_dir_all(a.join(".git/refs/heads")).unwrap();
         std::fs::write(a.join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
+        std::fs::write(a.join(".git/refs/heads/main"), "d".repeat(40)).unwrap();
         let roots = git_roots(d.to_str().unwrap());
         let found = roots.iter().find(|r| r.path == a.to_string_lossy()).expect("repo-a 발견");
         assert_eq!(found.branch, "main");

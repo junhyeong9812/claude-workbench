@@ -4,7 +4,7 @@ import { emit, listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import type { ITheme } from "@xterm/xterm";
 import type { DirEntry, Project, ProjectType, SshConnection, WorkspaceState } from "../types";
-import { pruneTreeCache, sameEntries } from "./treeSelectors";
+import { pruneTreeCache, sameEntries, underRoot } from "./treeSelectors";
 
 /** Clamp a font size to the allowed range (also normalizes NaN). */
 export const clampFontSize = (n: number): number => Math.max(9, Math.min(28, Math.round(n) || 13));
@@ -534,8 +534,30 @@ function broadcastActiveProject(path: string | null) {
   );
 }
 
-/** P2: reloadActiveTree 배치 사이클 in-flight 가드 (모듈 스코프 — 창 단위). */
+/** P2: reloadActiveTree 배치 사이클 in-flight 가드 + 재실행 요청 비트(모듈
+ * 스코프 — 창 단위). 겹친 호출(수동 ↻ 포함)은 버리지 않고 현 사이클 종료 후
+ * 한 번 더 돈다 — "최신 요청 우선"(spec ②, 리뷰: 수동 ↻ 무시 방지). */
 let treeReloadInFlight = false;
+let treeReloadPending = false;
+
+/** hang한 read_dir(끊긴 네트워크 마운트 등) 하나가 폴링을 영구 정지시키지
+ * 않도록 사이클당 가드 점유 상한 — 초과 시 가드만 풀고 늦은 응답의 쓰기는
+ * before-스냅샷/keep 가드가 걸러낸다(리뷰 P2). */
+const TREE_RELOAD_GUARD_MS = 10_000;
+
+/** 트리 캐시에 지금 써도 되는 dir인가 — 열린 프로젝트·스터디 폴더 아래만.
+ * closeProject 축출 후 도착한 늦은 응답이 닫힌 프로젝트 키를 되살리는 경로
+ * 차단(리뷰 P1 — 부활한 키는 재오픈 cache-hit로 stale까지 유발한다). */
+function treeWriteAllowed(
+  s: { projects: { path: string }[]; studyFolders: { left: string | null; right: string | null } },
+  dir: string,
+): boolean {
+  return (
+    s.projects.some((p) => underRoot(dir, p.path)) ||
+    (!!s.studyFolders.left && underRoot(dir, s.studyFolders.left)) ||
+    (!!s.studyFolders.right && underRoot(dir, s.studyFolders.right))
+  );
+}
 
 export const useAppStore = create<AppState>((set, get) => ({
   projects: [],
@@ -880,6 +902,8 @@ export const useAppStore = create<AppState>((set, get) => ({
   },
 
   toggleExpanded: (dirPath) => {
+    // expanded는 항상 **새 배열**로 교체한다 — expandedSetOf의 identity 메모
+    // 계약(in-place push/splice 금지, treeSelectors 참조).
     set((s) => ({
       projects: s.projects.map((p) => {
         if (p.path !== s.activeProject) return p;
@@ -900,28 +924,38 @@ export const useAppStore = create<AppState>((set, get) => ({
     set((s) => ({ loadingDirs: { ...s.loadingDirs, [dirPath]: true } }));
     try {
       const entries = await invoke<DirEntry[]>("read_dir", { path: dirPath });
-      set((s) => ({
-        childrenCache: { ...s.childrenCache, [dirPath]: entries },
-      }));
+      // 축출 이후 도착한 응답은 캐시를 되살리지 않는다(리뷰 P1 부활 경로).
+      set((s) =>
+        treeWriteAllowed(s, dirPath)
+          ? { childrenCache: { ...s.childrenCache, [dirPath]: entries } }
+          : s,
+      );
     } catch (err) {
       // Surface as an empty (but resolved) listing; do not crash the tree.
       console.error("read_dir failed", err);
-      set((s) => ({
-        childrenCache: { ...s.childrenCache, [dirPath]: [] },
-      }));
+      set((s) =>
+        treeWriteAllowed(s, dirPath)
+          ? { childrenCache: { ...s.childrenCache, [dirPath]: [] } }
+          : s,
+      );
     } finally {
-      set((s) => ({ loadingDirs: { ...s.loadingDirs, [dirPath]: false } }));
+      // 축출로 키가 사라졌으면 false 재삽입도 하지 않는다(고아 키 방지).
+      set((s) => {
+        if (!(dirPath in s.loadingDirs)) return s;
+        return { loadingDirs: { ...s.loadingDirs, [dirPath]: false } };
+      });
     }
   },
 
   reloadDir: async (dirPath) => {
     try {
       const entries = await invoke<DirEntry[]>("read_dir", { path: dirPath });
-      // P2: 내용 무변화면 기존 배열 identity 유지(set 스킵) — 4초 폴링이 매번
-      // 새 배열을 꽂아 트리 전체(StudyTree 포함)를 리렌더하던 churn 제거.
+      // P2: 내용 무변화면 기존 state 그대로 반환(Object.is로 알림 자체 스킵 —
+      // 리뷰: `{}` 반환은 merge로 새 루트 state를 만들어 전 리스너를 깨운다).
+      // 축출 뒤 늦은 응답은 쓰지 않는다.
       set((s) =>
-        sameEntries(s.childrenCache[dirPath], entries)
-          ? {}
+        !treeWriteAllowed(s, dirPath) || sameEntries(s.childrenCache[dirPath], entries)
+          ? s
           : { childrenCache: { ...s.childrenCache, [dirPath]: entries } },
       );
     } catch (err) {
@@ -930,38 +964,61 @@ export const useAppStore = create<AppState>((set, get) => ({
   },
 
   reloadActiveTree: async () => {
-    const { activeProject, projects } = get();
-    if (!activeProject) return;
-    // P2: in-flight 가드 — 4초 주기가 느린 디스크/대형 트리에서 겹치면 이전
-    // 사이클 응답이 새 상태를 덮을 수 있다(stale-drop: 겹침 자체를 스킵).
-    if (treeReloadInFlight) return;
+    // P2(리뷰 재설계): 겹침은 pending 비트로 "종료 후 1회 더"(최신 우선 —
+    // 수동 ↻ 무시 방지), 사이클은 가드 점유 상한으로 hang 복구, 쓰기는
+    // ①before-스냅샷(읽는 사이 사용자 조작이 쓴 dir는 건드리지 않는다 —
+    // 삭제 파일 유령 부활 차단) ②treeWriteAllowed(축출 부활 차단) 이중 가드.
+    if (treeReloadInFlight) {
+      treeReloadPending = true;
+      return;
+    }
     treeReloadInFlight = true;
     try {
-      const expanded = projects.find((p) => p.path === activeProject)?.tree_state.expanded ?? [];
-      const dirs = [activeProject, ...expanded];
-      // P2: 배치 — 직렬 IPC N회·set N회를 병렬 조회 1배치·set 1회로. 실패한
-      // dir는 기존 캐시 유지(기존 reloadDir 오류 경로와 동일 관측 동작).
-      const results = await Promise.all(
-        dirs.map(async (d) => {
-          try {
-            return [d, await invoke<DirEntry[]>("read_dir", { path: d })] as const;
-          } catch (err) {
-            console.error("reloadDir failed", err);
-            return [d, null] as const;
-          }
-        }),
-      );
-      set((s) => {
-        let changed = false;
-        const next = { ...s.childrenCache };
-        for (const [d, entries] of results) {
-          if (entries && !sameEntries(next[d], entries)) {
-            next[d] = entries;
-            changed = true;
-          }
-        }
-        return changed ? { childrenCache: next } : {};
-      });
+      do {
+        treeReloadPending = false;
+        const { activeProject, projects } = get();
+        if (!activeProject) return;
+        const expanded =
+          projects.find((p) => p.path === activeProject)?.tree_state.expanded ?? [];
+        const dirs = [activeProject, ...expanded];
+        const before = get().childrenCache;
+        const cycle = (async () => {
+          // 배치 — 직렬 IPC N회·set N회를 병렬 조회 1배치·set 1회로. 실패
+          // dir는 기존 캐시 유지(기존 reloadDir 오류 경로와 동일 관측 동작).
+          const results = await Promise.all(
+            dirs.map(async (d) => {
+              try {
+                return [d, await invoke<DirEntry[]>("read_dir", { path: d })] as const;
+              } catch (err) {
+                console.error("reloadDir failed", err);
+                return [d, null] as const;
+              }
+            }),
+          );
+          set((s) => {
+            let changed = false;
+            const next = { ...s.childrenCache };
+            for (const [d, entries] of results) {
+              if (!entries) continue;
+              // 배치 시작 후 다른 경로(runOp reloadDir·loadChildren·축출)가
+              // 이 dir를 이미 갱신했다면 그쪽이 더 새 데이터 — 덮지 않는다.
+              if (s.childrenCache[d] !== before[d]) continue;
+              if (!treeWriteAllowed(s, d)) continue;
+              if (!sameEntries(next[d], entries)) {
+                next[d] = entries;
+                changed = true;
+              }
+            }
+            return changed ? { childrenCache: next } : s;
+          });
+        })();
+        // hang한 read_dir 하나가 폴링을 영구 정지시키지 않게 가드 점유만
+        // 시간 상한 — 늦은 완료의 쓰기는 위 이중 가드가 걸러낸다.
+        await Promise.race([
+          cycle,
+          new Promise<void>((r) => setTimeout(r, TREE_RELOAD_GUARD_MS)),
+        ]);
+      } while (treeReloadPending);
     } finally {
       treeReloadInFlight = false;
     }
