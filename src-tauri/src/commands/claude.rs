@@ -114,6 +114,27 @@ struct ClaudeTimelinePayload {
 /// 언급하는 아이템). 자기 transcript는 제외 — 자기 id 에코가 self-parent가
 /// 되어 트리에서 사라지는 회귀 방지(codex B1 F1). 동작 보존: 기존 인라인
 /// 체인 스캔과 동일한 순회 순서·판정(특성테스트 subagent_parent_*).
+/// P1: 표시 계층 content_text 상한 — payload·스냅샷에서만 절단(원본 JSONL·
+/// 아카이브는 전문 유지). 절단 아이템은 `content_truncated`로 표시되고
+/// 뷰어가 `claude_item_detail`로 원문을 lazy 조회한다.
+pub(crate) const CONTENT_CAP: usize = 32 * 1024;
+
+/// UTF-8 경계 보존 절단 — 순수 (P1 특성테스트 대상).
+pub(crate) fn cap_content(items: &mut [TimelineItem]) {
+    for it in items.iter_mut() {
+        if let Some(ct) = &it.content_text {
+            if ct.len() > CONTENT_CAP {
+                let mut n = CONTENT_CAP;
+                while n > 0 && !ct.is_char_boundary(n) {
+                    n -= 1;
+                }
+                it.content_text = Some(ct[..n].to_string());
+                it.content_truncated = true;
+            }
+        }
+    }
+}
+
 /// 파일 서명 (len, mtime ns) — 완료 판정·재활성 감지 입력 (P0 B2, 리뷰
 /// 재수정: len 단독은 truncate·동일 길이 재작성·mtime-only 변경을 놓친다).
 pub(crate) type FileSig = (u64, u128);
@@ -685,6 +706,12 @@ fn run_timeline_poll(
     // 60초(150ms×400) 연속 무변화 = 완료로 간주 — 리뷰: 6초는 긴 툴 실행
     // 대기(cargo test 등)마다 완료↔재활성 churn + 전체 재파싱을 유발한다.
     const DONE_STREAK: u32 = 400;
+    // P1: 스냅샷 저장 debounce 상태.
+    const SAVE_DEBOUNCE: Duration = Duration::from_secs(2);
+    let mut snap_dirty = false;
+    let mut last_save = std::time::Instant::now()
+        .checked_sub(SAVE_DEBOUNCE)
+        .unwrap_or_else(std::time::Instant::now);
     // Cheap fingerprint of the last emitted state (incl. subagent item count). A
     // prompt- or answer-only record advances turns/answers without touching any
     // tool item, so we can't key off `poll`'s touched indices alone.
@@ -899,11 +926,22 @@ fn run_timeline_poll(
         // P0 B1(재수정): first-match를 매 변경 틱 그대로 재계산하되, 아이템별
         // contains 판정만 revision 키로 메모 — naive와 완전 동치(부모 승격
         // 포함), 비용은 변경 아이템으로 국한(재점검 N3 주석 정정).
-        let subagents_v: Vec<(String, Option<String>, u64, Vec<TimelineItem>)> = sub_raw
+        // 부모 추론은 **절단 전** 원문으로(멘션이 32KB 밖에 있을 수 있다 —
+        // P1 절단은 그 뒤 표시용 클론에만 적용).
+        let parents: Vec<Option<String>> = sub_raw
             .iter()
-            .map(|(aid, turn, its)| {
-                let parent = subagent_parent_memo(aid, &items_v, &sub_raw, &mut mention_memo);
-                (aid.clone(), parent, *turn, its.clone())
+            .map(|(aid, _, _)| subagent_parent_memo(aid, &items_v, &sub_raw, &mut mention_memo))
+            .collect();
+        // P1: 표시 계층 절단 + payload는 clone 없이 move(스냅샷은 아래 debounce
+        // 블록이 t에서 재구성 — 틱당 딥클론 2회→1회).
+        let mut items_p = items_v;
+        cap_content(&mut items_p);
+        let subagents_v: Vec<(String, Option<String>, u64, Vec<TimelineItem>)> = sub_raw
+            .into_iter()
+            .zip(parents)
+            .map(|((aid, turn, mut its), parent)| {
+                cap_content(&mut its);
+                (aid, parent, turn, its)
             })
             .collect();
 
@@ -911,16 +949,17 @@ fn run_timeline_poll(
             "claude-timeline",
             ClaudeTimelinePayload {
                 id,
-                items: items_v.clone(),
-                turns: turns_v.clone(),
-                answers: answers_v.clone(),
-                dates: dates_v.clone(),
-                tokens: tokens_v.clone(),
-                model: model_v.clone(),
+                items: items_p,
+                turns: turns_v,
+                answers: answers_v,
+                dates: dates_v,
+                tokens: tokens_v,
+                model: model_v,
                 last_usage: last_usage_v,
                 subagents: subagents_v,
             },
         );
+        snap_dirty = true;
 
         // Persist a whole-session snapshot (D-1): overwrite, so the session
         // survives restart and can be listed/reopened, without the append
@@ -929,34 +968,43 @@ fn run_timeline_poll(
         if stop.load(Ordering::Relaxed) {
             break; // closed during poll/emit — don't persist after close (F4)
         }
-        if let Ok(base) = app.path().app_data_dir() {
-            // Read the rename override (decoupled file) rather than the body's
-            // own name, so a concurrent rename isn't clobbered (codex F1).
-            let name = core_lib::snapshot::read_name(&base, &cwd, &uuid)
-                .unwrap_or_else(|| initial_name.clone());
-            let date = chrono::Local::now().format("%Y-%m-%d").to_string();
-            let snap = core_lib::snapshot::SessionSnapshot {
-                uuid: uuid.clone(),
-                name,
-                date,
-                items: items_v,
-                turns: turns_v,
-                answers: answers_v,
-                dates: dates_v,
-                tokens: tokens_v,
-                model: model_v,
-                last_usage: last_usage_v,
-                // Task-chain meta lives in the decoupled `.task` sidecar (set at
-                // handoff), not the body — the body is overwritten every tick, so
-                // these stay `None` here and `load` sources them from the sidecar.
-                prev_uuid: None,
-                summary_path: None,
-                // Title/summary likewise sidecar-sourced on `load` (`.title`/
-                // `.summary.md`), so the per-tick body write never clobbers them.
-                title: None,
-                summary: None,
-            };
-            let _ = core_lib::snapshot::save(&base, &cwd, &snap);
+        // P1: 디스크 저장 debounce — emit(위, fp 게이트 그대로)과 분리해
+        // 마지막 변화 후 최소 SAVE_DEBOUNCE 간격으로만 전체 스냅샷을 쓴다
+        // (활발 세션에서 초당 최대 6.7회 × 수 MB 재작성 제거). 잃는 것은
+        // 크래시 시 ≤2초분 — JSONL이 정본, 스냅샷은 캐시. stop 이후 저장
+        // 금지(F4)는 위 break가 보장.
+        if snap_dirty && last_save.elapsed() >= SAVE_DEBOUNCE {
+            if let Ok(base) = app.path().app_data_dir() {
+                // Read the rename override (decoupled file) rather than the
+                // body's own name, so a concurrent rename isn't clobbered (F1).
+                let name = core_lib::snapshot::read_name(&base, &cwd, &uuid)
+                    .unwrap_or_else(|| initial_name.clone());
+                let date = chrono::Local::now().format("%Y-%m-%d").to_string();
+                let mut items_s = t.timeline().items().to_vec();
+                cap_content(&mut items_s); // 스냅샷도 표시 캐시 — 동일 상한
+                let snap = core_lib::snapshot::SessionSnapshot {
+                    uuid: uuid.clone(),
+                    name,
+                    date,
+                    items: items_s,
+                    turns: t.turns().iter().map(|(k, v)| (*k, v.clone())).collect(),
+                    answers: t.answers().iter().map(|(k, v)| (*k, v.clone())).collect(),
+                    dates: t.dates().iter().map(|(k, v)| (*k, v.clone())).collect(),
+                    tokens: t.tokens().iter().map(|(k, v)| (*k, *v)).collect(),
+                    model: t.model().map(str::to_string),
+                    last_usage: t.last_usage(),
+                    // Task-chain meta lives in the decoupled `.task` sidecar (set
+                    // at handoff), not the body — `load` sources them from there.
+                    prev_uuid: None,
+                    summary_path: None,
+                    // Title/summary likewise sidecar-sourced on `load`.
+                    title: None,
+                    summary: None,
+                };
+                let _ = core_lib::snapshot::save(&base, &cwd, &snap);
+            }
+            snap_dirty = false;
+            last_save = std::time::Instant::now();
         }
     }
 
@@ -975,6 +1023,65 @@ fn run_timeline_poll(
     if existed {
         let _ = app.emit("claude-session-closed", id);
     }
+}
+
+/// P1: 절단된 아이템의 원문 상세 — 원본 JSONL(+서브에이전트 transcript)에서
+/// 재추출한다(read-only, mapper 결정적 — spec 가정②). 뷰어가
+/// `content_truncated` 아이템 선택 시 lazy 호출.
+#[derive(Serialize)]
+pub struct ItemDetail {
+    pub content_text: Option<String>,
+    pub raw_input: Option<serde_json::Value>,
+}
+
+#[tauri::command]
+pub async fn claude_item_detail(
+    project: String,
+    uuid: String,
+    tool_call_id: String,
+) -> Result<ItemDetail, AppError> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let root = core_lib::jsonl::claude_projects_root()
+            .ok_or_else(|| AppError::new("Cannot locate the Claude projects root"))?;
+        let jsonl = core_lib::jsonl::find_session_jsonl(&root, &uuid)
+            .map_err(|e| AppError::new(io_message("Locate transcript", &e)))?
+            .ok_or_else(|| AppError::new("Session transcript not found"))?;
+        let detail_of = |it: &TimelineItem| ItemDetail {
+            content_text: it.content_text.clone(),
+            raw_input: it.raw_input.clone(),
+        };
+        // 본 세션 transcript 전체 재파싱(온디맨드 1회 — 클릭당 수십~수백 ms).
+        let mut t = core_lib::jsonl::SessionTail::new(project.clone(), uuid.clone(), jsonl.clone());
+        t.poll().map_err(|e| AppError::new(io_message("Read transcript", &e)))?;
+        if let Some(it) = t.timeline().items().iter().find(|i| i.tool_call_id == tool_call_id) {
+            return Ok(detail_of(it));
+        }
+        // 서브에이전트 transcript들 (poll 루프와 동일 규칙: <jsonl stem>/subagents/*.jsonl).
+        let sub_dir = jsonl.with_extension("").join("subagents");
+        if let Ok(entries) = std::fs::read_dir(&sub_dir) {
+            for entry in entries.flatten() {
+                let f = entry.path();
+                if f.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+                    continue;
+                }
+                let aid = f
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .map(|s| s.trim_start_matches("agent-").to_string())
+                    .unwrap_or_default();
+                let mut st = core_lib::jsonl::SessionTail::new(project.clone(), aid, f);
+                let _ = st.poll();
+                if let Some(it) =
+                    st.timeline().items().iter().find(|i| i.tool_call_id == tool_call_id)
+                {
+                    return Ok(detail_of(it));
+                }
+            }
+        }
+        Err(AppError::new("Timeline item not found in the transcript"))
+    })
+    .await
+    .map_err(|_| AppError::new("Detail lookup task failed"))?
 }
 
 /// List the saved Claude (A) sessions for `project`, newest first (for the
@@ -1084,6 +1191,22 @@ mod tests {
 
     fn agent(aid: &str, items: Vec<TimelineItem>) -> (String, u64, Vec<TimelineItem>) {
         (aid.to_string(), 1, items)
+    }
+
+    // P1 특성테스트 — 절단은 UTF-8 경계 보존 + 플래그, 상한 이하는 불변.
+    #[test]
+    fn cap_content_truncates_on_char_boundary_and_flags() {
+        let long = "가".repeat(CONTENT_CAP); // 3바이트 문자 — 경계가 CAP에 안 떨어짐
+        let mut items = vec![item("big", Some(&long)), item("small", Some("짧음")), item("none", None)];
+        cap_content(&mut items);
+        let big = &items[0];
+        assert!(big.content_truncated);
+        let ct = big.content_text.as_deref().unwrap();
+        assert!(ct.len() <= CONTENT_CAP);
+        assert!(ct.chars().all(|c| c == '가'), "경계 절단이 문자를 깨면 안 된다");
+        assert!(!items[1].content_truncated);
+        assert_eq!(items[1].content_text.as_deref(), Some("짧음"));
+        assert!(!items[2].content_truncated);
     }
 
     // P0 B2 특성테스트 — 기대값 손계산.
