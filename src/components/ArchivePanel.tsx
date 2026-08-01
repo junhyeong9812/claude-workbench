@@ -1,9 +1,10 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { errText } from "../utils/error";
 import { fmtUnix } from "../utils/time";
 import { useAppStore } from "../state/store";
+import { SESSION_DRAG_MIME, encodeSessionDrag } from "./sessionDropZone";
 
 /** 추출 모델 선택지 — claude CLI에 목록 명령이 없어 별칭을 큐레이션한다.
  * "custom"은 자유 입력(전체 모델명 등). null(기본) = opus. */
@@ -44,11 +45,15 @@ const baseName = (p: string) => p.split("/").filter(Boolean).pop() ?? p;
 
 export function ArchivePanel() {
   const [groups, setGroups] = useState<ArchiveGroup[]>([]);
+  // 드래그 직전 실제로 눌린 요소 — dragstart의 e.target은 draggable 행 자신
+  // 이라 내부 버튼 판별이 불가능해 mousedown 캡처로 기록한다 (리뷰 S6 감사).
+  const dragPressRef = useRef<EventTarget | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [collapsed, setCollapsed] = useState<Set<string>>(new Set());
   // 과거 버전 목록이 펼쳐진 세션(uuid)들.
   const [versionsOpen, setVersionsOpen] = useState<Set<string>>(new Set());
   const setPeekFile = useAppStore((s) => s.setPeekFile);
+  const requestSessionResume = useAppStore((s) => s.requestSessionResume);
   const archiveRoot = useAppStore((s) => s.archiveRoot);
   const archiveModel = useAppStore((s) => s.archiveModel);
   const archiveEffort = useAppStore((s) => s.archiveEffort);
@@ -242,7 +247,42 @@ export function ArchivePanel() {
               </div>
               {!closed &&
                 g.sessions.map((s) => (
-                  <div key={s.uuid} className="archive-session" title={`${s.title}\n${s.dir}`}>
+                  <div
+                    key={s.uuid}
+                    className="archive-session"
+                    title={`${s.title}\n${s.dir}\n드래그해서 dock의 원하는 위치에 이어서 열기 (중앙=탭 · 가장자리=스플릿)`}
+                    draggable
+                    onMouseDownCapture={(e) => {
+                      dragPressRef.current = e.target;
+                    }}
+                    onDragStart={(e) => {
+                      // 행 안의 버튼(이어서·버전·책·요약)에서 시작한 드래그는
+                      // 취소 — 몇 px 움직인 클릭이 드래그로 승격돼 클릭이
+                      // 사라지는 충돌 방지 (S6). dragstart의 e.target은 HTML
+                      // DnD 표준상 draggable 행 자신이라 내부 버튼 판별이
+                      // 안 되므로 mousedown 캡처로 기록한 요소를 본다(감사).
+                      // project 미상 행은 드래그 불가 (S8).
+                      const pressed = dragPressRef.current;
+                      if (
+                        (pressed instanceof HTMLElement &&
+                          pressed.closest("button, input, a")) ||
+                        !g.project
+                      ) {
+                        e.preventDefault();
+                        return;
+                      }
+                      e.dataTransfer.setData(
+                        SESSION_DRAG_MIME,
+                        encodeSessionDrag({
+                          uuid: s.uuid,
+                          project: g.project,
+                          title: s.title.slice(0, 24) || s.date,
+                          source: "archive",
+                        }),
+                      );
+                      e.dataTransfer.effectAllowed = "copy";
+                    }}
+                  >
                     <div className="archive-session-title">{s.title}</div>
                     <div className="archive-session-meta">
                       <span>
@@ -266,6 +306,19 @@ export function ArchivePanel() {
                             {versionsOpen.has(s.uuid) ? "▾" : "▸"} 버전 {s.history.length + 1}
                           </button>
                         )}
+                        <button
+                          className="archive-btn"
+                          title="이 세션을 이어서 열기 (Claude resume — 이미 열려 있으면 그 탭으로)"
+                          onClick={() =>
+                            requestSessionResume({
+                              uuid: s.uuid,
+                              project: g.project,
+                              title: s.title.slice(0, 24) || s.date,
+                            })
+                          }
+                        >
+                          이어서
+                        </button>
                         <button
                           className="archive-btn"
                           title="책(book.html)을 시스템 브라우저로 열기 — 처음부터 단계별 넘겨보기"
