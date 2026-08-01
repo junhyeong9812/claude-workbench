@@ -10,6 +10,7 @@
 
 pub mod archive;
 pub mod claude_cli;
+pub mod embed;
 pub mod fs;
 pub mod git;
 pub mod graph;

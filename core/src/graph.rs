@@ -515,14 +515,8 @@ pub fn save_graph_all(
 /// renderer assigns node/edge text via `textContent` only (never innerHTML), so
 /// model-supplied strings are inert (XSS-safe).
 pub fn render_graph_html(graph: &Graph) -> String {
-    let json = serde_json::to_string(graph)
-        .unwrap_or_else(|_| "null".to_string())
-        .replace('<', "\\u003c")
-        // U+2028/U+2029 are legal in JSON but line terminators in older JS
-        // engines — escape them so the literal can never break.
-        .replace('\u{2028}', "\\u2028")
-        .replace('\u{2029}', "\\u2029");
-    GRAPH_TEMPLATE.replace("__DATA__", &json)
+    // 이스케이프 규칙은 core::embed 단일 출처 (P4 — archive와 공용).
+    GRAPH_TEMPLATE.replace("__DATA__", &crate::embed::embed_json(graph))
 }
 
 /// UTC ISO-8601 (`YYYY-MM-DDThh:mm:ssZ`) for "now". Dependency-free — `core`
