@@ -209,14 +209,19 @@ pub(crate) fn subagent_parent_memo(
     aid: &str,
     main_items: &[TimelineItem],
     sub_raw: &[(String, u64, Vec<TimelineItem>)],
-    memo: &mut HashMap<(String, String), (u32, bool)>,
+    memo: &mut HashMap<(String, String, String), (u32, bool)>,
 ) -> Option<String> {
+    // 키 = (aid, **session_id**, tool_call_id) — tool_call_id만으로는 다른
+    // 세션(다른 서브에이전트 transcript)의 동일 id와 충돌해 앞 아이템의
+    // 판정이 뒤 아이템에 재사용된다(재점검 N1-1). revision 계약은 같은
+    // Timeline 안에서만 유효하므로 재파싱 재구축 시 호출부가 해당 소스의
+    // 메모를 무효화한다(N1-2 — purge_mention_memo_for_source).
     fn mentions(
         aid: &str,
         it: &TimelineItem,
-        memo: &mut HashMap<(String, String), (u32, bool)>,
+        memo: &mut HashMap<(String, String, String), (u32, bool)>,
     ) -> bool {
-        let key = (aid.to_string(), it.tool_call_id.clone());
+        let key = (aid.to_string(), it.session_id.clone(), it.tool_call_id.clone());
         if let Some((rev, m)) = memo.get(&key) {
             if *rev == it.revision {
                 return *m;
@@ -663,8 +668,12 @@ fn run_timeline_poll(
     let mut sub_dir: Option<PathBuf> = None;
     let mut subagents: HashMap<String, core_lib::jsonl::SessionTail> = HashMap::new();
     let mut subagent_turn: HashMap<String, u64> = HashMap::new();
-    // P0 B1: 아이템별 contains(aid) 메모 — (aid, tool_call_id) → (revision, 결과).
-    let mut mention_memo: HashMap<(String, String), (u32, bool)> = HashMap::new();
+    // P0 B1: 아이템별 contains(aid) 메모 — (aid, session_id, tool_call_id) →
+    // (revision, 결과). first-match는 매 변경 틱 재계산(동결 없음).
+    let mut mention_memo: HashMap<(String, String, String), (u32, bool)> = HashMap::new();
+    // P0 B2/N2: 재활성(Timeline 재구축) 세대 — revision이 리셋되어 내용이
+    // 달라도 fp가 같아질 수 있으므로 fp에 합산해 emit 누락을 막는다.
+    let mut sub_gen: u64 = 0;
     // P0 B2: 완료 서브에이전트(파일 서명 DONE_STREAK 연속 안정) — tail 드롭,
     // items 보존. 서명 변화 시 같은 틱에 재파싱까지 마쳐 원자 교체.
     let mut sub_done: HashMap<String, DoneSub> = HashMap::new();
@@ -679,8 +688,8 @@ fn run_timeline_poll(
     // Cheap fingerprint of the last emitted state (incl. subagent item count). A
     // prompt- or answer-only record advances turns/answers without touching any
     // tool item, so we can't key off `poll`'s touched indices alone.
-    let mut last_fp: (usize, u32, usize, usize, usize, usize, u64, u64, u64) =
-        (0, 0, 0, 0, 0, 0, 0, 0, 0);
+    let mut last_fp: (usize, u32, usize, usize, usize, usize, u64, u64, u64, u64) =
+        (0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
 
     while !stop.load(Ordering::Relaxed) {
         thread::sleep(Duration::from_millis(150));
@@ -745,6 +754,12 @@ fn run_timeline_poll(
                                 }
                                 sub_stable.remove(&aid);
                                 sub_path.insert(aid.clone(), f);
+                                // N1-2: 재구축된 Timeline은 revision이 리셋된다
+                                // — 이 소스의 멘션 메모를 통째로 무효화.
+                                mention_memo.retain(|(_, sid, _), _| sid != &aid);
+                                // N2: 내용이 달라도 revision 합·개수가 같을 수
+                                // 있다 — 세대 카운터로 fp 변화를 보장.
+                                sub_gen += 1;
                                 subagents.insert(aid, st);
                             }
                         }
@@ -833,6 +848,7 @@ fn run_timeline_poll(
             token_fp,
             ctx_fp,
             model_fp,
+            sub_gen, // N2: 재활성 세대 — 재구축으로 rev 합이 같아도 emit 보장
         );
         if fp == last_fp {
             continue; // nothing changed this tick
@@ -862,9 +878,9 @@ fn run_timeline_poll(
         // Link each agent to the timeline item (the spawning `Agent`/`Task` call)
         // whose result mentions the agent id — that item, in main or in a parent
         // agent, is its parent (recursive tree). `None` ⇒ nest under its turn.
-        // P0 B1: 링크는 한 번 확정되면 불변인데 매 틱 O(A×C) 전문 스캔을
-        // 반복하던 것을 Some 결과만 캐시한다(None은 다음 틱 재탐색 — 스폰
-        // 아이템의 content_text가 늦게 도착하는 기존 동작 보존).
+        // P0 B1(재수정): first-match를 매 변경 틱 그대로 재계산하되, 아이템별
+        // contains 판정만 revision 키로 메모 — naive와 완전 동치(부모 승격
+        // 포함), 비용은 변경 아이템으로 국한(재점검 N3 주석 정정).
         let subagents_v: Vec<(String, Option<String>, u64, Vec<TimelineItem>)> = sub_raw
             .iter()
             .map(|(aid, turn, its)| {
@@ -1105,7 +1121,7 @@ mod tests {
     // P0 B1(재수정) — 메모 스캔이 naive와 완전 동치인지 + revision bump 반영.
     #[test]
     fn parent_memo_matches_naive_and_tracks_revision_updates() {
-        let mut memo: HashMap<(String, String), (u32, bool)> = HashMap::new();
+        let mut memo: HashMap<(String, String, String), (u32, bool)> = HashMap::new();
         let mut main = vec![item("call-1", Some("nothing")), item("call-2", Some("spawn agent-A"))];
         let subs = vec![agent("agent-A", vec![])];
         assert_eq!(
@@ -1127,6 +1143,30 @@ mod tests {
             subagent_parent_memo("agent-A", &main, &subs, &mut memo),
             subagent_parent("agent-A", &main, &subs)
         );
+    }
+
+    /// 재점검 N1-1: 다른 세션(다른 transcript)의 동일 tool_call_id·동일
+    /// revision이 있어도 메모가 충돌하지 않아야 한다 — 키에 session_id 포함.
+    #[test]
+    fn parent_memo_does_not_collide_across_sessions() {
+        fn item_in(sid: &str, tcid: &str, ct: Option<&str>) -> TimelineItem {
+            let mut it = item(tcid, ct);
+            it.session_id = sid.to_string();
+            it
+        }
+        let mut memo: HashMap<(String, String, String), (u32, bool)> = HashMap::new();
+        // main의 "dup"(미언급)이 먼저 스캔되고, agent-B transcript의 "dup"
+        // (언급, 같은 revision)이 뒤에 온다 — naive는 b쪽 dup을 부모로 찾는다.
+        let main = vec![item_in("main", "dup", Some("nothing"))];
+        let subs = vec![
+            agent("agent-A", vec![]),
+            ("agent-B".to_string(), 1, vec![item_in("agent-B", "dup", Some("spawn agent-A"))]),
+        ];
+        assert_eq!(
+            subagent_parent_memo("agent-A", &main, &subs, &mut memo),
+            subagent_parent("agent-A", &main, &subs)
+        );
+        assert_eq!(subagent_parent_memo("agent-A", &main, &subs, &mut memo), Some("dup".into()));
     }
 
     // P0 B1 특성테스트 — 기대값 손계산 (자기참조 금지).

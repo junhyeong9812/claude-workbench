@@ -239,6 +239,36 @@ export function GitPanel() {
   // project root itself isn't a repo but has nested ones (codex P1).
   // Nested repos strictly under the project (the enclosing root is the "현재" row).
   const nestedRoots = roots.filter((r) => !!activeProject && r.path.startsWith(activeProject + "/"));
+  // ---- P0 F4 메모들: 모든 조기 return(!cwd 포함) **이전**에 — 훅 수가 렌더마다
+  // 달라지면 "Rendered fewer hooks" 크래시(리뷰 반증 확인). staged/unstaged를
+  // 먼저 고정하고 트리 deps를 그 배열로 잡는다(넓은 [status] 대신).
+  const conflicted = useMemo(() => status?.changes.filter((c) => c.conflicted) ?? [], [status]);
+  const staged = useMemo(
+    () => status?.changes.filter((c) => c.staged && !c.conflicted) ?? [],
+    [status],
+  );
+  const unstaged = useMemo(
+    () => status?.changes.filter((c) => !c.staged && !c.conflicted) ?? [],
+    [status],
+  );
+  // 커밋 그래프 레인 계산은 commits 변경 시에만 — 결과 불변.
+  const graphMemo = useMemo(() => {
+    const rows = computeGraph(commits);
+    const maxLanes = rows.reduce((m, r) => Math.max(m, r.before.length, r.after.length), 1);
+    return { rows, maxLanes };
+  }, [commits]);
+  // 트리는 tree 뷰에서만 계산(리뷰: flat 뷰 eager 계산 제거). buildTree는
+  // 모듈 스코프 순수 함수라 deps는 입력 배열이면 충분.
+  const stagedTree = useMemo(
+    () => (view === "tree" ? buildTree(staged) : null),
+    [staged, view],
+  );
+  const unstagedTree = useMemo(
+    () => (view === "tree" ? buildTree(unstaged) : null),
+    [unstaged, view],
+  );
+
+
   const showRootSelect = nestedRoots.length > 0;
   const projBase = (activeProject ?? "").split("/").pop() || (activeProject ?? "");
   // The enclosing repo of the project — `activeProject` itself when it's a repo
@@ -332,35 +362,6 @@ export function GitPanel() {
 
   if (!cwd) return <div className="git-empty">프로젝트를 먼저 여세요.</div>;
   // Non-repo root: still surface the selector so a nested repo can be picked.
-  // ---- P0 F4 메모들: 반드시 아래 조기 return **이전**에 — 훅 수가 렌더마다
-  // 달라지면 "Rendered fewer hooks" 크래시(리뷰 반증 확인). staged/unstaged를
-  // 먼저 고정하고 트리 deps를 그 배열로 잡는다(넓은 [status] 대신).
-  const conflicted = useMemo(() => status?.changes.filter((c) => c.conflicted) ?? [], [status]);
-  const staged = useMemo(
-    () => status?.changes.filter((c) => c.staged && !c.conflicted) ?? [],
-    [status],
-  );
-  const unstaged = useMemo(
-    () => status?.changes.filter((c) => !c.staged && !c.conflicted) ?? [],
-    [status],
-  );
-  // 커밋 그래프 레인 계산은 commits 변경 시에만 — 결과 불변.
-  const graphMemo = useMemo(() => {
-    const rows = computeGraph(commits);
-    const maxLanes = rows.reduce((m, r) => Math.max(m, r.before.length, r.after.length), 1);
-    return { rows, maxLanes };
-  }, [commits]);
-  // 트리는 tree 뷰에서만 계산(리뷰: flat 뷰 eager 계산 제거). buildTree는
-  // 모듈 스코프 순수 함수라 deps는 입력 배열이면 충분.
-  const stagedTree = useMemo(
-    () => (view === "tree" ? buildTree(staged) : null),
-    [staged, view],
-  );
-  const unstagedTree = useMemo(
-    () => (view === "tree" ? buildTree(unstaged) : null),
-    [unstaged, view],
-  );
-
   if (status && !status.is_repo)
     return (
       <div className="git-panel">
