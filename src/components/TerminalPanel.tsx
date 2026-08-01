@@ -164,8 +164,16 @@ export function TerminalPanel(props: IDockviewPanelProps<TerminalParams>) {
     // 순서가 깨진다(감사 B1). heal 왕복 중 재드롭이 나면 신호가 사라질 때까지
     // 반복(감사 B2 — 상한은 연속 홍수 방어, 각 반복이 더 새 스냅샷으로 전진).
     const healDroppedGap = async () => {
-      for (let i = 0; i < 10 && pendingDropped && sessionId != null && !disposed; i++) {
+      // 반복 불변식: 매 회 pending을 비우고 스냅샷을 뜨면 그 스냅샷이 비운
+      // 분량 전체를 대체한다(≤ last_seq). 왕복 중 새 도착분은 새 pending —
+      // 그것도 넘치면 dropped가 다시 서고 한 번 더 돈다. 상한 없이 안전:
+      // 지속 홍수에서는 "스냅샷 폴링 + RIS 재도장"으로 자연 강등(await로
+      // 양보, disposed/세션 소멸로 탈출)이고 홍수가 멎으면 즉시 종료(감사
+      // B2 잔존 경계 — 10회 뒤 갭 대신 무갭 강등을 선택).
+      while (pendingDropped && sessionId != null && !disposed) {
         pendingDropped = false;
+        pending.length = 0;
+        pendingTotal = 0;
         try {
           const snap = await invoke<SnapshotResult>("terminal_snapshot", { id: sessionId });
           if (disposed) return;

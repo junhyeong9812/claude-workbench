@@ -712,8 +712,13 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
     // 절단 방지). 초기화는 RIS(ESC c)를 write 큐로 — 동기 reset()은 큐 잔여
     // 도장분과 순서가 깨진다(감사 B1). 재드롭 시 신호 소진까지 반복(감사 B2).
     const healDroppedGap = async () => {
-      for (let i = 0; i < 10 && pendingDropped && sessionId != null && !disposed; i++) {
+      // 매 회 pending을 비우고 스냅샷으로 완전 대체 — 상한 없이 무갭(지속
+      // 홍수에선 스냅샷 폴링으로 강등, disposed/세션 소멸 탈출. TerminalPanel
+      // 동일 로직 참조).
+      while (pendingDropped && sessionId != null && !disposed) {
         pendingDropped = false;
+        pending.length = 0;
+        pendingTotal = 0;
         try {
           const snap = await invoke<SnapshotResult>("terminal_snapshot", { id: sessionId });
           if (disposed) return;
