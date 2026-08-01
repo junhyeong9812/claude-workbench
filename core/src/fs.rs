@@ -97,7 +97,9 @@ pub fn list_dir<P: AsRef<Path>>(path: P) -> io::Result<Vec<DirEntry>> {
         let is_dir = dent.file_type().map(|ft| ft.is_dir()).unwrap_or(false);
         let entry_path = dent.path();
         let project_types = if is_dir {
-            detect_project_types(&entry_path)
+            // P2: (dir mtime, package.json mtime) 키 캐시 — 4초 폴링의 마커
+            // stat 폭풍 제거, 결과는 detect_project_types와 동일(특성테스트).
+            crate::project_type::detect_project_types_cached(&entry_path)
         } else {
             Vec::new()
         };
