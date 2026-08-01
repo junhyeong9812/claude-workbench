@@ -358,7 +358,9 @@ export function TimelineView({
         ? `[data-turn="${selectedTurn}"]`
         : null;
     if (sel) listRef.current.querySelector(sel)?.scrollIntoView({ block: "nearest" });
-  }, [selectedId, selectedTurn, selectedScope, scope]);
+    // turnLimit dep: 캡 밖 선택이 자동 확장으로 다음 렌더에 나타나면 그때
+    // 스크롤이 재실행돼야 한다(감사 #13 후속 — 확장 전 렌더엔 대상 DOM이 없다).
+  }, [selectedId, selectedTurn, selectedScope, scope, turnLimit]);
 
   // New content arrives at the bottom — follow it down so the latest is in view.
   // Only the live timeline follows (followBottom). The stacked lists share one

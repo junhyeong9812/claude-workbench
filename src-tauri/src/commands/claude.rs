@@ -741,17 +741,15 @@ fn run_timeline_poll(
             }
         }
         let Some(t) = tail.as_mut() else { continue };
-        if t.poll().is_err() {
-            continue; // transient read error — retry next tick
-        }
 
-        // P1(듀얼 리뷰 #1·#2): 스냅샷 debounce 플러시 — emit의 fp 게이트보다
-        // **앞**, 매 틱 검사한다. 변화가 멎어도 마지막 변화 후 ~SAVE_DEBOUNCE에
-        // 트레일링 엣지가 반드시 착지한다(게이트 뒤에 두면 무변화 틱이
-        // `continue`로 건너뛰어 마지막 턴이 영구 미저장 — 정상 종료마다 재현).
-        // stop 후 미실행(F4)은 루프 진입부의 stop 검사가 보장. 무변화 틱 비용은
-        // Instant 비교 1회.
-        if snap_dirty && last_save.elapsed() >= SAVE_DEBOUNCE {
+        // P1(듀얼 리뷰 #1·#2, 감사 B1): 스냅샷 debounce 플러시 — emit의 fp
+        // 게이트와 poll의 `continue`보다 **앞**, 매 틱 검사한다. 변화가 멎어도
+        // (또는 일시 read 오류 틱에도) 마지막 변화 후 ~SAVE_DEBOUNCE에 트레일링
+        // 엣지가 반드시 착지한다(게이트 뒤에 두면 무변화 틱이 건너뛰어 마지막
+        // 턴이 영구 미저장 — 정상 종료마다 재현). stop을 조건에서 재검사해
+        // close 직후 delete가 스냅샷 재생성으로 덮이지 않게 한다(F4 — 구현 전과
+        // 동일한 보장 지점). 무변화 틱 비용은 Instant 비교 1회.
+        if snap_dirty && !stop.load(Ordering::Relaxed) && last_save.elapsed() >= SAVE_DEBOUNCE {
             // last_save는 성공/실패 무관 갱신(실패 핫루프 방지 — 2s 간격 재시도),
             // dirty는 본문 save() 성공 시에만 해제 — 일시 디스크 오류 1회가 그
             // 시점까지의 변화를 저장 대상에서 영구히 빼지 않는다(#2).
@@ -790,6 +788,9 @@ fn run_timeline_poll(
                     snap_dirty = false;
                 }
             }
+        }
+        if t.poll().is_err() {
+            continue; // transient read error — retry next tick (플러시는 이미 수행)
         }
 
         // Tail each subagent transcript (parallel Task agents write their own

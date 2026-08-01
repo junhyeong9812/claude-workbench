@@ -926,8 +926,8 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
   // 전문을 보여준다. 듀얼 리뷰 수정(#4·#11): 캐시 키는 `${uuid}:${tool_call_id}`
   // (세션 결속 — 패널 재사용/합성 id 충돌 방지), effect 의존성은 키 문자열
   // (selectedItem 객체는 emit마다 새 참조 — 객체 dep이면 invoke 폭주), 실패도
-  // null sentinel로 캐시(무한 재시도 방지) + in-flight 가드 + LRU 상한(원문
-  // 수 MB가 힙에 무한 상주하지 않게).
+  // null sentinel로 캐시(무한 재시도 방지) + in-flight 가드 + 개수 상한(FIFO
+  // 축출 — 목적은 메모리 바운드, 원문 수 MB가 힙에 무한 상주하지 않게).
   const DETAIL_CACHE_MAX = 8;
   const [fullDetail, setFullDetail] = useState<Map<string, string | null>>(new Map());
   const detailInFlight = useRef<Set<string>>(new Set());
@@ -956,24 +956,23 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
     const key = detailKey;
     const tcid = key.slice(detailUuid.length + 1);
     detailInFlight.current.add(key);
-    let alive = true;
+    // 감사 B2: 결과는 선택 이탈 여부와 무관하게 **항상** 캐시한다(키 스코프라
+    // 오염 없음). 이탈 시 버리면 — A 조회 중 B 갔다 A 복귀 → in-flight 가드가
+    // 재발주를 막는데 결과도 없음 → 영구 "불러오는 중" race.
     invoke<{ content_text: string | null }>("claude_item_detail", {
       project: detailProject,
       uuid: detailUuid,
       toolCallId: tcid,
     })
       .then((d) => {
-        if (alive) cacheDetail(key, d.content_text);
+        cacheDetail(key, d.content_text);
       })
       .catch(() => {
-        if (alive) cacheDetail(key, null); // 실패 sentinel — 배너가 재시도 제공
+        cacheDetail(key, null); // 실패 sentinel — 배너가 재시도 제공
       })
       .finally(() => {
         detailInFlight.current.delete(key);
       });
-    return () => {
-      alive = false;
-    };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [detailKey, detailProject, detailRetry]);
   const cachedFull = detailKey != null ? fullDetail.get(detailKey) : undefined;
