@@ -4,6 +4,7 @@ import { emit, listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import type { ITheme } from "@xterm/xterm";
 import type { DirEntry, Project, ProjectType, SshConnection, WorkspaceState } from "../types";
+import { pruneTreeCache, sameEntries } from "./treeSelectors";
 
 /** Clamp a font size to the allowed range (also normalizes NaN). */
 export const clampFontSize = (n: number): number => Math.max(9, Math.min(28, Math.round(n) || 13));
@@ -533,6 +534,9 @@ function broadcastActiveProject(path: string | null) {
   );
 }
 
+/** P2: reloadActiveTree 배치 사이클 in-flight 가드 (모듈 스코프 — 창 단위). */
+let treeReloadInFlight = false;
+
 export const useAppStore = create<AppState>((set, get) => ({
   projects: [],
   activeProject: null,
@@ -674,7 +678,16 @@ export const useAppStore = create<AppState>((set, get) => ({
       if (activeProject === path) {
         activeProject = projects.length > 0 ? projects[0].path : null;
       }
-      return { projects, activeProject };
+      // P2 F3: 닫힌 프로젝트의 트리 캐시 축출(무제한 성장 방지 — 모노repo
+      // 수십 MB 잔존). 남은 프로젝트·스터디 폴더 아래는 보존(중첩 대비);
+      // 재오픈 시 loadChildren이 새로 읽으므로 stale 없음.
+      const keep = [...projects.map((p) => p.path), s.studyFolders.left, s.studyFolders.right];
+      return {
+        projects,
+        activeProject,
+        childrenCache: pruneTreeCache(s.childrenCache, path, keep),
+        loadingDirs: pruneTreeCache(s.loadingDirs, path, keep),
+      };
     });
     get().persist();
     // If closing the active project moved focus elsewhere, sync other windows
@@ -904,7 +917,13 @@ export const useAppStore = create<AppState>((set, get) => ({
   reloadDir: async (dirPath) => {
     try {
       const entries = await invoke<DirEntry[]>("read_dir", { path: dirPath });
-      set((s) => ({ childrenCache: { ...s.childrenCache, [dirPath]: entries } }));
+      // P2: 내용 무변화면 기존 배열 identity 유지(set 스킵) — 4초 폴링이 매번
+      // 새 배열을 꽂아 트리 전체(StudyTree 포함)를 리렌더하던 churn 제거.
+      set((s) =>
+        sameEntries(s.childrenCache[dirPath], entries)
+          ? {}
+          : { childrenCache: { ...s.childrenCache, [dirPath]: entries } },
+      );
     } catch (err) {
       console.error("reloadDir failed", err);
     }
@@ -913,9 +932,39 @@ export const useAppStore = create<AppState>((set, get) => ({
   reloadActiveTree: async () => {
     const { activeProject, projects } = get();
     if (!activeProject) return;
-    await get().reloadDir(activeProject);
-    const expanded = projects.find((p) => p.path === activeProject)?.tree_state.expanded ?? [];
-    for (const d of expanded) await get().reloadDir(d);
+    // P2: in-flight 가드 — 4초 주기가 느린 디스크/대형 트리에서 겹치면 이전
+    // 사이클 응답이 새 상태를 덮을 수 있다(stale-drop: 겹침 자체를 스킵).
+    if (treeReloadInFlight) return;
+    treeReloadInFlight = true;
+    try {
+      const expanded = projects.find((p) => p.path === activeProject)?.tree_state.expanded ?? [];
+      const dirs = [activeProject, ...expanded];
+      // P2: 배치 — 직렬 IPC N회·set N회를 병렬 조회 1배치·set 1회로. 실패한
+      // dir는 기존 캐시 유지(기존 reloadDir 오류 경로와 동일 관측 동작).
+      const results = await Promise.all(
+        dirs.map(async (d) => {
+          try {
+            return [d, await invoke<DirEntry[]>("read_dir", { path: d })] as const;
+          } catch (err) {
+            console.error("reloadDir failed", err);
+            return [d, null] as const;
+          }
+        }),
+      );
+      set((s) => {
+        let changed = false;
+        const next = { ...s.childrenCache };
+        for (const [d, entries] of results) {
+          if (entries && !sameEntries(next[d], entries)) {
+            next[d] = entries;
+            changed = true;
+          }
+        }
+        return changed ? { childrenCache: next } : {};
+      });
+    } finally {
+      treeReloadInFlight = false;
+    }
   },
 
   setLayout: (path, layout) => {
