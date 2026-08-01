@@ -745,6 +745,53 @@ fn run_timeline_poll(
             continue; // transient read error — retry next tick
         }
 
+        // P1(듀얼 리뷰 #1·#2): 스냅샷 debounce 플러시 — emit의 fp 게이트보다
+        // **앞**, 매 틱 검사한다. 변화가 멎어도 마지막 변화 후 ~SAVE_DEBOUNCE에
+        // 트레일링 엣지가 반드시 착지한다(게이트 뒤에 두면 무변화 틱이
+        // `continue`로 건너뛰어 마지막 턴이 영구 미저장 — 정상 종료마다 재현).
+        // stop 후 미실행(F4)은 루프 진입부의 stop 검사가 보장. 무변화 틱 비용은
+        // Instant 비교 1회.
+        if snap_dirty && last_save.elapsed() >= SAVE_DEBOUNCE {
+            // last_save는 성공/실패 무관 갱신(실패 핫루프 방지 — 2s 간격 재시도),
+            // dirty는 본문 save() 성공 시에만 해제 — 일시 디스크 오류 1회가 그
+            // 시점까지의 변화를 저장 대상에서 영구히 빼지 않는다(#2).
+            last_save = std::time::Instant::now();
+            if let Ok(base) = app.path().app_data_dir() {
+                // Read the rename override (decoupled file) rather than the
+                // body's own name, so a concurrent rename isn't clobbered (F1).
+                let name = core_lib::snapshot::read_name(&base, &cwd, &uuid)
+                    .unwrap_or_else(|| initial_name.clone());
+                let date = chrono::Local::now().format("%Y-%m-%d").to_string();
+                // 스냅샷 본문은 **전문**(절단 없음 — 듀얼 리뷰 #3). 절단은 IPC
+                // 반환 경계(emit payload·claude_session_snapshot)에서만 —
+                // 절단본을 디스크 정본 캐시로 남기면 CLI가 원본 JSONL을
+                // 로테이트한 뒤 복구 불능이 된다. 디스크 쓰기 크기는 병목이
+                // 아니다(병목 = 직렬화 CPU·IPC·DOM).
+                let snap = core_lib::snapshot::SessionSnapshot {
+                    uuid: uuid.clone(),
+                    name,
+                    date,
+                    items: t.timeline().items().to_vec(),
+                    turns: t.turns().iter().map(|(k, v)| (*k, v.clone())).collect(),
+                    answers: t.answers().iter().map(|(k, v)| (*k, v.clone())).collect(),
+                    dates: t.dates().iter().map(|(k, v)| (*k, v.clone())).collect(),
+                    tokens: t.tokens().iter().map(|(k, v)| (*k, *v)).collect(),
+                    model: t.model().map(str::to_string),
+                    last_usage: t.last_usage(),
+                    // Task-chain meta lives in the decoupled `.task` sidecar (set
+                    // at handoff), not the body — `load` sources them from there.
+                    prev_uuid: None,
+                    summary_path: None,
+                    // Title/summary likewise sidecar-sourced on `load`.
+                    title: None,
+                    summary: None,
+                };
+                if core_lib::snapshot::save(&base, &cwd, &snap).is_ok() {
+                    snap_dirty = false;
+                }
+            }
+        }
+
         // Tail each subagent transcript (parallel Task agents write their own
         // `<uuid>/subagents/agent-<id>.jsonl`). New files appear as agents spawn.
         if let Some(sd) = &sub_dir {
@@ -959,52 +1006,13 @@ fn run_timeline_poll(
                 subagents: subagents_v,
             },
         );
+        // 저장 자체는 위(틱 진입부) debounce 플러시가 수행한다 — 여기서는
+        // dirty 마킹만. Persisting keeps the session listable/reopenable across
+        // restarts (D-1) without the append duplication.
         snap_dirty = true;
 
-        // Persist a whole-session snapshot (D-1): overwrite, so the session
-        // survives restart and can be listed/reopened, without the append
-        // duplication. A rename (claude_rename writes the snapshot's name) is
-        // preserved by reading the existing name back here.
         if stop.load(Ordering::Relaxed) {
             break; // closed during poll/emit — don't persist after close (F4)
-        }
-        // P1: 디스크 저장 debounce — emit(위, fp 게이트 그대로)과 분리해
-        // 마지막 변화 후 최소 SAVE_DEBOUNCE 간격으로만 전체 스냅샷을 쓴다
-        // (활발 세션에서 초당 최대 6.7회 × 수 MB 재작성 제거). 잃는 것은
-        // 크래시 시 ≤2초분 — JSONL이 정본, 스냅샷은 캐시. stop 이후 저장
-        // 금지(F4)는 위 break가 보장.
-        if snap_dirty && last_save.elapsed() >= SAVE_DEBOUNCE {
-            if let Ok(base) = app.path().app_data_dir() {
-                // Read the rename override (decoupled file) rather than the
-                // body's own name, so a concurrent rename isn't clobbered (F1).
-                let name = core_lib::snapshot::read_name(&base, &cwd, &uuid)
-                    .unwrap_or_else(|| initial_name.clone());
-                let date = chrono::Local::now().format("%Y-%m-%d").to_string();
-                let mut items_s = t.timeline().items().to_vec();
-                cap_content(&mut items_s); // 스냅샷도 표시 캐시 — 동일 상한
-                let snap = core_lib::snapshot::SessionSnapshot {
-                    uuid: uuid.clone(),
-                    name,
-                    date,
-                    items: items_s,
-                    turns: t.turns().iter().map(|(k, v)| (*k, v.clone())).collect(),
-                    answers: t.answers().iter().map(|(k, v)| (*k, v.clone())).collect(),
-                    dates: t.dates().iter().map(|(k, v)| (*k, v.clone())).collect(),
-                    tokens: t.tokens().iter().map(|(k, v)| (*k, *v)).collect(),
-                    model: t.model().map(str::to_string),
-                    last_usage: t.last_usage(),
-                    // Task-chain meta lives in the decoupled `.task` sidecar (set
-                    // at handoff), not the body — `load` sources them from there.
-                    prev_uuid: None,
-                    summary_path: None,
-                    // Title/summary likewise sidecar-sourced on `load`.
-                    title: None,
-                    summary: None,
-                };
-                let _ = core_lib::snapshot::save(&base, &cwd, &snap);
-            }
-            snap_dirty = false;
-            last_save = std::time::Instant::now();
         }
     }
 
@@ -1025,9 +1033,9 @@ fn run_timeline_poll(
     }
 }
 
-/// P1: 절단된 아이템의 원문 상세 — 원본 JSONL(+서브에이전트 transcript)에서
-/// 재추출한다(read-only, mapper 결정적 — spec 가정②). 뷰어가
-/// `content_truncated` 아이템 선택 시 lazy 호출.
+/// P1: 절단된 아이템의 원문 상세 — 전문 스냅샷 우선, 부재 시 원본 JSONL
+/// (+서브에이전트 transcript)에서 재추출(read-only, mapper 결정적 — spec
+/// 가정②). 뷰어가 `content_truncated` 아이템 선택 시 lazy 호출.
 #[derive(Serialize)]
 pub struct ItemDetail {
     pub content_text: Option<String>,
@@ -1036,20 +1044,41 @@ pub struct ItemDetail {
 
 #[tauri::command]
 pub async fn claude_item_detail(
+    app: AppHandle,
     project: String,
     uuid: String,
     tool_call_id: String,
 ) -> Result<ItemDetail, AppError> {
+    // 커맨드 경계에서 uuid를 명시 검증(#6) — 아래 경로 탐색(find_session_jsonl·
+    // 서브에이전트 dir join)에 통제 밖 문자열이 들어가지 않게 한 줄로 막는다.
+    if !core_lib::snapshot::is_safe_uuid(&uuid) {
+        return Err(AppError::new("Invalid session id"));
+    }
     tauri::async_runtime::spawn_blocking(move || {
+        let detail_of = |it: &TimelineItem| ItemDetail {
+            content_text: it.content_text.clone(),
+            raw_input: it.raw_input.clone(),
+        };
+        // 1) 스냅샷 우선(#3·#20) — 디스크 본문은 전문이므로 대부분 여기서 끝난다
+        //    (수 MB 파싱 1회, transcript 수십 MB 재파싱 회피). 구버전(절단 저장)
+        //    스냅샷의 아이템은 content_truncated가 남아 있으므로 폴백으로 넘긴다.
+        if let Ok(base) = app.path().app_data_dir() {
+            if let Some(snap) = core_lib::snapshot::load(&base, &project, &uuid) {
+                if let Some(it) = snap
+                    .items
+                    .iter()
+                    .find(|i| i.tool_call_id == tool_call_id && !i.content_truncated)
+                {
+                    return Ok(detail_of(it));
+                }
+            }
+        }
+        // 2) 원본 JSONL 폴백 — 스냅샷 부재/미포함(서브에이전트 아이템 등).
         let root = core_lib::jsonl::claude_projects_root()
             .ok_or_else(|| AppError::new("Cannot locate the Claude projects root"))?;
         let jsonl = core_lib::jsonl::find_session_jsonl(&root, &uuid)
             .map_err(|e| AppError::new(io_message("Locate transcript", &e)))?
             .ok_or_else(|| AppError::new("Session transcript not found"))?;
-        let detail_of = |it: &TimelineItem| ItemDetail {
-            content_text: it.content_text.clone(),
-            raw_input: it.raw_input.clone(),
-        };
         // 본 세션 transcript 전체 재파싱(온디맨드 1회 — 클릭당 수십~수백 ms).
         let mut t = core_lib::jsonl::SessionTail::new(project.clone(), uuid.clone(), jsonl.clone());
         t.poll().map_err(|e| AppError::new(io_message("Read transcript", &e)))?;
@@ -1102,7 +1131,10 @@ pub fn claude_session_snapshot(
     uuid: String,
 ) -> Option<core_lib::snapshot::SessionSnapshot> {
     let base = app.path().app_data_dir().ok()?;
-    core_lib::snapshot::load(&base, &project, &uuid)
+    let mut snap = core_lib::snapshot::load(&base, &project, &uuid)?;
+    // P1(#3): 절단은 IPC 반환 경계에서만 — 디스크 본문은 전문 유지.
+    cap_content(&mut snap.items);
+    Some(snap)
 }
 
 /// Rename a saved session (persists in its snapshot; the poll thread reads the
