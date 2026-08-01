@@ -124,23 +124,15 @@ fn reject_unsafe_path(path: &str) -> Result<(), AppError> {
 /// deepest existing ancestor, so a new nested file still gets validated against
 /// its real on-disk location.
 fn ensure_within(path: &str, root: &str) -> Result<(), AppError> {
-    let root_c = std::fs::canonicalize(root)
-        .map_err(|_| AppError::new("프로젝트 경로를 확인할 수 없습니다"))?;
-    let mut probe = std::path::PathBuf::from(path);
-    let resolved = loop {
-        match std::fs::canonicalize(&probe) {
-            Ok(c) => break c,
-            Err(_) => match probe.parent() {
-                Some(parent) if parent != probe => probe = parent.to_path_buf(),
-                _ => return Err(AppError::new("경로를 확인할 수 없습니다")),
-            },
-        }
-    };
-    if resolved.starts_with(&root_c) {
-        Ok(())
-    } else {
-        Err(AppError::new("프로젝트 밖 경로는 허용되지 않습니다"))
-    }
+    // 봉쇄 알고리즘은 core::pathguard 단일 출처(P4) — 문구만 도메인 소유.
+    use core_lib::pathguard::ContainErr;
+    core_lib::pathguard::contained_prospective(path, root).map_err(|e| {
+        AppError::new(match e {
+            ContainErr::Root => "프로젝트 경로를 확인할 수 없습니다",
+            ContainErr::Path => "경로를 확인할 수 없습니다",
+            ContainErr::Outside => "프로젝트 밖 경로는 허용되지 않습니다",
+        })
+    })
 }
 
 #[tauri::command]

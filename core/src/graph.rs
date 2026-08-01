@@ -276,9 +276,7 @@ generated_at 은 빈 문자열로 두라(호출자가 채운다)."
 pub fn generate_project_graph(project_path: &str, opts: &ClaudeOpts) -> Result<Graph, String> {
     // Canonicalize so git's canonicalized `--show-toplevel` output and our prefix
     // filter agree; fall back to the raw path if it can't be resolved.
-    let canon = fs::canonicalize(project_path)
-        .map(|p| p.to_string_lossy().to_string())
-        .unwrap_or_else(|_| project_path.to_string());
+    let canon = crate::pathguard::canonical_key(project_path);
     let mut roots = subproject_roots(&canon, git_roots(&canon));
 
     // ≤1 root → nothing to cluster: reuse the single-project path verbatim.
