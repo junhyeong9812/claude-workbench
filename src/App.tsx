@@ -47,6 +47,7 @@ import {
   applyTabPick,
   ctrlBAction,
   loadSidebarView,
+  mountedTabs,
   saveSidebarView,
   toggleSplit,
   type SidebarHalf,
@@ -78,40 +79,47 @@ function SidebarTabBody({ tab }: { tab: SidebarTab }) {
  * 스왑) + 본문. files 반쪽에는 기존 ↻(새로고침)를 seg 우측에 병치한다.
  * 반쪽 개별 접기는 없다(접기는 전체 단위 — 설계 §A-4).
  */
-function SidebarHalfPane({ tab, onPick }: { tab: SidebarTab; onPick: (t: SidebarTab) => void }) {
+function SidebarHalfHead({
+  half,
+  tab,
+  otherTab,
+  onPick,
+}: {
+  half: SidebarHalf;
+  tab: SidebarTab;
+  /** 상대 반쪽의 현재 탭 — 선택 시 스왑됨을 title로 예고(리뷰 a11y). */
+  otherTab: SidebarTab;
+  onPick: (t: SidebarTab) => void;
+}) {
+  const halfLabel = half === "top" ? "위쪽 칸" : "아래쪽 칸";
   return (
-    <>
-      <div className="sidebar-half-head">
-        {/* aria-pressed 토글 버튼 묶음(.seg idiom) — tablist가 아니다(액티비티
-            바와 같은 이유: tabpanel/roving tabindex 계약을 만족하지 않는다). */}
-        <div className="seg sidebar-seg" role="group" aria-label="이 칸에 표시할 탭">
-          {SIDE_TABS.map((t) => (
-            <button
-              key={t.key}
-              className={`seg-item sidebar-seg-item${tab === t.key ? " seg-on" : ""}`}
-              aria-pressed={tab === t.key}
-              aria-label={t.label}
-              title={t.label}
-              onClick={() => onPick(t.key)}
-            >
-              <span aria-hidden="true">{t.ico}</span>
-            </button>
-          ))}
-        </div>
-        {tab === "files" && (
+    <div className="sidebar-half-head">
+      {/* aria-pressed 토글 버튼 묶음(.seg idiom) — tablist가 아니다(액티비티
+          바와 같은 이유: tabpanel/roving tabindex 계약을 만족하지 않는다). */}
+      <div className="seg sidebar-seg" role="group" aria-label={`${halfLabel}에 표시할 탭`}>
+        {SIDE_TABS.map((t) => (
           <button
-            className="tree-refresh"
-            title="디스크에서 새로고침"
-            onClick={() => void useAppStore.getState().reloadActiveTree()}
+            key={t.key}
+            className={`seg-item sidebar-seg-item${tab === t.key ? " seg-on" : ""}`}
+            aria-pressed={tab === t.key}
+            aria-label={t.label}
+            title={t.key === otherTab ? `${t.label} — 위아래 맞바꾸기` : t.label}
+            onClick={() => onPick(t.key)}
           >
-            ↻
+            <span aria-hidden="true">{t.ico}</span>
           </button>
-        )}
+        ))}
       </div>
-      <div className="sidebar-half-body">
-        <SidebarTabBody tab={tab} />
-      </div>
-    </>
+      {tab === "files" && (
+        <button
+          className="tree-refresh"
+          title="디스크에서 새로고침"
+          onClick={() => void useAppStore.getState().reloadActiveTree()}
+        >
+          ↻
+        </button>
+      )}
+    </div>
   );
 }
 
@@ -328,6 +336,9 @@ function AppMain() {
   useEffect(() => saveSidebarView(sidebarView), [sidebarView]);
   // 액티비티 바가 가리키는 탭: 분할 OFF면 단일 탭, ON이면 위쪽 반쪽.
   const activeSideTab = sidebarView.split ? sidebarView.topTab : sidebarView.tab;
+  // Ctrl+B 핸들러([] deps effect)가 최신 분할 상태를 읽도록 ref 미러.
+  const sidebarViewRef = useRef(sidebarView);
+  sidebarViewRef.current = sidebarView;
   const pickHalfTab = (half: SidebarHalf, tab: SidebarTab) =>
     setSidebarView((v) => applyTabPick(v, half, tab));
   const [termSettingsOpen, setTermSettingsOpen] = useState(false);
@@ -492,11 +503,17 @@ function AppMain() {
       const action = ctrlBAction(
         panel.isCollapsed(),
         !!sidebar && sidebar.contains(document.activeElement),
+        mountedTabs(sidebarViewRef.current).includes("files"),
       );
       if (action.kind === "expand") {
         panel.expand();
         // 펼침이 반영된 뒤에 포커스 — 트리가 보이는 반쪽에 없으면 이동 생략.
         requestAnimationFrame(() => document.getElementById("folder-tree")?.focus());
+        return;
+      }
+      if (action.kind === "focusTree") {
+        // 하이브리드(리뷰): 펼쳐져 있고 트리가 보이면 구 동작(트리로 진입).
+        document.getElementById("folder-tree")?.focus();
         return;
       }
       panel.collapse();
@@ -819,7 +836,10 @@ function AppMain() {
             aria-pressed={sidebarView.split}
             title={sidebarView.split ? "상하 분할 해제" : "사이드바 상하 분할"}
             aria-label={sidebarView.split ? "상하 분할 해제" : "사이드바 상하 분할"}
-            onClick={() => setSidebarView(toggleSplit)}
+            onClick={() => {
+              if (collapsed) treePanelRef.current?.expand(); // 접힘 중 ⊟ = 펼침 동반(리뷰)
+              setSidebarView(toggleSplit);
+            }}
           >
             <span className="activity-ico">⊟</span>
           </button>
@@ -846,41 +866,54 @@ function AppMain() {
           className="pane-left"
         >
           <div className="sidebar-content">
-            {sidebarView.split ? (
-              /* 상하 2분할 — 비율은 autoSaveId가 영속(StudyView study-vert 동형).
-                 두 반쪽이 같은 탭이 되는 상태는 sidebarView 규칙이 막는다. */
-              <PanelGroup direction="vertical" autoSaveId="sidebar-vert" className="sidebar-split">
-                <Panel id="sidebar-top" order={1} minSize={15} className="sidebar-half">
-                  <SidebarHalfPane
+            {/* PanelGroup은 분할 여부와 무관하게 **상시** 렌더 — ⊟ 토글이 위쪽
+                본문(keyed "body")의 identity를 보존해 GitPanel 커밋 메시지 등
+                로컬 상태가 소실되지 않는다(리뷰 P2). 아래 반쪽·핸들만 조건부
+                (commit-files 조건부 Panel 선례). 두 반쪽이 같은 탭이 되는
+                상태는 sidebarView 규칙(total 정규화)이 막는다. */}
+            <PanelGroup direction="vertical" autoSaveId="sidebar-vert" className="sidebar-split">
+              <Panel id="sidebar-top" order={1} minSize={15} className="sidebar-half">
+                {sidebarView.split ? (
+                  <SidebarHalfHead
+                    key="head"
+                    half="top"
                     tab={sidebarView.topTab}
+                    otherTab={sidebarView.bottomTab}
                     onPick={(t) => pickHalfTab("top", t)}
                   />
-                </Panel>
-                <PanelResizeHandle className="resize-handle resize-handle-v" />
-                <Panel id="sidebar-bottom" order={2} minSize={15} className="sidebar-half">
-                  <SidebarHalfPane
-                    tab={sidebarView.bottomTab}
-                    onPick={(t) => pickHalfTab("bottom", t)}
-                  />
-                </Panel>
-              </PanelGroup>
-            ) : sidebarView.tab === "files" ? (
-              <>
-                <div className="tree-hint">
-                  <span>Ctrl+B 사이드바 · ↑↓ 이동 · Enter 열기 · Ctrl+E 에디터</span>
-                  <button
-                    className="tree-refresh"
-                    title="디스크에서 새로고침"
-                    onClick={() => void useAppStore.getState().reloadActiveTree()}
-                  >
-                    ↻
-                  </button>
+                ) : sidebarView.tab === "files" ? (
+                  <div key="head" className="tree-hint">
+                    <span>Ctrl+B 트리/사이드바 · ↑↓ 이동 · Enter 열기 · Ctrl+E 에디터</span>
+                    <button
+                      className="tree-refresh"
+                      title="디스크에서 새로고침"
+                      onClick={() => void useAppStore.getState().reloadActiveTree()}
+                    >
+                      ↻
+                    </button>
+                  </div>
+                ) : null}
+                <div key="body" className="sidebar-half-body">
+                  <SidebarTabBody tab={sidebarView.split ? sidebarView.topTab : sidebarView.tab} />
                 </div>
-                <FolderTree />
-              </>
-            ) : (
-              <SidebarTabBody tab={sidebarView.tab} />
-            )}
+              </Panel>
+              {sidebarView.split && (
+                <>
+                  <PanelResizeHandle className="resize-handle resize-handle-v" />
+                  <Panel id="sidebar-bottom" order={2} minSize={15} className="sidebar-half">
+                    <SidebarHalfHead
+                      half="bottom"
+                      tab={sidebarView.bottomTab}
+                      otherTab={sidebarView.topTab}
+                      onPick={(t) => pickHalfTab("bottom", t)}
+                    />
+                    <div className="sidebar-half-body">
+                      <SidebarTabBody tab={sidebarView.bottomTab} />
+                    </div>
+                  </Panel>
+                </>
+              )}
+            </PanelGroup>
           </div>
         </Panel>
         {gitHistory && (

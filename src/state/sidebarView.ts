@@ -59,7 +59,10 @@ export function normalizeSidebarView(v: SidebarView): SidebarView {
  * 반쪽 헤더 seg 선택 규칙 — 상대 반쪽이 이미 그 탭이면 **두 반쪽을 맞바꾼다**
  * (설계 §A-1). 그 외에는 그 반쪽만 교체. 같은 탭 재선택은 무동작(참조 유지).
  */
-export function applyTabPick(state: SidebarView, half: SidebarHalf, tab: SidebarTab): SidebarView {
+export function applyTabPick(raw: SidebarView, half: SidebarHalf, tab: SidebarTab): SidebarView {
+  // 전(total) 함수 계약(리뷰): 입력이 위반 상태여도 먼저 정규화 — 조기 반환이
+  // 위반을 그대로 흘려보내지 않는다(exhaustive raw 테스트가 이를 고정).
+  const state = normalizeSidebarView(raw);
   const mine = half === "top" ? state.topTab : state.bottomTab;
   if (mine === tab) return state;
   const theirs = half === "top" ? state.bottomTab : state.topTab;
@@ -77,7 +80,8 @@ export function applyTabPick(state: SidebarView, half: SidebarHalf, tab: Sidebar
  * (설계 §A-3). 분할 ON 동안 `tab`은 건드리지 않는다: 분할을 끌 때 위쪽 탭을
  * 물려받으므로(toggleSplit) 중간 상태를 남길 필요가 없다.
  */
-export function applyActivityPick(state: SidebarView, tab: SidebarTab): SidebarView {
+export function applyActivityPick(raw: SidebarView, tab: SidebarTab): SidebarView {
+  const state = normalizeSidebarView(raw); // total 계약 — applyTabPick과 동일
   if (state.split) return applyTabPick(state, "top", tab);
   if (state.tab === tab) return state;
   return { ...state, tab };
@@ -133,10 +137,19 @@ export function saveSidebarView(v: SidebarView): void {
  *   갇히지 않게 마지막 작업 지점으로 되돌린다.
  */
 export type CtrlBAction =
-  | { kind: "expand"; focusTree: true }
+  | { kind: "expand" }
+  | { kind: "focusTree" }
   | { kind: "collapse"; restoreFocus: boolean };
 
-export function ctrlBAction(collapsed: boolean, focusInSidebar: boolean): CtrlBAction {
-  if (collapsed) return { kind: "expand", focusTree: true };
+/** 하이브리드 규칙(리뷰 — 구 "트리 진입"과 신 "탭 무관 상시 동작" 둘 다 보존):
+ * 접힘 → 펼침(+트리 있으면 포커스) / 펼침·포커스가 사이드바 밖·트리 마운트
+ * → 트리 포커스 / 그 외(트리 없음 또는 이미 사이드바 안) → 접기. */
+export function ctrlBAction(
+  collapsed: boolean,
+  focusInSidebar: boolean,
+  treeMounted: boolean,
+): CtrlBAction {
+  if (collapsed) return { kind: "expand" };
+  if (!focusInSidebar && treeMounted) return { kind: "focusTree" };
   return { kind: "collapse", restoreFocus: focusInSidebar };
 }

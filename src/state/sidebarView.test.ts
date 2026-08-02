@@ -65,7 +65,7 @@ describe("applyTabPick", () => {
       for (const bottom of SIDEBAR_TABS) {
         for (const half of ["top", "bottom"] as const) {
           for (const pick of SIDEBAR_TABS) {
-            const start = normalizeSidebarView(view({ split: true, topTab: top, bottomTab: bottom }));
+            const start = (view({ split: true, topTab: top, bottomTab: bottom }));
             const out = applyTabPick(start, half, pick);
             expect(out.topTab).not.toBe(out.bottomTab);
             // 선택한 탭은 반드시 그 반쪽에 놓인다.
@@ -194,22 +194,23 @@ describe("loadSidebarView", () => {
   });
 });
 
-describe("ctrlBAction", () => {
-  it("expands a collapsed sidebar and focuses the tree when one is mounted", () => {
-    expect(ctrlBAction(true, false)).toEqual({ kind: "expand", focusTree: true });
+describe("ctrlBAction (하이브리드 — 리뷰 반영)", () => {
+  it("접힘 → 항상 펼침", () => {
+    expect(ctrlBAction(true, false, true)).toEqual({ kind: "expand" });
+    expect(ctrlBAction(true, true, false)).toEqual({ kind: "expand" });
   });
 
-  it("collapses an expanded sidebar regardless of which tab is showing (결함 ① 해소)", () => {
-    // 트리가 없는 탭(git 등)에서도 무동작이 아니라 접힌다.
-    expect(ctrlBAction(false, false)).toEqual({ kind: "collapse", restoreFocus: false });
+  it("펼침·사이드바 밖 포커스·트리 마운트 → 트리 포커스(구 진입 경로 보존)", () => {
+    expect(ctrlBAction(false, false, true)).toEqual({ kind: "focusTree" });
   });
 
-  it("restores the last work spot when collapsing away from focus inside the sidebar", () => {
-    expect(ctrlBAction(false, true)).toEqual({ kind: "collapse", restoreFocus: true });
+  it("트리 없는 탭에서는 접기 — 무동작 아님(결함 ① 해소)", () => {
+    expect(ctrlBAction(false, false, false)).toEqual({ kind: "collapse", restoreFocus: false });
   });
 
-  it("ignores focus location while expanding", () => {
-    expect(ctrlBAction(true, true)).toEqual({ kind: "expand", focusTree: true });
+  it("포커스가 사이드바 안이면 접고 마지막 작업 지점 복귀", () => {
+    expect(ctrlBAction(false, true, true)).toEqual({ kind: "collapse", restoreFocus: true });
+    expect(ctrlBAction(false, true, false)).toEqual({ kind: "collapse", restoreFocus: true });
   });
 });
 

@@ -608,10 +608,12 @@ body {
   padding: 3px 4px;
   overflow: hidden;
   border-bottom: 1px solid var(--border);
+  flex-wrap: wrap; /* 좁은 폭에서 ↻·seg가 다음 줄로 — 잘림 대신 줄바꿈(리뷰) */
 }
 .sidebar-seg {
   min-width: 0;
   overflow: hidden;
+  flex-wrap: wrap; /* 5칸이 못 들어가면 2줄 — 아래 반쪽의 유일한 탭 전환 수단이라 잘리면 안 된다 */
 }
 .sidebar-seg-item {
   height: 20px;
