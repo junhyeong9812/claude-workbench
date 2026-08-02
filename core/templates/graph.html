@@ -1,0 +1,275 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>의존성 그래프</title>
+<style>
+:root { color-scheme: dark; }
+* { box-sizing: border-box; }
+html, body { margin: 0; height: 100%; }
+body { background: #14161a; color: #d7dae0; font: 14px/1.6 -apple-system, "Noto Sans KR", sans-serif; overflow: hidden; }
+header { position: fixed; top: 0; left: 0; right: 0; background: #1a1d23; border-bottom: 1px solid #2a2e36; padding: 10px 16px; z-index: 3; }
+header h1 { font-size: 15px; margin: 0 0 2px; overflow-wrap: anywhere; }
+header .meta { font-size: 12px; color: #8b93a1; }
+#banner { margin-top: 8px; background: #3a2e12; border: 1px solid #e0af68; border-radius: 6px; padding: 6px 10px; color: #f0d9a0; font-size: 12px; }
+#banner div { overflow-wrap: anywhere; }
+#banner div + div { margin-top: 4px; }
+#svg { position: fixed; inset: 0; width: 100%; height: 100%; cursor: grab; }
+#svg.dragging { cursor: grabbing; }
+#empty { position: fixed; inset: 0; display: flex; align-items: center; justify-content: center; color: #8b93a1; font-size: 13px; }
+.edge { stroke: #3a4050; stroke-width: 1.2; }
+.node circle { stroke: #14161a; stroke-width: 1.5; cursor: pointer; }
+.node text { fill: #c4cad4; font-size: 11px; pointer-events: none; user-select: none; }
+.node.sel circle { stroke: #fff; stroke-width: 2.5; }
+#legend { position: fixed; left: 12px; bottom: 12px; background: rgba(26,29,35,.9); border: 1px solid #2a2e36; border-radius: 8px; padding: 8px 10px; font-size: 12px; z-index: 3; max-width: 240px; max-height: 40vh; overflow-y: auto; }
+#legend .row { display: flex; align-items: center; gap: 6px; margin: 2px 0; }
+#legend .sw { width: 11px; height: 11px; border-radius: 3px; display: inline-block; flex: 0 0 auto; }
+#legend .lbl { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+#panel { position: fixed; right: 12px; top: 62px; width: 260px; max-width: 44vw; background: rgba(26,29,35,.96); border: 1px solid #2a2e36; border-radius: 8px; padding: 10px 12px; font-size: 12px; z-index: 3; display: none; }
+#panel.show { display: block; }
+#panel h2 { font-size: 13px; margin: 0 0 6px; overflow-wrap: anywhere; }
+#panel dt { color: #8b93a1; margin-top: 6px; }
+#panel dd { margin: 0; overflow-wrap: anywhere; font: 12px/1.5 ui-monospace, monospace; }
+#panel .close { position: absolute; top: 6px; right: 8px; cursor: pointer; color: #8b93a1; border: none; background: none; font-size: 14px; }
+</style>
+</head>
+<body>
+<header><h1 id="t"></h1><div class="meta" id="m"></div></header>
+<svg id="svg"><g id="vp"><defs>
+<marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+<path d="M0,0 L10,5 L0,10 z" fill="#4a5265"></path>
+</marker>
+</defs><g id="edges"></g><g id="nodes"></g></g></svg>
+<div id="empty" style="display:none">노드가 없습니다</div>
+<div id="legend"></div>
+<div id="panel"><button class="close" id="pclose" title="닫기">×</button><h2 id="pl"></h2><dl id="pd"></dl></div>
+<script>
+"use strict";
+const DATA = __DATA__;
+// Derive the SVG namespace from the static <svg> the HTML parser already put in
+// it — avoids writing the namespace URI literal, so the source carries zero
+// "http" strings (genuinely no external-request-shaped text).
+const SVGNS = document.getElementById("svg").namespaceURI;
+const COLOR = { module: "#7aa2f7", file: "#9ece6a", package: "#e0af68", external: "#bb9af7" };
+const FALLBACK = "#8b93a1";
+function colorOf(kind) { return COLOR[kind] || FALLBACK; }
+function svg(tag, attrs) { const e = document.createElementNS(SVGNS, tag); if (attrs) for (const k in attrs) e.setAttribute(k, attrs[k]); return e; }
+
+const nodes = (DATA && Array.isArray(DATA.nodes)) ? DATA.nodes.map(n => Object.assign({}, n)) : [];
+const rawEdges = (DATA && Array.isArray(DATA.edges)) ? DATA.edges : [];
+
+// Hierarchical grouping (task-05): when nodes carry a `group` (owning sub-project),
+// color by group so the viewer clusters visually; with no groups this stays empty
+// and rendering falls back to the kind palette — byte-identical to the pre-group
+// single-project graph.
+const GROUP_COLORS = ["#7aa2f7","#9ece6a","#e0af68","#bb9af7","#f7768e","#2ac3de","#ff9e64","#73daca"];
+const groups = [...new Set(nodes.map(n => n.group).filter(Boolean))].sort();
+const hasGroups = groups.length > 0;
+function groupColor(g) { const i = groups.indexOf(g); return i < 0 ? FALLBACK : GROUP_COLORS[i % GROUP_COLORS.length]; }
+function nodeColor(n) { return hasGroups ? groupColor(n.group) : colorOf(n.kind); }
+
+document.getElementById("t").textContent = (DATA && DATA.project) || "의존성 그래프";
+document.title = "의존성 그래프 · " + ((DATA && DATA.project) || "");
+document.getElementById("m").textContent =
+  [ "노드 " + nodes.length, "엣지 " + rawEdges.length, (DATA && DATA.generated_at) || "" ].filter(Boolean).join("  ·  ");
+
+// Completeness advisories (e.g. sub-project list capped): show a prominent
+// warning banner so a truncated graph is never mistaken for a complete one
+// (F1 — GUI users never see stderr). textContent only → model strings inert.
+const notes = (DATA && Array.isArray(DATA.notes)) ? DATA.notes.filter(Boolean) : [];
+if (notes.length) {
+  const banner = document.createElement("div");
+  banner.id = "banner";
+  banner.setAttribute("role", "alert");
+  notes.forEach(msg => {
+    const line = document.createElement("div");
+    line.textContent = "⚠ " + msg;
+    banner.appendChild(line);
+  });
+  document.querySelector("header").appendChild(banner);
+}
+
+// Legend. Grouped graphs list the sub-projects (color = group); otherwise the
+// kinds actually present (color = kind) — the original single-project legend.
+const legend = document.getElementById("legend");
+function legendRow(bg, label) {
+  const row = document.createElement("div"); row.className = "row";
+  const sw = document.createElement("span"); sw.className = "sw"; sw.style.background = bg;
+  row.appendChild(sw);
+  const t = document.createElement("span"); t.className = "lbl";
+  t.textContent = label; t.setAttribute("title", label);   // textContent → model string inert
+  row.appendChild(t); legend.appendChild(row);
+}
+if (hasGroups) {
+  groups.forEach(g => legendRow(groupColor(g), g));
+  if (nodes.some(n => !n.group)) legendRow(FALLBACK, "그룹 없음");
+} else {
+  const kinds = new Set(nodes.map(n => n.kind || ""));
+  [["module","module"],["file","file"],["package","package"],["external","external"]].forEach(([k,label]) => {
+    if (kinds.has(k)) legendRow(COLOR[k], label);
+  });
+  if ([...kinds].some(k => !COLOR[k])) legendRow(FALLBACK, "기타");
+}
+
+if (nodes.length === 0) {
+  document.getElementById("empty").style.display = "flex";
+  document.getElementById("legend").style.display = "none";
+} else {
+  layoutAndRender();
+}
+
+function layoutAndRender() {
+  const N = nodes.length;
+  const idx = new Map(nodes.map((n, i) => [n.id, i]));
+  const links = [];
+  for (const e of rawEdges) {
+    const s = idx.get(e.from), t = idx.get(e.to);
+    if (s != null && t != null && s !== t) links.push({ s, t });
+  }
+  // Deterministic initial placement on a circle (no Math.random → stable shape).
+  const R = 40 * Math.sqrt(N) + 60;
+  for (let i = 0; i < N; i++) {
+    const a = (2 * Math.PI * i) / Math.max(1, N);
+    nodes[i].x = Math.cos(a) * R;
+    nodes[i].y = Math.sin(a) * R;
+  }
+  // Fruchterman–Reingold: repulsion between all pairs + attraction along links.
+  const area = (2 * R) * (2 * R);
+  const k = Math.sqrt(area / Math.max(1, N));
+  const iters = N > 200 ? 80 : 300;
+  let temp = R * 0.5;
+  const cool = temp / (iters + 1);
+  for (let it = 0; it < iters; it++) {
+    const dispx = new Float64Array(N), dispy = new Float64Array(N);
+    for (let i = 0; i < N; i++) {
+      for (let j = i + 1; j < N; j++) {
+        let dx = nodes[i].x - nodes[j].x, dy = nodes[i].y - nodes[j].y;
+        let d = Math.hypot(dx, dy) || 0.01;
+        const f = (k * k) / d;
+        const ux = dx / d, uy = dy / d;
+        dispx[i] += ux * f; dispy[i] += uy * f;
+        dispx[j] -= ux * f; dispy[j] -= uy * f;
+      }
+    }
+    for (const l of links) {
+      let dx = nodes[l.s].x - nodes[l.t].x, dy = nodes[l.s].y - nodes[l.t].y;
+      let d = Math.hypot(dx, dy) || 0.01;
+      const f = (d * d) / k;
+      const ux = dx / d, uy = dy / d;
+      dispx[l.s] -= ux * f; dispy[l.s] -= uy * f;
+      dispx[l.t] += ux * f; dispy[l.t] += uy * f;
+    }
+    for (let i = 0; i < N; i++) {
+      let dx = dispx[i], dy = dispy[i];
+      const d = Math.hypot(dx, dy) || 0.01;
+      const step = Math.min(d, temp);
+      nodes[i].x += (dx / d) * step;
+      nodes[i].y += (dy / d) * step;
+    }
+    temp = Math.max(temp - cool, 1);
+  }
+
+  // Draw.
+  const gEdges = document.getElementById("edges"), gNodes = document.getElementById("nodes");
+  const rad = 7;
+  for (const l of links) {
+    const a = nodes[l.s], b = nodes[l.t];
+    let dx = b.x - a.x, dy = b.y - a.y;
+    const d = Math.hypot(dx, dy) || 1;
+    const ux = dx / d, uy = dy / d;
+    const line = svg("line", {
+      class: "edge",
+      x1: a.x + ux * rad, y1: a.y + uy * rad,
+      x2: b.x - ux * (rad + 4), y2: b.y - uy * (rad + 4),
+      "marker-end": "url(#arrow)",
+    });
+    gEdges.appendChild(line);
+  }
+  const els = [];
+  nodes.forEach((n) => {
+    const g = svg("g", { class: "node" });
+    g.setAttribute("transform", "translate(" + n.x + "," + n.y + ")");
+    const c = svg("circle", { r: rad, fill: nodeColor(n) });
+    const label = svg("text", { x: rad + 3, y: 4 });
+    label.textContent = n.label || n.id;   // textContent → model string inert
+    g.appendChild(c); g.appendChild(label);
+    g.addEventListener("click", (ev) => { ev.stopPropagation(); select(n, g); });
+    gNodes.appendChild(g);
+    els.push(g);
+  });
+
+  // Fit viewBox to the laid-out bounds.
+  let minx = Infinity, miny = Infinity, maxx = -Infinity, maxy = -Infinity;
+  for (const n of nodes) {
+    minx = Math.min(minx, n.x); miny = Math.min(miny, n.y);
+    maxx = Math.max(maxx, n.x); maxy = Math.max(maxy, n.y);
+  }
+  const pad = 80;
+  const svgEl = document.getElementById("svg");
+  svgEl.setAttribute("viewBox", (minx - pad) + " " + (miny - pad) + " " +
+    ((maxx - minx) + 2 * pad) + " " + ((maxy - miny) + 2 * pad));
+
+  // Selection panel.
+  const panel = document.getElementById("panel");
+  const pl = document.getElementById("pl"), pd = document.getElementById("pd");
+  let selEl = null;
+  function select(n, g) {
+    if (selEl) selEl.classList.remove("sel");
+    selEl = g; g.classList.add("sel");
+    pl.textContent = n.label || n.id;
+    pd.replaceChildren();
+    const rows = [["id", n.id], ["kind", n.kind || "(없음)"], ["path", n.path || "(없음)"]];
+    if (hasGroups) rows.push(["group", n.group || "(없음)"]);
+    for (const [key, val] of rows) {
+      const dt = document.createElement("dt"); dt.textContent = key;
+      const dd = document.createElement("dd"); dd.textContent = val;   // textContent
+      pd.appendChild(dt); pd.appendChild(dd);
+    }
+    panel.classList.add("show");
+  }
+  document.getElementById("pclose").addEventListener("click", () => {
+    panel.classList.remove("show");
+    if (selEl) { selEl.classList.remove("sel"); selEl = null; }
+  });
+
+  // Zoom (wheel, around cursor) + pan (drag background).
+  const vp = document.getElementById("vp");
+  let scale = 1, tx = 0, ty = 0;
+  function apply() { vp.setAttribute("transform", "translate(" + tx + "," + ty + ") scale(" + scale + ")"); }
+  function toWorld(ev) {
+    const r = svgEl.getBoundingClientRect();
+    const vb = svgEl.viewBox.baseVal;
+    return {
+      x: vb.x + (ev.clientX - r.left) / r.width * vb.width,
+      y: vb.y + (ev.clientY - r.top) / r.height * vb.height,
+    };
+  }
+  svgEl.addEventListener("wheel", (ev) => {
+    ev.preventDefault();
+    const w = toWorld(ev);
+    const factor = ev.deltaY < 0 ? 1.1 : 1 / 1.1;
+    const ns = Math.min(8, Math.max(0.15, scale * factor));
+    tx = w.x - (w.x - tx) * (ns / scale);
+    ty = w.y - (w.y - ty) * (ns / scale);
+    scale = ns; apply();
+  }, { passive: false });
+  let dragging = false, lastx = 0, lasty = 0;
+  svgEl.addEventListener("pointerdown", (ev) => {
+    dragging = true; lastx = ev.clientX; lasty = ev.clientY;
+    svgEl.classList.add("dragging"); svgEl.setPointerCapture(ev.pointerId);
+  });
+  svgEl.addEventListener("pointermove", (ev) => {
+    if (!dragging) return;
+    const vb = svgEl.viewBox.baseVal, r = svgEl.getBoundingClientRect();
+    tx += (ev.clientX - lastx) / r.width * vb.width;
+    ty += (ev.clientY - lasty) / r.height * vb.height;
+    lastx = ev.clientX; lasty = ev.clientY; apply();
+  });
+  function endDrag() { dragging = false; svgEl.classList.remove("dragging"); }
+  svgEl.addEventListener("pointerup", endDrag);
+  svgEl.addEventListener("pointercancel", endDrag);
+}
+</script>
+</body>
+</html>
