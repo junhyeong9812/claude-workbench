@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { expandedSetOf, pruneTreeCache, sameEntries } from "./treeSelectors";
+import { capTreeCache, computeTreeKeepSet, expandedSetOf, pruneTreeCache, sameEntries } from "./treeSelectors";
 import type { DirEntry } from "../types";
 
 /** P2 특성테스트 — 기대값은 손계산. expandedSetOf는 기존 렌더 경로의
@@ -91,5 +91,36 @@ describe("pruneTreeCache", () => {
   it("제거 대상 없음 → 원본 identity 반환", () => {
     const out = pruneTreeCache(cache, "/none", []);
     expect(out).toBe(cache);
+  });
+});
+
+describe("computeTreeKeepSet / capTreeCache (P5 F-g)", () => {
+  const projects = [{ path: "/p1", tree_state: { expanded: ["/p1/a", "/p1/b"] } }];
+  const study = { left: "/s", right: null };
+  const studyExp = { "study-left": ["/s/x"] };
+
+  it("keep = 프로젝트 루트+확장 + 스터디 루트+확장 (손계산)", () => {
+    const keep = computeTreeKeepSet(projects, study, studyExp);
+    expect([...keep].sort()).toEqual(["/p1", "/p1/a", "/p1/b", "/s", "/s/x"]);
+  });
+
+  it("상한 이하 → 원본 identity", () => {
+    const cache = { "/p1": 1, "/x": 2 };
+    expect(capTreeCache(cache, new Set(["/p1"]), 5)).toBe(cache);
+  });
+
+  it("초과 시 keep 밖만 축출, keep(표시 중)은 절대 미축출", () => {
+    const cache = { "/p1": 1, "/junk1": 2, "/junk2": 3, "/s/x": 4 };
+    const keep = new Set(["/p1", "/s/x"]);
+    const out = capTreeCache(cache, keep, 2);
+    expect(out["/p1"]).toBe(1);
+    expect(out["/s/x"]).toBe(4);
+    expect(Object.keys(out).length).toBe(2);
+  });
+
+  it("keep만으로 상한 초과여도 keep은 남긴다(초과 잔존 허용)", () => {
+    const cache = { "/a": 1, "/b": 2, "/c": 3 };
+    const keep = new Set(["/a", "/b", "/c"]);
+    expect(Object.keys(capTreeCache(cache, keep, 1)).sort()).toEqual(["/a", "/b", "/c"]);
   });
 });

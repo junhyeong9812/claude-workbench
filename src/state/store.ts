@@ -4,7 +4,7 @@ import { emit, listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import type { ITheme } from "@xterm/xterm";
 import type { DirEntry, Project, ProjectType, SshConnection, WorkspaceState } from "../types";
-import { pruneTreeCache, sameEntries, underRoot } from "./treeSelectors";
+import { capTreeCache, computeTreeKeepSet, pruneTreeCache, sameEntries, underRoot } from "./treeSelectors";
 import { basename } from "../utils/path";
 
 /** Clamp a font size to the allowed range (also normalizes NaN). */
@@ -349,6 +349,10 @@ interface AppState {
   devUuids: Record<string, string>;
   /** Study view: root folder per side (persisted). */
   studyFolders: { left: string | null; right: string | null };
+  /** 스터디 트리별 확장 dir 목록(키 = 트리 인스턴스 id ?? root). P5 F-g:
+   * 컴포넌트 로컬 Set이던 것을 승격 — 캐시 상한 keep-set·구독 분리의 전제.
+   * 비영속(ephemeral — savePersisted에 넣지 않는다, 기존 수명 계약 유지). */
+  studyExpanded: Record<string, string[]>;
   /** Study view: open file tabs per side, MRU order (most recent first). */
   studyTabs: { left: string[]; right: string[] };
   /** Study view: active tab path per side. */
@@ -501,6 +505,8 @@ interface AppState {
   ensureDevUuid: (project: string) => string;
   /** Set (or clear) a study side's root folder (resets that side's tabs). */
   setStudyFolder: (side: "left" | "right", path: string | null) => void;
+  /** 스터디 트리(key)의 확장 목록 교체 — 항상 새 배열(메모 계약). */
+  setStudyExpanded: (key: string, dirs: string[]) => void;
   /** Open a file in a study side's viewer (front of MRU + active). */
   openStudyTab: (side: "left" | "right", path: string) => void;
   /** Close a study tab (fixes the active tab if it was the one closed). */
@@ -607,6 +613,7 @@ export const useAppStore = create<AppState>((set, get) => ({
   projectModes: loadProjectModes(),
   devUuids: loadStringMap("devUuids"),
   studyFolders: STUDY0.folders,
+  studyExpanded: {},
   studyTabs: STUDY0.tabs,
   studyActive: STUDY0.active,
   studyMode: STUDY0.mode,
@@ -848,6 +855,8 @@ export const useAppStore = create<AppState>((set, get) => ({
     }));
     saveStudyView(get());
   },
+  setStudyExpanded: (key, dirs) =>
+    set((s) => ({ studyExpanded: { ...s.studyExpanded, [key]: dirs } })),
   openStudyTab: (side, path) => {
     set((s) => ({
       studyTabs: { ...s.studyTabs, [side]: [path, ...s.studyTabs[side].filter((p) => p !== path)] },
@@ -950,7 +959,13 @@ export const useAppStore = create<AppState>((set, get) => ({
       const entries = await invoke<DirEntry[]>("read_dir", { path: dirPath });
       set((s) =>
         epoch === treeCacheEpoch && treeWriteAllowed(s, dirPath)
-          ? { childrenCache: { ...s.childrenCache, [dirPath]: entries } }
+          ? {
+              // P5 F-g: 성장 지점에서 상한 강제(keep-set 밖 접힌 dir만 축출).
+              childrenCache: capTreeCache(
+                { ...s.childrenCache, [dirPath]: entries },
+                computeTreeKeepSet(s.projects, s.studyFolders, s.studyExpanded),
+              ),
+            }
           : s,
       );
     } catch (err) {
@@ -1046,7 +1061,14 @@ export const useAppStore = create<AppState>((set, get) => ({
                 changed = true;
               }
             }
-            return changed ? { childrenCache: next } : s;
+            return changed
+              ? {
+                  childrenCache: capTreeCache(
+                    next,
+                    computeTreeKeepSet(s.projects, s.studyFolders, s.studyExpanded),
+                  ),
+                }
+              : s;
           });
         })();
         // hang한 read_dir 하나가 폴링을 영구 정지시키지 않게 가드 점유만
