@@ -156,180 +156,55 @@ fn archive_session_blocking(
         .ok_or_else(|| AppError::new("Session transcript not found"))?;
     let jsonl_bytes = std::fs::read(&jsonl_path)
         .map_err(|e| AppError::new(io_message("Cannot read transcript", &e)))?;
-    let jsonl_text = String::from_utf8_lossy(&jsonl_bytes);
-
     // Fallback title until extraction supplies one: the `.title` sidecar, else
     // the display name — the archive folder slug derives from it.
     let fallback_title = core_lib::snapshot::read_title(&base, &cwd, &uuid)
         .or_else(|| core_lib::snapshot::read_name(&base, &cwd, &uuid))
         .unwrap_or_else(|| "Claude".to_string());
     let date = chrono::Local::now().format("%Y-%m-%d").to_string();
-
-    let mut session = core_lib::archive::normalize(&cwd, &uuid, &fallback_title, &date, &jsonl_text);
-    if session.turns.is_empty() {
-        return Err(AppError::new("아카이브할 대화가 없습니다"));
-    }
-
     let root = archive_root(&app)?;
+    // 서버 바이너리는 앱 실행 파일 옆(knowledge-mcp) — dev(target/…)와 설치본
+    // 모두 같은 규약.
+    let mcp_bin = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.join("knowledge-mcp")));
 
-    // Last-good summary of a previous archive of this session — read BEFORE the
-    // first write below displaces that folder (감사 A1: 지식만 남고 요약만
-    // 사라지는 비대칭 방지). A read failure is reported, not swallowed.
-    let mut errors: Vec<String> = Vec::new();
-    let prev_entry = core_lib::archive::list_archives(&root)
-        .into_iter()
-        .flat_map(|p| p.sessions)
-        .find(|s| s.meta.uuid == uuid);
-
-    // 변경 없음 스킵: 트랜스크립트가 최신 아카이브 스냅샷과 동일하고 그
-    // 아카이브의 추출이 온전히 완료(summary + `.extraction-ok` 마커)라면
-    // 아무것도 다시 쓰지 않는다 — 같은 내용에 1~3분짜리 추출을 재실행하지
-    // 않기 위해. 마커가 없으면(추출 실패·부분 실패·구버전 아카이브) 재아카이브
-    // 가 추출 재시도로 동작한다 (리뷰 F5 — summary만 보면 지식 부분 실패가
-    // 영구히 재시도 불가).
-    if let Some(prev) = &prev_entry {
-        let same = core_lib::archive::archived_stat(&prev.dir, &prev.meta)
-            .is_some_and(|s| s.same_content(&core_lib::archive::jsonl_stat(&jsonl_bytes)));
-        if same && prev.summary_path.is_some() && prev.dir.join(".extraction-ok").is_file() {
-            return Ok(ArchiveResult {
-                dir: prev.dir.to_string_lossy().to_string(),
-                book_path: prev.book_path.to_string_lossy().to_string(),
-                replaced: false,
-                summary_ok: true,
-                knowledge_files: 0,
-                extraction_error: None,
-                unchanged: true,
-            });
-        }
-    }
-
-    let prev_summary = prev_entry
-        .and_then(|s| s.summary_path)
-        .and_then(|p| match std::fs::read_to_string(&p) {
-            Ok(text) => Some(text),
-            Err(e) => {
-                errors.push(io_message("Cannot read previous summary", &e));
-                None
-            }
-        });
-
-    // 1) The core archive lands FIRST, under the fallback title — an app quit or
-    // crash during the (up to 3-minute) extraction below must never cost the
-    // transcript copy + book (감사 A11 — "부분 성공은 먼저 남아야 성립").
-    let mut out = core_lib::archive::write_archive(&root, &cwd, &session, &jsonl_bytes)
-        .map_err(|e| AppError::new(io_message("Cannot write archive", &e)))?;
-    let replaced = out.replaced;
-    // The last-good summary goes to disk NOW — held only in memory, a crash
-    // during extraction would lose it for good (post-fix P3). A fresh summary
-    // below simply overwrites it.
-    if let Some(prev) = &prev_summary {
-        if let Err(e) = std::fs::write(out.dir.join("summary.md"), prev) {
-            errors.push(io_message("Cannot keep previous summary", &e));
-        }
-    }
-
-    // 2) Extraction (title + summary + knowledge) — best-effort. Failures merge
-    // into reported errors (neither masks the other), never a failed archive.
-    let mut extraction = None;
-    let rendered = core_lib::knowledge::render_session_for_extraction(&session);
+    // 파이프라인 본체는 core::archive 단일 출처 — CLI 백필(archive_backfill)과
+    // 같은 코드가 같은 산출물·같은 `.extraction-ok` 계약을 만든다. GUI는 추출
+    // 재시도 없이 1회 (사용자가 다시 누르는 것이 재시도).
     let opts = extraction_opts(&app);
-    // 추출은 /tmp 스크래치 cwd에서 — 프로젝트 안에서 돌리면 추출 자체가 그
-    // 프로젝트의 새 세션 트랜스크립트가 되어 백필 되먹임 루프를 만든다.
-    let workdir = core_lib::claude_cli::extraction_workdir();
-    match core_lib::claude_cli::run_claude_p(
-        &workdir.to_string_lossy(),
-        &core_lib::knowledge::extraction_prompt(&rendered),
-        Duration::from_secs(300),
-        &opts,
-    ) {
-        Ok(raw) => extraction = Some(core_lib::knowledge::parse_extraction(&raw)),
-        Err(e) => errors.push(e),
-    }
+    let extract = core_lib::archive::claude_extractor(&opts, Duration::from_secs(300));
+    let run = core_lib::archive::run_archive(
+        &core_lib::archive::ArchiveRequest {
+            archive_root: &root,
+            project: &cwd,
+            uuid: &uuid,
+            fallback_title: &fallback_title,
+            date: &date,
+            jsonl_bytes: &jsonl_bytes,
+            mcp_bin: mcp_bin.as_deref(),
+            attempts: 1,
+        },
+        &extract,
+    )
+    .map_err(|e| match e {
+        core_lib::archive::ArchiveError::NoTurns => AppError::new("아카이브할 대화가 없습니다"),
+        core_lib::archive::ArchiveError::Write(e) => {
+            AppError::new(io_message("Cannot write archive", &e))
+        }
+    })?;
 
-    let mut summary_ok = false;
-    let mut knowledge_files = 0;
-    if let Some(ex) = extraction {
-        // Extracted title → re-land the archive under it. write_archive is
-        // idempotent per uuid, so this just replaces our own fallback folder.
-        let new_title = ex.title.trim();
-        if !new_title.is_empty() && new_title != session.title {
-            session.title = new_title.to_string();
-            match core_lib::archive::write_archive(&root, &cwd, &session, &jsonl_bytes) {
-                Ok(o) => out = o,
-                Err(e) => errors.push(io_message("Cannot retitle archive", &e)),
-            }
-        }
-        if !ex.summary.trim().is_empty() {
-            match std::fs::write(out.dir.join("summary.md"), &ex.summary) {
-                Ok(()) => summary_ok = true,
-                Err(e) => errors.push(io_message("Cannot save summary", &e)),
-            }
-        }
-        match core_lib::knowledge::write_knowledge(&root, &cwd, &uuid, &date, &ex.entries) {
-            Ok(paths) => knowledge_files = paths.len(),
-            Err(e) => errors.push(io_message("Cannot save knowledge", &e)),
-        }
-    }
-    // 지식 MCP 서버를 대상 프로젝트 .mcp.json에 등록(병합·멱등) — 이후 그
-    // 프로젝트의 Claude 세션이 이슈 발생 시 과거 지식을 바로 조회한다. 서버
-    // 바이너리는 앱 실행 파일 옆(knowledge-mcp) — dev(target/…)와 설치본 모두
-    // 같은 규약. 실패·부재는 보고만(아카이브는 성공).
-    let proj_path = std::path::Path::new(&cwd);
-    if proj_path.is_dir() {
-        let bin = std::env::current_exe()
-            .ok()
-            .and_then(|p| p.parent().map(|d| d.join("knowledge-mcp")));
-        match bin {
-            Some(bin) if bin.is_file() => {
-                let kdir = core_lib::knowledge::knowledge_dir(&root, &cwd);
-                if let Err(e) = core_lib::mcp::register_in_mcp_json(proj_path, &bin, &kdir) {
-                    errors.push(io_message("Cannot register mcp", &e));
-                }
-            }
-            _ => errors.push("knowledge-mcp 바이너리 없음 — MCP 등록 생략".to_string()),
-        }
-    }
-
-    // 3) No fresh summary → keep the previous archive's (last-good), mirroring
-    // how knowledge entries persist when extraction fails. (Re-written here
-    // because a retitle re-land above replaced the folder the early copy was
-    // in.) A restore failure is reported like any other (post-fix P6).
-    if !summary_ok {
-        if let Some(prev) = prev_summary {
-            match std::fs::write(out.dir.join("summary.md"), prev) {
-                Ok(()) => {
-                    summary_ok = true;
-                    errors.push("요약은 이전 아카이브분을 유지".to_string());
-                }
-                Err(e) => errors.push(io_message("Cannot keep previous summary", &e)),
-            }
-        }
-    }
-    // 추출이 온전히 성공했을 때만 완료 마커 — unchanged 스킵(위)의 근거.
-    // 경고가 하나라도 있으면(지식 일부 실패·요약 last-good 유지 등) 마커를
-    // 남기지 않아, 동일 내용 재아카이브가 추출 재시도로 동작한다.
-    if summary_ok && errors.is_empty() {
-        if let Err(e) = std::fs::write(out.dir.join(".extraction-ok"), b"") {
-            errors.push(io_message("Cannot mark extraction ok", &e));
-        }
-    }
-    let extraction_error = if errors.is_empty() {
-        None
-    } else {
-        Some(errors.join(" / "))
-    };
-
+    // GUI 보고 표면은 **errors만** — notes(mcp 등록 실패 등 부가 작업)는 CLI
+    // 로그 전용이다(리뷰: 성공/부가 note가 '추출 경고'로 오노출되던 것 차단).
+    let warnings: Vec<&str> = run.errors.iter().map(String::as_str).collect();
     Ok(ArchiveResult {
-        dir: out.dir.to_string_lossy().to_string(),
-        book_path: out.book_path.to_string_lossy().to_string(),
-        // The FIRST write's verdict — the retitle re-land always "replaces" the
-        // fallback folder it just made, which is not a user-meaningful replace
-        // (post-fix P7).
-        replaced,
-        summary_ok,
-        knowledge_files,
-        extraction_error,
-        unchanged: false,
+        dir: run.dir.to_string_lossy().to_string(),
+        book_path: run.book_path.to_string_lossy().to_string(),
+        replaced: run.replaced,
+        summary_ok: run.summary_ok,
+        knowledge_files: run.knowledge_files,
+        extraction_error: (!warnings.is_empty()).then(|| warnings.join(" / ")),
+        unchanged: run.unchanged,
     })
 }
 

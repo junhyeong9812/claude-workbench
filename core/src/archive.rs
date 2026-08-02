@@ -38,6 +38,10 @@ use crate::timeline::{TimelineItem, TokenUsage};
 /// (viewer, MCP indexer) can branch on it instead of guessing.
 pub const SCHEMA_VERSION: u32 = 1;
 
+/// Marker file dropped in an archived session folder when that run's extraction
+/// finished **whole**. See [`is_extraction_complete`] for the full contract.
+pub const EXTRACTION_OK: &str = ".extraction-ok";
+
 /// Process-unique suffix counter for temp dirs (same rationale as snapshot.rs:
 /// concurrent writers must never race on a shared temp path).
 static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
@@ -754,6 +758,356 @@ pub fn backfill_meta(archive_root: &Path) -> (usize, usize) {
     (candidates, filled)
 }
 
+// ---- 재아카이브 판정 (GUI 커맨드 ↔ CLI 백필 단일 출처) ----
+
+/// The archived session for `uuid` **within `project`**. uuid만으로 찾으면
+/// 안 된다 — 세션 도중 cwd가 바뀌면 같은 uuid가 두 프로젝트에 서로 다른
+/// 내용으로 존재할 수 있고(리뷰 실측: 실제 아카이브에 충돌 존재), 그때
+/// read_dir 순서가 남의 프로젝트 스냅샷과 비교/복원하게 만든다.
+pub fn find_archived_session(
+    archive_root: &Path,
+    project: &str,
+    uuid: &str,
+) -> Option<ArchiveSessionEntry> {
+    list_archives(archive_root)
+        .into_iter()
+        .filter(|p| p.project == project)
+        .flat_map(|p| p.sessions)
+        .find(|s| s.meta.uuid == uuid)
+}
+
+/// **`.extraction-ok` 계약** — 이 아카이브의 추출이 온전히 끝났는가.
+///
+/// - *기록*: 한 번의 아카이브 실행이 ① 추출 호출 성공 ② 이번 실행의 **신선한**
+///   summary.md 기록 ③ 지식 기록 실패 없음 ④ 그 밖의 추출 단계 경고 0 을 모두
+///   만족할 때만, 그 실행이 안착시킨 세션 폴더에 빈 파일로 남긴다. `.mcp.json`
+///   등록 결과는 추출과 무관하므로 마커를 막지 않는다(보고만).
+/// - *판정*: 여기(summary.md + 마커). 마커가 없으면 — 추출 실패·부분 실패·마커
+///   도입 이전(구 CLI 백필) 아카이브 — 재아카이브가 **추출 재시도**로 동작한다
+///   (리뷰 F5/G2: 부분 실패가 영영 재시도되지 않는 상태 차단).
+/// - *수명*: [`write_archive`]는 새 폴더를 만들어 갈아끼우므로 마커는 이월되지
+///   않는다 — 항상 "마지막 실행의 결과"만 나타낸다.
+pub fn is_extraction_complete(entry: &ArchiveSessionEntry) -> bool {
+    entry.summary_path.is_some() && entry.dir.join(EXTRACTION_OK).is_file()
+}
+
+/// 변경 없음 스킵 판정: 라이브 전사가 이 아카이브의 스냅샷과 같은 내용이고
+/// ([`JsonlStat::same_content`]) 그 아카이브의 추출이 온전하면
+/// ([`is_extraction_complete`]) 아무것도 다시 쓰지 않는다 — 같은 내용에 1~3분
+/// 짜리 추출을 재실행하지 않기 위해.
+
+/// 사용자 표면용 io 오류 요약 — kind만 노출(errno·경로 원문 비노출, GUI의
+/// 구 io_message 소독 정책 승계 — 리뷰: raw Display가 UI에 새던 것 차단).
+fn io_brief(e: &io::Error) -> &'static str {
+    match e.kind() {
+        io::ErrorKind::NotFound => "경로 없음",
+        io::ErrorKind::PermissionDenied => "권한 없음",
+        _ => "I/O 오류",
+    }
+}
+
+/// CLI 프리스캔용 동일성 판정. 1차는 저비용(메타데이터 바이트 길이 —
+/// 불일치면 즉시 후보 유지), 통과 시에만 전문을 읽어 **정본 판별식**
+/// ([`JsonlStat::same_content`] — 라인 수+마지막 uuid)으로 확정한다(감사:
+/// bytes+tail uuid 근사는 동길이·동tail의 중간 변형을 선스킵할 수 있었다).
+/// 전문 read는 바이트가 정확히 일치한 세션(사실상 무변경)에서만 발생하고
+/// ms 단위 — 프리스캔이 피하려는 비용은 read가 아니라 1~3분 추출이다.
+pub fn live_matches_archive(live_jsonl: &Path, entry: &ArchiveSessionEntry) -> bool {
+    let Some(bytes) = fs::metadata(live_jsonl).ok().map(|m| m.len()) else {
+        return false;
+    };
+    if entry.meta.jsonl_bytes != Some(bytes) {
+        return false;
+    }
+    let Ok(raw) = fs::read(live_jsonl) else {
+        return false; // 읽기 실패 = 후보 유지(정본 판정으로)
+    };
+    let live = jsonl_stat(&raw);
+    archived_stat(&entry.dir, &entry.meta).is_some_and(|s| s.same_content(&live))
+}
+
+pub fn is_unchanged_complete(entry: &ArchiveSessionEntry, live: &JsonlStat) -> bool {
+    is_extraction_complete(entry)
+        && archived_stat(&entry.dir, &entry.meta).is_some_and(|s| s.same_content(live))
+}
+
+// ---- 아카이브 파이프라인 (GUI 커맨드 ↔ CLI 백필 단일 출처) ----
+
+/// One archive run's inputs. Everything environment-shaped (경로·모델 설정·
+/// 바이너리 위치) is resolved by the caller and passed in — core stays
+/// tauri-free and the CLI keeps its flags.
+pub struct ArchiveRequest<'a> {
+    pub archive_root: &'a Path,
+    /// Project root (cwd) the session ran in.
+    pub project: &'a str,
+    pub uuid: &'a str,
+    /// Title used until extraction supplies one (사이드카 `.title`/`.name`).
+    pub fallback_title: &'a str,
+    /// Archive date (YYYY-MM-DD) — the folder-name prefix. GUI uses today,
+    /// backfill uses the transcript's last timestamp.
+    pub date: &'a str,
+    /// The live transcript, verbatim — copied to `session.jsonl` byte for byte.
+    pub jsonl_bytes: &'a [u8],
+    /// knowledge-mcp server binary for `.mcp.json` registration; `None` skips it.
+    pub mcp_bin: Option<&'a Path>,
+    /// 추출 시도 횟수 (1 = 재시도 없음). 재시도는 **호출자 소유 파라미터**다:
+    /// 대화형 GUI는 1회(사용자가 다시 누르면 그만), 무인 대량 실행인 CLI 백필은
+    /// 2회로 일시적 실패를 흡수한다.
+    pub attempts: usize,
+}
+
+/// Why an archive run never got off the ground. Everything after `write_archive`
+/// is best-effort and reported in [`ArchiveRun`] instead — the core artifacts
+/// landing is what makes a run a (partial) success.
+#[derive(Debug)]
+pub enum ArchiveError {
+    /// The transcript has no conversation turn to archive.
+    NoTurns,
+    /// The core artifacts could not be written.
+    Write(io::Error),
+}
+
+/// What one archive run produced.
+pub struct ArchiveRun {
+    pub dir: PathBuf,
+    pub book_path: PathBuf,
+    /// Final title (extraction's when it supplied one, else the fallback).
+    pub title: String,
+    /// A previous archive of this session was replaced.
+    pub replaced: bool,
+    /// `summary.md` is present (fresh, or the previous archive's last-good).
+    pub summary_ok: bool,
+    pub knowledge_files: usize,
+    /// Nothing was rewritten — the existing archive already matched
+    /// ([`is_unchanged_complete`]).
+    pub unchanged: bool,
+    /// 추출 단계 경고. **하나라도 있으면 `.extraction-ok` 마커를 남기지
+    /// 않는다** — 다음 재아카이브가 추출 재시도로 동작한다.
+    pub errors: Vec<String>,
+    /// 추출과 무관한 부가 작업(재시도 알림·`.mcp.json` 등록) 보고. 마커를
+    /// 막지 않는다.
+    pub notes: Vec<String>,
+}
+
+impl ArchiveRun {
+    /// This run left (or found) a complete extraction — the CLI's ok/부분 집계.
+    pub fn extraction_complete(&self) -> bool {
+        self.unchanged || (self.summary_ok && self.errors.is_empty())
+    }
+
+    /// Every warning, extraction-gating first — for one-line UI/CLI reporting.
+    pub fn all_warnings(&self) -> Vec<&str> {
+        self.errors
+            .iter()
+            .chain(self.notes.iter())
+            .map(String::as_str)
+            .collect()
+    }
+}
+
+/// The real extractor: a one-shot `claude -p` in the `/tmp` scratch cwd
+/// (프로젝트 안에서 돌리면 추출 자체가 그 프로젝트의 새 세션 전사가 되어 백필
+/// 되먹임 루프를 만든다 — `claude_cli::extraction_workdir` 참조).
+pub fn claude_extractor(
+    opts: &crate::claude_cli::ClaudeOpts,
+    timeout: std::time::Duration,
+) -> impl Fn(&str) -> Result<String, String> + '_ {
+    let workdir = crate::claude_cli::extraction_workdir()
+        .to_string_lossy()
+        .into_owned();
+    move |prompt: &str| crate::claude_cli::run_claude_p(&workdir, prompt, timeout, opts)
+}
+
+/// Archive one session end to end — **the** pipeline both the app command and
+/// the backfill CLI run, so their output shape and their re-archive verdict can
+/// never drift apart.
+///
+/// Order (durability first, 감사 A11): unchanged-skip verdict → core artifacts
+/// (`session.jsonl` verbatim + `normalized.json` + `book.html` + `meta.json`)
+/// → previous last-good summary re-landed → extraction (`attempts` tries) →
+/// retitle re-land → `summary.md` → knowledge + `INDEX.md` → `.mcp.json`
+/// registration → last-good summary restore → `.extraction-ok` marker.
+///
+/// Extraction is injected (`extract`) so the pipeline is testable without
+/// spawning `claude`; production callers pass [`claude_extractor`]. Its failure
+/// is never the run's failure — the transcript copy and the book always land.
+pub fn run_archive(
+    req: &ArchiveRequest<'_>,
+    extract: &dyn Fn(&str) -> Result<String, String>,
+) -> Result<ArchiveRun, ArchiveError> {
+    let text = String::from_utf8_lossy(req.jsonl_bytes);
+    let mut session = normalize(
+        req.project,
+        req.uuid,
+        req.fallback_title,
+        req.date,
+        &text,
+    );
+    drop(text);
+    if session.turns.is_empty() {
+        return Err(ArchiveError::NoTurns);
+    }
+    let mut errors: Vec<String> = Vec::new();
+    let mut notes: Vec<String> = Vec::new();
+
+    // Read the previous archive BEFORE the first write below displaces it
+    // (감사 A1: 지식만 남고 요약만 사라지는 비대칭 방지).
+    let live = jsonl_stat(req.jsonl_bytes);
+    let prev = find_archived_session(req.archive_root, req.project, req.uuid);
+    if let Some(p) = &prev {
+        if is_unchanged_complete(p, &live) {
+            return Ok(ArchiveRun {
+                dir: p.dir.clone(),
+                book_path: p.book_path.clone(),
+                title: p.meta.title.clone(),
+                replaced: false,
+                summary_ok: true,
+                knowledge_files: 0,
+                unchanged: true,
+                errors,
+                notes,
+            });
+        }
+    }
+    let prev_summary = prev
+        .and_then(|s| s.summary_path)
+        .and_then(|p| match fs::read_to_string(&p) {
+            Ok(text) => Some(text),
+            Err(e) => {
+                errors.push(format!("이전 요약 읽기 실패: {}", io_brief(&e)));
+                None
+            }
+        });
+
+    // 1) Core artifacts land FIRST — a quit or crash during the (up to
+    // 3-minute) extraction must never cost the transcript copy + book.
+    let mut out = write_archive(req.archive_root, req.project, &session, req.jsonl_bytes)
+        .map_err(ArchiveError::Write)?;
+    let replaced = out.replaced;
+    // The last-good summary goes to disk NOW — held only in memory, a crash
+    // during extraction would lose it for good (post-fix P3).
+    if let Some(prev) = &prev_summary {
+        if let Err(e) = fs::write(out.dir.join("summary.md"), prev) {
+            errors.push(format!("이전 요약 보존 실패: {}", io_brief(&e)));
+        }
+    }
+
+    // 2) Extraction — best-effort, `attempts` tries.
+    let prompt = crate::knowledge::extraction_prompt(&crate::knowledge::render_session_for_extraction(&session));
+    let attempts = req.attempts.max(1);
+    let mut raw = None;
+    for attempt in 1..=attempts {
+        match extract(&prompt) {
+            Ok(text) => {
+                raw = Some(text);
+                break;
+            }
+            // 재시도로 성공한 실행은 온전한 추출이다 — 1차 실패는 마커를 막지
+            // 않는 note로만 남는다.
+            Err(e) if attempt < attempts => notes.push(format!("추출 {attempt}차 실패({e}) — 재시도")),
+            Err(e) => errors.push(format!("추출 실패: {e}")),
+        }
+    }
+
+    let mut summary_ok = false;
+    let mut knowledge_files = 0usize;
+    if let Some(raw) = raw {
+        let ex = crate::knowledge::parse_extraction(&raw);
+        // Extracted title → re-land the archive under it. write_archive is
+        // idempotent per uuid, so this just replaces our own fallback folder.
+        let new_title = ex.title.trim();
+        if !new_title.is_empty() && new_title != session.title {
+            session.title = new_title.to_string();
+            match write_archive(req.archive_root, req.project, &session, req.jsonl_bytes) {
+                Ok(o) => out = o,
+                Err(e) => errors.push(format!("제목 반영 실패: {}", io_brief(&e))),
+            }
+        }
+        if !ex.summary.trim().is_empty() {
+            match fs::write(out.dir.join("summary.md"), &ex.summary) {
+                Ok(()) => summary_ok = true,
+                Err(e) => errors.push(format!("요약 저장 실패: {}", io_brief(&e))),
+            }
+        }
+        // P1 가드(리뷰): 원문에 ===ENTRY=== 마커가 있는데 파싱된 항목이 0이면
+        // 형식 깨짐 — write_knowledge가 기존 세션 지식을 지운 채 0건을 기록해
+        // "지식 소실 + 마커 완료 위장"이 되는 것을 error로 승격해 차단한다.
+        if ex.entries.is_empty() && raw.contains("===ENTRY===") {
+            errors.push("지식 파싱 실패(ENTRY 형식 불일치) — 재추출 필요".to_string());
+        } else {
+            match crate::knowledge::write_knowledge(
+                req.archive_root,
+                req.project,
+                req.uuid,
+                req.date,
+                &ex.entries,
+            ) {
+                Ok(paths) => knowledge_files = paths.len(),
+                Err(e) => errors.push(format!("지식 저장 실패: {}", io_brief(&e))),
+            }
+        }
+    }
+
+    // 3) 지식 MCP 서버를 대상 프로젝트 `.mcp.json`에 등록(병합·멱등) — 이후 그
+    // 프로젝트의 Claude 세션이 과거 지식을 바로 조회한다. 추출 품질과 무관한
+    // 부가 작업이므로 결과는 note (마커를 막지 않는다).
+    let proj_path = Path::new(req.project);
+    if proj_path.is_dir() {
+        match req.mcp_bin {
+            Some(bin) if bin.is_file() => {
+                let kdir = crate::knowledge::knowledge_dir(req.archive_root, req.project);
+                match crate::mcp::register_in_mcp_json(proj_path, bin, &kdir) {
+                    Ok(true) => {} // 정상 성공 — 보고 표면 없음(리뷰: GUI 경고 오노출)
+                    Ok(false) => {}
+                    Err(e) => notes.push(format!("mcp 등록 실패: {e}")),
+                }
+            }
+            // 바이너리 부재는 note도 남기지 않는다 — CLI는 시작 시 1회 경고,
+            // GUI는 설치 규약 문제라 세션 단위 보고 대상이 아니다(리뷰: 세션당
+            // 노이즈 + GUI 경고 오노출).
+            _ => {}
+        }
+    }
+
+    // 4) No fresh summary → keep the previous archive's (last-good), mirroring
+    // how knowledge entries persist when extraction fails. (Re-written here
+    // because a retitle re-land above replaced the folder the early copy was
+    // in.) 이 경로는 "이번 실행의 추출이 온전하지 않았다"는 뜻이므로 경고다.
+    if !summary_ok {
+        if let Some(prev) = prev_summary {
+            match fs::write(out.dir.join("summary.md"), prev) {
+                Ok(()) => {
+                    summary_ok = true;
+                    errors.push("요약은 이전 아카이브분을 유지".to_string());
+                }
+                Err(e) => errors.push(format!("이전 요약 보존 실패: {}", io_brief(&e))),
+            }
+        }
+    }
+    // 5) 추출이 온전히 성공했을 때만 완료 마커 — unchanged 스킵의 근거
+    // ([`is_extraction_complete`]의 계약).
+    if summary_ok && errors.is_empty() {
+        if let Err(e) = fs::write(out.dir.join(EXTRACTION_OK), b"") {
+            errors.push(format!("추출 완료 마커 기록 실패: {}", io_brief(&e)));
+        }
+    }
+
+    Ok(ArchiveRun {
+        book_path: out.book_path,
+        dir: out.dir,
+        title: session.title,
+        // The FIRST write's verdict — the retitle re-land always "replaces" the
+        // fallback folder it just made, which is not a user-meaningful replace
+        // (post-fix P7).
+        replaced,
+        summary_ok,
+        knowledge_files,
+        unchanged: false,
+        errors,
+        notes,
+    })
+}
+
 /// The self-contained reader page. Placeholders: `__TITLE__` (HTML-escaped) and
 /// `__DATA__` (the `<`-escaped JSON document). No external requests, no
 /// innerHTML — content is rendered with `textContent` only.
@@ -1194,6 +1548,321 @@ mod tests {
                 .starts_with(".old-")),
             "이월 완료 후 aside 잔존 없음"
         );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// 한 줄 append로 "내용이 자란" 전사 — unchanged 판정의 반대편.
+    fn grown(jsonl: &str) -> String {
+        format!(
+            "{jsonl}\n{}",
+            json!({"type":"user","uuid":"u-grow","message":{"role":"user","content":"more"}})
+        )
+    }
+
+    // 특성테스트: unchanged 스킵의 세 조건(같은 내용 + summary.md + 마커)을
+    // 고정한다. 셋 중 하나라도 빠지면 재아카이브가 추출 재시도로 동작한다.
+    #[test]
+    fn unchanged_skip_requires_same_content_summary_and_marker() {
+        let root = temp_root("verdict");
+        let jsonl = sample_jsonl("p");
+        let out = write_archive(&root, "/p", &sample_session("t"), jsonl.as_bytes()).unwrap();
+        let live = jsonl_stat(jsonl.as_bytes());
+        let entry = || find_archived_session(&root, "/p", UUID).unwrap();
+
+        // core 산출물만 (추출 전) → 재추출 대상.
+        assert!(!is_extraction_complete(&entry()));
+        assert!(!is_unchanged_complete(&entry(), &live));
+        // summary만 있고 마커 없음 → 여전히 재추출 대상 (F5: 지식 부분 실패가
+        // 영구히 재시도 불가해지는 것 차단).
+        fs::write(out.dir.join("summary.md"), "요약").unwrap();
+        assert!(!is_unchanged_complete(&entry(), &live));
+        // summary + 마커 → 스킵.
+        fs::write(out.dir.join(EXTRACTION_OK), b"").unwrap();
+        assert!(is_extraction_complete(&entry()));
+        assert!(is_unchanged_complete(&entry(), &live));
+        // 마커가 있어도 전사가 자랐으면 스킵하지 않는다.
+        assert!(!is_unchanged_complete(&entry(), &jsonl_stat(grown(&jsonl).as_bytes())));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    // 실결함 재현: 마커를 남기지 않는 경로(구 CLI 백필)가 만든 아카이브는
+    // 내용이 그대로여도 GUI 판정이 매번 재추출(1~3분)을 요구한다. 파이프라인
+    // 단일화 이후에도 **구 아카이브**에 대해서는 이 자기치유 동작이 유지된다.
+    #[test]
+    fn legacy_archive_without_marker_forces_reextraction() {
+        let root = temp_root("legacy");
+        let jsonl = sample_jsonl("p");
+        // 구 CLI 백필이 남기던 형상 그대로: core 산출물 + summary.md, 마커 없음.
+        let out = write_archive(&root, "/p", &sample_session("t"), jsonl.as_bytes()).unwrap();
+        fs::write(out.dir.join("summary.md"), "요약").unwrap();
+        assert!(!out.dir.join(EXTRACTION_OK).exists());
+
+        let entry = find_archived_session(&root, "/p", UUID).unwrap();
+        assert!(entry.summary_path.is_some(), "추출은 성공했던 아카이브");
+        assert!(
+            !is_unchanged_complete(&entry, &jsonl_stat(jsonl.as_bytes())),
+            "마커가 없으면 내용이 같아도 재추출을 요구한다"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// A session normalized from exactly `jsonl` — used where the reference
+    /// archive must be byte-comparable with the pipeline's own output.
+    fn session_from(jsonl: &str, title: &str) -> NormalizedSession {
+        normalize("/p", UUID, title, "2026-07-19", jsonl)
+    }
+
+    /// A stub extractor that counts calls — production passes
+    /// [`claude_extractor`] (a real `claude -p`), tests pass this.
+    struct FakeExtractor {
+        raw: String,
+        calls: std::cell::Cell<usize>,
+    }
+
+    impl FakeExtractor {
+        fn new(title: &str) -> Self {
+            FakeExtractor {
+                raw: format!("===SUMMARY===\nTITLE: {title}\n요약 본문\n"),
+                calls: std::cell::Cell::new(0),
+            }
+        }
+        fn f(&self) -> impl Fn(&str) -> Result<String, String> + '_ {
+            move |_prompt: &str| {
+                self.calls.set(self.calls.get() + 1);
+                Ok(self.raw.clone())
+            }
+        }
+    }
+
+    fn cli_request<'a>(root: &'a Path, jsonl: &'a [u8]) -> ArchiveRequest<'a> {
+        ArchiveRequest {
+            archive_root: root,
+            project: "/p",
+            uuid: UUID,
+            fallback_title: "Claude",
+            date: "2026-07-19",
+            jsonl_bytes: jsonl,
+            mcp_bin: None,
+            attempts: 2, // 백필 소유 파라미터
+        }
+    }
+
+    // 실결함 해소의 조작적 정의: **CLI 백필 경로로 아카이브한 세션**을 GUI가
+    // 재아카이브하면 unchanged로 스킵한다 — 추출(1~3분)이 다시 돌지 않는다.
+    #[test]
+    fn cli_archived_session_is_skipped_by_gui_rearchive() {
+        let root = temp_root("unify");
+        let jsonl = sample_jsonl("작업");
+
+        // ① CLI 백필이 아카이브 (attempts=2).
+        let cli = FakeExtractor::new("추출된 제목");
+        let run = run_archive(&cli_request(&root, jsonl.as_bytes()), &cli.f()).unwrap();
+        assert_eq!(cli.calls.get(), 1);
+        assert!(run.summary_ok && run.errors.is_empty(), "{:?}", run.errors);
+        assert!(run.extraction_complete());
+        assert!(run.dir.join(EXTRACTION_OK).is_file(), "CLI도 마커를 남긴다");
+
+        // ② GUI 판정(=커맨드가 쓰는 그 식)이 스킵으로 떨어진다.
+        let entry = find_archived_session(&root, "/p", UUID).unwrap();
+        assert!(is_unchanged_complete(&entry, &jsonl_stat(jsonl.as_bytes())));
+
+        // ③ GUI 재아카이브(attempts=1)가 실제로 추출을 부르지 않는다.
+        let gui = FakeExtractor::new("다시 추출됨");
+        let mut req = cli_request(&root, jsonl.as_bytes());
+        req.attempts = 1;
+        let again = run_archive(&req, &gui.f()).unwrap();
+        assert!(again.unchanged, "변경 없음 → 스킵");
+        assert_eq!(gui.calls.get(), 0, "재추출이 돌지 않는다 — 실결함 해소");
+        assert_eq!(again.dir, run.dir, "기존 아카이브를 그대로 가리킨다");
+        assert!(again.extraction_complete());
+
+        // ④ 전사가 자라면 다시 추출한다(스킵이 과하지 않다).
+        let v2 = grown(&jsonl);
+        let gui2 = FakeExtractor::new("추출된 제목");
+        let run2 = run_archive(&cli_request(&root, v2.as_bytes()), &gui2.f()).unwrap();
+        assert!(!run2.unchanged);
+        assert_eq!(gui2.calls.get(), 1);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    // 마커가 없는 구 아카이브는 파이프라인 단일화 이후에도 한 번 재추출되고,
+    // 그 실행이 마커를 남겨 이후로는 스킵된다(자기치유).
+    #[test]
+    fn legacy_archive_is_reextracted_once_then_marked() {
+        let root = temp_root("heal");
+        let jsonl = sample_jsonl("작업");
+        // 구 CLI 백필 형상 재현: core 산출물 + summary.md, 마커 없음.
+        let out =
+            write_archive(&root, "/p", &session_from(&jsonl, "옛 제목"), jsonl.as_bytes()).unwrap();
+        fs::write(out.dir.join("summary.md"), "옛 요약").unwrap();
+
+        let ex = FakeExtractor::new("옛 제목");
+        let run = run_archive(&cli_request(&root, jsonl.as_bytes()), &ex.f()).unwrap();
+        assert!(!run.unchanged, "마커 없음 → 재추출");
+        assert_eq!(ex.calls.get(), 1);
+        assert!(run.dir.join(EXTRACTION_OK).is_file(), "이제 마커가 남는다");
+        // 두 번째부터는 스킵.
+        let ex2 = FakeExtractor::new("옛 제목");
+        assert!(run_archive(&cli_request(&root, jsonl.as_bytes()), &ex2.f()).unwrap().unchanged);
+        assert_eq!(ex2.calls.get(), 0);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    // 추출 실패는 부분 성공: core 산출물은 남고, 마커는 남지 않아 다음
+    // 재아카이브가 재시도한다. 재시도로 성공한 실행은 온전한 추출로 친다.
+    #[test]
+    fn failed_extraction_lands_core_artifacts_without_marker() {
+        let root = temp_root("partial");
+        let jsonl = sample_jsonl("작업");
+        let calls = std::cell::Cell::new(0);
+        let always_fail = |_: &str| -> Result<String, String> {
+            calls.set(calls.get() + 1);
+            Err("claude 없음".into())
+        };
+        let run = run_archive(&cli_request(&root, jsonl.as_bytes()), &always_fail).unwrap();
+        assert_eq!(calls.get(), 2, "attempts=2 → 1회 재시도");
+        assert!(!run.summary_ok);
+        assert!(!run.extraction_complete());
+        assert!(run.dir.join("book.html").is_file(), "core 산출물은 남는다");
+        assert!(!run.dir.join(EXTRACTION_OK).exists(), "마커 없음 → 재시도 대상");
+        assert!(!is_extraction_complete(&find_archived_session(&root, "/p", UUID).unwrap()));
+
+        // 재시도가 성공하는 실행: 1차 실패는 마커를 막지 않는다.
+        let n = std::cell::Cell::new(0);
+        let flaky = |_: &str| -> Result<String, String> {
+            n.set(n.get() + 1);
+            if n.get() == 1 {
+                Err("일시 실패".into())
+            } else {
+                Ok("===SUMMARY===\nTITLE: 두번째\n본문\n".into())
+            }
+        };
+        let run2 = run_archive(&cli_request(&root, jsonl.as_bytes()), &flaky).unwrap();
+        assert_eq!(n.get(), 2);
+        assert!(run2.errors.is_empty(), "1차 실패는 note: {:?}", run2.errors);
+        assert!(!run2.notes.is_empty());
+        assert!(run2.dir.join(EXTRACTION_OK).is_file());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    // 형상 불변(record-level): 파이프라인이 만든 산출물은 write_archive를 직접
+    // 부른 참조본과 **파일 목록·바이트**가 같다 (archived_at만 시각 의존).
+    #[test]
+    fn pipeline_output_shape_matches_direct_write_archive() {
+        let jsonl = sample_jsonl("작업");
+        let title = "추출된 제목";
+
+        let pipe_root = temp_root("shape-pipe");
+        let ex = FakeExtractor::new(title);
+        let run = run_archive(&cli_request(&pipe_root, jsonl.as_bytes()), &ex.f()).unwrap();
+
+        // 참조본: 최종 제목으로 write_archive만 호출한 결과.
+        let ref_root = temp_root("shape-ref");
+        let reference =
+            write_archive(&ref_root, "/p", &session_from(&jsonl, title), jsonl.as_bytes()).unwrap();
+
+        assert_eq!(
+            run.dir.file_name(),
+            reference.dir.file_name(),
+            "폴더 이름(date-slug-uuid8) 동일"
+        );
+        let names = |d: &Path| {
+            let mut v: Vec<String> = fs::read_dir(d)
+                .unwrap()
+                .flatten()
+                .map(|e| e.file_name().to_string_lossy().to_string())
+                .collect();
+            v.sort();
+            v
+        };
+        assert_eq!(
+            names(&run.dir),
+            vec![
+                ".extraction-ok".to_string(),
+                "book.html".into(),
+                "meta.json".into(),
+                "normalized.json".into(),
+                "session.jsonl".into(),
+                "summary.md".into(),
+            ],
+            "파이프라인 산출물 = core 4종 + summary + 마커"
+        );
+        assert_eq!(
+            names(&reference.dir),
+            vec![
+                "book.html".to_string(),
+                "meta.json".into(),
+                "normalized.json".into(),
+                "session.jsonl".into()
+            ]
+        );
+        for f in ["session.jsonl", "normalized.json", "book.html"] {
+            assert_eq!(
+                fs::read(run.dir.join(f)).unwrap(),
+                fs::read(reference.dir.join(f)).unwrap(),
+                "{f} 바이트 동일"
+            );
+        }
+        assert_eq!(
+            fs::read(run.dir.join("session.jsonl")).unwrap(),
+            jsonl.as_bytes(),
+            "session.jsonl은 원본 verbatim"
+        );
+        let strip_ts = |d: &Path| {
+            let mut v: serde_json::Value =
+                serde_json::from_str(&fs::read_to_string(d.join("meta.json")).unwrap()).unwrap();
+            v.as_object_mut().unwrap().remove("archived_at");
+            v
+        };
+        assert_eq!(strip_ts(&run.dir), strip_ts(&reference.dir), "meta.json 동일");
+
+        // 버전 보존: 내용이 바뀐 재아카이브는 이전본을 history/v-*로 남긴다.
+        let v2 = grown(&jsonl);
+        let ex2 = FakeExtractor::new(title);
+        let run2 = run_archive(&cli_request(&pipe_root, v2.as_bytes()), &ex2.f()).unwrap();
+        assert!(run2.replaced);
+        let listed = &list_archives(&pipe_root)[0].sessions[0];
+        assert_eq!(listed.history.len(), 1, "이전 스냅샷이 버전으로 보존");
+        assert_eq!(
+            fs::read(listed.history[0].dir.join("session.jsonl")).unwrap(),
+            jsonl.as_bytes(),
+            "버전 내용 = 이전 스냅샷 그대로"
+        );
+        assert_eq!(
+            fs::read(run2.dir.join("session.jsonl")).unwrap(),
+            v2.as_bytes(),
+            "최신 폴더 = 새 스냅샷"
+        );
+        // 멱등: 같은 내용으로 한 번 더 — 폴더 1개, 버전 안 쌓임.
+        let ex3 = FakeExtractor::new(title);
+        let run3 = run_archive(&cli_request(&pipe_root, v2.as_bytes()), &ex3.f()).unwrap();
+        assert!(run3.unchanged);
+        assert_eq!(
+            fs::read_dir(run2.dir.parent().unwrap()).unwrap().flatten().count(),
+            1
+        );
+        assert_eq!(list_archives(&pipe_root)[0].sessions[0].history.len(), 1);
+        let _ = fs::remove_dir_all(&pipe_root);
+        let _ = fs::remove_dir_all(&ref_root);
+    }
+
+    // 이전 요약 보존(last-good): 추출이 실패해도 직전 아카이브의 summary.md는
+    // 살아남는다 — 단 "이번 실행은 온전하지 않다"이므로 마커는 없다.
+    #[test]
+    fn failed_extraction_keeps_previous_summary_without_marker() {
+        let root = temp_root("lastgood");
+        let jsonl = sample_jsonl("작업");
+        let ok = FakeExtractor::new("제목");
+        let first = run_archive(&cli_request(&root, jsonl.as_bytes()), &ok.f()).unwrap();
+        let kept = fs::read_to_string(first.dir.join("summary.md")).unwrap();
+
+        let v2 = grown(&jsonl);
+        let fail = |_: &str| -> Result<String, String> { Err("실패".into()) };
+        let run = run_archive(&cli_request(&root, v2.as_bytes()), &fail).unwrap();
+        assert!(run.summary_ok, "이전 요약을 유지");
+        assert_eq!(fs::read_to_string(run.dir.join("summary.md")).unwrap(), kept);
+        assert!(!run.dir.join(EXTRACTION_OK).exists(), "그래도 마커는 없다");
+        assert!(run.errors.iter().any(|e| e.contains("이전 아카이브분을 유지")));
         let _ = fs::remove_dir_all(&root);
     }
 

@@ -6,6 +6,11 @@
 
 import { Fragment, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { isMarkdownPath, Markdown } from "./markdown";
+import type { TimelineItem } from "../types";
+
+// P6 D3: TimelineItem은 src/types 소유(상태 모듈의 컴포넌트 역의존 해소) —
+// 기존 소비처 호환을 위해 재수출.
+export type { TimelineItem } from "../types";
 import { groupItemsByTurn, sliceRecentTurns } from "./timelineIndex";
 import { useFileText } from "../hooks/useFileText";
 
@@ -19,28 +24,6 @@ export function MarkdownText({ text }: { text: string }) {
   return <Markdown text={text} className="study-md tl-markdown" blockMedia />;
 }
 
-export interface TimelineItem {
-  turn: number;
-  session_id: string;
-  tool_call_id: string;
-  seq: number;
-  kind: string;
-  title: string;
-  locations: string[];
-  project_label: string | null;
-  /** Directory this call ran in (JSONL cwd). Differs from the session cwd when a
-   * subagent works in an isolation worktree — used to label "another worktree". */
-  cwd?: string | null;
-  diffs: { path: string; old_text: string | null; new_text: string }[];
-  content_text: string | null;
-  /** P1: 표시 계층에서 content_text가 상한(32KB)으로 절단됨 — 뷰어가
-   * claude_item_detail로 원문을 lazy 조회한다. 구 스냅샷엔 없음(optional). */
-  content_truncated?: boolean;
-  raw_input: unknown;
-  agent_status: string;
-  write_status: string;
-  revision: number;
-}
 
 export const KIND_ICON: Record<string, string> = {
   read: "📖",

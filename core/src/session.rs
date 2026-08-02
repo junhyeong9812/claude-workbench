@@ -65,8 +65,8 @@ impl Shared {
     /// fan out to live subscribers (dropping any whose receiver is gone). This is
     /// the single output contract shared by local and SSH sessions.
     pub(crate) fn emit(&self, data: &[u8]) {
-        let seq = self.scrollback.lock().unwrap().push(data);
-        let mut subs = self.subscribers.lock().unwrap();
+        let seq = self.scrollback.lock().unwrap_or_else(|p| p.into_inner()).push(data);
+        let mut subs = self.subscribers.lock().unwrap_or_else(|p| p.into_inner());
         subs.retain(|tx| tx.send(OutputChunk { seq, bytes: data.to_vec() }).is_ok());
     }
 
@@ -81,7 +81,7 @@ impl Shared {
     /// `snapshot`; the first live chunk still gets `seq = 1` and the no-loss /
     /// no-dup backfill contract is preserved.
     pub(crate) fn seed(&self, bytes: &[u8]) {
-        let mut sb = self.scrollback.lock().unwrap();
+        let mut sb = self.scrollback.lock().unwrap_or_else(|p| p.into_inner());
         sb.buf.clear();
         sb.buf.extend(bytes.iter().copied());
         while sb.buf.len() > sb.cap {
@@ -160,6 +160,23 @@ impl Default for SessionManager {
 }
 
 impl SessionManager {
+    /// P6 D2: 맵 락 접근 단일 지점 — poison 관용 통일(kill_all 선례). 패닉한
+    /// 세션 스레드 하나가 다른 세션의 write/resize/snapshot/close까지 영구
+    /// 마비(패닉 전파)시키지 않도록 guard를 회수한다. 안전 근거는 "상태가
+    /// 세션별"이 아니라 **락 아래 임계 구역이 실질 패닉-프리**라는 것이다
+    /// (push/seed는 alloc 외 패닉원이 없고 alloc 실패는 abort — 리뷰 정정).
+    /// 회수는 1회 로그를 남긴다 — 관용 전환으로 잃는 관측 채널 보상.
+    fn sessions_lock(&self) -> std::sync::MutexGuard<'_, HashMap<SessionId, Session>> {
+        self.sessions.lock().unwrap_or_else(|p| {
+            static WARNED: std::sync::atomic::AtomicBool =
+                std::sync::atomic::AtomicBool::new(false);
+            if !WARNED.swap(true, Ordering::Relaxed) {
+                eprintln!("[session] poisoned map lock recovered — a session thread panicked earlier");
+            }
+            p.into_inner()
+        })
+    }
+
     pub fn new() -> Self {
         Self::with_cap(DEFAULT_SCROLLBACK_CAP)
     }
@@ -283,7 +300,7 @@ impl SessionManager {
         });
 
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
-        self.sessions.lock().unwrap().insert(
+        self.sessions_lock().insert(
             id,
             Session {
                 shared,
@@ -318,7 +335,7 @@ impl SessionManager {
         let (handle, channels) =
             crate::ssh::spawn_ssh(config, Arc::clone(&shared), known_hosts_path, cols, rows);
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
-        self.sessions.lock().unwrap().insert(
+        self.sessions_lock().insert(
             id,
             Session {
                 shared,
@@ -333,6 +350,10 @@ impl SessionManager {
     /// True if a session with this id exists and is still alive (multiwindow
     /// mirror needs to know a 2nd window can attach to a running PTY).
     pub fn exists(&self, id: SessionId) -> bool {
+        // poison 시 보수 응답(false) 유지 — 이전 계약 그대로(리뷰: 패닉 후
+        // true를 주면 alive 플래그가 갱신 안 된 죽은 세션에 미러가 붙는다).
+        // 다른 사이트의 관용 회수(진짜 값)와 달리, 여기서만은 "모름 = 없음"이
+        // 더 안전한 폴백이다.
         self.sessions
             .lock()
             .map(|m| m.get(&id).is_some_and(|s| s.shared.alive.load(Ordering::SeqCst)))
@@ -340,7 +361,7 @@ impl SessionManager {
     }
 
     pub fn write(&self, id: SessionId, data: &[u8]) -> Result<(), String> {
-        let mut map = self.sessions.lock().unwrap();
+        let mut map = self.sessions_lock();
         let s = map.get_mut(&id).ok_or("no such session")?;
         if !s.shared.alive.load(Ordering::SeqCst) {
             return Err("session is dead".into());
@@ -360,7 +381,7 @@ impl SessionManager {
         if cols == 0 || rows == 0 {
             return Ok(());
         }
-        let map = self.sessions.lock().unwrap();
+        let map = self.sessions_lock();
         let s = map.get(&id).ok_or("no such session")?;
         match &s.transport {
             Transport::Local { master, .. } => master
@@ -381,9 +402,9 @@ impl SessionManager {
     /// Snapshot the scrollback atomically with its last seq (backfill contract,
     /// spec §0 ③).
     pub fn snapshot(&self, id: SessionId) -> Result<(Vec<u8>, u64), String> {
-        let map = self.sessions.lock().unwrap();
+        let map = self.sessions_lock();
         let s = map.get(&id).ok_or("no such session")?;
-        let sb = s.shared.scrollback.lock().unwrap();
+        let sb = s.shared.scrollback.lock().unwrap_or_else(|p| p.into_inner());
         Ok((sb.buf.iter().copied().collect(), sb.last_seq))
     }
 
@@ -391,18 +412,16 @@ impl SessionManager {
     /// *after* subscription; combined with [`snapshot`] + the `seq > last_seq`
     /// rule this loses and duplicates nothing.
     pub fn subscribe(&self, id: SessionId) -> Result<Receiver<OutputChunk>, String> {
-        let map = self.sessions.lock().unwrap();
+        let map = self.sessions_lock();
         let s = map.get(&id).ok_or("no such session")?;
         let (tx, rx) = mpsc::channel();
-        s.shared.subscribers.lock().unwrap().push(tx);
+        s.shared.subscribers.lock().unwrap_or_else(|p| p.into_inner()).push(tx);
         Ok(rx)
     }
 
     /// Whether the session's child is still running. `None` if unknown.
     pub fn is_alive(&self, id: SessionId) -> Option<bool> {
-        self.sessions
-            .lock()
-            .unwrap()
+        self.sessions_lock()
             .get(&id)
             .map(|s| s.shared.alive.load(Ordering::SeqCst))
     }
@@ -410,7 +429,7 @@ impl SessionManager {
     /// Signal the child to terminate, mark dead. Keeps the (dead) session
     /// queryable. Unknown session errors.
     pub fn kill(&self, id: SessionId) -> Result<(), String> {
-        let mut map = self.sessions.lock().unwrap();
+        let mut map = self.sessions_lock();
         let s = map.get_mut(&id).ok_or("no such session")?;
         match &mut s.transport {
             Transport::Local { killer, .. } => {
@@ -428,9 +447,7 @@ impl SessionManager {
         // Take ownership out of the map before joining so the map lock is not
         // held across the join.
         let mut session = self
-            .sessions
-            .lock()
-            .unwrap()
+            .sessions_lock()
             .remove(&id)
             .ok_or("no such session")?;
         session.shared.set_dead();
@@ -470,7 +487,7 @@ impl SessionManager {
     pub fn kill_all(&self) {
         // Best-effort: this is the shutdown path, so a poisoned lock (a panicked
         // session thread) must NOT skip PTY cleanup — recover the guard and reap.
-        let mut map = self.sessions.lock().unwrap_or_else(|p| p.into_inner());
+        let mut map = self.sessions_lock();
         for session in map.values_mut() {
             match &mut session.transport {
                 Transport::Local { killer, .. } => {
@@ -675,5 +692,24 @@ mod tests {
         mgr.remove(id).unwrap();
         assert!(start.elapsed() < Duration::from_millis(2000), "remove should join quickly");
         assert!(mgr.is_alive(id).is_none(), "session gone after remove");
+    }
+
+    /// P6 D2: poison 관용 통일 — 패닉한 스레드가 맵 락을 오염시켜도 다른
+    /// 경로(exists/write/is_alive)가 패닉을 전파하지 않고 관용 회수한다
+    /// (이전: kill_all만 관용, 12곳 unwrap = 한 세션 패닉이 전 세션 마비).
+    #[test]
+    fn poisoned_map_lock_is_recovered_not_propagated() {
+        let mgr = SessionManager::new();
+        std::thread::scope(|scope| {
+            let h = scope.spawn(|| {
+                let _g = mgr.sessions_lock();
+                panic!("세션 스레드 패닉 시뮬레이션");
+            });
+            assert!(h.join().is_err()); // 패닉 확인 — 락은 이제 poisoned
+        });
+        // 관용 회수 계약: 패닉 없이 정상 의미로 응답한다.
+        assert!(!mgr.exists(1));
+        assert!(mgr.is_alive(1).is_none());
+        assert!(mgr.write(1, b"x").is_err(), "no such session — 패닉 아님");
     }
 }
