@@ -435,181 +435,232 @@ export function GitPanel() {
       {/* Top half: branch, changes, commit */}
       <div className="git-top">
         {rootSelect}
+        {/* 헤더 = 4+1 그룹(.git-group 구분선): [브랜치] │ [추적] │ [원격] │
+            [stash·태그] │ [뷰·히스토리·새로고침]. 그룹이 flex 아이템이라 좁아지면
+            그룹 단위로 wrap한다. 기능·핸들러는 재배치 전과 동일(리스타일 B-2). */}
         <div className="git-head">
-          <span className="git-branch" title="브랜치 전환">
-            ⎇{" "}
-            <select
-              value={status?.branch ?? ""}
-              disabled={busy}
-              onChange={(e) => act(() => invoke("git_checkout", { cwd, branch: e.target.value }))}
-            >
-              {!branches?.local.includes(status?.branch ?? "") && status?.branch && (
-                <option value={status.branch}>{status.branch}</option>
-              )}
-              <optgroup label="로컬">
-                {branches?.local.map((b) => (
-                  <option key={b} value={b}>
-                    {b}
-                  </option>
-                ))}
-              </optgroup>
-              {branches && branches.remote.length > 0 && (
-                <optgroup label="원격">
-                  {branches.remote.map((r) => (
-                    <option key={r} value={localOf(r)}>
-                      {r}
+          {/* ① 브랜치 — 전환 select + 생성·삭제·이름변경(아이콘)·머지 */}
+          <div className="git-group">
+            <span className="git-branch" title="브랜치 전환">
+              ⎇{" "}
+              <select
+                value={status?.branch ?? ""}
+                disabled={busy}
+                onChange={(e) => act(() => invoke("git_checkout", { cwd, branch: e.target.value }))}
+              >
+                {!branches?.local.includes(status?.branch ?? "") && status?.branch && (
+                  <option value={status.branch}>{status.branch}</option>
+                )}
+                <optgroup label="로컬">
+                  {branches?.local.map((b) => (
+                    <option key={b} value={b}>
+                      {b}
                     </option>
                   ))}
                 </optgroup>
-              )}
-            </select>
-          </span>
-          <button
-            className="git-btn"
-            disabled={busy}
-            title="새 브랜치 생성"
-            onClick={() => {
-              const name = window.prompt("새 브랜치 이름");
-              if (name && name.trim()) act(() => invoke("git_create_branch", { cwd, name: name.trim() }));
-            }}
-          >
-            + 브랜치
-          </button>
-          <button
-            className="git-btn"
-            disabled={busy}
-            title="브랜치 삭제"
-            onClick={() => {
-              const name = window.prompt("삭제할 브랜치 이름");
-              if (!name || !name.trim()) return;
-              if (!window.confirm(`'${name.trim()}' 브랜치를 삭제할까요?`)) return; // cancel = abort
-              const force = window.confirm("머지 안 됐어도 강제 삭제(-D)? (확인=강제 / 취소=안전 삭제 -d)");
-              act(() => invoke("git_delete_branch", { cwd, name: name.trim(), force }));
-            }}
-          >
-            − 브랜치
-          </button>
-          <button
-            className="git-btn"
-            disabled={busy}
-            title="브랜치 이름 변경"
-            onClick={() => {
-              const cur = status?.branch ?? "";
-              const oldName = window.prompt("이름을 바꿀 브랜치", cur);
-              if (!oldName || !oldName.trim()) return;
-              const newName = window.prompt(`'${oldName.trim()}' → 새 이름`, oldName.trim());
-              if (!newName || !newName.trim() || newName.trim() === oldName.trim()) return;
-              act(() => invoke("git_rename_branch", { cwd, old: oldName.trim(), new: newName.trim() }), "브랜치 이름 변경 완료");
-            }}
-          >
-            ✎ 브랜치
-          </button>
-          <button
-            className="git-btn"
-            disabled={busy}
-            title="브랜치 머지(현재 브랜치로)"
-            onClick={() => {
-              const b = window.prompt("현재 브랜치에 머지할 브랜치");
-              if (b && b.trim()) act(() => invoke("git_merge", { cwd, branch: b.trim() }), "머지 완료");
-            }}
-          >
-            merge
-          </button>
-          <span className="git-track">
-            {status ? `↑${status.ahead} ↓${status.behind}` : ""}
-            {status && !status.has_remote ? " (원격없음)" : ""}
-          </span>
-          <button
-            className="git-btn"
-            disabled={!commits[0]}
-            title="최신 커밋의 변경 파일 보기"
-            onClick={() => cwd && commits[0] && openGitHistory(cwd, commits[0].hash)}
-          >
-            📜
-          </button>
-          <button
-            className="git-btn"
-            disabled={busy || !status?.has_remote}
-            title="fetch --all --prune"
-            onClick={() => act(() => invoke("git_fetch", { cwd }), "fetch 완료")}
-          >
-            fetch
-          </button>
-          <button
-            className="git-btn"
-            disabled={busy || !status?.has_remote}
-            title="pull"
-            onClick={() => act(() => invoke("git_pull", { cwd }), "pull 완료")}
-          >
-            pull
-          </button>
-          <button
-            className="git-btn"
-            disabled={busy || !status?.has_remote}
-            title="현재 브랜치 push"
-            onClick={() => act(() => invoke("git_push", { cwd }), "push 완료")}
-          >
-            push
-          </button>
-          <button
-            className="git-btn"
-            disabled={busy}
-            title="변경을 stash에 저장"
-            onClick={() => {
-              const m = window.prompt("stash 메시지(선택)") ?? "";
-              act(() => invoke("git_stash_save", { cwd, message: m }), "stash 저장");
-            }}
-          >
-            stash
-          </button>
-          <button
-            className="git-btn"
-            disabled={busy}
-            title="최근 stash 적용(pop)"
-            onClick={() => {
-              if (window.confirm("최근 stash를 적용(pop)할까요? (적용 후 stash에서 제거됩니다)"))
-                act(() => invoke("git_stash_pop", { cwd }), "stash pop");
-            }}
-          >
-            pop
-          </button>
-          <button
-            className="git-btn"
-            disabled={busy}
-            title="HEAD에 태그 생성"
-            onClick={() => {
-              const name = window.prompt("태그 이름");
-              if (!name || !name.trim()) return;
-              const message = window.prompt("주석 메시지 (비우면 lightweight)") ?? "";
-              act(() => invoke("git_create_tag", { cwd, name: name.trim(), message }), "태그 생성");
-            }}
-          >
-            tag
-          </button>
-          <button
-            className="git-btn"
-            disabled={busy}
-            title="태그 삭제"
-            onClick={() => {
-              const name = window.prompt("삭제할 태그 이름");
-              if (!name || !name.trim()) return;
-              if (!window.confirm(`태그 '${name.trim()}'를 삭제할까요?`)) return;
-              act(() => invoke("git_delete_tag", { cwd, name: name.trim() }), "태그 삭제");
-            }}
-          >
-            tag−
-          </button>
-          <button
-            className="git-btn"
-            disabled={busy}
-            title={view === "tree" ? "목록형으로" : "폴더형으로"}
-            onClick={() => setView((v) => (v === "tree" ? "flat" : "tree"))}
-          >
-            {view === "tree" ? "▤" : "▥"}
-          </button>
-          <button className="git-btn" disabled={busy} title="새로고침" onClick={() => void reload()}>
-            ↻
-          </button>
+                {branches && branches.remote.length > 0 && (
+                  <optgroup label="원격">
+                    {branches.remote.map((r) => (
+                      <option key={r} value={localOf(r)}>
+                        {r}
+                      </option>
+                    ))}
+                  </optgroup>
+                )}
+              </select>
+            </span>
+            <button
+              className="git-btn git-ico"
+              disabled={busy}
+              title="새 브랜치 생성"
+              aria-label="새 브랜치 생성"
+              onClick={() => {
+                const name = window.prompt("새 브랜치 이름");
+                if (name && name.trim()) act(() => invoke("git_create_branch", { cwd, name: name.trim() }));
+              }}
+            >
+              +
+            </button>
+            <button
+              className="git-btn git-ico"
+              disabled={busy}
+              title="브랜치 삭제"
+              aria-label="브랜치 삭제"
+              onClick={() => {
+                const name = window.prompt("삭제할 브랜치 이름");
+                if (!name || !name.trim()) return;
+                if (!window.confirm(`'${name.trim()}' 브랜치를 삭제할까요?`)) return; // cancel = abort
+                const force = window.confirm("머지 안 됐어도 강제 삭제(-D)? (확인=강제 / 취소=안전 삭제 -d)");
+                act(() => invoke("git_delete_branch", { cwd, name: name.trim(), force }));
+              }}
+            >
+              −
+            </button>
+            <button
+              className="git-btn git-ico"
+              disabled={busy}
+              title="브랜치 이름 변경"
+              aria-label="브랜치 이름 변경"
+              onClick={() => {
+                const cur = status?.branch ?? "";
+                const oldName = window.prompt("이름을 바꿀 브랜치", cur);
+                if (!oldName || !oldName.trim()) return;
+                const newName = window.prompt(`'${oldName.trim()}' → 새 이름`, oldName.trim());
+                if (!newName || !newName.trim() || newName.trim() === oldName.trim()) return;
+                act(() => invoke("git_rename_branch", { cwd, old: oldName.trim(), new: newName.trim() }), "브랜치 이름 변경 완료");
+              }}
+            >
+              ✎
+            </button>
+            <button
+              className="git-btn"
+              disabled={busy}
+              title="브랜치 머지(현재 브랜치로)"
+              onClick={() => {
+                const b = window.prompt("현재 브랜치에 머지할 브랜치");
+                if (b && b.trim()) act(() => invoke("git_merge", { cwd, branch: b.trim() }), "머지 완료");
+              }}
+            >
+              merge
+            </button>
+          </div>
+
+          {/* ② 추적 상태 — 남는 폭을 먹어 오른쪽 그룹들을 끝으로 미는 스페이서 겸용 */}
+          <div className="git-group git-group-grow">
+            <span className="git-track">
+              {status ? `↑${status.ahead} ↓${status.behind}` : ""}
+              {status && !status.has_remote ? " (원격없음)" : ""}
+            </span>
+          </div>
+
+          {/* ③ 원격 — 의미가 짧고 명확해 텍스트 유지 */}
+          <div className="git-group">
+            <button
+              className="git-btn"
+              disabled={busy || !status?.has_remote}
+              title="fetch --all --prune"
+              onClick={() => act(() => invoke("git_fetch", { cwd }), "fetch 완료")}
+            >
+              fetch
+            </button>
+            <button
+              className="git-btn"
+              disabled={busy || !status?.has_remote}
+              title="pull"
+              onClick={() => act(() => invoke("git_pull", { cwd }), "pull 완료")}
+            >
+              pull
+            </button>
+            <button
+              className="git-btn"
+              disabled={busy || !status?.has_remote}
+              title="현재 브랜치 push"
+              onClick={() => act(() => invoke("git_push", { cwd }), "push 완료")}
+            >
+              push
+            </button>
+          </div>
+
+          {/* ④ 보관 — stash 저장(⇩)/적용(⇧) · 태그 생성(⚑)/삭제(⚑−) */}
+          <div className="git-group">
+            <button
+              className="git-btn git-ico"
+              disabled={busy}
+              title="변경을 stash에 저장"
+              aria-label="변경을 stash에 저장"
+              onClick={() => {
+                const m = window.prompt("stash 메시지(선택)") ?? "";
+                act(() => invoke("git_stash_save", { cwd, message: m }), "stash 저장");
+              }}
+            >
+              ⇩
+            </button>
+            <button
+              className="git-btn git-ico"
+              disabled={busy}
+              title="최근 stash 적용(pop)"
+              aria-label="최근 stash 적용(pop)"
+              onClick={() => {
+                if (window.confirm("최근 stash를 적용(pop)할까요? (적용 후 stash에서 제거됩니다)"))
+                  act(() => invoke("git_stash_pop", { cwd }), "stash pop");
+              }}
+            >
+              ⇧
+            </button>
+            <button
+              className="git-btn git-ico"
+              disabled={busy}
+              title="HEAD에 태그 생성"
+              aria-label="HEAD에 태그 생성"
+              onClick={() => {
+                const name = window.prompt("태그 이름");
+                if (!name || !name.trim()) return;
+                const message = window.prompt("주석 메시지 (비우면 lightweight)") ?? "";
+                act(() => invoke("git_create_tag", { cwd, name: name.trim(), message }), "태그 생성");
+              }}
+            >
+              ⚑
+            </button>
+            <button
+              className="git-btn git-ico"
+              disabled={busy}
+              title="태그 삭제"
+              aria-label="태그 삭제"
+              onClick={() => {
+                const name = window.prompt("삭제할 태그 이름");
+                if (!name || !name.trim()) return;
+                if (!window.confirm(`태그 '${name.trim()}'를 삭제할까요?`)) return;
+                act(() => invoke("git_delete_tag", { cwd, name: name.trim() }), "태그 삭제");
+              }}
+            >
+              ⚑−
+            </button>
+          </div>
+
+          {/* ⑤ 보기 — 목록 형태(seg 2택) · 최신 커밋 · 새로고침 */}
+          <div className="git-group">
+            {/* aria-pressed 토글 묶음(.seg idiom) — tablist가 아니다(사이드바 seg와 동일 근거). */}
+            <div className="seg git-seg" role="group" aria-label="변경 목록 보기 형태">
+              <button
+                className={`seg-item git-seg-item${view === "tree" ? " seg-on" : ""}`}
+                disabled={busy}
+                aria-pressed={view === "tree"}
+                aria-label="폴더형"
+                title="폴더형으로"
+                onClick={() => setView("tree")}
+              >
+                <span aria-hidden="true">▤</span>
+              </button>
+              <button
+                className={`seg-item git-seg-item${view === "flat" ? " seg-on" : ""}`}
+                disabled={busy}
+                aria-pressed={view === "flat"}
+                aria-label="목록형"
+                title="목록형으로"
+                onClick={() => setView("flat")}
+              >
+                <span aria-hidden="true">▥</span>
+              </button>
+            </div>
+            <button
+              className="git-btn git-ico"
+              disabled={!commits[0]}
+              title="최신 커밋의 변경 파일 보기"
+              aria-label="최신 커밋의 변경 파일 보기"
+              onClick={() => cwd && commits[0] && openGitHistory(cwd, commits[0].hash)}
+            >
+              📜
+            </button>
+            <button
+              className="git-btn git-ico"
+              disabled={busy}
+              title="새로고침"
+              aria-label="새로고침"
+              onClick={() => void reload()}
+            >
+              ↻
+            </button>
+          </div>
         </div>
 
         <div className="git-body">

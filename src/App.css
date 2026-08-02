@@ -574,9 +574,15 @@ body {
   flex-direction: column;
   overflow: hidden;
 }
-/* Small keyboard-shortcut hint pinned above the folder tree. */
+/* Small keyboard-shortcut hint pinned above the folder tree (워크트리 패널의
+   설명 줄도 같은 클래스를 쓴다). 한 곳에 통합 — 예전에는 아래쪽 트리 섹션에
+   flex 관련 4줄이 따로 있었다(단일 출처). */
 .tree-hint {
   flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
   padding: 3px 8px;
   font-size: 0.68em;
   line-height: 1.4;
@@ -1418,12 +1424,20 @@ body {
   font-variant-numeric: tabular-nums;
   opacity: 0.9;
 }
+.git-branch {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  min-width: 0;
+}
 .git-branch select {
-  background: var(--bg-alt);
-  color: var(--fg, #cdd6f4);
-  border: 1px solid var(--border, #45475a);
-  border-radius: 4px;
-  padding: 1px 4px;
+  height: 22px;
+  background: var(--bg);
+  color: var(--fg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 0 4px;
+  font-size: 11px;
   max-width: 160px;
 }
 .git-track {
@@ -1434,18 +1448,63 @@ body {
   overflow: hidden;
   text-overflow: ellipsis;
 }
+/* 버튼 어휘 (git-restyle) — .toolbar-btn 체계의 **미니 변형**. 패널은 0.82em이지만
+   버튼의 치수·글자는 px 고정이라 패널 폰트 스케일과 독립적이다. hover/focus/
+   disabled/transition 값은 .toolbar-btn과 동일(단일 어휘). */
 .git-btn {
   flex: 0 0 auto;
-  padding: 1px 8px;
-  color: var(--fg, #cdd6f4);
-  background: color-mix(in srgb, var(--accent-bright) 15%, transparent);
-  border: 1px solid color-mix(in srgb, var(--accent-bright) 40%, transparent);
-  border-radius: 4px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+  height: 22px;
+  padding: 0 8px;
+  color: var(--fg);
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  font-size: 11px;
+  line-height: 1;
+  white-space: nowrap;
   cursor: pointer;
+  transition:
+    background 0.12s ease,
+    border-color 0.12s ease,
+    color 0.12s ease;
 }
-.git-btn:disabled {
-  opacity: 0.4;
-  cursor: default;
+/* 헤더 버튼 그룹 — .toolbar-group의 구분선 idiom(여기선 좌측 구분선만: .git-head는
+   wrap 컨테이너라 양쪽 테두리를 쓰면 줄바꿈 지점에서 이중선이 된다). wrap은 우선
+   그룹 단위로 일어나되, 그룹이 패널보다 넓으면 내부도 줄바꿈한다 — 사이드바는
+   overflow-x가 없어 nowrap이면 버튼이 잘려 도달 불가가 된다. */
+.git-group {
+  display: inline-flex;
+  align-items: center;
+  flex-wrap: wrap;
+  min-width: 0;
+  gap: 4px;
+  margin-left: 2px;
+  padding-left: 6px;
+  border-left: 1px solid var(--border);
+}
+.git-group:first-child {
+  margin-left: 0;
+  padding-left: 0;
+  border-left: none;
+}
+/* 남는 가로 공간을 먹는 그룹(추적 상태 ↑↓) — 스페이서 겸용. */
+.git-group-grow {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+}
+/* 뷰 토글 세그 — .seg 어휘의 미니 변형(총 높이 22px = .git-btn과 동일). */
+.git-seg {
+  flex: 0 0 auto;
+}
+.git-seg-item {
+  height: 16px;
+  padding: 0 6px;
+  font-size: 12px;
 }
 .git-body {
   flex: 1 1 0;
@@ -1498,18 +1557,88 @@ body {
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+/* 목록 행 안의 조밀 변형 — .git-btn과 같은 어휘의 고스트(평시 투명, hover에 칩).
+   불투명 칩을 행마다 두면 변경목록 행이 ~40% 길어져(리뷰 P2) 평시엔 테두리·배경을
+   비워 종전 행 높이를 지키고, hover/focus/disabled 규칙만 공유한다. */
 .git-mini {
   flex: 0 0 auto;
-  padding: 0 6px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+  height: 18px;
+  padding: 0 7px;
   color: var(--fg-dim);
   background: transparent;
-  border: 1px solid var(--border, #45475a);
-  border-radius: 3px;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  font-size: 11px;
+  line-height: 1;
+  white-space: nowrap;
   cursor: pointer;
+  transition:
+    background 0.12s ease,
+    border-color 0.12s ease,
+    color 0.12s ease;
 }
+/* 아이콘 전용(글리프 1~2자) — 좌우 여백을 줄이고 최소 폭만 확보. 복합 선택자로
+   특이도를 올려 선언 순서와 무관하게 padding/font-size 를 덮는다. */
+.git-btn.git-ico,
+.git-mini.git-ico {
+  min-width: 24px;
+  padding: 0 5px;
+  font-size: 12px;
+}
+.git-btn:hover,
+.git-mini:hover {
+  color: var(--fg);
+  background: var(--bg-hover);
+  border-color: color-mix(in srgb, var(--accent-bright) 45%, var(--border));
+}
+.git-btn:focus-visible,
+.git-mini:focus-visible {
+  outline: 2px solid var(--accent-bright);
+  outline-offset: 1px;
+}
+.git-btn:disabled,
 .git-mini:disabled {
-  opacity: 0.4;
+  opacity: 0.45;
   cursor: default;
+}
+.git-btn:disabled:hover {
+  color: var(--fg);
+  background: var(--bg);
+  border-color: var(--border);
+}
+.git-mini:disabled:hover {
+  color: var(--fg-dim);
+  background: transparent;
+  border-color: transparent;
+}
+/* 강조 버튼: 커밋(주 동작)·활성 토글(diff/원본, 저장) — 예전 .git-btn의 accent
+   틴트를 여기로 옮겨 "강조"의 의미를 되찾는다. */
+.git-btn.active,
+.git-commit-btn {
+  color: var(--fg);
+  background: color-mix(in srgb, var(--accent-bright) 16%, transparent);
+  border-color: color-mix(in srgb, var(--accent-bright) 45%, var(--border));
+}
+.git-btn.active:hover,
+.git-commit-btn:hover {
+  background: color-mix(in srgb, var(--accent-bright) 26%, transparent);
+  border-color: color-mix(in srgb, var(--accent-bright) 60%, var(--border));
+}
+.git-btn.active:disabled:hover,
+.git-commit-btn:disabled:hover {
+  background: color-mix(in srgb, var(--accent-bright) 16%, transparent);
+  border-color: color-mix(in srgb, var(--accent-bright) 45%, var(--border));
+}
+@media (prefers-reduced-motion: reduce) {
+  .git-btn,
+  .git-mini,
+  .git-seg-item {
+    transition: none;
+  }
 }
 .git-clean {
   padding: 8px;
@@ -1586,13 +1715,6 @@ body {
 }
 .git-commit-row-g:hover {
   background: var(--bg-hover, rgba(255, 255, 255, 0.04));
-}
-.git-node {
-  flex: 0 0 auto;
-  color: var(--accent-bright);
-}
-.git-node-merge {
-  color: #f5c2e7;
 }
 .git-chash {
   flex: 0 0 auto;
@@ -3208,13 +3330,15 @@ body {
 .placeholder-sub {
   font-size: 12px;
 }
+/* 헤더 브랜치 select와 같은 어휘(리뷰 P2 — 한 패널에 셀렉트 스타일 2종 방지). */
 .git-sort {
-  background: var(--bg-alt);
+  height: 20px;
+  background: var(--bg);
   color: var(--fg);
   border: 1px solid var(--border);
-  border-radius: 4px;
-  font-size: 0.9em;
-  padding: 0 2px;
+  border-radius: 6px;
+  font-size: 11px;
+  padding: 0 3px;
 }
 
 /* ---- Terminal color settings modal ---- */
@@ -3698,12 +3822,6 @@ body {
   font-size: 0.85em;
 }
 
-.tree-hint {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 6px;
-}
 .tree-refresh {
   flex: 0 0 auto;
   background: none;

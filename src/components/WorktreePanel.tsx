@@ -209,9 +209,10 @@ export function WorktreePanel() {
           Claude
         </button>
         <button
-          className="git-mini"
+          className="git-mini git-ico"
           disabled={busy}
           title="워크트리 제거"
+          aria-label="워크트리 제거"
           onClick={() => {
             if (window.confirm(`${w.path} 워크트리를 제거할까요?`))
               act(() => invoke("git_worktree_remove", { cwd: repoCwd, path: w.path }));
@@ -232,38 +233,54 @@ export function WorktreePanel() {
         워크트리 = 같은 저장소의 <b>추가 작업 폴더</b>(각자 다른 브랜치를 동시 체크아웃). 병렬 작업
         격리용 — 브랜치 자체가 아니라 그 브랜치가 놓인 폴더입니다. ‘열기’로 프로젝트 탭에 엽니다.
       </div>
+      {/* GitPanel과 같은 버튼 어휘(.git-btn 미니 변형) — 헤더는 [상태] │ [동작]
+          2그룹으로만 나눈다(버튼이 2개뿐). */}
       <div className="git-head">
-        <span className="git-track">
-          워크트리 ({total}){multi ? ` · 저장소 ${groups.length}` : ""}
-        </span>
-        {!multi && groups.length === 1 && (
+        <div className="git-group git-group-grow">
+          <span className="git-track">
+            워크트리 ({total}){multi ? ` · 저장소 ${groups.length}` : ""}
+          </span>
+        </div>
+        <div className="git-group">
+          {!multi && groups.length === 1 && (
+            <button
+              className="git-btn"
+              disabled={busy}
+              title="새 워크트리 추가"
+              onClick={() => addWorktree(groups[0].mainPath)}
+            >
+              + 추가
+            </button>
+          )}
           <button
-            className="git-btn"
+            className="git-btn git-ico"
             disabled={busy}
-            title="새 워크트리 추가"
-            onClick={() => addWorktree(groups[0].mainPath)}
+            title="새로고침"
+            aria-label="새로고침"
+            onClick={() => void reload()}
           >
-            + 추가
+            ↻
           </button>
-        )}
-        <button className="git-btn" disabled={busy} title="새로고침" onClick={() => void reload()}>
-          ↻
-        </button>
+        </div>
       </div>
       <div className="git-body">
         {groups.map((g) => (
           <div key={g.mainPath}>
             {multi && (
               <div className="git-head worktree-repo-head" title={g.mainPath}>
-                <span className="git-track">{baseName(g.mainPath)}</span>
-                <button
-                  className="git-btn"
-                  disabled={busy}
-                  title={`${baseName(g.mainPath)}에 새 워크트리 추가`}
-                  onClick={() => addWorktree(g.mainPath)}
-                >
-                  + 추가
-                </button>
+                <div className="git-group git-group-grow">
+                  <span className="git-track">{baseName(g.mainPath)}</span>
+                </div>
+                <div className="git-group">
+                  <button
+                    className="git-btn"
+                    disabled={busy}
+                    title={`${baseName(g.mainPath)}에 새 워크트리 추가`}
+                    onClick={() => addWorktree(g.mainPath)}
+                  >
+                    + 추가
+                  </button>
+                </div>
               </div>
             )}
             {g.worktrees.map((w) => renderRow(w, g.mainPath))}
