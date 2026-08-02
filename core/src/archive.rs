@@ -794,6 +794,273 @@ pub fn is_unchanged_complete(entry: &ArchiveSessionEntry, live: &JsonlStat) -> b
         && archived_stat(&entry.dir, &entry.meta).is_some_and(|s| s.same_content(live))
 }
 
+// ---- 아카이브 파이프라인 (GUI 커맨드 ↔ CLI 백필 단일 출처) ----
+
+/// One archive run's inputs. Everything environment-shaped (경로·모델 설정·
+/// 바이너리 위치) is resolved by the caller and passed in — core stays
+/// tauri-free and the CLI keeps its flags.
+pub struct ArchiveRequest<'a> {
+    pub archive_root: &'a Path,
+    /// Project root (cwd) the session ran in.
+    pub project: &'a str,
+    pub uuid: &'a str,
+    /// Title used until extraction supplies one (사이드카 `.title`/`.name`).
+    pub fallback_title: &'a str,
+    /// Archive date (YYYY-MM-DD) — the folder-name prefix. GUI uses today,
+    /// backfill uses the transcript's last timestamp.
+    pub date: &'a str,
+    /// The live transcript, verbatim — copied to `session.jsonl` byte for byte.
+    pub jsonl_bytes: &'a [u8],
+    /// knowledge-mcp server binary for `.mcp.json` registration; `None` skips it.
+    pub mcp_bin: Option<&'a Path>,
+    /// 추출 시도 횟수 (1 = 재시도 없음). 재시도는 **호출자 소유 파라미터**다:
+    /// 대화형 GUI는 1회(사용자가 다시 누르면 그만), 무인 대량 실행인 CLI 백필은
+    /// 2회로 일시적 실패를 흡수한다.
+    pub attempts: usize,
+}
+
+/// Why an archive run never got off the ground. Everything after `write_archive`
+/// is best-effort and reported in [`ArchiveRun`] instead — the core artifacts
+/// landing is what makes a run a (partial) success.
+#[derive(Debug)]
+pub enum ArchiveError {
+    /// The transcript has no conversation turn to archive.
+    NoTurns,
+    /// The core artifacts could not be written.
+    Write(io::Error),
+}
+
+/// What one archive run produced.
+pub struct ArchiveRun {
+    pub dir: PathBuf,
+    pub book_path: PathBuf,
+    /// Final title (extraction's when it supplied one, else the fallback).
+    pub title: String,
+    /// A previous archive of this session was replaced.
+    pub replaced: bool,
+    /// `summary.md` is present (fresh, or the previous archive's last-good).
+    pub summary_ok: bool,
+    pub knowledge_files: usize,
+    /// Nothing was rewritten — the existing archive already matched
+    /// ([`is_unchanged_complete`]).
+    pub unchanged: bool,
+    /// 추출 단계 경고. **하나라도 있으면 `.extraction-ok` 마커를 남기지
+    /// 않는다** — 다음 재아카이브가 추출 재시도로 동작한다.
+    pub errors: Vec<String>,
+    /// 추출과 무관한 부가 작업(재시도 알림·`.mcp.json` 등록) 보고. 마커를
+    /// 막지 않는다.
+    pub notes: Vec<String>,
+}
+
+impl ArchiveRun {
+    /// This run left (or found) a complete extraction — the CLI's ok/부분 집계.
+    pub fn extraction_complete(&self) -> bool {
+        self.unchanged || (self.summary_ok && self.errors.is_empty())
+    }
+
+    /// Every warning, extraction-gating first — for one-line UI/CLI reporting.
+    pub fn all_warnings(&self) -> Vec<&str> {
+        self.errors
+            .iter()
+            .chain(self.notes.iter())
+            .map(String::as_str)
+            .collect()
+    }
+}
+
+/// The real extractor: a one-shot `claude -p` in the `/tmp` scratch cwd
+/// (프로젝트 안에서 돌리면 추출 자체가 그 프로젝트의 새 세션 전사가 되어 백필
+/// 되먹임 루프를 만든다 — `claude_cli::extraction_workdir` 참조).
+pub fn claude_extractor(
+    opts: &crate::claude_cli::ClaudeOpts,
+    timeout: std::time::Duration,
+) -> impl Fn(&str) -> Result<String, String> + '_ {
+    let workdir = crate::claude_cli::extraction_workdir()
+        .to_string_lossy()
+        .into_owned();
+    move |prompt: &str| crate::claude_cli::run_claude_p(&workdir, prompt, timeout, opts)
+}
+
+/// Archive one session end to end — **the** pipeline both the app command and
+/// the backfill CLI run, so their output shape and their re-archive verdict can
+/// never drift apart.
+///
+/// Order (durability first, 감사 A11): unchanged-skip verdict → core artifacts
+/// (`session.jsonl` verbatim + `normalized.json` + `book.html` + `meta.json`)
+/// → previous last-good summary re-landed → extraction (`attempts` tries) →
+/// retitle re-land → `summary.md` → knowledge + `INDEX.md` → `.mcp.json`
+/// registration → last-good summary restore → `.extraction-ok` marker.
+///
+/// Extraction is injected (`extract`) so the pipeline is testable without
+/// spawning `claude`; production callers pass [`claude_extractor`]. Its failure
+/// is never the run's failure — the transcript copy and the book always land.
+pub fn run_archive(
+    req: &ArchiveRequest<'_>,
+    extract: &dyn Fn(&str) -> Result<String, String>,
+) -> Result<ArchiveRun, ArchiveError> {
+    let text = String::from_utf8_lossy(req.jsonl_bytes);
+    let mut session = normalize(
+        req.project,
+        req.uuid,
+        req.fallback_title,
+        req.date,
+        &text,
+    );
+    drop(text);
+    if session.turns.is_empty() {
+        return Err(ArchiveError::NoTurns);
+    }
+    let mut errors: Vec<String> = Vec::new();
+    let mut notes: Vec<String> = Vec::new();
+
+    // Read the previous archive BEFORE the first write below displaces it
+    // (감사 A1: 지식만 남고 요약만 사라지는 비대칭 방지).
+    let live = jsonl_stat(req.jsonl_bytes);
+    let prev = find_archived_session(req.archive_root, req.uuid);
+    if let Some(p) = &prev {
+        if is_unchanged_complete(p, &live) {
+            return Ok(ArchiveRun {
+                dir: p.dir.clone(),
+                book_path: p.book_path.clone(),
+                title: p.meta.title.clone(),
+                replaced: false,
+                summary_ok: true,
+                knowledge_files: 0,
+                unchanged: true,
+                errors,
+                notes,
+            });
+        }
+    }
+    let prev_summary = prev
+        .and_then(|s| s.summary_path)
+        .and_then(|p| match fs::read_to_string(&p) {
+            Ok(text) => Some(text),
+            Err(e) => {
+                errors.push(format!("이전 요약 읽기 실패: {e}"));
+                None
+            }
+        });
+
+    // 1) Core artifacts land FIRST — a quit or crash during the (up to
+    // 3-minute) extraction must never cost the transcript copy + book.
+    let mut out = write_archive(req.archive_root, req.project, &session, req.jsonl_bytes)
+        .map_err(ArchiveError::Write)?;
+    let replaced = out.replaced;
+    // The last-good summary goes to disk NOW — held only in memory, a crash
+    // during extraction would lose it for good (post-fix P3).
+    if let Some(prev) = &prev_summary {
+        if let Err(e) = fs::write(out.dir.join("summary.md"), prev) {
+            errors.push(format!("이전 요약 보존 실패: {e}"));
+        }
+    }
+
+    // 2) Extraction — best-effort, `attempts` tries.
+    let prompt = crate::knowledge::extraction_prompt(&crate::knowledge::render_session_for_extraction(&session));
+    let attempts = req.attempts.max(1);
+    let mut raw = None;
+    for attempt in 1..=attempts {
+        match extract(&prompt) {
+            Ok(text) => {
+                raw = Some(text);
+                break;
+            }
+            // 재시도로 성공한 실행은 온전한 추출이다 — 1차 실패는 마커를 막지
+            // 않는 note로만 남는다.
+            Err(e) if attempt < attempts => notes.push(format!("추출 {attempt}차 실패({e}) — 재시도")),
+            Err(e) => errors.push(format!("추출 실패: {e}")),
+        }
+    }
+
+    let mut summary_ok = false;
+    let mut knowledge_files = 0usize;
+    if let Some(raw) = raw {
+        let ex = crate::knowledge::parse_extraction(&raw);
+        // Extracted title → re-land the archive under it. write_archive is
+        // idempotent per uuid, so this just replaces our own fallback folder.
+        let new_title = ex.title.trim();
+        if !new_title.is_empty() && new_title != session.title {
+            session.title = new_title.to_string();
+            match write_archive(req.archive_root, req.project, &session, req.jsonl_bytes) {
+                Ok(o) => out = o,
+                Err(e) => errors.push(format!("제목 반영 실패: {e}")),
+            }
+        }
+        if !ex.summary.trim().is_empty() {
+            match fs::write(out.dir.join("summary.md"), &ex.summary) {
+                Ok(()) => summary_ok = true,
+                Err(e) => errors.push(format!("요약 저장 실패: {e}")),
+            }
+        }
+        match crate::knowledge::write_knowledge(
+            req.archive_root,
+            req.project,
+            req.uuid,
+            req.date,
+            &ex.entries,
+        ) {
+            Ok(paths) => knowledge_files = paths.len(),
+            Err(e) => errors.push(format!("지식 저장 실패: {e}")),
+        }
+    }
+
+    // 3) 지식 MCP 서버를 대상 프로젝트 `.mcp.json`에 등록(병합·멱등) — 이후 그
+    // 프로젝트의 Claude 세션이 과거 지식을 바로 조회한다. 추출 품질과 무관한
+    // 부가 작업이므로 결과는 note (마커를 막지 않는다).
+    let proj_path = Path::new(req.project);
+    if proj_path.is_dir() {
+        match req.mcp_bin {
+            Some(bin) if bin.is_file() => {
+                let kdir = crate::knowledge::knowledge_dir(req.archive_root, req.project);
+                match crate::mcp::register_in_mcp_json(proj_path, bin, &kdir) {
+                    Ok(true) => notes.push("mcp 등록".to_string()),
+                    Ok(false) => {}
+                    Err(e) => notes.push(format!("mcp 등록 실패: {e}")),
+                }
+            }
+            _ => notes.push("knowledge-mcp 바이너리 없음 — MCP 등록 생략".to_string()),
+        }
+    }
+
+    // 4) No fresh summary → keep the previous archive's (last-good), mirroring
+    // how knowledge entries persist when extraction fails. (Re-written here
+    // because a retitle re-land above replaced the folder the early copy was
+    // in.) 이 경로는 "이번 실행의 추출이 온전하지 않았다"는 뜻이므로 경고다.
+    if !summary_ok {
+        if let Some(prev) = prev_summary {
+            match fs::write(out.dir.join("summary.md"), prev) {
+                Ok(()) => {
+                    summary_ok = true;
+                    errors.push("요약은 이전 아카이브분을 유지".to_string());
+                }
+                Err(e) => errors.push(format!("이전 요약 보존 실패: {e}")),
+            }
+        }
+    }
+    // 5) 추출이 온전히 성공했을 때만 완료 마커 — unchanged 스킵의 근거
+    // ([`is_extraction_complete`]의 계약).
+    if summary_ok && errors.is_empty() {
+        if let Err(e) = fs::write(out.dir.join(EXTRACTION_OK), b"") {
+            errors.push(format!("추출 완료 마커 기록 실패: {e}"));
+        }
+    }
+
+    Ok(ArchiveRun {
+        book_path: out.book_path,
+        dir: out.dir,
+        title: session.title,
+        // The FIRST write's verdict — the retitle re-land always "replaces" the
+        // fallback folder it just made, which is not a user-meaningful replace
+        // (post-fix P7).
+        replaced,
+        summary_ok,
+        knowledge_files,
+        unchanged: false,
+        errors,
+        notes,
+    })
+}
+
 /// The self-contained reader page. Placeholders: `__TITLE__` (HTML-escaped) and
 /// `__DATA__` (the `<`-escaped JSON document). No external requests, no
 /// innerHTML — content is rendered with `textContent` only.

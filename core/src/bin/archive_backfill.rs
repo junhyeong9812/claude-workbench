@@ -6,18 +6,19 @@
 //! knowledge/INDEX.md는 공유 자원이라(write_knowledge 참조) 세션 병렬이
 //! 금지되고, 서로 다른 프로젝트는 완전히 독립이다.
 //!
-//! 멱등·자기치유: **summary.md까지 있는** 아카이브만 완료로 보고 skip한다 —
-//! core 아카이브만 있고 추출이 실패한 세션은 재실행이 자동으로 재추출한다
-//! (리뷰 G2: "추출 실패가 영영 재시도되지 않는" 상태 차단). 추출 실패는
-//! ok가 아니라 `부분`으로 집계된다.
+//! 멱등·자기치유: **추출이 온전히 끝난**(summary.md + `.extraction-ok` 마커)
+//! 아카이브만 완료로 보고 skip한다 — 판정식은 `core::archive` 단일 출처
+//! (`is_extraction_complete`)라 앱 GUI의 "변경 없음" 판정과 절대 갈라지지
+//! 않는다. 추출이 실패했거나 부분 실패한 세션(마커 없음)은 재실행이 자동으로
+//! 재추출한다 (리뷰 G2: "추출 실패가 영영 재시도되지 않는" 상태 차단). 추출
+//! 실패는 ok가 아니라 `부분`으로 집계된다.
 
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{Duration, SystemTime};
 
-use core_lib::claude_cli::{run_claude_p, ClaudeOpts};
-use core_lib::knowledge::{extraction_prompt, parse_extraction, render_session_for_extraction, write_knowledge};
+use core_lib::claude_cli::ClaudeOpts;
 
 struct Args {
     days: u64,
@@ -137,12 +138,15 @@ fn main() {
     let args = parse_args();
     let cutoff = SystemTime::now() - Duration::from_secs(args.days * 24 * 3600);
 
-    // 아카이브 상태: summary까지 있으면 완료(skip), core만 있으면 재추출 대상.
+    // 아카이브 상태: 추출 완료(summary + 마커)면 skip, 아니면 재추출 대상.
+    // 판정은 core::archive 단일 출처 — 앱의 "변경 없음" 스킵과 같은 식이다.
+    // 마커 도입 이전에 백필된 아카이브는 여기서 재추출 대상으로 잡혀 한 번
+    // 재추출되고, 그때 마커가 남아 이후로는 양쪽 다 스킵한다(자기치유).
     let mut complete: HashSet<String> = HashSet::new();
     let mut partial: HashSet<String> = HashSet::new();
     for listing in core_lib::archive::list_archives(&args.archive_root) {
         for s in listing.sessions {
-            if s.summary_path.is_some() {
+            if core_lib::archive::is_extraction_complete(&s) {
                 complete.insert(s.meta.uuid);
             } else {
                 partial.insert(s.meta.uuid);
@@ -306,12 +310,16 @@ fn main() {
     let (ok, part, skip, fail) = *done.lock().unwrap();
     println!("완료: ok {ok} · 부분(추출실패) {part} · skip {skip} · fail {fail}");
     if part > 0 {
-        println!("부분 세션은 재실행 시 자동으로 재추출됩니다 (summary 없는 아카이브 = 재시도 대상).");
+        println!("부분 세션은 재실행 시 자동으로 재추출됩니다 (.extraction-ok 마커 없는 아카이브 = 재시도 대상).");
     }
 }
 
 /// Returns `Ok((message, extraction_ok))` — extraction failure is a *partial*
 /// success (core archive landed), never a silent ok (리뷰 G2).
+///
+/// 파이프라인 본체는 `core::archive::run_archive` — 앱 GUI 커맨드와 **같은**
+/// 코드다. 이 함수는 CLI 소유 입력(경로·플래그·재시도 횟수)을 채우고 결과를
+/// 한 줄로 보고할 뿐이다.
 fn archive_one(
     args: &Args,
     opts: &ClaudeOpts,
@@ -320,77 +328,40 @@ fn archive_one(
     c: &Candidate,
     date: &str,
 ) -> Result<(String, bool), String> {
-    let text = std::fs::read_to_string(&c.jsonl_path).map_err(|e| format!("트랜스크립트 읽기: {e}"))?;
+    // 바이트 그대로 읽는다 — session.jsonl은 verbatim 복사본이어야 한다.
+    let jsonl_bytes = std::fs::read(&c.jsonl_path).map_err(|e| format!("트랜스크립트 읽기: {e}"))?;
     // fallback 제목: 앱 사이드카(.title/.name), 없으면 "Claude".
     let title = core_lib::snapshot::read_title(&args.snapshot_base, project, &c.uuid)
         .or_else(|| core_lib::snapshot::read_name(&args.snapshot_base, project, &c.uuid))
         .unwrap_or_else(|| "Claude".to_string());
-    let mut session = core_lib::archive::normalize(project, &c.uuid, &title, date, &text);
-    if session.turns.is_empty() {
-        return Err("skip(0턴)".to_string());
-    }
-    let jsonl_bytes = text.as_bytes();
 
-    // ① core 산출물 선착지 (앱 커맨드와 동일한 내구 순서).
-    let mut out = core_lib::archive::write_archive(&args.archive_root, project, &session, jsonl_bytes)
-        .map_err(|e| format!("write_archive: {e}"))?;
+    let extract = core_lib::archive::claude_extractor(opts, Duration::from_secs(300));
+    let run = core_lib::archive::run_archive(
+        &core_lib::archive::ArchiveRequest {
+            archive_root: &args.archive_root,
+            project,
+            uuid: &c.uuid,
+            fallback_title: &title,
+            date,
+            jsonl_bytes: &jsonl_bytes,
+            mcp_bin,
+            // 무인 대량 실행 — 일시적 추출 실패는 1회 재시도로 흡수한다.
+            attempts: 2,
+        },
+        &extract,
+    )
+    .map_err(|e| match e {
+        core_lib::archive::ArchiveError::NoTurns => "skip(0턴)".to_string(),
+        core_lib::archive::ArchiveError::Write(e) => format!("write_archive: {e}"),
+    })?;
 
-    // ② 추출 — 1회 재시도, 그래도 실패면 부분 성공으로 보고.
-    let mut notes = Vec::new();
-    let rendered = render_session_for_extraction(&session);
-    let prompt = extraction_prompt(&rendered);
-    let mut knowledge_files = 0usize;
-    let mut extraction_ok = false;
-    // 추출은 /tmp 스크래치 cwd — 프로젝트 안에서 돌리면 추출 트랜스크립트가
-    // 다음 스캔의 후보가 되는 되먹임 루프 (2026-07-19 실측 179→256).
-    let workdir = core_lib::claude_cli::extraction_workdir();
-    let workdir = workdir.to_string_lossy();
-    let raw = run_claude_p(&workdir, &prompt, Duration::from_secs(300), opts)
-        .or_else(|e1| {
-            notes.push(format!("추출 1차 실패({e1}) — 재시도"));
-            run_claude_p(&workdir, &prompt, Duration::from_secs(300), opts)
-        });
-    match raw {
-        Ok(raw) => {
-            extraction_ok = true;
-            let ex = parse_extraction(&raw);
-            let new_title = ex.title.trim();
-            if !new_title.is_empty() && new_title != session.title {
-                session.title = new_title.to_string();
-                match core_lib::archive::write_archive(&args.archive_root, project, &session, jsonl_bytes) {
-                    Ok(o) => out = o,
-                    Err(e) => notes.push(format!("retitle 실패: {e}")),
-                }
-            }
-            if !ex.summary.trim().is_empty() {
-                if let Err(e) = std::fs::write(out.dir.join("summary.md"), &ex.summary) {
-                    notes.push(format!("summary 실패: {e}"));
-                }
-            }
-            match write_knowledge(&args.archive_root, project, &c.uuid, date, &ex.entries) {
-                Ok(paths) => knowledge_files = paths.len(),
-                Err(e) => notes.push(format!("knowledge 실패: {e}")),
-            }
-        }
-        Err(e) => notes.push(format!("추출 실패: {e}")),
+    if run.unchanged {
+        return Err("skip(변경 없음)".to_string());
     }
-
-    // ③ 프로젝트 폴더가 실재하고 서버 바이너리가 있으면 .mcp.json 등록 (병합·멱등).
-    let proj_path = Path::new(project);
-    if proj_path.is_dir() {
-        if let Some(bin) = mcp_bin {
-            let kdir = core_lib::knowledge::knowledge_dir(&args.archive_root, project);
-            match core_lib::mcp::register_in_mcp_json(proj_path, bin, &kdir) {
-                Ok(true) => notes.push("mcp 등록".to_string()),
-                Ok(false) => {}
-                Err(e) => notes.push(format!("mcp 등록 실패: {e}")),
-            }
-        }
+    let mut msg = format!("\"{}\" 지식 {}건", run.title, run.knowledge_files);
+    let warnings = run.all_warnings();
+    if !warnings.is_empty() {
+        msg.push_str(&format!(" ({})", warnings.join(", ")));
     }
-
-    let mut msg = format!("\"{}\" 지식 {}건", session.title, knowledge_files);
-    if !notes.is_empty() {
-        msg.push_str(&format!(" ({})", notes.join(", ")));
-    }
-    Ok((msg, extraction_ok))
+    Ok((msg, run.extraction_complete()))
 }
