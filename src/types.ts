@@ -112,3 +112,28 @@ export interface SnapshotResult {
   data: string;
   last_seq: number;
 }
+
+/** P6 D3: 타임라인 아이템 — 컴포넌트가 아니라 타입 모듈 소유(상태
+ * 모듈(claudeStatusGlobal 등)의 컴포넌트 역의존 해소). */
+export interface TimelineItem {
+  turn: number;
+  session_id: string;
+  tool_call_id: string;
+  seq: number;
+  kind: string;
+  title: string;
+  locations: string[];
+  project_label: string | null;
+  /** Directory this call ran in (JSONL cwd). Differs from the session cwd when a
+   * subagent works in an isolation worktree — used to label "another worktree". */
+  cwd?: string | null;
+  diffs: { path: string; old_text: string | null; new_text: string }[];
+  content_text: string | null;
+  /** P1: 표시 계층에서 content_text가 상한(32KB)으로 절단됨 — 뷰어가
+   * claude_item_detail로 원문을 lazy 조회한다. 구 스냅샷엔 없음(optional). */
+  content_truncated?: boolean;
+  raw_input: unknown;
+  agent_status: string;
+  write_status: string;
+  revision: number;
+}

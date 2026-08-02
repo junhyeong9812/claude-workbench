@@ -7,7 +7,8 @@ import {
   hasSessionMapping,
   mapHookEvent,
 } from "./claudeStatus";
-import type { TimelineItem } from "../components/TimelineView";
+import type { TimelineItem } from "../types";
+import { setTransferCommittedListener } from "./windowTransfer";
 
 /**
  * App-level attention-status listener (agent-status-badges P3).
@@ -75,6 +76,10 @@ function track(p: Promise<UnlistenFn>, gen: number): void {
  * stale handle from an already-disposed init is a no-op, so calling it again
  * can't tear down a newer generation's live listeners (S3). */
 export function initClaudeStatusGlobal(): () => void {
+  // P6 D3: 전송 커밋 시 소스 창 배지 제거(S9) — windowTransfer의 직접
+  // 의존을 콜백 등록으로 역전(상태 모듈 간 단방향 유지).
+  setTransferCommittedListener((uuid) => useClaudeStatus.getState().remove(uuid));
+
   if (started) {
     // Already running — hand out a disposer bound to the RUNNING generation.
     const cur = generation;

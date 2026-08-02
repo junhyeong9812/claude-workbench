@@ -4,7 +4,17 @@ import { emit, listen } from "@tauri-apps/api/event";
 import type { DockviewApi, IDockviewPanel } from "dockview-react";
 import { useAppStore } from "./store";
 import { beginTransfer, endTransfer } from "./panelTransfer";
-import { useClaudeStatus } from "./claudeStatus";
+
+/** P6 D3: 전송 커밋(target ok) 알림 — claudeStatus로의 직접 의존을 역전한다.
+ * 등록자는 claudeStatusGlobal.init(창당 1회, 앱 마운트 시 — 전송은 사용자
+ * 드래그 이후에만 가능하므로 등록 선행이 보장된다). 계약(S9): **ok일 때만**
+ * 호출 — reject/timeout 재삽입 경로에서는 배지가 남아야 한다. */
+type TransferCommittedListener = (uuid: string) => void;
+let transferCommittedListener: TransferCommittedListener | null = null;
+export function setTransferCommittedListener(cb: TransferCommittedListener): void {
+  transferCommittedListener = cb;
+}
+
 
 const KNOWN_COMPONENTS = new Set([
   "placeholder",
@@ -101,7 +111,7 @@ async function handOff(
           (spec.params.sessionUuid as string | undefined) ??
           (spec.params.loadSessionId as string | undefined) ??
           null;
-        if (uuid) useClaudeStatus.getState().remove(uuid);
+        if (uuid) transferCommittedListener?.(uuid);
       }
     } finally {
       un();
