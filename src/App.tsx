@@ -45,6 +45,7 @@ import { resolveVisibleDual } from "./state/dualSurface";
 import {
   applyActivityPick,
   applyTabPick,
+  ctrlBAction,
   loadSidebarView,
   saveSidebarView,
   toggleSplit,
@@ -459,39 +460,50 @@ function AppMain() {
     localStorage.setItem("fontSize", String(fontSize));
   }, [fontSize]);
 
-  // Remember the last focused element OUTSIDE the tree (timeline list, terminal,
-  // editor…), updated on every focus change — mouse click or keyboard — so Ctrl+B
-  // returns to exactly where you were, however you got there.
+  // Remember the last focused element OUTSIDE the sidebar (timeline list,
+  // terminal, editor…), updated on every focus change — mouse click or keyboard —
+  // so Ctrl+B returns to exactly where you were, however you got there. 사이드바
+  // 전체를 제외한다: 접히는 순간 그 안의 요소는 복귀 대상이 될 수 없다(분할
+  // 이후로는 트리 말고도 사이드바 안 포커스 가능 요소가 여럿이다).
   const lastFocusRef = useRef<HTMLElement | null>(null);
   useEffect(() => {
     const onFocusIn = (e: FocusEvent) => {
       const t = e.target as HTMLElement | null;
       if (!t || t === document.body) return;
-      const tree = document.getElementById("folder-tree");
-      if (tree && (t === tree || tree.contains(t))) return; // tree isn't a "return" target
+      if (t.closest(".pane-left")) return; // 사이드바는 "복귀" 대상이 아니다
       lastFocusRef.current = t;
     };
     document.addEventListener("focusin", onFocusIn);
     return () => document.removeEventListener("focusin", onFocusIn);
   }, []);
 
-  // Ctrl+B toggles between the folder tree and your last work spot: from the tree
-  // it restores the remembered element (falling back to the active dockview panel
-  // when there's none); from anywhere else it focuses the tree.
+  // Ctrl+B = 사이드바 접기/펴기 — **어떤 탭이 떠 있든 항상** 동작한다(설계
+  // §A-6). 이전에는 트리가 마운트된 files 탭에서만 의미가 있어 git·아카이브
+  // 탭에서는 아무 일도 일어나지 않았다(조사 결함 ①). 펼칠 때 트리가 있으면
+  // 그리로 포커스, 접을 때 포커스가 사이드바 안이었다면 마지막 작업 지점으로
+  // 되돌린다(접힌 패널 안에 포커스가 갇히지 않게).
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if (!(e.ctrlKey && (e.key === "b" || e.key === "B"))) return;
       e.preventDefault();
-      const tree = document.getElementById("folder-tree");
-      const treeFocused =
-        !!tree && (tree === document.activeElement || tree.contains(document.activeElement));
-      if (treeFocused) {
-        const prev = lastFocusRef.current;
-        if (prev && document.contains(prev) && !tree?.contains(prev)) prev.focus();
-        else useAppStore.getState().requestFocusMain();
-      } else {
-        tree?.focus();
+      const panel = treePanelRef.current;
+      if (!panel) return;
+      const sidebar = document.querySelector(".pane-left");
+      const action = ctrlBAction(
+        panel.isCollapsed(),
+        !!sidebar && sidebar.contains(document.activeElement),
+      );
+      if (action.kind === "expand") {
+        panel.expand();
+        // 펼침이 반영된 뒤에 포커스 — 트리가 보이는 반쪽에 없으면 이동 생략.
+        requestAnimationFrame(() => document.getElementById("folder-tree")?.focus());
+        return;
       }
+      panel.collapse();
+      if (!action.restoreFocus) return;
+      const prev = lastFocusRef.current;
+      if (prev && document.contains(prev) && !sidebar?.contains(prev)) prev.focus();
+      else useAppStore.getState().requestFocusMain();
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
