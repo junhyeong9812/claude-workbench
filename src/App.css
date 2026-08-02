@@ -15,6 +15,8 @@
   --git-ref-local: #4493f8;
   --git-ref-remote: #c678dd;
   --git-ref-tag: #d29922;
+  /* commit-graph merge-lane accent (was a #f5c2e7 literal in .git-node-merge) */
+  --git-lane-merge: #f5c2e7;
   /* timeline change-detail diff colors (bright text on the dark bg) */
   --diff-add-bg: rgba(63, 185, 80, 0.12);
   --diff-add-fg: #a8d8a8;
@@ -82,6 +84,8 @@
   --git-ref-local: #0969da;
   --git-ref-remote: #8250df;
   --git-ref-tag: #9a6700;
+  /* light 변형 — 흰 배경에서 읽히는 진한 자홍(다크의 파스텔 핑크 대응) */
+  --git-lane-merge: #bf3989;
   /* darker diff text + fainter tints so they read on white */
   --diff-add-bg: rgba(26, 127, 55, 0.12);
   --diff-add-fg: #0a5d2a;
@@ -574,9 +578,15 @@ body {
   flex-direction: column;
   overflow: hidden;
 }
-/* Small keyboard-shortcut hint pinned above the folder tree. */
+/* Small keyboard-shortcut hint pinned above the folder tree (워크트리 패널의
+   설명 줄도 같은 클래스를 쓴다). 한 곳에 통합 — 예전에는 아래쪽 트리 섹션에
+   flex 관련 4줄이 따로 있었다(단일 출처). */
 .tree-hint {
   flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
   padding: 3px 8px;
   font-size: 0.68em;
   line-height: 1.4;
@@ -1709,7 +1719,7 @@ body {
   color: var(--accent-bright);
 }
 .git-node-merge {
-  color: #f5c2e7;
+  color: var(--git-lane-merge);
 }
 .git-chash {
   flex: 0 0 auto;
@@ -3815,12 +3825,6 @@ body {
   font-size: 0.85em;
 }
 
-.tree-hint {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 6px;
-}
 .tree-refresh {
   flex: 0 0 auto;
   background: none;
