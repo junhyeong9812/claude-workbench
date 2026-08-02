@@ -6,6 +6,7 @@ import {
 } from "dockview-react";
 import "dockview-react/dist/styles/dockview.css";
 import { invoke } from "@tauri-apps/api/core";
+import { resolveCloseRequest } from "./sessionClose";
 import { emit, listen } from "@tauri-apps/api/event";
 import { useAppStore } from "../state/store";
 import { useClaudeUi } from "../state/claudeUi";
@@ -712,19 +713,10 @@ export function MainArea({
     const req = closeRequest;
     clearClose();
     if (!req) return;
-    // Delete must target the session's *own* project (a workspace-wide reopen can
-    // open a task from a project other than the active tab) — codex P2 F1.
-    const project = req.project ?? activeProject;
-    // 삭제: tear the WHOLE session down (force-close every viewer) before deleting
-    // its history, so a mirror in another window can't recreate the snapshot. 닫기:
-    // just close the panel — onDidRemovePanel detaches this window (refcount, P6).
-    if (req.kind === "claudeterm" && deleteHistory && typeof req.ptyId === "number") {
-      await invoke("claude_close", { id: req.ptyId }).catch(() => {});
-      if (req.sessionId && project) {
-        await invoke("claude_delete", { project, uuid: req.sessionId }).catch(() => {});
-      }
-    }
-    apiRef.current?.getPanel(req.panelId)?.api.close();
+    // 실행부는 sessionClose 단일 출처 (P4 — Popout과 문자단위 동일이던 것).
+    await resolveCloseRequest(req, activeProject, deleteHistory, (panelId) =>
+      apiRef.current?.getPanel(panelId)?.api.close(),
+    );
   };
 
   /** Session ids currently open in a panel (live `sessionId`/`sessionUuid` or

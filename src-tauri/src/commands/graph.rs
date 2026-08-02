@@ -54,7 +54,7 @@ struct GraphGenerated {
 /// empty here; [`core_lib::graph::generate_project_graph`] adds the target project
 /// and every sub-project root itself.
 fn graph_opts(app: &AppHandle) -> ClaudeOpts {
-    let ws = super::load_state(app.clone());
+    let ws = super::files::load_state(app.clone());
     ClaudeOpts {
         model: Some(ws.graph_model.filter(|m| !m.trim().is_empty()).unwrap_or_else(|| "opus".into())),
         effort: Some(ws.graph_effort.filter(|e| !e.trim().is_empty()).unwrap_or_else(|| "xhigh".into())),
@@ -70,9 +70,7 @@ fn graph_opts(app: &AppHandle) -> ClaudeOpts {
 /// (both then see the canonical path). Falls back to the raw path when it can't be
 /// resolved (e.g. the project isn't on disk).
 fn canonical_project(project_path: &str) -> String {
-    std::fs::canonicalize(project_path)
-        .map(|p| p.to_string_lossy().to_string())
-        .unwrap_or_else(|_| project_path.to_string())
+    core_lib::pathguard::canonical_key(project_path) // P4 — alias 접기 계약 단일 출처
 }
 
 /// Generate a dependency graph for `project_path` and persist JSON + HTML under
@@ -217,14 +215,15 @@ pub fn graph_open_path(app: AppHandle, path: String) -> Result<(), AppError> {
 /// Pure (no `AppHandle`, no spawn) so the containment gate is unit-testable
 /// independently of the actual `xdg-open`.
 fn contained_target(root: &Path, path: &str) -> Result<PathBuf, AppError> {
-    let root_c = std::fs::canonicalize(root)
-        .map_err(|_| AppError::new("아카이브 폴더를 확인할 수 없습니다"))?;
-    let target = std::fs::canonicalize(path)
-        .map_err(|_| AppError::new("경로를 확인할 수 없습니다"))?;
-    if !target.starts_with(&root_c) {
-        return Err(AppError::new("아카이브 밖 경로는 열 수 없습니다"));
-    }
-    Ok(target)
+    // 봉쇄 알고리즘은 core::pathguard 단일 출처(P4) — 문구만 도메인 소유.
+    use core_lib::pathguard::ContainErr;
+    core_lib::pathguard::contained_existing(root, path).map_err(|e| {
+        AppError::new(match e {
+            ContainErr::Root => "아카이브 폴더를 확인할 수 없습니다",
+            ContainErr::Path => "경로를 확인할 수 없습니다",
+            ContainErr::Outside => "아카이브 밖 경로는 열 수 없습니다",
+        })
+    })
 }
 
 #[cfg(test)]

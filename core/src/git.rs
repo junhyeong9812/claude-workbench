@@ -14,11 +14,26 @@ mod rewrite;
 mod status;
 mod worktree;
 
-pub use branch::*;
-pub use history::*;
-pub use rewrite::*;
-pub use status::*;
-pub use worktree::*;
+// P4 B5(리뷰 지적: commands.rs만 처리하고 여기 5벌 잔존): 명시 재수출 —
+// 형제 모듈이 한 네임스페이스로 합류하는 구조라 충돌 shadow를 컴파일 에러로.
+pub use branch::{
+    branches, checkout, commit, create_branch, delete_branch, discard, fetch, merge, merge_abort,
+    merge_continue, pull, push, rename_branch, resolve_ours, resolve_theirs, stage, stage_all,
+    unstage, Branches,
+};
+pub use history::{
+    commit_file_content, commit_file_diff, commit_files, commit_message, diff, head_message, log,
+    show, Commit, CommitFile,
+};
+pub use rewrite::{
+    backup_ref, reset_to, revert, revert_abort, revert_continue, reword, reword_past, uncommit,
+    ResetResult, RewordResult,
+};
+pub use status::{status, FileChange, GitStatus};
+pub use worktree::{
+    create_tag, delete_tag, git_roots, stash_list, stash_pop, stash_save, tags, worktree_add,
+    worktree_remove, worktree_root, worktrees, GitRoot, Worktree,
+};
 
 /// Run `git <args>` in `cwd`. `Ok(stdout)` on success (trailing newline trimmed),
 /// `Err(stderr)` on a non-zero exit or spawn failure.

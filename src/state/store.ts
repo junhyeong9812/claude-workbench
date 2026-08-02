@@ -5,6 +5,7 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 import type { ITheme } from "@xterm/xterm";
 import type { DirEntry, Project, ProjectType, SshConnection, WorkspaceState } from "../types";
 import { pruneTreeCache, sameEntries, underRoot } from "./treeSelectors";
+import { basename } from "../utils/path";
 
 /** Clamp a font size to the allowed range (also normalizes NaN). */
 export const clampFontSize = (n: number): number => Math.max(9, Math.min(28, Math.round(n) || 13));
@@ -520,10 +521,7 @@ interface AppState {
   persist: () => void;
 }
 
-function basename(path: string): string {
-  const parts = path.split(/[\\/]/).filter(Boolean);
-  return parts.length > 0 ? parts[parts.length - 1] : path;
-}
+// basename은 utils/path 단일 출처 (P4 — 동일 구현 3벌 통합).
 
 /** Broadcast the active project to other windows (origin-tagged so the sender
  * skips its own echo). Every path that changes `activeProject` calls this so all

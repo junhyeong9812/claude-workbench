@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { buildPathTree, type PathNode } from "../utils/pathTree";
 import { errText } from "../utils/error";
 import { invoke } from "@tauri-apps/api/core";
 import { useAppStore } from "../state/store";
@@ -83,30 +84,10 @@ function parseRefs(refs: string): Ref[] {
     });
 }
 
-/** A node in the folder-tree view of changed files. */
-interface TreeNode {
-  name: string;
-  path: string;
-  change?: FileChange;
-  children: Map<string, TreeNode>;
-}
-function buildTree(changes: FileChange[]): TreeNode {
-  const root: TreeNode = { name: "", path: "", children: new Map() };
-  for (const ch of changes) {
-    const parts = ch.path.split("/").filter(Boolean);
-    let node = root;
-    parts.forEach((part, i) => {
-      let child = node.children.get(part);
-      if (!child) {
-        child = { name: part, path: parts.slice(0, i + 1).join("/"), children: new Map() };
-        node.children.set(part, child);
-      }
-      if (i === parts.length - 1) child.change = ch;
-      node = child;
-    });
-  }
-  return root;
-}
+/** A node in the folder-tree view of changed files (leaf = the FileChange).
+ * trie 조립은 utils/pathTree 단일 출처 (P4 — rootTree와 동일 알고리즘). */
+type TreeNode = PathNode<FileChange>;
+const buildTree = (changes: FileChange[]): TreeNode => buildPathTree(changes, (c) => c.path);
 
 /**
  * Git panel (G1) — built into the left sidebar (Git tab). Top half: branch +
@@ -285,47 +266,34 @@ export function GitPanel() {
     selectedRoot === null ? (status?.branch ?? enclosingRoot?.branch ?? "") : (enclosingRoot?.branch ?? "");
 
   // Build a folder tree from the nested roots' relative paths: intermediate path
-  // segments become structural folder nodes, the final segment a selectable repo.
-  type RootNode = { name: string; rel: string; full: string; branch: string; isRoot: boolean; children: Map<string, RootNode> };
-  const rootTree: RootNode = { name: "", rel: "", full: "", branch: "", isRoot: false, children: new Map() };
-  for (const r of nestedRoots) {
-    const segs = r.path.slice((activeProject ?? "").length + 1).split("/").filter(Boolean);
-    let node = rootTree;
-    segs.forEach((seg, i) => {
-      let child = node.children.get(seg);
-      if (!child) {
-        child = { name: seg, rel: node.rel ? `${node.rel}/${seg}` : seg, full: "", branch: "", isRoot: false, children: new Map() };
-        node.children.set(seg, child);
-      }
-      if (i === segs.length - 1) {
-        child.isRoot = true;
-        child.full = r.path;
-        child.branch = r.branch;
-      }
-      node = child;
-    });
-  }
+  // segments become structural folder nodes, the final segment a selectable repo
+  // (leaf = GitRoot). trie 조립은 utils/pathTree 단일 출처 (P4).
+  type RootNode = PathNode<GitRoot>;
+  const rootTree: RootNode = buildPathTree(nestedRoots, (r) =>
+    r.path.slice((activeProject ?? "").length + 1),
+  );
   const renderRootNodes = (node: RootNode, depth: number): ReactNode[] => {
     const out: ReactNode[] = [];
     const entries = [...node.children.values()].sort((a, b) => {
-      const af = !a.isRoot; // folders first
-      const bf = !b.isRoot;
+      const af = a.leaf === undefined; // folders first (leaf = repo)
+      const bf = b.leaf === undefined;
       if (af !== bf) return af ? -1 : 1;
       return a.name.localeCompare(b.name);
     });
     for (const child of entries) {
-      if (child.isRoot) {
-        const sel = selectedRoot === child.full;
+      if (child.leaf !== undefined) {
+        const full = child.leaf.path;
+        const sel = selectedRoot === full;
         // The selected root is the one `status` reflects, so show its live branch
         // (updates on checkout); other rows show the scanned branch.
-        const branch = sel ? (status?.branch ?? child.branch) : child.branch;
+        const branch = sel ? (status?.branch ?? child.leaf.branch) : child.leaf.branch;
         out.push(
           <div
-            key={`r:${child.full}`}
+            key={`r:${full}`}
             className={`git-root-row${sel ? " git-root-sel" : ""}`}
             style={{ paddingLeft: 6 + depth * 12 }}
-            title={child.full}
-            onClick={() => setSelectedRoot(child.full)}
+            title={full}
+            onClick={() => setSelectedRoot(full)}
           >
             <span className="git-root-dot">{sel ? "●" : "○"}</span>
             <span className="git-root-name">{child.name}</span>
@@ -335,7 +303,7 @@ export function GitPanel() {
         if (child.children.size > 0) out.push(...renderRootNodes(child, depth + 1));
       } else {
         out.push(
-          <div key={`d:${child.rel}`} className="git-root-dir" style={{ paddingLeft: 6 + depth * 12 }}>
+          <div key={`d:${child.path}`} className="git-root-dir" style={{ paddingLeft: 6 + depth * 12 }}>
             {child.name}/
           </div>,
         );
@@ -435,8 +403,8 @@ export function GitPanel() {
       return a.name.localeCompare(b.name);
     });
     for (const child of entries) {
-      if (child.change && child.children.size === 0) {
-        out.push(fileRow(child.change, child.name, depth, kind));
+      if (child.leaf !== undefined && child.children.size === 0) {
+        out.push(fileRow(child.leaf!, child.name, depth, kind));
       } else {
         out.push(
           <div key={`d:${child.path}`} className="git-dir" style={{ paddingLeft: 8 + depth * 12 }}>

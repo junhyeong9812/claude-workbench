@@ -22,7 +22,7 @@ interface SessionCwd {
   root: string;
 }
 
-const baseName = (p: string) => p.split("/").filter(Boolean).pop() ?? p;
+import { basename as baseName } from "../utils/path";
 
 
 /**

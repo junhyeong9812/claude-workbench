@@ -401,13 +401,8 @@ fn html_escape(s: &str) -> String {
 /// string escape), so no transcript content can close the `<script>` element or
 /// open a tag; the inline renderer only ever assigns `textContent`.
 pub fn render_book_html(session: &NormalizedSession) -> String {
-    let json = serde_json::to_string(session)
-        .unwrap_or_else(|_| "null".to_string())
-        .replace('<', "\\u003c")
-        // U+2028/U+2029 are legal in JSON but line terminators in older JS
-        // engines — escape them so the literal can never break.
-        .replace('\u{2028}', "\\u2028")
-        .replace('\u{2029}', "\\u2029");
+    // 이스케이프 규칙은 core::embed 단일 출처 (P4 — graph와 공용).
+    let json = crate::embed::embed_json(session);
     BOOK_TEMPLATE
         .replace("__TITLE__", &html_escape(&session.title))
         .replace("__DATA__", &json)

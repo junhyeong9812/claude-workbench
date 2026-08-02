@@ -54,7 +54,7 @@ impl Drop for InFlightGuard {
 /// The archive-extraction model/effort: workspace settings when set, else the
 /// app default **opus + xhigh** (사용자 결정 — 추출 품질 우선).
 fn extraction_opts(app: &AppHandle) -> ClaudeOpts {
-    let ws = super::load_state(app.clone());
+    let ws = super::files::load_state(app.clone());
     ClaudeOpts {
         model: Some(ws.archive_model.filter(|m| !m.trim().is_empty()).unwrap_or_else(|| "opus".into())),
         effort: Some(ws.archive_effort.filter(|e| !e.trim().is_empty()).unwrap_or_else(|| "xhigh".into())),
@@ -84,7 +84,7 @@ pub struct ArchiveResult {
 /// non-blank, else `<app_data_dir>/archive`. `pub(super)` so sibling command
 /// modules (e.g. the graph viewer) resolve the identical root — single source.
 pub(super) fn archive_root(app: &AppHandle) -> Result<PathBuf, AppError> {
-    let configured = super::load_state(app.clone()).archive_root;
+    let configured = super::files::load_state(app.clone()).archive_root;
     if let Some(root) = configured {
         let trimmed = root.trim();
         if !trimmed.is_empty() {
@@ -109,9 +109,7 @@ pub async fn archive_session(
 ) -> Result<ArchiveResult, AppError> {
     // Canonical project identity, so `.`/trailing-slash/symlink aliases of the
     // same project can't slip past the guard (post-fix P4).
-    let key = std::fs::canonicalize(&cwd)
-        .map(|p| p.to_string_lossy().to_string())
-        .unwrap_or_else(|_| cwd.clone());
+    let key = core_lib::pathguard::canonical_key(&cwd);
     {
         let mut set = in_flight()
             .lock()
@@ -137,9 +135,7 @@ pub async fn archive_session(
 /// Infallible: any doubt reads as "not in flight" (배지는 정보성).
 #[tauri::command]
 pub fn archive_in_flight(project: String) -> bool {
-    let key = std::fs::canonicalize(&project)
-        .map(|p| p.to_string_lossy().to_string())
-        .unwrap_or(project);
+    let key = core_lib::pathguard::canonical_key(&project);
     in_flight().lock().map(|s| s.contains(&key)).unwrap_or(false)
 }
 
@@ -525,13 +521,16 @@ pub async fn archive_status(app: AppHandle, project: String) -> Vec<ArchiveStatu
 #[tauri::command]
 pub fn archive_open_path(app: AppHandle, path: String) -> Result<(), AppError> {
     let root = archive_root(&app)?;
-    let root_c = std::fs::canonicalize(&root)
-        .map_err(|_| AppError::new("아카이브 폴더를 확인할 수 없습니다"))?;
-    let target = std::fs::canonicalize(&path)
-        .map_err(|_| AppError::new("경로를 확인할 수 없습니다"))?;
-    if !target.starts_with(&root_c) {
-        return Err(AppError::new("아카이브 밖 경로는 열 수 없습니다"));
-    }
+    // 봉쇄 알고리즘은 core::pathguard 단일 출처(P4 — graph contained_target와
+    // 문자단위 동일하던 인라인 제거, 문구는 도메인 소유 유지).
+    use core_lib::pathguard::ContainErr;
+    let target = core_lib::pathguard::contained_existing(&root, &path).map_err(|e| {
+        AppError::new(match e {
+            ContainErr::Root => "아카이브 폴더를 확인할 수 없습니다",
+            ContainErr::Path => "경로를 확인할 수 없습니다",
+            ContainErr::Outside => "아카이브 밖 경로는 열 수 없습니다",
+        })
+    })?;
     std::process::Command::new("xdg-open")
         .arg(&target)
         .spawn()

@@ -276,9 +276,7 @@ generated_at 은 빈 문자열로 두라(호출자가 채운다)."
 pub fn generate_project_graph(project_path: &str, opts: &ClaudeOpts) -> Result<Graph, String> {
     // Canonicalize so git's canonicalized `--show-toplevel` output and our prefix
     // filter agree; fall back to the raw path if it can't be resolved.
-    let canon = fs::canonicalize(project_path)
-        .map(|p| p.to_string_lossy().to_string())
-        .unwrap_or_else(|_| project_path.to_string());
+    let canon = crate::pathguard::canonical_key(project_path);
     let mut roots = subproject_roots(&canon, git_roots(&canon));
 
     // ≤1 root → nothing to cluster: reuse the single-project path verbatim.
@@ -515,14 +513,8 @@ pub fn save_graph_all(
 /// renderer assigns node/edge text via `textContent` only (never innerHTML), so
 /// model-supplied strings are inert (XSS-safe).
 pub fn render_graph_html(graph: &Graph) -> String {
-    let json = serde_json::to_string(graph)
-        .unwrap_or_else(|_| "null".to_string())
-        .replace('<', "\\u003c")
-        // U+2028/U+2029 are legal in JSON but line terminators in older JS
-        // engines — escape them so the literal can never break.
-        .replace('\u{2028}', "\\u2028")
-        .replace('\u{2029}', "\\u2029");
-    GRAPH_TEMPLATE.replace("__DATA__", &json)
+    // 이스케이프 규칙은 core::embed 단일 출처 (P4 — archive와 공용).
+    GRAPH_TEMPLATE.replace("__DATA__", &crate::embed::embed_json(graph))
 }
 
 /// UTC ISO-8601 (`YYYY-MM-DDThh:mm:ssZ`) for "now". Dependency-free — `core`

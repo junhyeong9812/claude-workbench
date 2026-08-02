@@ -124,23 +124,15 @@ fn reject_unsafe_path(path: &str) -> Result<(), AppError> {
 /// deepest existing ancestor, so a new nested file still gets validated against
 /// its real on-disk location.
 fn ensure_within(path: &str, root: &str) -> Result<(), AppError> {
-    let root_c = std::fs::canonicalize(root)
-        .map_err(|_| AppError::new("프로젝트 경로를 확인할 수 없습니다"))?;
-    let mut probe = std::path::PathBuf::from(path);
-    let resolved = loop {
-        match std::fs::canonicalize(&probe) {
-            Ok(c) => break c,
-            Err(_) => match probe.parent() {
-                Some(parent) if parent != probe => probe = parent.to_path_buf(),
-                _ => return Err(AppError::new("경로를 확인할 수 없습니다")),
-            },
-        }
-    };
-    if resolved.starts_with(&root_c) {
-        Ok(())
-    } else {
-        Err(AppError::new("프로젝트 밖 경로는 허용되지 않습니다"))
-    }
+    // 봉쇄 알고리즘은 core::pathguard 단일 출처(P4) — 문구만 도메인 소유.
+    use core_lib::pathguard::ContainErr;
+    core_lib::pathguard::contained_prospective(std::path::Path::new(root), path).map_err(|e| {
+        AppError::new(match e {
+            ContainErr::Root => "프로젝트 경로를 확인할 수 없습니다",
+            ContainErr::Path => "경로를 확인할 수 없습니다",
+            ContainErr::Outside => "프로젝트 밖 경로는 허용되지 않습니다",
+        })
+    })
 }
 
 #[tauri::command]
@@ -286,7 +278,9 @@ fn copy_tree(from: &std::path::Path, to: &std::path::Path, depth: usize) -> std:
 }
 
 /// 존재하지 않을 수 있는 경로의 **실효 경로**: 존재하는 최심 조상을
-/// canonicalize하고 나머지 구성요소를 붙인다(`ensure_within`과 같은 해석).
+/// canonicalize하고 나머지 구성요소를 붙인다(조상 해소 규칙은 core::pathguard
+/// contained_prospective와 동형 — tail 재부착·Option 반환만 다르다. 통합은
+/// P5 후보(resolve_deepest_existing), 리뷰 ledger 기록).
 /// root 안 심링크 별칭이 같은 위치를 다른 문자열로 가리키는 것을 정규화해,
 /// lexical starts_with만으로는 뚫리는 자기 하위 판정을 막는다 (리뷰 D4).
 fn effective_path(path: &str) -> Option<std::path::PathBuf> {

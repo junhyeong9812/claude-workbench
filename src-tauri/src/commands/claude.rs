@@ -334,18 +334,17 @@ fn spawn_claude(
     };
     let stop = Arc::new(AtomicBool::new(false));
 
-    // (a) Relay PTY output -> webview (global emit; every attached window filters
-    // by id). When the PTY dies the sender drops, the loop ends, and `stop` is
-    // set so the poll thread stops tailing.
+    // (a) Relay PTY output -> webview (공용 헬퍼, P4). When the PTY dies the
+    // sender drops, the loop ends, and `on_end`가 `stop`을 세워 poll 스레드를
+    // 멈춘다.
     {
-        let app = app.clone();
         let stop = stop.clone();
-        thread::spawn(move || {
-            while let Ok(chunk) = rx.recv() {
-                super::emit_terminal_output(&app, id, chunk.seq, &chunk.bytes);
-            }
-            stop.store(true, Ordering::Relaxed);
-        });
+        super::spawn_output_relay(
+            app.clone(),
+            id,
+            rx,
+            Some(Box::new(move || stop.store(true, Ordering::Relaxed))),
+        );
     }
     // (b) Tail the JSONL -> claude-timeline + persist snapshot.
     {
@@ -424,7 +423,7 @@ pub fn claude_open_or_attach(
 
     // 이 프로젝트에 아카이브 지식이 있으면 .mcp.json 등록을 보장 — 새로 뜨는
     // claude가 지식 서버(search_knowledge)를 바로 쓸 수 있게 (best-effort).
-    super::ensure_mcp_registration(&app, &cwd);
+    super::archive::ensure_mcp_registration(&app, &cwd);
 
     // Driver: start a fresh PTY (lock held so a concurrent open can't double-start).
     let (id, session_uuid, stop) = spawn_claude(

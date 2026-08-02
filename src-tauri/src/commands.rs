@@ -15,22 +15,19 @@ use core_lib::SessionManager;
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager};
 
-mod archive;
-mod claude;
-mod files;
-mod git;
-mod graph;
+pub mod archive;
+pub mod claude;
+pub mod files;
+pub mod git;
+pub mod graph;
 mod hookserver;
-mod ssh;
-mod terminal;
+pub mod ssh;
+pub mod terminal;
 
-pub use archive::*;
-pub use claude::*;
-pub use files::*;
-pub use git::*;
-pub use graph::*;
-pub use ssh::*;
-pub use terminal::*;
+// P4 U3: 글롭 재수출 제거 — 커맨드는 lib.rs generate_handler가 모듈 경로
+// (`commands::files::read_dir` 등)로 직접 참조한다(tauri 매크로의 숨은
+// `__cmd__*` 항목까지 함께 해소되는 관용형). 평평한 재수출 표면 109개를
+// 없애 소유를 모듈 경로로 드러내고 이름 충돌의 조용한 shadow를 차단.
 
 /// A single, consistent error type shared by all commands.
 #[derive(Debug, Serialize)]
@@ -67,6 +64,25 @@ struct TerminalOutput {
     session_id: u64,
     seq: u64,
     data: String,
+}
+
+/// P4: PTY 출력 relay 스레드 공용화 — 세 생성 경로(터미널·SSH·Claude)가
+/// 문자단위 동일하던 spawn 블록의 단일 출처. `on_end`는 수신 채널이 닫힌 뒤
+/// (세션 종료) 1회 호출 — Claude가 타임라인 poll 정지 플래그를 세우는 데 쓴다.
+fn spawn_output_relay(
+    app: AppHandle,
+    session_id: u64,
+    rx: std::sync::mpsc::Receiver<core_lib::OutputChunk>,
+    on_end: Option<Box<dyn FnOnce() + Send>>,
+) {
+    thread::spawn(move || {
+        while let Ok(chunk) = rx.recv() {
+            emit_terminal_output(&app, session_id, chunk.seq, &chunk.bytes);
+        }
+        if let Some(f) = on_end {
+            f();
+        }
+    });
 }
 
 /// Emit one PTY chunk to its session-scoped event. 모든 PTY relay(터미널·SSH·

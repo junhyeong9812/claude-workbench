@@ -41,7 +41,7 @@ interface ArchiveGroup {
   sessions: ArchiveEntry[];
 }
 
-const baseName = (p: string) => p.split("/").filter(Boolean).pop() ?? p;
+import { basename as baseName } from "../utils/path";
 
 export function ArchivePanel() {
   const [groups, setGroups] = useState<ArchiveGroup[]>([]);

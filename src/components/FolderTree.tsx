@@ -194,11 +194,9 @@ export function FolderTree() {
   const dropZoneOpeningRef = useRef(false);
 
   // Parent dir of an absolute path; "/" for a root-level entry (so reloadDir
-  // never gets "" → the process cwd).
-  const dirname = (p: string): string => {
-    const i = p.lastIndexOf("/");
-    return i <= 0 ? "/" : p.slice(0, i);
-  };
+  // never gets "" → the process cwd). treeDnd.parentDir와 문자단위 동일이라
+  // 그쪽(테스트 보유)을 단일 출처로 (P4).
+  const dirname = parentDir;
 
   // Clean a typed relative path: drop empty/`.`/`..` segments. "" if invalid, so
   // `.` / `/` / `...` don't slip through as a no-op create.
