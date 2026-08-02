@@ -42,7 +42,77 @@ import { initClaudeStatusGlobal } from "./state/claudeStatusGlobal";
 import { initNotify } from "./state/notify";
 import { resolveLayerMode, devLayerMounted, shouldFlipToIntegrated } from "./state/layerRouting";
 import { resolveVisibleDual } from "./state/dualSurface";
+import {
+  applyActivityPick,
+  applyTabPick,
+  loadSidebarView,
+  saveSidebarView,
+  toggleSplit,
+  type SidebarHalf,
+  type SidebarTab,
+  type SidebarView,
+} from "./state/sidebarView";
 import "./App.css";
+
+/** 사이드바 탭 5종의 표시 메타 — 액티비티 바와 반쪽 헤더 seg가 공유한다. */
+const SIDE_TABS = [
+  { key: "files", ico: "🗂", label: "파일" },
+  { key: "git", ico: "⎇", label: "Git" },
+  { key: "worktree", ico: "🌿", label: "워크트리" },
+  { key: "archive", ico: "📦", label: "아카이브" },
+  { key: "graph", ico: "◉", label: "그래프" },
+] as const satisfies readonly { key: SidebarTab; ico: string; label: string }[];
+
+/** 사이드바 탭 하나의 본문 — 분할 ON/OFF가 같은 렌더를 공유한다. */
+function SidebarTabBody({ tab }: { tab: SidebarTab }) {
+  if (tab === "files") return <FolderTree />;
+  if (tab === "git") return <GitPanel />;
+  if (tab === "worktree") return <WorktreePanel />;
+  if (tab === "archive") return <ArchivePanel />;
+  return <GraphPanel />;
+}
+
+/**
+ * 분할 ON일 때의 반쪽 하나: 미니 아이콘 seg 헤더(탭 선택 — 상대 반쪽과 겹치면
+ * 스왑) + 본문. files 반쪽에는 기존 ↻(새로고침)를 seg 우측에 병치한다.
+ * 반쪽 개별 접기는 없다(접기는 전체 단위 — 설계 §A-4).
+ */
+function SidebarHalfPane({ tab, onPick }: { tab: SidebarTab; onPick: (t: SidebarTab) => void }) {
+  return (
+    <>
+      <div className="sidebar-half-head">
+        {/* aria-pressed 토글 버튼 묶음(.seg idiom) — tablist가 아니다(액티비티
+            바와 같은 이유: tabpanel/roving tabindex 계약을 만족하지 않는다). */}
+        <div className="seg sidebar-seg" role="group" aria-label="이 칸에 표시할 탭">
+          {SIDE_TABS.map((t) => (
+            <button
+              key={t.key}
+              className={`seg-item sidebar-seg-item${tab === t.key ? " seg-on" : ""}`}
+              aria-pressed={tab === t.key}
+              aria-label={t.label}
+              title={t.label}
+              onClick={() => onPick(t.key)}
+            >
+              <span aria-hidden="true">{t.ico}</span>
+            </button>
+          ))}
+        </div>
+        {tab === "files" && (
+          <button
+            className="tree-refresh"
+            title="디스크에서 새로고침"
+            onClick={() => void useAppStore.getState().reloadActiveTree()}
+          >
+            ↻
+          </button>
+        )}
+      </div>
+      <div className="sidebar-half-body">
+        <SidebarTabBody tab={tab} />
+      </div>
+    </>
+  );
+}
 
 /**
  * Toolbar attention roll-up (agent-status-badges P3): a compact `●n` for the
@@ -251,9 +321,14 @@ function AppMain() {
       window.removeEventListener("drop", onDrop);
     };
   }, []);
-  const [sideTab, setSideTab] = useState<"files" | "git" | "worktree" | "archive" | "graph">(
-    "files",
-  );
+  // 사이드바 뷰(분할 여부 + 탭 3종) — 규칙·검증 파서는 state/sidebarView.ts,
+  // 비율은 PanelGroup autoSaveId="sidebar-vert"가 담당한다.
+  const [sidebarView, setSidebarView] = useState<SidebarView>(loadSidebarView);
+  useEffect(() => saveSidebarView(sidebarView), [sidebarView]);
+  // 액티비티 바가 가리키는 탭: 분할 OFF면 단일 탭, ON이면 위쪽 반쪽.
+  const activeSideTab = sidebarView.split ? sidebarView.topTab : sidebarView.tab;
+  const pickHalfTab = (half: SidebarHalf, tab: SidebarTab) =>
+    setSidebarView((v) => applyTabPick(v, half, tab));
   const [termSettingsOpen, setTermSettingsOpen] = useState(false);
   const theme = useAppStore((s) => s.theme);
   const setTheme = useAppStore((s) => s.setTheme);
@@ -446,12 +521,14 @@ function AppMain() {
 
   // Activity-bar tab click (IntelliJ-style left stripe): clicking the active
   // tab folds the sidebar; clicking any tab while folded unfolds onto it.
-  const activityClick = (tab: typeof sideTab) => {
-    if (sideTab === tab && !collapsed) {
+  // 분할 ON일 때는 **위쪽 반쪽**을 제어한다(설계 §A-3) — 상대 반쪽과 겹치는
+  // 선택은 applyActivityPick이 스왑으로 흡수하므로 같은 탭 2개가 될 수 없다.
+  const activityClick = (tab: SidebarTab) => {
+    if (activeSideTab === tab && !collapsed) {
       treePanelRef.current?.collapse();
       return;
     }
-    setSideTab(tab);
+    setSidebarView((v) => applyActivityPick(v, tab));
     if (collapsed) treePanelRef.current?.expand();
   };
 
@@ -706,21 +783,17 @@ function AppMain() {
           {/* role=toolbar + aria-pressed (탭 패턴 아님 — 리뷰 A6: tablist는
               tabpanel/roving tabindex 계약을 요구하고 spacer·셰브론이 섞여
               규격 위반이 된다. 접힌 상태에선 눌린 탭 0개가 정상 표현). */}
-          {(
-            [
-              { key: "files", ico: "🗂", label: "파일" },
-              { key: "git", ico: "⎇", label: "Git" },
-              { key: "worktree", ico: "🌿", label: "워크트리" },
-              { key: "archive", ico: "📦", label: "아카이브" },
-              { key: "graph", ico: "◉", label: "그래프" },
-            ] as const
-          ).map((t) => (
+          {SIDE_TABS.map((t) => (
             <button
               key={t.key}
-              aria-pressed={sideTab === t.key && !collapsed}
-              className={`activity-item${sideTab === t.key && !collapsed ? " activity-on" : ""}`}
+              aria-pressed={activeSideTab === t.key && !collapsed}
+              className={`activity-item${activeSideTab === t.key && !collapsed ? " activity-on" : ""}`}
               title={
-                sideTab === t.key && !collapsed ? `${t.label} — 클릭해 사이드바 접기` : t.label
+                activeSideTab === t.key && !collapsed
+                  ? `${t.label} — 클릭해 사이드바 접기`
+                  : sidebarView.split
+                    ? `${t.label} — 위쪽 칸에 표시`
+                    : t.label
               }
               onClick={() => activityClick(t.key)}
             >
@@ -729,6 +802,15 @@ function AppMain() {
             </button>
           ))}
           <div className="activity-spacer" />
+          <button
+            className={`activity-item activity-split${sidebarView.split ? " activity-on" : ""}`}
+            aria-pressed={sidebarView.split}
+            title={sidebarView.split ? "상하 분할 해제" : "사이드바 상하 분할"}
+            aria-label={sidebarView.split ? "상하 분할 해제" : "사이드바 상하 분할"}
+            onClick={() => setSidebarView(toggleSplit)}
+          >
+            <span className="activity-ico">⊟</span>
+          </button>
           <button
             className="activity-item activity-chevron"
             title={collapsed ? "사이드바 펼치기" : "사이드바 접기"}
@@ -752,10 +834,28 @@ function AppMain() {
           className="pane-left"
         >
           <div className="sidebar-content">
-            {sideTab === "files" ? (
+            {sidebarView.split ? (
+              /* 상하 2분할 — 비율은 autoSaveId가 영속(StudyView study-vert 동형).
+                 두 반쪽이 같은 탭이 되는 상태는 sidebarView 규칙이 막는다. */
+              <PanelGroup direction="vertical" autoSaveId="sidebar-vert" className="sidebar-split">
+                <Panel id="sidebar-top" order={1} minSize={15} className="sidebar-half">
+                  <SidebarHalfPane
+                    tab={sidebarView.topTab}
+                    onPick={(t) => pickHalfTab("top", t)}
+                  />
+                </Panel>
+                <PanelResizeHandle className="resize-handle resize-handle-v" />
+                <Panel id="sidebar-bottom" order={2} minSize={15} className="sidebar-half">
+                  <SidebarHalfPane
+                    tab={sidebarView.bottomTab}
+                    onPick={(t) => pickHalfTab("bottom", t)}
+                  />
+                </Panel>
+              </PanelGroup>
+            ) : sidebarView.tab === "files" ? (
               <>
                 <div className="tree-hint">
-                  <span>Ctrl+B 포커스 · ↑↓ 이동 · Enter 열기 · Ctrl+E 에디터</span>
+                  <span>Ctrl+B 사이드바 · ↑↓ 이동 · Enter 열기 · Ctrl+E 에디터</span>
                   <button
                     className="tree-refresh"
                     title="디스크에서 새로고침"
@@ -766,14 +866,8 @@ function AppMain() {
                 </div>
                 <FolderTree />
               </>
-            ) : sideTab === "git" ? (
-              <GitPanel />
-            ) : sideTab === "worktree" ? (
-              <WorktreePanel />
-            ) : sideTab === "archive" ? (
-              <ArchivePanel />
             ) : (
-              <GraphPanel />
+              <SidebarTabBody tab={sidebarView.tab} />
             )}
           </div>
         </Panel>

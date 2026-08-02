@@ -552,6 +552,14 @@ body {
   font-size: 12px;
   opacity: 0.8;
 }
+/* 상하 분할 토글 — 셰브론 바로 위, 같은 미니 치수. */
+.activity-split {
+  padding: 6px 0;
+}
+.activity-split .activity-ico {
+  font-size: 13px;
+  opacity: 0.85;
+}
 
 .pane-left {
   background: var(--bg-alt);
@@ -575,6 +583,47 @@ body {
   color: var(--fg-dim);
   opacity: 0.8;
   border-bottom: 1px solid var(--border, #333);
+}
+
+/* ---- 사이드바 상하 2분할 (sidebar-split) ----
+   .sidebar-content > PanelGroup(vertical) > 반쪽 2개. 각 반쪽은 얇은 헤더(미니
+   아이콘 seg + files의 ↻)와 본문으로 나뉘고, 본문이 기존 탭 컴포넌트를 그대로
+   담는다 — 높이 체인(flex:1 + min-height:0 + overflow)이 끊기면 안쪽 패널들이
+   부모를 밀어낸다. */
+.sidebar-split {
+  flex: 1 1 0;
+  min-height: 0;
+}
+.sidebar-half {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  overflow: hidden;
+}
+.sidebar-half-head {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 3px 4px;
+  overflow: hidden;
+  border-bottom: 1px solid var(--border);
+}
+.sidebar-seg {
+  min-width: 0;
+  overflow: hidden;
+}
+.sidebar-seg-item {
+  height: 20px;
+  padding: 0 6px;
+  font-size: 12px;
+}
+.sidebar-half-body {
+  flex: 1 1 0;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
 }
 
 /* ---- Archive browser (sidebar tab) ---- */
@@ -3269,6 +3318,9 @@ body {
   flex-direction: column;
 }
 .resize-handle-v {
+  /* 세로 그룹의 핸들은 가로로 꽉 차야 한다 — .resize-handle의 width:4px를
+     그대로 두면 column 컨테이너에서 stretch가 죽어 4×4 조각만 남는다. */
+  width: auto;
   height: 4px;
   cursor: row-resize;
 }
