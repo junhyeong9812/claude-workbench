@@ -1559,6 +1559,266 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
     }
 
+    /// A session normalized from exactly `jsonl` — used where the reference
+    /// archive must be byte-comparable with the pipeline's own output.
+    fn session_from(jsonl: &str, title: &str) -> NormalizedSession {
+        normalize("/p", UUID, title, "2026-07-19", jsonl)
+    }
+
+    /// A stub extractor that counts calls — production passes
+    /// [`claude_extractor`] (a real `claude -p`), tests pass this.
+    struct FakeExtractor {
+        raw: String,
+        calls: std::cell::Cell<usize>,
+    }
+
+    impl FakeExtractor {
+        fn new(title: &str) -> Self {
+            FakeExtractor {
+                raw: format!("===SUMMARY===\nTITLE: {title}\n요약 본문\n"),
+                calls: std::cell::Cell::new(0),
+            }
+        }
+        fn f(&self) -> impl Fn(&str) -> Result<String, String> + '_ {
+            move |_prompt: &str| {
+                self.calls.set(self.calls.get() + 1);
+                Ok(self.raw.clone())
+            }
+        }
+    }
+
+    fn cli_request<'a>(root: &'a Path, jsonl: &'a [u8]) -> ArchiveRequest<'a> {
+        ArchiveRequest {
+            archive_root: root,
+            project: "/p",
+            uuid: UUID,
+            fallback_title: "Claude",
+            date: "2026-07-19",
+            jsonl_bytes: jsonl,
+            mcp_bin: None,
+            attempts: 2, // 백필 소유 파라미터
+        }
+    }
+
+    // 실결함 해소의 조작적 정의: **CLI 백필 경로로 아카이브한 세션**을 GUI가
+    // 재아카이브하면 unchanged로 스킵한다 — 추출(1~3분)이 다시 돌지 않는다.
+    #[test]
+    fn cli_archived_session_is_skipped_by_gui_rearchive() {
+        let root = temp_root("unify");
+        let jsonl = sample_jsonl("작업");
+
+        // ① CLI 백필이 아카이브 (attempts=2).
+        let cli = FakeExtractor::new("추출된 제목");
+        let run = run_archive(&cli_request(&root, jsonl.as_bytes()), &cli.f()).unwrap();
+        assert_eq!(cli.calls.get(), 1);
+        assert!(run.summary_ok && run.errors.is_empty(), "{:?}", run.errors);
+        assert!(run.extraction_complete());
+        assert!(run.dir.join(EXTRACTION_OK).is_file(), "CLI도 마커를 남긴다");
+
+        // ② GUI 판정(=커맨드가 쓰는 그 식)이 스킵으로 떨어진다.
+        let entry = find_archived_session(&root, UUID).unwrap();
+        assert!(is_unchanged_complete(&entry, &jsonl_stat(jsonl.as_bytes())));
+
+        // ③ GUI 재아카이브(attempts=1)가 실제로 추출을 부르지 않는다.
+        let gui = FakeExtractor::new("다시 추출됨");
+        let mut req = cli_request(&root, jsonl.as_bytes());
+        req.attempts = 1;
+        let again = run_archive(&req, &gui.f()).unwrap();
+        assert!(again.unchanged, "변경 없음 → 스킵");
+        assert_eq!(gui.calls.get(), 0, "재추출이 돌지 않는다 — 실결함 해소");
+        assert_eq!(again.dir, run.dir, "기존 아카이브를 그대로 가리킨다");
+        assert!(again.extraction_complete());
+
+        // ④ 전사가 자라면 다시 추출한다(스킵이 과하지 않다).
+        let v2 = grown(&jsonl);
+        let gui2 = FakeExtractor::new("추출된 제목");
+        let run2 = run_archive(&cli_request(&root, v2.as_bytes()), &gui2.f()).unwrap();
+        assert!(!run2.unchanged);
+        assert_eq!(gui2.calls.get(), 1);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    // 마커가 없는 구 아카이브는 파이프라인 단일화 이후에도 한 번 재추출되고,
+    // 그 실행이 마커를 남겨 이후로는 스킵된다(자기치유).
+    #[test]
+    fn legacy_archive_is_reextracted_once_then_marked() {
+        let root = temp_root("heal");
+        let jsonl = sample_jsonl("작업");
+        // 구 CLI 백필 형상 재현: core 산출물 + summary.md, 마커 없음.
+        let out =
+            write_archive(&root, "/p", &session_from(&jsonl, "옛 제목"), jsonl.as_bytes()).unwrap();
+        fs::write(out.dir.join("summary.md"), "옛 요약").unwrap();
+
+        let ex = FakeExtractor::new("옛 제목");
+        let run = run_archive(&cli_request(&root, jsonl.as_bytes()), &ex.f()).unwrap();
+        assert!(!run.unchanged, "마커 없음 → 재추출");
+        assert_eq!(ex.calls.get(), 1);
+        assert!(run.dir.join(EXTRACTION_OK).is_file(), "이제 마커가 남는다");
+        // 두 번째부터는 스킵.
+        let ex2 = FakeExtractor::new("옛 제목");
+        assert!(run_archive(&cli_request(&root, jsonl.as_bytes()), &ex2.f()).unwrap().unchanged);
+        assert_eq!(ex2.calls.get(), 0);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    // 추출 실패는 부분 성공: core 산출물은 남고, 마커는 남지 않아 다음
+    // 재아카이브가 재시도한다. 재시도로 성공한 실행은 온전한 추출로 친다.
+    #[test]
+    fn failed_extraction_lands_core_artifacts_without_marker() {
+        let root = temp_root("partial");
+        let jsonl = sample_jsonl("작업");
+        let calls = std::cell::Cell::new(0);
+        let always_fail = |_: &str| -> Result<String, String> {
+            calls.set(calls.get() + 1);
+            Err("claude 없음".into())
+        };
+        let run = run_archive(&cli_request(&root, jsonl.as_bytes()), &always_fail).unwrap();
+        assert_eq!(calls.get(), 2, "attempts=2 → 1회 재시도");
+        assert!(!run.summary_ok);
+        assert!(!run.extraction_complete());
+        assert!(run.dir.join("book.html").is_file(), "core 산출물은 남는다");
+        assert!(!run.dir.join(EXTRACTION_OK).exists(), "마커 없음 → 재시도 대상");
+        assert!(!is_extraction_complete(&find_archived_session(&root, UUID).unwrap()));
+
+        // 재시도가 성공하는 실행: 1차 실패는 마커를 막지 않는다.
+        let n = std::cell::Cell::new(0);
+        let flaky = |_: &str| -> Result<String, String> {
+            n.set(n.get() + 1);
+            if n.get() == 1 {
+                Err("일시 실패".into())
+            } else {
+                Ok("===SUMMARY===\nTITLE: 두번째\n본문\n".into())
+            }
+        };
+        let run2 = run_archive(&cli_request(&root, jsonl.as_bytes()), &flaky).unwrap();
+        assert_eq!(n.get(), 2);
+        assert!(run2.errors.is_empty(), "1차 실패는 note: {:?}", run2.errors);
+        assert!(!run2.notes.is_empty());
+        assert!(run2.dir.join(EXTRACTION_OK).is_file());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    // 형상 불변(record-level): 파이프라인이 만든 산출물은 write_archive를 직접
+    // 부른 참조본과 **파일 목록·바이트**가 같다 (archived_at만 시각 의존).
+    #[test]
+    fn pipeline_output_shape_matches_direct_write_archive() {
+        let jsonl = sample_jsonl("작업");
+        let title = "추출된 제목";
+
+        let pipe_root = temp_root("shape-pipe");
+        let ex = FakeExtractor::new(title);
+        let run = run_archive(&cli_request(&pipe_root, jsonl.as_bytes()), &ex.f()).unwrap();
+
+        // 참조본: 최종 제목으로 write_archive만 호출한 결과.
+        let ref_root = temp_root("shape-ref");
+        let reference =
+            write_archive(&ref_root, "/p", &session_from(&jsonl, title), jsonl.as_bytes()).unwrap();
+
+        assert_eq!(
+            run.dir.file_name(),
+            reference.dir.file_name(),
+            "폴더 이름(date-slug-uuid8) 동일"
+        );
+        let names = |d: &Path| {
+            let mut v: Vec<String> = fs::read_dir(d)
+                .unwrap()
+                .flatten()
+                .map(|e| e.file_name().to_string_lossy().to_string())
+                .collect();
+            v.sort();
+            v
+        };
+        assert_eq!(
+            names(&run.dir),
+            vec![
+                ".extraction-ok".to_string(),
+                "book.html".into(),
+                "meta.json".into(),
+                "normalized.json".into(),
+                "session.jsonl".into(),
+                "summary.md".into(),
+            ],
+            "파이프라인 산출물 = core 4종 + summary + 마커"
+        );
+        assert_eq!(
+            names(&reference.dir),
+            vec![
+                "book.html".to_string(),
+                "meta.json".into(),
+                "normalized.json".into(),
+                "session.jsonl".into()
+            ]
+        );
+        for f in ["session.jsonl", "normalized.json", "book.html"] {
+            assert_eq!(
+                fs::read(run.dir.join(f)).unwrap(),
+                fs::read(reference.dir.join(f)).unwrap(),
+                "{f} 바이트 동일"
+            );
+        }
+        assert_eq!(
+            fs::read(run.dir.join("session.jsonl")).unwrap(),
+            jsonl.as_bytes(),
+            "session.jsonl은 원본 verbatim"
+        );
+        let strip_ts = |d: &Path| {
+            let mut v: serde_json::Value =
+                serde_json::from_str(&fs::read_to_string(d.join("meta.json")).unwrap()).unwrap();
+            v.as_object_mut().unwrap().remove("archived_at");
+            v
+        };
+        assert_eq!(strip_ts(&run.dir), strip_ts(&reference.dir), "meta.json 동일");
+
+        // 버전 보존: 내용이 바뀐 재아카이브는 이전본을 history/v-*로 남긴다.
+        let v2 = grown(&jsonl);
+        let ex2 = FakeExtractor::new(title);
+        let run2 = run_archive(&cli_request(&pipe_root, v2.as_bytes()), &ex2.f()).unwrap();
+        assert!(run2.replaced);
+        let listed = &list_archives(&pipe_root)[0].sessions[0];
+        assert_eq!(listed.history.len(), 1, "이전 스냅샷이 버전으로 보존");
+        assert_eq!(
+            fs::read(listed.history[0].dir.join("session.jsonl")).unwrap(),
+            jsonl.as_bytes(),
+            "버전 내용 = 이전 스냅샷 그대로"
+        );
+        assert_eq!(
+            fs::read(run2.dir.join("session.jsonl")).unwrap(),
+            v2.as_bytes(),
+            "최신 폴더 = 새 스냅샷"
+        );
+        // 멱등: 같은 내용으로 한 번 더 — 폴더 1개, 버전 안 쌓임.
+        let ex3 = FakeExtractor::new(title);
+        let run3 = run_archive(&cli_request(&pipe_root, v2.as_bytes()), &ex3.f()).unwrap();
+        assert!(run3.unchanged);
+        assert_eq!(
+            fs::read_dir(run2.dir.parent().unwrap()).unwrap().flatten().count(),
+            1
+        );
+        assert_eq!(list_archives(&pipe_root)[0].sessions[0].history.len(), 1);
+        let _ = fs::remove_dir_all(&pipe_root);
+        let _ = fs::remove_dir_all(&ref_root);
+    }
+
+    // 이전 요약 보존(last-good): 추출이 실패해도 직전 아카이브의 summary.md는
+    // 살아남는다 — 단 "이번 실행은 온전하지 않다"이므로 마커는 없다.
+    #[test]
+    fn failed_extraction_keeps_previous_summary_without_marker() {
+        let root = temp_root("lastgood");
+        let jsonl = sample_jsonl("작업");
+        let ok = FakeExtractor::new("제목");
+        let first = run_archive(&cli_request(&root, jsonl.as_bytes()), &ok.f()).unwrap();
+        let kept = fs::read_to_string(first.dir.join("summary.md")).unwrap();
+
+        let v2 = grown(&jsonl);
+        let fail = |_: &str| -> Result<String, String> { Err("실패".into()) };
+        let run = run_archive(&cli_request(&root, v2.as_bytes()), &fail).unwrap();
+        assert!(run.summary_ok, "이전 요약을 유지");
+        assert_eq!(fs::read_to_string(run.dir.join("summary.md")).unwrap(), kept);
+        assert!(!run.dir.join(EXTRACTION_OK).exists(), "그래도 마커는 없다");
+        assert!(run.errors.iter().any(|e| e.contains("이전 아카이브분을 유지")));
+        let _ = fs::remove_dir_all(&root);
+    }
+
     #[test]
     fn unsafe_or_short_uuid_is_rejected() {
         let root = temp_root("unsafe");
