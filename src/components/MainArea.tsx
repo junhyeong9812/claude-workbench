@@ -7,6 +7,7 @@ import {
 import "dockview-react/dist/styles/dockview.css";
 import { invoke } from "@tauri-apps/api/core";
 import { resolveCloseRequest } from "./sessionClose";
+import { CloseSessionModal } from "./CloseSessionModal";
 import { emit, listen } from "@tauri-apps/api/event";
 import { useAppStore } from "../state/store";
 import { useClaudeUi } from "../state/claudeUi";
@@ -1451,23 +1452,11 @@ export function MainArea({
           판정이 리액티브하고(마운트 직후 ref null 창), id는 surface 접두사로
           유일하다 (리뷰 D3). */}
       {closeRequest && apiReady && apiRef.current?.getPanel(closeRequest.panelId) && (
-        <div className="claude-modal-backdrop" onClick={() => clearClose()}>
-          <div className="claude-modal" onClick={(e) => e.stopPropagation()}>
-            <div className="claude-modal-title">이 Claude 세션을 어떻게 할까요?</div>
-            <button className="claude-modal-opt" onClick={() => resolveClose(false)}>
-              닫기 <span className="claude-modal-hint">세션 히스토리 보존 (나중에 다시 열기)</span>
-            </button>
-            <button
-              className="claude-modal-opt claude-modal-del"
-              onClick={() => resolveClose(true)}
-            >
-              삭제 <span className="claude-modal-hint">히스토리까지 영구 삭제</span>
-            </button>
-            <button className="claude-modal-opt claude-modal-cancel" onClick={() => clearClose()}>
-              취소
-            </button>
-          </div>
-        </div>
+        <CloseSessionModal
+          onClose={() => void resolveClose(false)}
+          onDelete={() => void resolveClose(true)}
+          onCancel={() => clearClose()}
+        />
       )}
 
       {isPrimary && sshForm && (
