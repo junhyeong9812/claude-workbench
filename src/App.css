@@ -15,8 +15,6 @@
   --git-ref-local: #4493f8;
   --git-ref-remote: #c678dd;
   --git-ref-tag: #d29922;
-  /* commit-graph merge-lane accent (was a #f5c2e7 literal in .git-node-merge) */
-  --git-lane-merge: #f5c2e7;
   /* timeline change-detail diff colors (bright text on the dark bg) */
   --diff-add-bg: rgba(63, 185, 80, 0.12);
   --diff-add-fg: #a8d8a8;
@@ -84,8 +82,6 @@
   --git-ref-local: #0969da;
   --git-ref-remote: #8250df;
   --git-ref-tag: #9a6700;
-  /* light 변형 — 흰 배경에서 읽히는 진한 자홍(다크의 파스텔 핑크 대응) */
-  --git-lane-merge: #bf3989;
   /* darker diff text + fainter tints so they read on white */
   --diff-add-bg: rgba(26, 127, 55, 0.12);
   --diff-add-fg: #0a5d2a;
@@ -1477,12 +1473,14 @@ body {
     color 0.12s ease;
 }
 /* 헤더 버튼 그룹 — .toolbar-group의 구분선 idiom(여기선 좌측 구분선만: .git-head는
-   wrap 컨테이너라 양쪽 테두리를 쓰면 줄바꿈 지점에서 이중선이 된다). 그룹이
-   flex 아이템이므로 wrap은 그룹 단위로 일어난다(내부는 nowrap). */
+   wrap 컨테이너라 양쪽 테두리를 쓰면 줄바꿈 지점에서 이중선이 된다). wrap은 우선
+   그룹 단위로 일어나되, 그룹이 패널보다 넓으면 내부도 줄바꿈한다 — 사이드바는
+   overflow-x가 없어 nowrap이면 버튼이 잘려 도달 불가가 된다. */
 .git-group {
   display: inline-flex;
   align-items: center;
-  flex-wrap: nowrap;
+  flex-wrap: wrap;
+  min-width: 0;
   gap: 4px;
   margin-left: 2px;
   padding-left: 6px;
@@ -1559,18 +1557,20 @@ body {
   text-overflow: ellipsis;
   white-space: nowrap;
 }
-/* 목록 행 안의 조밀 변형 — .git-btn과 같은 어휘, 파일 목록 밀도를 지키려고 20px. */
+/* 목록 행 안의 조밀 변형 — .git-btn과 같은 어휘의 고스트(평시 투명, hover에 칩).
+   불투명 칩을 행마다 두면 변경목록 행이 ~40% 길어져(리뷰 P2) 평시엔 테두리·배경을
+   비워 종전 행 높이를 지키고, hover/focus/disabled 규칙만 공유한다. */
 .git-mini {
   flex: 0 0 auto;
   display: inline-flex;
   align-items: center;
   justify-content: center;
   gap: 4px;
-  height: 20px;
+  height: 18px;
   padding: 0 7px;
   color: var(--fg-dim);
-  background: var(--bg);
-  border: 1px solid var(--border);
+  background: transparent;
+  border: 1px solid transparent;
   border-radius: 6px;
   font-size: 11px;
   line-height: 1;
@@ -1581,9 +1581,10 @@ body {
     border-color 0.12s ease,
     color 0.12s ease;
 }
-/* 아이콘 전용(글리프 1~2자) — 좌우 여백을 줄이고 최소 폭만 확보. .git-btn·
-   .git-mini 뒤에 와야 padding/font-size 를 덮는다(동일 특이도). */
-.git-ico {
+/* 아이콘 전용(글리프 1~2자) — 좌우 여백을 줄이고 최소 폭만 확보. 복합 선택자로
+   특이도를 올려 선언 순서와 무관하게 padding/font-size 를 덮는다. */
+.git-btn.git-ico,
+.git-mini.git-ico {
   min-width: 24px;
   padding: 0 5px;
   font-size: 12px;
@@ -1611,8 +1612,8 @@ body {
 }
 .git-mini:disabled:hover {
   color: var(--fg-dim);
-  background: var(--bg);
-  border-color: var(--border);
+  background: transparent;
+  border-color: transparent;
 }
 /* 강조 버튼: 커밋(주 동작)·활성 토글(diff/원본, 저장) — 예전 .git-btn의 accent
    틴트를 여기로 옮겨 "강조"의 의미를 되찾는다. */
@@ -1634,7 +1635,8 @@ body {
 }
 @media (prefers-reduced-motion: reduce) {
   .git-btn,
-  .git-mini {
+  .git-mini,
+  .git-seg-item {
     transition: none;
   }
 }
@@ -1713,13 +1715,6 @@ body {
 }
 .git-commit-row-g:hover {
   background: var(--bg-hover, rgba(255, 255, 255, 0.04));
-}
-.git-node {
-  flex: 0 0 auto;
-  color: var(--accent-bright);
-}
-.git-node-merge {
-  color: var(--git-lane-merge);
 }
 .git-chash {
   flex: 0 0 auto;
@@ -3335,13 +3330,15 @@ body {
 .placeholder-sub {
   font-size: 12px;
 }
+/* 헤더 브랜치 select와 같은 어휘(리뷰 P2 — 한 패널에 셀렉트 스타일 2종 방지). */
 .git-sort {
-  background: var(--bg-alt);
+  height: 20px;
+  background: var(--bg);
   color: var(--fg);
   border: 1px solid var(--border);
-  border-radius: 4px;
-  font-size: 0.9em;
-  padding: 0 2px;
+  border-radius: 6px;
+  font-size: 11px;
+  padding: 0 3px;
 }
 
 /* ---- Terminal color settings modal ---- */
