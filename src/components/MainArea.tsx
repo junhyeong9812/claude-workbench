@@ -26,15 +26,10 @@ import { installTransferTarget } from "../state/panelTransferTarget";
 import { components, AppTab, type PanelKind } from "./panelRegistry";
 import {
   SESSION_DRAG_MIME,
-  decodeSessionDrag,
   encodeSessionDrag,
-  resolveDropZone,
-  sameZoneRect,
-  zoneHighlight,
-  type DropZone,
   type SessionDragPayload,
-  type ZoneRect,
 } from "./sessionDropZone";
+import { useSessionDropZone } from "../hooks/useSessionDropZone";
 import { resolveLayerMode, integratedIsFront } from "../state/layerRouting";
 import { getAllWindows, getCurrentWindow } from "@tauri-apps/api/window";
 import { fileName } from "./cmLang";
@@ -1033,176 +1028,24 @@ export function MainArea({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [sessionResumeRequest, apiReady, layerMode]);
 
-  // ---- 세션 드래그 배치 (spec task 03) ------------------------------------
-  // 아카이브/피커 행 드래그가 dock 위를 지날 때: 마우스가 올라간 그룹의 존
-  // (중앙/가장자리 20%)을 계산해 하이라이트하고, 드롭 시 그 위치로 연다.
-  // 전용 MIME에만 반응 — 트리 DnD·탭 창간 전송·OS Files와 무간섭 (spec §2).
-  // dockview 자체 droptarget은 외부 드래그를 onUnhandledDragOverEvent 수락
-  // 시에만 받는데 우리는 구독하지 않으므로 dockview 오버레이는 뜨지 않는다
-  // (dockviewComponent.js rootCanDisplayOverlay — 리뷰 S10 실코드 확인).
-  const mainAreaRef = useRef<HTMLDivElement>(null);
-  const [sessionDrop, setSessionDrop] = useState<{
-    referencePanel: string | null;
-    zone: DropZone;
-    /** .main-area 로컬 좌표의 하이라이트 사각형. */
-    hl: ZoneRect;
-  } | null>(null);
-  // dragleave 지연 클리어 타이머 — WebKitGTK는 자식 경계 전이에서도
-  // relatedTarget이 null일 수 있어(리뷰 S5) 즉시 지우면 60Hz 깜빡인다.
-  // 다음 dragover가 취소하고, 진짜 이탈이면 타이머가 지운다.
-  const dropLeaveTimerRef = useRef<number | null>(null);
+  // ---- 세션 드래그 배치 (spec task 03) — 훅으로 이관 (P5 F-a) --------------
   // 드래그 직전 실제로 눌린 요소 — dragstart의 e.target은 HTML DnD 표준상
   // draggable 조상(행)이라 내부 버튼 판별이 불가능하다(리뷰 S6 감사, WHATWG
   // dnd). mousedown 캡처로 기록해 dragstart에서 판별한다.
   const dragPressRef = useRef<EventTarget | null>(null);
-  const cancelLeaveTimer = () => {
-    if (dropLeaveTimerRef.current !== null) {
-      window.clearTimeout(dropLeaveTimerRef.current);
-      dropLeaveTimerRef.current = null;
-    }
-  };
-
-  const isSessionDrag = (e: React.DragEvent) =>
-    e.dataTransfer.types.includes(SESSION_DRAG_MIME);
-
-  /** 좌표 → 드롭 타깃. dragover(프리뷰)와 drop(실행)이 **같은 함수·같은 입력**
-   * 을 쓴다 — 렌더 state를 drop의 진실로 쓰면 마지막 dragover 커밋 전의 drop이
-   * 직전 존으로 열린다(리뷰 S1: dragover=continuous, drop=discrete 우선순위
-   * 역전). null = 유효한 드롭 위치 아님(비어 있지 않은 dock의 그룹 밖 여백 포함
-   * — 리뷰 S7: "빈 dock"만 기본 배치 대상). */
-  const computeSessionDropTarget = (
-    x: number,
-    y: number,
-  ): { referencePanel: string | null; zone: DropZone; hl: ZoneRect } | null => {
-    const api = apiRef.current;
-    const host = mainAreaRef.current?.getBoundingClientRect();
-    if (!api || !host) return null;
-    // 겹치는 그룹(저장 레이아웃이 floating group을 복원할 수 있다 — 리뷰 S12
-    // 감사)은 히트한 것 중 **최소 면적**을 고른다: floating은 타일 위에 더
-    // 작게 떠 있으므로 최상단(가장 안쪽)을 근사한다.
-    let best: { ref: string; rect: DOMRect; zone: DropZone; area: number } | null = null;
-    for (const g of api.groups) {
-      // 빈 그룹(activePanel도 panels[0]도 없음)은 프리뷰-결과 계약을 지킬 수
-      // 없어 대상에서 제외한다 (리뷰 S3).
-      const ref = g.activePanel ?? g.panels[0];
-      if (!ref) continue;
-      const r = g.element.getBoundingClientRect();
-      const zone = resolveDropZone(r, x, y);
-      if (zone === null) continue;
-      const area = r.width * r.height;
-      if (!best || area < best.area) best = { ref: ref.id, rect: r, zone, area };
-    }
-    if (best) {
-      const hl = zoneHighlight(best.rect, best.zone);
-      return {
-        referencePanel: best.ref,
-        zone: best.zone,
-        hl: {
-          left: hl.left - host.left,
-          top: hl.top - host.top,
-          width: hl.width,
-          height: hl.height,
-        },
-      };
-    }
-    if (api.panels.length === 0) {
-      return {
-        referencePanel: null,
-        zone: "center",
-        hl: { left: 0, top: 0, width: host.width, height: host.height },
-      };
-    }
-    return null;
-  };
-
-  const onSessionDragOver = (e: React.DragEvent) => {
-    if (!isPrimary) return; // 드롭 존은 주 surface 전용 (부는 수동적 dock)
-    if (!isSessionDrag(e)) return;
-    if (!integratedIsFront(layerMode)) return;
-    cancelLeaveTimer();
-    // 피커 위는 드롭 대상이 아니다 — 좌표 히트테스트가 피커 '뒤' 그룹으로
-    // 새면, 되돌려 놓기(취소) 제스처가 실제 열기가 된다 (리뷰 S7b).
-    if ((e.target as HTMLElement).closest?.(".claude-picker")) {
-      setSessionDrop(null);
-      return;
-    }
-    const next = computeSessionDropTarget(e.clientX, e.clientY);
-    if (!next) {
-      setSessionDrop(null); // preventDefault 없이 반환 → 이 좌표는 드롭 불허
-      return;
-    }
-    e.preventDefault();
-    e.dataTransfer.dropEffect = "copy";
-    // dragover는 초당 수십 회 — 동일 타깃이면 setState 생략 (rect 4값 전부 비교, S4).
-    setSessionDrop((prev) =>
-      prev &&
-      prev.referencePanel === next.referencePanel &&
-      prev.zone === next.zone &&
-      sameZoneRect(prev.hl, next.hl)
-        ? prev
-        : next,
-    );
-  };
-
-  const onSessionDragLeave = (e: React.DragEvent) => {
-    if (!isPrimary) return; // 드롭 존 핸들러 3종 동일 게이트 (D10)
-    if (!isSessionDrag(e)) return;
-    const rt = e.relatedTarget;
-    if (rt instanceof Node && mainAreaRef.current?.contains(rt)) return; // 내부 이동
-    cancelLeaveTimer();
-    dropLeaveTimerRef.current = window.setTimeout(() => {
-      dropLeaveTimerRef.current = null;
-      setSessionDrop(null);
-    }, 120);
-  };
-
-  const onSessionDrop = (e: React.DragEvent) => {
-    if (!isPrimary) return;
-    if (!isSessionDrag(e)) return;
-    e.preventDefault();
-    e.stopPropagation();
-    cancelLeaveTimer();
-    setSessionDrop(null);
-    if (!integratedIsFront(layerMode)) return;
-    if ((e.target as HTMLElement).closest?.(".claude-picker")) return; // 피커 위 드롭 = 취소
-    const payload = decodeSessionDrag(e.dataTransfer.getData(SESSION_DRAG_MIME));
-    if (!payload) return;
-    // 드롭 좌표로 재계산 — 하이라이트와 결과가 항상 같은 입력에서 나온다 (S1).
-    const target = computeSessionDropTarget(e.clientX, e.clientY);
-    if (!target) return; // 유효 위치 아님 — 아무것도 열지 않음
-    if (payload.source === "picker") setPicker(null); // 피커 드래그만 피커를 닫는다 (S11)
-    openOrActivateSession(
-      payload,
-      target.referencePanel
-        ? {
-            referencePanel: target.referencePanel,
-            direction: target.zone === "center" ? "within" : target.zone,
-          }
-        : undefined,
-    );
-  };
-
-  // 취소 백스톱 (리뷰 S2): Esc·창 밖 드롭·다른 핸들러의 drop 소비(stopPropagation)
-  // 는 dragleave/drop을 우리에게 보장하지 않는다 — window 캡처 단계에서 정리.
-  // (onSessionDrop은 state가 아니라 드롭 좌표 재계산을 쓰므로, 캡처 단계에서
-  // 먼저 지워져도 무해하다.)
-  useEffect(() => {
-    if (!isPrimary) return;
-    const clear = () => {
-      cancelLeaveTimer();
-      setSessionDrop(null);
-    };
-    window.addEventListener("dragend", clear, true);
-    window.addEventListener("drop", clear, true);
-    return () => {
-      window.removeEventListener("dragend", clear, true);
-      window.removeEventListener("drop", clear, true);
-    };
-  }, []);
-  // 드래그 중 레이어가 dev로 바뀌면 프리뷰 제거.
-  useEffect(() => {
-    if (!integratedIsFront(layerMode)) setSessionDrop(null);
-  }, [layerMode]);
+  const {
+    mainAreaRef,
+    sessionDrop,
+    onDragOver: onSessionDragOver,
+    onDragLeave: onSessionDragLeave,
+    onDrop: onSessionDrop,
+  } = useSessionDropZone({
+    isPrimary,
+    integratedFront: integratedIsFront(layerMode),
+    getApi: () => apiRef.current,
+    openOrActivateSession,
+    closePicker: () => setPicker(null),
+  });
 
   // Attention roll-up cycle: activate the panel for the requested session uuid.
   // Matched by the panel's live `sessionUuid` or its resume `loadSessionId` (a

@@ -115,3 +115,70 @@ export function zoneHighlight(rect: ZoneRect, zone: DropZone): ZoneRect {
       return { left, top, width, height };
   }
 }
+
+/** 드롭 타깃 후보 = dock 그룹 1개. `ref`는 그 그룹의 대표 패널 id
+ * (activePanel ?? panels[0]); 빈 그룹은 null — 프리뷰-결과 계약을 지킬 수 없어
+ * 대상에서 제외된다 (리뷰 S3). `rect`는 host와 같은 (뷰포트) 좌표계. */
+export interface DropGroupRect {
+  ref: string | null;
+  rect: ZoneRect;
+}
+
+export interface SessionDropTarget {
+  /** null = 빈 dock 기본 배치. */
+  referencePanel: string | null;
+  zone: DropZone;
+  /** host 로컬 좌표의 하이라이트 사각형. */
+  hl: ZoneRect;
+}
+
+/**
+ * 좌표 → 드롭 타깃. dragover(프리뷰)와 drop(실행)이 **같은 함수·같은 입력**을
+ * 쓴다 — 렌더 state를 drop의 진실로 쓰면 마지막 dragover 커밋 전의 drop이 직전
+ * 존으로 열린다(리뷰 S1: dragover=continuous, drop=discrete 우선순위 역전).
+ *
+ * 겹치는 그룹(저장 레이아웃이 floating group을 복원할 수 있다 — 리뷰 S12 감사)
+ * 은 히트한 것 중 **최소 면적**을 고른다: floating은 타일 위에 더 작게 떠 있으
+ * 므로 최상단(가장 안쪽)을 근사한다.
+ *
+ * null = 유효한 드롭 위치 아님(비어 있지 않은 dock의 그룹 밖 여백 포함 — 리뷰
+ * S7: "빈 dock"만 기본 배치 대상). `hasPanels` = dock에 패널이 하나라도 있나.
+ */
+export function computeSessionDropTarget(
+  groups: DropGroupRect[],
+  host: ZoneRect,
+  x: number,
+  y: number,
+  hasPanels: boolean,
+): SessionDropTarget | null {
+  let best: { ref: string; rect: ZoneRect; zone: DropZone; area: number } | null = null;
+  for (const g of groups) {
+    if (!g.ref) continue;
+    const r = g.rect;
+    const zone = resolveDropZone(r, x, y);
+    if (zone === null) continue;
+    const area = r.width * r.height;
+    if (!best || area < best.area) best = { ref: g.ref, rect: r, zone, area };
+  }
+  if (best) {
+    const hl = zoneHighlight(best.rect, best.zone);
+    return {
+      referencePanel: best.ref,
+      zone: best.zone,
+      hl: {
+        left: hl.left - host.left,
+        top: hl.top - host.top,
+        width: hl.width,
+        height: hl.height,
+      },
+    };
+  }
+  if (!hasPanels) {
+    return {
+      referencePanel: null,
+      zone: "center",
+      hl: { left: 0, top: 0, width: host.width, height: host.height },
+    };
+  }
+  return null;
+}
