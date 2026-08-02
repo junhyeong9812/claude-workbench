@@ -806,11 +806,12 @@ fn io_brief(e: &io::Error) -> &'static str {
     }
 }
 
-/// CLI 프리스캔용 **저비용** 동일성 판정: 전문 read 없이 바이트 길이 +
-/// tail uuid(256KB 창)로 라이브 전사가 아카이브 스냅샷과 같은 내용인지
-/// 보수적으로 본다. **확신할 때만 true** — false는 후보 유지일 뿐이고 최종
-/// 결정은 run_archive의 [`is_unchanged_complete`](정본)가 내린다. 따라서
-/// 과잉 스킵은 구조적으로 불가(프리스캔은 비용 최적화 전용, 리뷰 P2).
+/// CLI 프리스캔용 동일성 판정. 1차는 저비용(메타데이터 바이트 길이 —
+/// 불일치면 즉시 후보 유지), 통과 시에만 전문을 읽어 **정본 판별식**
+/// ([`JsonlStat::same_content`] — 라인 수+마지막 uuid)으로 확정한다(감사:
+/// bytes+tail uuid 근사는 동길이·동tail의 중간 변형을 선스킵할 수 있었다).
+/// 전문 read는 바이트가 정확히 일치한 세션(사실상 무변경)에서만 발생하고
+/// ms 단위 — 프리스캔이 피하려는 비용은 read가 아니라 1~3분 추출이다.
 pub fn live_matches_archive(live_jsonl: &Path, entry: &ArchiveSessionEntry) -> bool {
     let Some(bytes) = fs::metadata(live_jsonl).ok().map(|m| m.len()) else {
         return false;
@@ -818,11 +819,11 @@ pub fn live_matches_archive(live_jsonl: &Path, entry: &ArchiveSessionEntry) -> b
     if entry.meta.jsonl_bytes != Some(bytes) {
         return false;
     }
-    match (&entry.meta.last_message_uuid, tail_last_uuid(live_jsonl)) {
-        (Some(a), Some(b)) => a == &b,
-        (None, None) => true, // uuid 없는 비정형 — 바이트 일치가 최선의 근거
-        _ => false,
-    }
+    let Ok(raw) = fs::read(live_jsonl) else {
+        return false; // 읽기 실패 = 후보 유지(정본 판정으로)
+    };
+    let live = jsonl_stat(&raw);
+    archived_stat(&entry.dir, &entry.meta).is_some_and(|s| s.same_content(&live))
 }
 
 pub fn is_unchanged_complete(entry: &ArchiveSessionEntry, live: &JsonlStat) -> bool {

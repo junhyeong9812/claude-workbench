@@ -144,13 +144,24 @@ fn main() {
     // 여기서는 "추출 완료" 세션만 표시해 두고, 후보 단계에서 내용 비교를
     // 통과한 것만 제외한다. 마커 도입 이전 백필분은 재추출 대상으로 잡혀
     // 한 번 재추출되고, 그때 마커가 남아 이후로는 양쪽 다 스킵(자기치유).
-    let mut complete: std::collections::HashMap<String, core_lib::archive::ArchiveSessionEntry> =
+    // uuid가 두 프로젝트에 존재하면(cwd 변경 세션 — 실측 존재) 어느 쪽이
+    // 이 전사의 아카이브인지 프리스캔 단계에선 모른다 → None(모호)로 두고
+    // 후보를 유지한다. 정본 판정은 run_archive(프로젝트 스코프 조회)가 한다.
+    let mut complete: std::collections::HashMap<String, Option<core_lib::archive::ArchiveSessionEntry>> =
         std::collections::HashMap::new();
     let mut partial: HashSet<String> = HashSet::new();
     for listing in core_lib::archive::list_archives(&args.archive_root) {
         for s in listing.sessions {
             if core_lib::archive::is_extraction_complete(&s) {
-                complete.insert(s.meta.uuid.clone(), s);
+                let uuid = s.meta.uuid.clone();
+                match complete.entry(uuid) {
+                    std::collections::hash_map::Entry::Occupied(mut o) => {
+                        o.insert(None); // 충돌 = 모호
+                    }
+                    std::collections::hash_map::Entry::Vacant(v) => {
+                        v.insert(Some(s));
+                    }
+                }
             } else {
                 partial.insert(s.meta.uuid);
             }
@@ -199,7 +210,7 @@ fn main() {
             };
             // 완료여도 전사가 자랐으면 후보 유지 — GUI is_unchanged_complete와
             // 같은 내용 비교(라이브 stat vs 아카이브 meta).
-            if let Some(entry) = complete.get(&uuid) {
+            if let Some(Some(entry)) = complete.get(&uuid) {
                 if core_lib::archive::live_matches_archive(&path, entry) {
                     continue;
                 }
