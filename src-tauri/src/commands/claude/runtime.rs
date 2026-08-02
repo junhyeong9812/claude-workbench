@@ -201,12 +201,6 @@ pub struct ClaudeDetached {
     rev: u64,
 }
 
-/// The full timeline snapshot for a Claude session, emitted as `claude-timeline`
-/// whenever a poll observed any change. Carries the change items **and** the
-/// derived conversation turns/answers/dates, so the UI shows plain Q&A turns
-/// (no tool calls) too — not only tool items. Re-sending the whole (modest)
-/// state keeps the frontend a simple replace.
-
 /// Open a Claude session for THIS window: if its PTY is already live (another
 /// window started it), attach as a read-only **mirror**; otherwise start a fresh
 /// PTY and become the **driver**. Atomic under the runtime lock so two windows
@@ -449,11 +443,6 @@ pub fn claude_live_uuids(claude: State<'_, ClaudeState>, project: String) -> Vec
         })
         .unwrap_or_default()
 }
-
-/// The polling loop for one Claude session (its own thread). Waits for the
-/// session JSONL to appear (the CLI creates it after init), then polls a
-/// `SessionTail` every ~150ms, emitting and persisting newly-touched items.
-/// Ends when the stop flag is set (`claude_close`).
 
 /// Force-close a Claude session regardless of viewers: stop the poll thread and
 /// kill the PTY (every attached window's relay ends). Used by "삭제" and as a

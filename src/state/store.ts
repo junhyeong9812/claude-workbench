@@ -1136,10 +1136,11 @@ export const useAppStore = create<AppState>((set, get) => ({
       const freshGeo = loadPopoutGeometry();
       const freshLayouts = loadPopoutLayouts();
       const orphans = Object.keys(freshGeo).filter((l) => !(l in freshLayouts));
-      if (orphans.length === 0) return {};
       for (const l of orphans) delete freshGeo[l];
-      savePopoutGeometry(freshGeo);
-      return { popoutGeometry: freshGeo };
+      if (orphans.length > 0) savePopoutGeometry(freshGeo);
+      // 판정에 쓴 fresh 스냅샷을 인메모리에도 반영 — 직후 App 재오픈 루프가
+      // 레이아웃/좌표를 같은 시점으로 읽게(감사 ①: 한쪽만 갱신하면 어긋난다).
+      return { popoutGeometry: freshGeo, popoutLayouts: freshLayouts };
     }),
 
   upsertConnection: (conn) => {

@@ -89,13 +89,18 @@ export function capTreeCache<T>(
   if (keys.length <= max) return cache;
   const next = { ...cache };
   let size = keys.length;
+  let deleted = 0;
   for (const k of keys) {
     if (size <= max) break;
     if (keep.has(k)) continue;
     delete next[k];
     size--;
+    deleted++;
   }
-  return next;
+  // 실제 삭제 0(keep만으로 초과)이면 원본 identity — 호출부의 epoch 연동이
+  // "축출 발생"과 정확히 동치가 되게(감사: 아니면 keep 초과 상태에서 매 쓰기
+  // 마다 전 in-flight 무효화 폭주).
+  return deleted === 0 ? cache : next;
 }
 
 /** key가 root 자신이거나 그 아래인가 (구분자 `/`·`\` 둘 다 + root의 후행

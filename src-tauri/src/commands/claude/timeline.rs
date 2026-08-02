@@ -13,9 +13,11 @@ use core_lib::{TimelineItem, TokenUsage};
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager};
 
-/// Snapshot payload for `claude-timeline`: the whole (modest) session state —
-/// items + prompts + answers + dates + per-turn tokens + subagent frames — so
-/// plain Q&A turns render too, not just tool calls.
+/// The full timeline snapshot for a Claude session, emitted as `claude-timeline`
+/// whenever a poll observed any change. Carries the change items **and** the
+/// derived conversation turns/answers/dates, so the UI shows plain Q&A turns
+/// (no tool calls) too — not only tool items. Re-sending the whole (modest)
+/// state keeps the frontend a simple replace.
 #[derive(Clone, Serialize)]
 struct ClaudeTimelinePayload {
     id: u64,
@@ -199,12 +201,10 @@ pub(super) fn subagent_parent_memo(
     None
 }
 
-/// Generate a fresh session UUID for `--session-id`. Linux-only (the app's
-/// platform): reads the kernel's random UUID source.
-
-/// The timeline poll loop: tail the session JSONL (+ per-subagent transcripts),
-/// emit `claude-timeline` on change (fp 게이트), debounce-persist the snapshot
-/// (트레일링 플러시 — P1), and clean the runtime entry when the PTY dies (T7).
+/// The polling loop for one Claude session (its own thread). Waits for the
+/// session JSONL to appear (the CLI creates it after init), then polls a
+/// `SessionTail` every ~150ms, emitting and persisting newly-touched items.
+/// Ends when the stop flag is set (`claude_close`).
 pub(super) fn run_timeline_poll(
     app: AppHandle,
     id: u64,
