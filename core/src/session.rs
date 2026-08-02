@@ -162,10 +162,19 @@ impl Default for SessionManager {
 impl SessionManager {
     /// P6 D2: 맵 락 접근 단일 지점 — poison 관용 통일(kill_all 선례). 패닉한
     /// 세션 스레드 하나가 다른 세션의 write/resize/snapshot/close까지 영구
-    /// 마비(패닉 전파)시키지 않도록 guard를 회수한다. 세션 상태는 세션별
-    /// 소유(버퍼·transport)라 관용 회수가 교차 정합을 해치지 않는다.
+    /// 마비(패닉 전파)시키지 않도록 guard를 회수한다. 안전 근거는 "상태가
+    /// 세션별"이 아니라 **락 아래 임계 구역이 실질 패닉-프리**라는 것이다
+    /// (push/seed는 alloc 외 패닉원이 없고 alloc 실패는 abort — 리뷰 정정).
+    /// 회수는 1회 로그를 남긴다 — 관용 전환으로 잃는 관측 채널 보상.
     fn sessions_lock(&self) -> std::sync::MutexGuard<'_, HashMap<SessionId, Session>> {
-        self.sessions.lock().unwrap_or_else(|p| p.into_inner())
+        self.sessions.lock().unwrap_or_else(|p| {
+            static WARNED: std::sync::atomic::AtomicBool =
+                std::sync::atomic::AtomicBool::new(false);
+            if !WARNED.swap(true, Ordering::Relaxed) {
+                eprintln!("[session] poisoned map lock recovered — a session thread panicked earlier");
+            }
+            p.into_inner()
+        })
     }
 
     pub fn new() -> Self {
@@ -341,9 +350,14 @@ impl SessionManager {
     /// True if a session with this id exists and is still alive (multiwindow
     /// mirror needs to know a 2nd window can attach to a running PTY).
     pub fn exists(&self, id: SessionId) -> bool {
-        self.sessions_lock()
-            .get(&id)
-            .is_some_and(|s| s.shared.alive.load(Ordering::SeqCst))
+        // poison 시 보수 응답(false) 유지 — 이전 계약 그대로(리뷰: 패닉 후
+        // true를 주면 alive 플래그가 갱신 안 된 죽은 세션에 미러가 붙는다).
+        // 다른 사이트의 관용 회수(진짜 값)와 달리, 여기서만은 "모름 = 없음"이
+        // 더 안전한 폴백이다.
+        self.sessions
+            .lock()
+            .map(|m| m.get(&id).is_some_and(|s| s.shared.alive.load(Ordering::SeqCst)))
+            .unwrap_or(false)
     }
 
     pub fn write(&self, id: SessionId, data: &[u8]) -> Result<(), String> {

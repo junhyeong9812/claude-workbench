@@ -15,6 +15,11 @@ export function setTransferCommittedListener(cb: TransferCommittedListener): voi
   transferCommittedListener = cb;
 }
 
+/** 테스트 전용 — 배선(S9) 검증용 커밋 발화. 프로덕션 경로는 handOff 내부. */
+export function __testFireTransferCommitted(uuid: string): void {
+  transferCommittedListener?.(uuid);
+}
+
 
 const KNOWN_COMPONENTS = new Set([
   "placeholder",

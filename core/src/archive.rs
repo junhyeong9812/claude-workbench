@@ -760,12 +760,18 @@ pub fn backfill_meta(archive_root: &Path) -> (usize, usize) {
 
 // ---- 재아카이브 판정 (GUI 커맨드 ↔ CLI 백필 단일 출처) ----
 
-/// The archived session for `uuid`, if any (across every project — a uuid is
-/// globally unique). The listing is the single lookup path both entry points
-/// use, so "이미 아카이브됨" can never mean two different things.
-pub fn find_archived_session(archive_root: &Path, uuid: &str) -> Option<ArchiveSessionEntry> {
+/// The archived session for `uuid` **within `project`**. uuid만으로 찾으면
+/// 안 된다 — 세션 도중 cwd가 바뀌면 같은 uuid가 두 프로젝트에 서로 다른
+/// 내용으로 존재할 수 있고(리뷰 실측: 실제 아카이브에 충돌 존재), 그때
+/// read_dir 순서가 남의 프로젝트 스냅샷과 비교/복원하게 만든다.
+pub fn find_archived_session(
+    archive_root: &Path,
+    project: &str,
+    uuid: &str,
+) -> Option<ArchiveSessionEntry> {
     list_archives(archive_root)
         .into_iter()
+        .filter(|p| p.project == project)
         .flat_map(|p| p.sessions)
         .find(|s| s.meta.uuid == uuid)
 }
@@ -789,6 +795,36 @@ pub fn is_extraction_complete(entry: &ArchiveSessionEntry) -> bool {
 /// ([`JsonlStat::same_content`]) 그 아카이브의 추출이 온전하면
 /// ([`is_extraction_complete`]) 아무것도 다시 쓰지 않는다 — 같은 내용에 1~3분
 /// 짜리 추출을 재실행하지 않기 위해.
+
+/// 사용자 표면용 io 오류 요약 — kind만 노출(errno·경로 원문 비노출, GUI의
+/// 구 io_message 소독 정책 승계 — 리뷰: raw Display가 UI에 새던 것 차단).
+fn io_brief(e: &io::Error) -> &'static str {
+    match e.kind() {
+        io::ErrorKind::NotFound => "경로 없음",
+        io::ErrorKind::PermissionDenied => "권한 없음",
+        _ => "I/O 오류",
+    }
+}
+
+/// CLI 프리스캔용 **저비용** 동일성 판정: 전문 read 없이 바이트 길이 +
+/// tail uuid(256KB 창)로 라이브 전사가 아카이브 스냅샷과 같은 내용인지
+/// 보수적으로 본다. **확신할 때만 true** — false는 후보 유지일 뿐이고 최종
+/// 결정은 run_archive의 [`is_unchanged_complete`](정본)가 내린다. 따라서
+/// 과잉 스킵은 구조적으로 불가(프리스캔은 비용 최적화 전용, 리뷰 P2).
+pub fn live_matches_archive(live_jsonl: &Path, entry: &ArchiveSessionEntry) -> bool {
+    let Some(bytes) = fs::metadata(live_jsonl).ok().map(|m| m.len()) else {
+        return false;
+    };
+    if entry.meta.jsonl_bytes != Some(bytes) {
+        return false;
+    }
+    match (&entry.meta.last_message_uuid, tail_last_uuid(live_jsonl)) {
+        (Some(a), Some(b)) => a == &b,
+        (None, None) => true, // uuid 없는 비정형 — 바이트 일치가 최선의 근거
+        _ => false,
+    }
+}
+
 pub fn is_unchanged_complete(entry: &ArchiveSessionEntry, live: &JsonlStat) -> bool {
     is_extraction_complete(entry)
         && archived_stat(&entry.dir, &entry.meta).is_some_and(|s| s.same_content(live))
@@ -916,7 +952,7 @@ pub fn run_archive(
     // Read the previous archive BEFORE the first write below displaces it
     // (감사 A1: 지식만 남고 요약만 사라지는 비대칭 방지).
     let live = jsonl_stat(req.jsonl_bytes);
-    let prev = find_archived_session(req.archive_root, req.uuid);
+    let prev = find_archived_session(req.archive_root, req.project, req.uuid);
     if let Some(p) = &prev {
         if is_unchanged_complete(p, &live) {
             return Ok(ArchiveRun {
@@ -937,7 +973,7 @@ pub fn run_archive(
         .and_then(|p| match fs::read_to_string(&p) {
             Ok(text) => Some(text),
             Err(e) => {
-                errors.push(format!("이전 요약 읽기 실패: {e}"));
+                errors.push(format!("이전 요약 읽기 실패: {}", io_brief(&e)));
                 None
             }
         });
@@ -951,7 +987,7 @@ pub fn run_archive(
     // during extraction would lose it for good (post-fix P3).
     if let Some(prev) = &prev_summary {
         if let Err(e) = fs::write(out.dir.join("summary.md"), prev) {
-            errors.push(format!("이전 요약 보존 실패: {e}"));
+            errors.push(format!("이전 요약 보존 실패: {}", io_brief(&e)));
         }
     }
 
@@ -983,24 +1019,31 @@ pub fn run_archive(
             session.title = new_title.to_string();
             match write_archive(req.archive_root, req.project, &session, req.jsonl_bytes) {
                 Ok(o) => out = o,
-                Err(e) => errors.push(format!("제목 반영 실패: {e}")),
+                Err(e) => errors.push(format!("제목 반영 실패: {}", io_brief(&e))),
             }
         }
         if !ex.summary.trim().is_empty() {
             match fs::write(out.dir.join("summary.md"), &ex.summary) {
                 Ok(()) => summary_ok = true,
-                Err(e) => errors.push(format!("요약 저장 실패: {e}")),
+                Err(e) => errors.push(format!("요약 저장 실패: {}", io_brief(&e))),
             }
         }
-        match crate::knowledge::write_knowledge(
-            req.archive_root,
-            req.project,
-            req.uuid,
-            req.date,
-            &ex.entries,
-        ) {
-            Ok(paths) => knowledge_files = paths.len(),
-            Err(e) => errors.push(format!("지식 저장 실패: {e}")),
+        // P1 가드(리뷰): 원문에 ===ENTRY=== 마커가 있는데 파싱된 항목이 0이면
+        // 형식 깨짐 — write_knowledge가 기존 세션 지식을 지운 채 0건을 기록해
+        // "지식 소실 + 마커 완료 위장"이 되는 것을 error로 승격해 차단한다.
+        if ex.entries.is_empty() && raw.contains("===ENTRY===") {
+            errors.push("지식 파싱 실패(ENTRY 형식 불일치) — 재추출 필요".to_string());
+        } else {
+            match crate::knowledge::write_knowledge(
+                req.archive_root,
+                req.project,
+                req.uuid,
+                req.date,
+                &ex.entries,
+            ) {
+                Ok(paths) => knowledge_files = paths.len(),
+                Err(e) => errors.push(format!("지식 저장 실패: {}", io_brief(&e))),
+            }
         }
     }
 
@@ -1013,12 +1056,15 @@ pub fn run_archive(
             Some(bin) if bin.is_file() => {
                 let kdir = crate::knowledge::knowledge_dir(req.archive_root, req.project);
                 match crate::mcp::register_in_mcp_json(proj_path, bin, &kdir) {
-                    Ok(true) => notes.push("mcp 등록".to_string()),
+                    Ok(true) => {} // 정상 성공 — 보고 표면 없음(리뷰: GUI 경고 오노출)
                     Ok(false) => {}
                     Err(e) => notes.push(format!("mcp 등록 실패: {e}")),
                 }
             }
-            _ => notes.push("knowledge-mcp 바이너리 없음 — MCP 등록 생략".to_string()),
+            // 바이너리 부재는 note도 남기지 않는다 — CLI는 시작 시 1회 경고,
+            // GUI는 설치 규약 문제라 세션 단위 보고 대상이 아니다(리뷰: 세션당
+            // 노이즈 + GUI 경고 오노출).
+            _ => {}
         }
     }
 
@@ -1033,7 +1079,7 @@ pub fn run_archive(
                     summary_ok = true;
                     errors.push("요약은 이전 아카이브분을 유지".to_string());
                 }
-                Err(e) => errors.push(format!("이전 요약 보존 실패: {e}")),
+                Err(e) => errors.push(format!("이전 요약 보존 실패: {}", io_brief(&e))),
             }
         }
     }
@@ -1041,7 +1087,7 @@ pub fn run_archive(
     // ([`is_extraction_complete`]의 계약).
     if summary_ok && errors.is_empty() {
         if let Err(e) = fs::write(out.dir.join(EXTRACTION_OK), b"") {
-            errors.push(format!("추출 완료 마커 기록 실패: {e}"));
+            errors.push(format!("추출 완료 마커 기록 실패: {}", io_brief(&e)));
         }
     }
 
@@ -1520,7 +1566,7 @@ mod tests {
         let jsonl = sample_jsonl("p");
         let out = write_archive(&root, "/p", &sample_session("t"), jsonl.as_bytes()).unwrap();
         let live = jsonl_stat(jsonl.as_bytes());
-        let entry = || find_archived_session(&root, UUID).unwrap();
+        let entry = || find_archived_session(&root, "/p", UUID).unwrap();
 
         // core 산출물만 (추출 전) → 재추출 대상.
         assert!(!is_extraction_complete(&entry()));
@@ -1550,7 +1596,7 @@ mod tests {
         fs::write(out.dir.join("summary.md"), "요약").unwrap();
         assert!(!out.dir.join(EXTRACTION_OK).exists());
 
-        let entry = find_archived_session(&root, UUID).unwrap();
+        let entry = find_archived_session(&root, "/p", UUID).unwrap();
         assert!(entry.summary_path.is_some(), "추출은 성공했던 아카이브");
         assert!(
             !is_unchanged_complete(&entry, &jsonl_stat(jsonl.as_bytes())),
@@ -1616,7 +1662,7 @@ mod tests {
         assert!(run.dir.join(EXTRACTION_OK).is_file(), "CLI도 마커를 남긴다");
 
         // ② GUI 판정(=커맨드가 쓰는 그 식)이 스킵으로 떨어진다.
-        let entry = find_archived_session(&root, UUID).unwrap();
+        let entry = find_archived_session(&root, "/p", UUID).unwrap();
         assert!(is_unchanged_complete(&entry, &jsonl_stat(jsonl.as_bytes())));
 
         // ③ GUI 재아카이브(attempts=1)가 실제로 추출을 부르지 않는다.
@@ -1678,7 +1724,7 @@ mod tests {
         assert!(!run.extraction_complete());
         assert!(run.dir.join("book.html").is_file(), "core 산출물은 남는다");
         assert!(!run.dir.join(EXTRACTION_OK).exists(), "마커 없음 → 재시도 대상");
-        assert!(!is_extraction_complete(&find_archived_session(&root, UUID).unwrap()));
+        assert!(!is_extraction_complete(&find_archived_session(&root, "/p", UUID).unwrap()));
 
         // 재시도가 성공하는 실행: 1차 실패는 마커를 막지 않는다.
         let n = std::cell::Cell::new(0);

@@ -138,16 +138,19 @@ fn main() {
     let args = parse_args();
     let cutoff = SystemTime::now() - Duration::from_secs(args.days * 24 * 3600);
 
-    // 아카이브 상태: 추출 완료(summary + 마커)면 skip, 아니면 재추출 대상.
-    // 판정은 core::archive 단일 출처 — 앱의 "변경 없음" 스킵과 같은 식이다.
-    // 마커 도입 이전에 백필된 아카이브는 여기서 재추출 대상으로 잡혀 한 번
-    // 재추출되고, 그때 마커가 남아 이후로는 양쪽 다 스킵한다(자기치유).
-    let mut complete: HashSet<String> = HashSet::new();
+    // 아카이브 상태 프리스캔 — **비용 최적화**일 뿐, 정본 판정은 run_archive
+    // 내부의 is_unchanged_complete(마커 + 내용 동일) 하나다(리뷰: 프리스캔이
+    // 마커만 보면 자란 전사가 영영 백필되지 않아 GUI 판정과 갈라진다).
+    // 여기서는 "추출 완료" 세션만 표시해 두고, 후보 단계에서 내용 비교를
+    // 통과한 것만 제외한다. 마커 도입 이전 백필분은 재추출 대상으로 잡혀
+    // 한 번 재추출되고, 그때 마커가 남아 이후로는 양쪽 다 스킵(자기치유).
+    let mut complete: std::collections::HashMap<String, core_lib::archive::ArchiveSessionEntry> =
+        std::collections::HashMap::new();
     let mut partial: HashSet<String> = HashSet::new();
     for listing in core_lib::archive::list_archives(&args.archive_root) {
         for s in listing.sessions {
             if core_lib::archive::is_extraction_complete(&s) {
-                complete.insert(s.meta.uuid);
+                complete.insert(s.meta.uuid.clone(), s);
             } else {
                 partial.insert(s.meta.uuid);
             }
@@ -194,8 +197,12 @@ fn main() {
             let Some(uuid) = path.file_stem().map(|s| s.to_string_lossy().to_string()) else {
                 continue;
             };
-            if complete.contains(&uuid) {
-                continue;
+            // 완료여도 전사가 자랐으면 후보 유지 — GUI is_unchanged_complete와
+            // 같은 내용 비교(라이브 stat vs 아카이브 meta).
+            if let Some(entry) = complete.get(&uuid) {
+                if core_lib::archive::live_matches_archive(&path, entry) {
+                    continue;
+                }
             }
             candidates.push(Candidate { uuid, jsonl_path: path, mtime });
         }
@@ -329,6 +336,9 @@ fn archive_one(
     date: &str,
 ) -> Result<(String, bool), String> {
     // 바이트 그대로 읽는다 — session.jsonl은 verbatim 복사본이어야 한다.
+    // NOTE(P6 단일화의 CLI 동작 변경 — 문서화): 구 CLI는 read_to_string이라
+    // 비-UTF8 전사를 스킵했지만, 이제 GUI와 같이 바이트로 읽어 verbatim 복사
+    // 계약을 지킨다(normalized만 lossy).
     let jsonl_bytes = std::fs::read(&c.jsonl_path).map_err(|e| format!("트랜스크립트 읽기: {e}"))?;
     // fallback 제목: 앱 사이드카(.title/.name), 없으면 "Claude".
     let title = core_lib::snapshot::read_title(&args.snapshot_base, project, &c.uuid)

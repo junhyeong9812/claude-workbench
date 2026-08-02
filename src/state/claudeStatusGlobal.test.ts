@@ -159,3 +159,19 @@ describe("initClaudeStatusGlobal — async race + retry (S3)", () => {
     for (const s of bSpies) expect(s).toHaveBeenCalledTimes(1);
   });
 });
+
+describe("P6 D3 — 전송 커밋 콜백 배선(S9)", () => {
+  it("모듈 import만으로 커밋 콜백이 배지를 제거한다(미등록 무음 실패 차단)", async () => {
+    const { useClaudeStatus } = await import("./claudeStatus");
+    const { __testFireTransferCommitted } = await import("./windowTransfer");
+    useClaudeStatus.getState().updateFromTimeline("uuid-s9", {
+      activity: "working",
+      questionBlocked: false,
+      seenNow: false,
+      origin: "live",
+    });
+    expect(useClaudeStatus.getState().entries["uuid-s9"]).toBeTruthy();
+    __testFireTransferCommitted("uuid-s9");
+    expect(useClaudeStatus.getState().entries["uuid-s9"]).toBeUndefined();
+  });
+});

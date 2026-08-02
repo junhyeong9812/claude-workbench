@@ -10,6 +10,12 @@ import {
 import type { TimelineItem } from "../types";
 import { setTransferCommittedListener } from "./windowTransfer";
 
+// P6 D3: 전송 커밋 시 소스 창 배지 제거(S9) — windowTransfer의 직접 의존을
+// 콜백 등록으로 역전. **모듈 스코프 등록**: effect 타이밍(자식 effect가 부모
+// init보다 선행)에 의존하지 않고, 이 모듈을 import하는 창(App/Popout 진입점
+// 전부)에서 어떤 드래그·ACK보다 먼저 배선된다(리뷰 — 미등록 무음 실패 차단).
+setTransferCommittedListener((uuid) => useClaudeStatus.getState().remove(uuid));
+
 /**
  * App-level attention-status listener (agent-status-badges P3).
  *
@@ -76,9 +82,6 @@ function track(p: Promise<UnlistenFn>, gen: number): void {
  * stale handle from an already-disposed init is a no-op, so calling it again
  * can't tear down a newer generation's live listeners (S3). */
 export function initClaudeStatusGlobal(): () => void {
-  // P6 D3: 전송 커밋 시 소스 창 배지 제거(S9) — windowTransfer의 직접
-  // 의존을 콜백 등록으로 역전(상태 모듈 간 단방향 유지).
-  setTransferCommittedListener((uuid) => useClaudeStatus.getState().remove(uuid));
 
   if (started) {
     // Already running — hand out a disposer bound to the RUNNING generation.

@@ -194,7 +194,9 @@ fn archive_session_blocking(
         }
     })?;
 
-    let warnings = run.all_warnings();
+    // GUI 보고 표면은 **errors만** — notes(mcp 등록 실패 등 부가 작업)는 CLI
+    // 로그 전용이다(리뷰: 성공/부가 note가 '추출 경고'로 오노출되던 것 차단).
+    let warnings: Vec<&str> = run.errors.iter().map(String::as_str).collect();
     Ok(ArchiveResult {
         dir: run.dir.to_string_lossy().to_string(),
         book_path: run.book_path.to_string_lossy().to_string(),
