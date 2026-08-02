@@ -38,6 +38,10 @@ use crate::timeline::{TimelineItem, TokenUsage};
 /// (viewer, MCP indexer) can branch on it instead of guessing.
 pub const SCHEMA_VERSION: u32 = 1;
 
+/// Marker file dropped in an archived session folder when that run's extraction
+/// finished **whole**. See [`is_extraction_complete`] for the full contract.
+pub const EXTRACTION_OK: &str = ".extraction-ok";
+
 /// Process-unique suffix counter for temp dirs (same rationale as snapshot.rs:
 /// concurrent writers must never race on a shared temp path).
 static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
@@ -754,6 +758,42 @@ pub fn backfill_meta(archive_root: &Path) -> (usize, usize) {
     (candidates, filled)
 }
 
+// ---- 재아카이브 판정 (GUI 커맨드 ↔ CLI 백필 단일 출처) ----
+
+/// The archived session for `uuid`, if any (across every project — a uuid is
+/// globally unique). The listing is the single lookup path both entry points
+/// use, so "이미 아카이브됨" can never mean two different things.
+pub fn find_archived_session(archive_root: &Path, uuid: &str) -> Option<ArchiveSessionEntry> {
+    list_archives(archive_root)
+        .into_iter()
+        .flat_map(|p| p.sessions)
+        .find(|s| s.meta.uuid == uuid)
+}
+
+/// **`.extraction-ok` 계약** — 이 아카이브의 추출이 온전히 끝났는가.
+///
+/// - *기록*: 한 번의 아카이브 실행이 ① 추출 호출 성공 ② 이번 실행의 **신선한**
+///   summary.md 기록 ③ 지식 기록 실패 없음 ④ 그 밖의 추출 단계 경고 0 을 모두
+///   만족할 때만, 그 실행이 안착시킨 세션 폴더에 빈 파일로 남긴다. `.mcp.json`
+///   등록 결과는 추출과 무관하므로 마커를 막지 않는다(보고만).
+/// - *판정*: 여기(summary.md + 마커). 마커가 없으면 — 추출 실패·부분 실패·마커
+///   도입 이전(구 CLI 백필) 아카이브 — 재아카이브가 **추출 재시도**로 동작한다
+///   (리뷰 F5/G2: 부분 실패가 영영 재시도되지 않는 상태 차단).
+/// - *수명*: [`write_archive`]는 새 폴더를 만들어 갈아끼우므로 마커는 이월되지
+///   않는다 — 항상 "마지막 실행의 결과"만 나타낸다.
+pub fn is_extraction_complete(entry: &ArchiveSessionEntry) -> bool {
+    entry.summary_path.is_some() && entry.dir.join(EXTRACTION_OK).is_file()
+}
+
+/// 변경 없음 스킵 판정: 라이브 전사가 이 아카이브의 스냅샷과 같은 내용이고
+/// ([`JsonlStat::same_content`]) 그 아카이브의 추출이 온전하면
+/// ([`is_extraction_complete`]) 아무것도 다시 쓰지 않는다 — 같은 내용에 1~3분
+/// 짜리 추출을 재실행하지 않기 위해.
+pub fn is_unchanged_complete(entry: &ArchiveSessionEntry, live: &JsonlStat) -> bool {
+    is_extraction_complete(entry)
+        && archived_stat(&entry.dir, &entry.meta).is_some_and(|s| s.same_content(live))
+}
+
 /// The self-contained reader page. Placeholders: `__TITLE__` (HTML-escaped) and
 /// `__DATA__` (the `<`-escaped JSON document). No external requests, no
 /// innerHTML — content is rendered with `textContent` only.
@@ -1193,6 +1233,61 @@ mod tests {
                 .to_string_lossy()
                 .starts_with(".old-")),
             "이월 완료 후 aside 잔존 없음"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// 한 줄 append로 "내용이 자란" 전사 — unchanged 판정의 반대편.
+    fn grown(jsonl: &str) -> String {
+        format!(
+            "{jsonl}\n{}",
+            json!({"type":"user","uuid":"u-grow","message":{"role":"user","content":"more"}})
+        )
+    }
+
+    // 특성테스트: unchanged 스킵의 세 조건(같은 내용 + summary.md + 마커)을
+    // 고정한다. 셋 중 하나라도 빠지면 재아카이브가 추출 재시도로 동작한다.
+    #[test]
+    fn unchanged_skip_requires_same_content_summary_and_marker() {
+        let root = temp_root("verdict");
+        let jsonl = sample_jsonl("p");
+        let out = write_archive(&root, "/p", &sample_session("t"), jsonl.as_bytes()).unwrap();
+        let live = jsonl_stat(jsonl.as_bytes());
+        let entry = || find_archived_session(&root, UUID).unwrap();
+
+        // core 산출물만 (추출 전) → 재추출 대상.
+        assert!(!is_extraction_complete(&entry()));
+        assert!(!is_unchanged_complete(&entry(), &live));
+        // summary만 있고 마커 없음 → 여전히 재추출 대상 (F5: 지식 부분 실패가
+        // 영구히 재시도 불가해지는 것 차단).
+        fs::write(out.dir.join("summary.md"), "요약").unwrap();
+        assert!(!is_unchanged_complete(&entry(), &live));
+        // summary + 마커 → 스킵.
+        fs::write(out.dir.join(EXTRACTION_OK), b"").unwrap();
+        assert!(is_extraction_complete(&entry()));
+        assert!(is_unchanged_complete(&entry(), &live));
+        // 마커가 있어도 전사가 자랐으면 스킵하지 않는다.
+        assert!(!is_unchanged_complete(&entry(), &jsonl_stat(grown(&jsonl).as_bytes())));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    // 실결함 재현: 마커를 남기지 않는 경로(구 CLI 백필)가 만든 아카이브는
+    // 내용이 그대로여도 GUI 판정이 매번 재추출(1~3분)을 요구한다. 파이프라인
+    // 단일화 이후에도 **구 아카이브**에 대해서는 이 자기치유 동작이 유지된다.
+    #[test]
+    fn legacy_archive_without_marker_forces_reextraction() {
+        let root = temp_root("legacy");
+        let jsonl = sample_jsonl("p");
+        // 구 CLI 백필이 남기던 형상 그대로: core 산출물 + summary.md, 마커 없음.
+        let out = write_archive(&root, "/p", &sample_session("t"), jsonl.as_bytes()).unwrap();
+        fs::write(out.dir.join("summary.md"), "요약").unwrap();
+        assert!(!out.dir.join(EXTRACTION_OK).exists());
+
+        let entry = find_archived_session(&root, UUID).unwrap();
+        assert!(entry.summary_path.is_some(), "추출은 성공했던 아카이브");
+        assert!(
+            !is_unchanged_complete(&entry, &jsonl_stat(jsonl.as_bytes())),
+            "마커가 없으면 내용이 같아도 재추출을 요구한다"
         );
         let _ = fs::remove_dir_all(&root);
     }

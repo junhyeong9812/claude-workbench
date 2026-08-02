@@ -176,21 +176,12 @@ fn archive_session_blocking(
     // first write below displaces that folder (감사 A1: 지식만 남고 요약만
     // 사라지는 비대칭 방지). A read failure is reported, not swallowed.
     let mut errors: Vec<String> = Vec::new();
-    let prev_entry = core_lib::archive::list_archives(&root)
-        .into_iter()
-        .flat_map(|p| p.sessions)
-        .find(|s| s.meta.uuid == uuid);
+    let prev_entry = core_lib::archive::find_archived_session(&root, &uuid);
 
-    // 변경 없음 스킵: 트랜스크립트가 최신 아카이브 스냅샷과 동일하고 그
-    // 아카이브의 추출이 온전히 완료(summary + `.extraction-ok` 마커)라면
-    // 아무것도 다시 쓰지 않는다 — 같은 내용에 1~3분짜리 추출을 재실행하지
-    // 않기 위해. 마커가 없으면(추출 실패·부분 실패·구버전 아카이브) 재아카이브
-    // 가 추출 재시도로 동작한다 (리뷰 F5 — summary만 보면 지식 부분 실패가
-    // 영구히 재시도 불가).
+    // 변경 없음 스킵 — 판정식은 core::archive 단일 출처(`is_unchanged_complete`).
     if let Some(prev) = &prev_entry {
-        let same = core_lib::archive::archived_stat(&prev.dir, &prev.meta)
-            .is_some_and(|s| s.same_content(&core_lib::archive::jsonl_stat(&jsonl_bytes)));
-        if same && prev.summary_path.is_some() && prev.dir.join(".extraction-ok").is_file() {
+        let live = core_lib::archive::jsonl_stat(&jsonl_bytes);
+        if core_lib::archive::is_unchanged_complete(prev, &live) {
             return Ok(ArchiveResult {
                 dir: prev.dir.to_string_lossy().to_string(),
                 book_path: prev.book_path.to_string_lossy().to_string(),
@@ -309,7 +300,7 @@ fn archive_session_blocking(
     // 경고가 하나라도 있으면(지식 일부 실패·요약 last-good 유지 등) 마커를
     // 남기지 않아, 동일 내용 재아카이브가 추출 재시도로 동작한다.
     if summary_ok && errors.is_empty() {
-        if let Err(e) = std::fs::write(out.dir.join(".extraction-ok"), b"") {
+        if let Err(e) = std::fs::write(out.dir.join(core_lib::archive::EXTRACTION_OK), b"") {
             errors.push(io_message("Cannot mark extraction ok", &e));
         }
     }
