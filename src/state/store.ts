@@ -443,6 +443,8 @@ interface AppState {
   popoutGeometry: Record<string, PopoutGeo>;
   /** Save a popout window's geometry (persists). */
   setPopoutGeometry: (windowLabel: string, geo: PopoutGeo) => void;
+  /** 레이아웃 없는 고아 popout geometry 정리 (기동 시 1회 — P5 F-h). */
+  pruneOrphanPopoutGeometry: () => void;
   /** Move the folder-tree keyboard cursor. */
   setTreeCursor: (path: string | null) => void;
   /** Open/close the peek viewer on a file (null closes it). */
@@ -1092,6 +1094,18 @@ export const useAppStore = create<AppState>((set, get) => ({
     set((s) => {
       persistPopoutGeometry(windowLabel, geo);
       return { popoutGeometry: { ...s.popoutGeometry, [windowLabel]: geo } };
+    }),
+  // P5 F-h(P2 이관): 레이아웃 없는 고아 geometry 정리 — geometry는 레이아웃
+  // 라벨을 재열 때만 읽히므로(App 재오픈 흐름) 레이아웃이 사라진 라벨의
+  // geometry는 영구 잔존하는 죽은 데이터다. 기동 시 1회 호출(App.tsx).
+  pruneOrphanPopoutGeometry: () =>
+    set((s) => {
+      const orphans = Object.keys(s.popoutGeometry).filter((l) => !(l in s.popoutLayouts));
+      if (orphans.length === 0) return s;
+      const nextGeo = { ...s.popoutGeometry };
+      for (const l of orphans) delete nextGeo[l];
+      savePopoutGeometry(nextGeo);
+      return { popoutGeometry: nextGeo };
     }),
 
   upsertConnection: (conn) => {
