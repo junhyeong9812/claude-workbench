@@ -47,6 +47,134 @@ struct ClaudeRuntime {
     by_id: HashMap<u64, Sess>,
 }
 
+/// T1/T2(open_or_attach의 live 분기) 계산 결과 — 부수효과 없음(P5 B-b).
+enum AttachLive {
+    /// live 항목 없음(또는 uuid 미지정) — 신규 스폰(T3) 경로로.
+    NotLive,
+    /// live PTY에 attach(미러, 또는 고아 드라이버 승격 시 handoff Some).
+    Attached {
+        id: u64,
+        driver: String,
+        rev: u64,
+        handoff: Option<(String, u64)>,
+    },
+    /// stale live 정리됨(PTY 소멸, T2) — 신규 스폰 경로로 낙하.
+    Cleaned,
+}
+
+/// T5(detach) 계산 결과 — 부수효과(PTY remove·emit)는 락 해제 후 호출부가.
+enum DetachAct {
+    None,
+    Close(Arc<AtomicBool>),
+    Handoff(String, u64),
+}
+
+/// P5 B-b: 드라이버 전이표(조사 §2-3 T1~T7)를 **순수 메서드**로 — 락 안에서
+/// 계산만 하고 부수효과(emit·mgr.remove)는 호출부가 락 해제 후 수행한다(I4).
+/// 유일한 외부 판정이던 `mgr.exists`는 `pty_alive` 클로저로 주입 — 전 전이가
+/// tauri 무의존이 되어 특성테스트가 커버리지 0이던 전이를 전수 고정한다.
+impl ClaudeRuntime {
+    /// T1/T2 — live uuid attach. 불변식: live↔by_id 동시 갱신(I1),
+    /// 고아 드라이버(전송 창 I3의 복구) 승격 시 rev+1(I2).
+    fn attach_live(
+        &mut self,
+        project: &str,
+        uuid: Option<&str>,
+        label: &str,
+        pty_alive: impl FnOnce(u64) -> bool,
+    ) -> AttachLive {
+        let Some(u) = uuid else { return AttachLive::NotLive };
+        let key = (project.to_string(), u.to_string());
+        let Some(&id) = self.live.get(&key) else { return AttachLive::NotLive };
+        if pty_alive(id) {
+            if let Some(sess) = self.by_id.get_mut(&id) {
+                if !sess.attached.iter().any(|l| l == label) {
+                    sess.attached.push(label.to_string());
+                }
+                let mut handoff = None;
+                if !sess.attached.iter().any(|l| l == &sess.driver) {
+                    sess.driver = label.to_string();
+                    sess.rev += 1;
+                    handoff = Some((sess.driver.clone(), sess.rev));
+                }
+                return AttachLive::Attached {
+                    id,
+                    driver: sess.driver.clone(),
+                    rev: sess.rev,
+                    handoff,
+                };
+            }
+        }
+        // Stale live entry (PTY gone): clean BOTH maps + stop flag so
+        // `claude_live_uuids` can't keep reporting it (review P6-impl #3).
+        if let Some(s) = self.by_id.remove(&id) {
+            s.stop.store(true, Ordering::Relaxed);
+        }
+        self.live.remove(&key);
+        AttachLive::Cleaned
+    }
+
+    /// T3 — 신규 스폰 등록(driver=label, rev=0, 양 맵 동시).
+    fn register(&mut self, id: u64, project: String, uuid: String, label: String, stop: Arc<AtomicBool>) {
+        self.live.insert((project.clone(), uuid.clone()), id);
+        self.by_id.insert(
+            id,
+            Sess { project, uuid, attached: vec![label.clone()], driver: label, rev: 0, stop },
+        );
+    }
+
+    /// T4 — 인수(테이크오버). None = 세션 없음. Some((driver, rev)):
+    /// attach된 비드라이버만 실제 전이(rev+1); 그 외는 현재값 그대로(emit은
+    /// 호출부가 `driver == label`일 때만 — I7 비대칭 보존).
+    fn set_driver(&mut self, id: u64, label: &str) -> Option<(String, u64)> {
+        match self.by_id.get_mut(&id) {
+            Some(s) if s.attached.iter().any(|l| l == label) && s.driver != label => {
+                s.driver = label.to_string();
+                s.rev += 1;
+                Some((s.driver.clone(), s.rev))
+            }
+            Some(s) => Some((s.driver.clone(), s.rev)), // already driver / not attached
+            None => None,
+        }
+    }
+
+    /// T5 — detach. None = 세션 없음. (a) 마지막 뷰어+close_if_last → Close
+    /// (양 맵 제거) (b) 마지막 뷰어+전송 중 → None(PTY·driver 유지, I6)
+    /// (c) 드라이버 이탈+잔여 → Handoff(attached[0], rev+1).
+    fn detach(&mut self, id: u64, label: &str, close_if_last: bool) -> Option<(DetachAct, String, u64)> {
+        let sess = self.by_id.get_mut(&id)?;
+        sess.attached.retain(|l| l != label);
+        if sess.attached.is_empty() {
+            if close_if_last {
+                let key = (sess.project.clone(), sess.uuid.clone());
+                let stop = sess.stop.clone();
+                self.by_id.remove(&id);
+                self.live.remove(&key);
+                Some((DetachAct::Close(stop), String::new(), 0))
+            } else {
+                // Transfer in progress: keep the PTY (target will attach); leave
+                // driver as-is (target will set_driver).
+                Some((DetachAct::None, sess.driver.clone(), sess.rev))
+            }
+        } else if sess.driver == label {
+            sess.driver = sess.attached[0].clone();
+            sess.rev += 1;
+            Some((DetachAct::Handoff(sess.driver.clone(), sess.rev), sess.driver.clone(), sess.rev))
+        } else {
+            Some((DetachAct::None, sess.driver.clone(), sess.rev))
+        }
+    }
+
+    /// T6/T7 — 강제 제거(양 맵). stop 플래그를 돌려준다 — T6(claude_close)는
+    /// store 후 PTY remove, T7(poll 자연사)는 존재 여부만 쓴다.
+    fn remove_session(&mut self, id: u64) -> Option<Arc<AtomicBool>> {
+        self.by_id.remove(&id).map(|s| {
+            self.live.remove(&(s.project, s.uuid));
+            s.stop
+        })
+    }
+}
+
 /// Managed state: all live Claude sessions (single lock).
 #[derive(Default)]
 pub struct ClaudeState {
@@ -378,47 +506,25 @@ pub fn claude_open_or_attach(
     let cwd = cwd.ok_or_else(|| AppError::new("Claude requires an active project"))?;
     let mut rt = claude.rt.lock().map_err(|_| AppError::new("Claude state unavailable"))?;
 
-    // Mirror: attach to the running PTY if this uuid is live.
-    if let Some(u) = &uuid {
-        let key = (project.clone(), u.clone());
-        if let Some(&id) = rt.live.get(&key) {
-            if mgr.exists(id) {
-                if let Some(sess) = rt.by_id.get_mut(&id) {
-                    if !sess.attached.contains(&label) {
-                        sess.attached.push(label.clone());
-                    }
-                    // Promote this window to driver if the current driver is gone
-                    // (e.g. it detached during a transfer, leaving a stale label) —
-                    // else the new viewer is locked as a mirror with no driver
-                    // (review P6-impl #1). `role` is computed from the real driver (#5).
-                    let mut handoff = None;
-                    if !sess.attached.iter().any(|l| l == &sess.driver) {
-                        sess.driver = label.clone();
-                        sess.rev += 1;
-                        handoff = Some((sess.driver.clone(), sess.rev));
-                    }
-                    let role = if sess.driver == label { "driver" } else { "mirror" };
-                    let opened = ClaudeOpened {
-                        id,
-                        session_uuid: u.clone(),
-                        role: role.into(),
-                        driver: sess.driver.clone(),
-                        rev: sess.rev,
-                    };
-                    drop(rt);
-                    if let Some((driver, rev)) = handoff {
-                        let _ = app.emit("claude-driver-changed", ClaudeDriver { id, driver, rev });
-                    }
-                    return Ok(opened);
-                }
+    // Mirror: attach to the running PTY if this uuid is live (T1/T2 — 전이는
+    // ClaudeRuntime 순수 메서드, 승격 emit은 락 해제 후. P6-impl #1/#3/#5).
+    match rt.attach_live(&project, uuid.as_deref(), &label, |id| mgr.exists(id)) {
+        AttachLive::Attached { id, driver, rev, handoff } => {
+            let role = if driver == label { "driver" } else { "mirror" };
+            let opened = ClaudeOpened {
+                id,
+                session_uuid: uuid.clone().unwrap_or_default(),
+                role: role.into(),
+                driver,
+                rev,
+            };
+            drop(rt);
+            if let Some((driver, rev)) = handoff {
+                let _ = app.emit("claude-driver-changed", ClaudeDriver { id, driver, rev });
             }
-            // Stale live entry (PTY gone): clean BOTH maps + stop flag so
-            // `claude_live_uuids` can't keep reporting it (review P6-impl #3).
-            if let Some(s) = rt.by_id.remove(&id) {
-                s.stop.store(true, Ordering::Relaxed);
-            }
-            rt.live.remove(&key);
+            return Ok(opened);
         }
+        AttachLive::NotLive | AttachLive::Cleaned => {}
     }
 
     // 이 프로젝트에 아카이브 지식이 있으면 .mcp.json 등록을 보장 — 새로 뜨는
@@ -435,18 +541,7 @@ pub fn claude_open_or_attach(
         cols,
         rows,
     )?;
-    rt.live.insert((project.clone(), session_uuid.clone()), id);
-    rt.by_id.insert(
-        id,
-        Sess {
-            project,
-            uuid: session_uuid.clone(),
-            attached: vec![label.clone()],
-            driver: label.clone(),
-            rev: 0,
-            stop,
-        },
-    );
+    rt.register(id, project, session_uuid.clone(), label.clone(), stop); // T3
     Ok(ClaudeOpened { id, session_uuid, role: "driver".into(), driver: label, rev: 0 })
 }
 
@@ -506,15 +601,7 @@ pub fn claude_set_driver(
     let label = window.label().to_string();
     let changed = {
         let mut rt = claude.rt.lock().map_err(|_| AppError::new("Claude state unavailable"))?;
-        match rt.by_id.get_mut(&id) {
-            Some(s) if s.attached.contains(&label) && s.driver != label => {
-                s.driver = label.clone();
-                s.rev += 1;
-                Some((s.driver.clone(), s.rev))
-            }
-            Some(s) => Some((s.driver.clone(), s.rev)), // already driver / not attached
-            None => None,
-        }
+        rt.set_driver(id, &label) // T4 (전이표 순수 메서드)
     };
     match changed {
         Some((driver, rev)) => {
@@ -541,48 +628,24 @@ pub fn claude_detach(
     close_if_last: bool,
 ) -> Result<ClaudeDetached, AppError> {
     let label = window.label().to_string();
-    enum Act {
-        None,
-        Close(Arc<AtomicBool>),
-        Handoff(String, u64),
-    }
-    let (act, driver, rev) = {
+    let outcome = {
         let mut rt = claude.rt.lock().map_err(|_| AppError::new("Claude state unavailable"))?;
-        let Some(sess) = rt.by_id.get_mut(&id) else {
-            return Ok(ClaudeDetached { closed: false, driver: String::new(), rev: 0 });
-        };
-        sess.attached.retain(|l| l != &label);
-        if sess.attached.is_empty() {
-            if close_if_last {
-                let key = (sess.project.clone(), sess.uuid.clone());
-                let stop = sess.stop.clone();
-                rt.by_id.remove(&id);
-                rt.live.remove(&key);
-                (Act::Close(stop), String::new(), 0)
-            } else {
-                // Transfer in progress: keep the PTY (target will attach); leave
-                // driver as-is (target will set_driver).
-                (Act::None, sess.driver.clone(), sess.rev)
-            }
-        } else if sess.driver == label {
-            sess.driver = sess.attached[0].clone();
-            sess.rev += 1;
-            (Act::Handoff(sess.driver.clone(), sess.rev), sess.driver.clone(), sess.rev)
-        } else {
-            (Act::None, sess.driver.clone(), sess.rev)
-        }
+        rt.detach(id, &label, close_if_last) // T5 (전이표 순수 메서드)
+    };
+    let Some((act, driver, rev)) = outcome else {
+        return Ok(ClaudeDetached { closed: false, driver: String::new(), rev: 0 });
     };
     match act {
-        Act::Close(stop) => {
+        DetachAct::Close(stop) => {
             stop.store(true, Ordering::Relaxed);
             mgr.remove(id).map_err(AppError::new)?;
             Ok(ClaudeDetached { closed: true, driver, rev })
         }
-        Act::Handoff(d, r) => {
+        DetachAct::Handoff(d, r) => {
             let _ = app.emit("claude-driver-changed", ClaudeDriver { id, driver: d, rev: r });
             Ok(ClaudeDetached { closed: false, driver, rev })
         }
-        Act::None => Ok(ClaudeDetached { closed: false, driver, rev }),
+        DetachAct::None => Ok(ClaudeDetached { closed: false, driver, rev }),
     }
 }
 
@@ -1023,10 +1086,7 @@ fn run_timeline_poll(
     let mut existed = false;
     if let Some(state) = app.try_state::<ClaudeState>() {
         if let Ok(mut rt) = state.rt.lock() {
-            if let Some(sess) = rt.by_id.remove(&id) {
-                rt.live.remove(&(sess.project, sess.uuid));
-                existed = true;
-            }
+            existed = rt.remove_session(id).is_some(); // T7 (전이표 순수 메서드)
         }
     }
     // Notify any mirror windows that the session ended (review P6-impl #2).
@@ -1183,10 +1243,7 @@ pub fn claude_close(
 ) -> Result<(), AppError> {
     let stop = {
         let mut rt = claude.rt.lock().map_err(|_| AppError::new("Claude state unavailable"))?;
-        rt.by_id.remove(&id).map(|s| {
-            rt.live.remove(&(s.project.clone(), s.uuid.clone()));
-            s.stop
-        })
+        rt.remove_session(id) // T6 (전이표 순수 메서드)
     };
     if let Some(stop) = stop {
         stop.store(true, Ordering::Relaxed);
@@ -1375,5 +1432,155 @@ mod tests {
     fn subagent_parent_none_when_unmentioned_or_no_content() {
         let main = vec![item("m-1", None)];
         assert_eq!(subagent_parent("agent-X", &main, &[]), None);
+    }
+
+    // ---- P5 B-b: 드라이버 전이표 특성테스트 (T1~T7 / I1~I7 — 조사 §2-3.
+    // 이전 커버리지 0이던 전이를 순수 메서드로 고정) ----
+
+    fn rt_with(id: u64, project: &str, uuid: &str, label: &str) -> (ClaudeRuntime, Arc<AtomicBool>) {
+        let mut rt = ClaudeRuntime::default();
+        let stop = Arc::new(AtomicBool::new(false));
+        rt.register(id, project.into(), uuid.into(), label.into(), stop.clone());
+        (rt, stop)
+    }
+
+    fn maps_consistent(rt: &ClaudeRuntime) -> bool {
+        // I1: live의 모든 id가 by_id에 있고, by_id의 (project,uuid)가 live와 일치.
+        rt.live.iter().all(|(k, id)| {
+            rt.by_id.get(id).map(|s| (&s.project, &s.uuid) == (&k.0, &k.1)).unwrap_or(false)
+        }) && rt.by_id.iter().all(|(id, s)| {
+            rt.live.get(&(s.project.clone(), s.uuid.clone())) == Some(id)
+        })
+    }
+
+    /// T3 + T1(미러 attach): 두 번째 창은 미러, 승격 없음, rev 불변.
+    #[test]
+    fn attach_live_second_window_is_mirror() {
+        let (mut rt, _stop) = rt_with(1, "/p", "u1", "main");
+        match rt.attach_live("/p", Some("u1"), "popout", |_| true) {
+            AttachLive::Attached { id, driver, rev, handoff } => {
+                assert_eq!((id, driver.as_str(), rev), (1, "main", 0));
+                assert!(handoff.is_none());
+            }
+            _ => panic!("live 세션에 attach여야 한다"),
+        }
+        assert!(maps_consistent(&rt));
+        assert_eq!(rt.by_id[&1].attached, vec!["main", "popout"]);
+    }
+
+    /// T1 고아 승격(I3 복구): driver가 attached에 없으면 새 뷰어가 승격 + rev+1
+    /// + handoff(락 해제 후 emit 계약 — I4는 반환값으로 표현된다).
+    #[test]
+    fn attach_live_promotes_orphaned_driver() {
+        let (mut rt, _stop) = rt_with(1, "/p", "u1", "main");
+        // 전송 창: 드라이버가 detach(close_if_last=false)로 빠져 attached 비움(I6).
+        let out = rt.detach(1, "main", false).unwrap();
+        assert!(matches!(out.0, DetachAct::None));
+        assert!(rt.by_id[&1].attached.is_empty());
+        assert_eq!(rt.by_id[&1].driver, "main"); // driver 유지(전송 계약)
+        match rt.attach_live("/p", Some("u1"), "popout", |_| true) {
+            AttachLive::Attached { driver, rev, handoff, .. } => {
+                assert_eq!(driver, "popout");
+                assert_eq!(rev, 1); // I2 단조
+                assert_eq!(handoff, Some(("popout".into(), 1)));
+            }
+            _ => panic!(),
+        }
+        assert!(maps_consistent(&rt));
+    }
+
+    /// T2: PTY 소멸 시 양 맵 동시 정리 + stop set → Cleaned(신규 스폰 낙하).
+    #[test]
+    fn attach_live_cleans_stale_entry() {
+        let (mut rt, stop) = rt_with(1, "/p", "u1", "main");
+        match rt.attach_live("/p", Some("u1"), "w2", |_| false) {
+            AttachLive::Cleaned => {}
+            _ => panic!("죽은 PTY는 Cleaned여야 한다"),
+        }
+        assert!(rt.live.is_empty() && rt.by_id.is_empty());
+        assert!(stop.load(Ordering::Relaxed));
+    }
+
+    /// T1 uuid 미지정/미라이브 → NotLive(스폰 경로).
+    #[test]
+    fn attach_live_not_live_paths() {
+        let (mut rt, _s) = rt_with(1, "/p", "u1", "main");
+        assert!(matches!(rt.attach_live("/p", None, "w", |_| true), AttachLive::NotLive));
+        assert!(matches!(rt.attach_live("/p", Some("u2"), "w", |_| true), AttachLive::NotLive));
+        assert!(matches!(rt.attach_live("/q", Some("u1"), "w", |_| true), AttachLive::NotLive));
+    }
+
+    /// T4: attach된 미러만 실전이(rev+1); 이미 드라이버/미attach는 현재값,
+    /// 미존재는 None. (emit은 driver==label일 때만 — I7은 호출부 계약.)
+    #[test]
+    fn set_driver_transitions() {
+        let (mut rt, _s) = rt_with(1, "/p", "u1", "main");
+        rt.attach_live("/p", Some("u1"), "popout", |_| true);
+        assert_eq!(rt.set_driver(1, "popout"), Some(("popout".into(), 1)));
+        assert_eq!(rt.set_driver(1, "popout"), Some(("popout".into(), 1))); // 재호출 무전이
+        assert_eq!(rt.set_driver(1, "ghost"), Some(("popout".into(), 1))); // 미attach 무전이
+        assert_eq!(rt.set_driver(9, "main"), None);
+        assert!(maps_consistent(&rt));
+    }
+
+    /// T5(a): 마지막 뷰어 + close_if_last → Close(양 맵 제거).
+    #[test]
+    fn detach_last_viewer_closes() {
+        let (mut rt, stop) = rt_with(1, "/p", "u1", "main");
+        let (act, driver, rev) = rt.detach(1, "main", true).unwrap();
+        assert!(matches!(act, DetachAct::Close(_)));
+        assert_eq!((driver.as_str(), rev), ("", 0));
+        assert!(rt.live.is_empty() && rt.by_id.is_empty());
+        // stop은 호출부가 store(I4 — 계산과 부수효과 분리): 여기선 아직 false.
+        assert!(!stop.load(Ordering::Relaxed));
+    }
+
+    /// T5(c): 드라이버 이탈 + 잔여 → attached[0] 승계 + rev+1 + Handoff.
+    #[test]
+    fn detach_driver_hands_off_in_attach_order() {
+        let (mut rt, _s) = rt_with(1, "/p", "u1", "main");
+        rt.attach_live("/p", Some("u1"), "w2", |_| true);
+        rt.attach_live("/p", Some("u1"), "w3", |_| true);
+        let (act, driver, rev) = rt.detach(1, "main", true).unwrap();
+        assert!(matches!(act, DetachAct::Handoff(ref d, 1) if d == "w2"));
+        assert_eq!((driver.as_str(), rev), ("w2", 1));
+        assert_eq!(rt.by_id[&1].attached, vec!["w2", "w3"]);
+        assert!(maps_consistent(&rt));
+    }
+
+    /// T5(d): 비드라이버 이탈 → 무전이(None), rev 불변.
+    #[test]
+    fn detach_mirror_is_no_transition() {
+        let (mut rt, _s) = rt_with(1, "/p", "u1", "main");
+        rt.attach_live("/p", Some("u1"), "w2", |_| true);
+        let (act, driver, rev) = rt.detach(1, "w2", true).unwrap();
+        assert!(matches!(act, DetachAct::None));
+        assert_eq!((driver.as_str(), rev), ("main", 0));
+        assert!(maps_consistent(&rt));
+    }
+
+    /// T6/T7: 강제 제거 — 양 맵 동시, stop 반환(저장은 호출부), 미존재 None.
+    #[test]
+    fn remove_session_clears_both_maps() {
+        let (mut rt, _s) = rt_with(1, "/p", "u1", "main");
+        assert!(rt.remove_session(1).is_some());
+        assert!(rt.live.is_empty() && rt.by_id.is_empty());
+        assert!(rt.remove_session(1).is_none());
+    }
+
+    /// I2 종합: 전이 시퀀스에서 rev가 단조 증가한다.
+    #[test]
+    fn rev_is_monotonic_across_transitions() {
+        let (mut rt, _s) = rt_with(1, "/p", "u1", "main");
+        rt.attach_live("/p", Some("u1"), "w2", |_| true);
+        let mut last = 0u64;
+        let mut check = |rev: u64| {
+            assert!(rev >= last, "rev 역행: {last} -> {rev}");
+            last = rev;
+        };
+        check(rt.set_driver(1, "w2").unwrap().1); // 1
+        check(rt.set_driver(1, "main").unwrap().1); // 2
+        let (_, _, rev) = rt.detach(1, "main", true).unwrap(); // handoff → 3
+        check(rev);
     }
 }
