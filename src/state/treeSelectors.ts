@@ -56,6 +56,53 @@ export function sameEntries(a: DirEntry[] | undefined, b: DirEntry[]): boolean {
   return true;
 }
 
+/** childrenCache 엔트리 상한 (P5 F-g — P2 이관 'F3 후반'). 초과 시 keep-set
+ * 밖(접힌·비표시 dir)만 축출 — 재확장 시 loadChildren이 다시 읽으므로 표시
+ * 회귀 없음. */
+export const TREE_CACHE_MAX = 400;
+
+/** 축출 금지 집합: 열린 프로젝트 루트+확장 dir, 스터디 폴더 루트+확장 dir —
+ * "표시 중이거나 즉시 표시될 수 있는" dir 전부. 이 밖의 캐시는 편의 사본. */
+export function computeTreeKeepSet(
+  projects: { path: string; tree_state: { expanded: string[] } }[],
+  studyFolders: { left: string | null; right: string | null },
+  studyExpanded: Record<string, string[]>,
+): Set<string> {
+  const keep = new Set<string>();
+  for (const p of projects) {
+    keep.add(p.path);
+    for (const d of p.tree_state.expanded) keep.add(d);
+  }
+  for (const r of [studyFolders.left, studyFolders.right]) if (r) keep.add(r);
+  for (const dirs of Object.values(studyExpanded)) for (const d of dirs) keep.add(d);
+  return keep;
+}
+
+/** 상한 강제: size ≤ max면 원본 identity 그대로, 초과면 keep 밖 키를 순서대로
+ * 지워 max 이하로. keep 키는 절대 축출하지 않는다(초과 잔존 허용 — 표시 우선). */
+export function capTreeCache<T>(
+  cache: Record<string, T>,
+  keep: ReadonlySet<string>,
+  max: number = TREE_CACHE_MAX,
+): Record<string, T> {
+  const keys = Object.keys(cache);
+  if (keys.length <= max) return cache;
+  const next = { ...cache };
+  let size = keys.length;
+  let deleted = 0;
+  for (const k of keys) {
+    if (size <= max) break;
+    if (keep.has(k)) continue;
+    delete next[k];
+    size--;
+    deleted++;
+  }
+  // 실제 삭제 0(keep만으로 초과)이면 원본 identity — 호출부의 epoch 연동이
+  // "축출 발생"과 정확히 동치가 되게(감사: 아니면 keep 초과 상태에서 매 쓰기
+  // 마다 전 in-flight 무효화 폭주).
+  return deleted === 0 ? cache : next;
+}
+
 /** key가 root 자신이거나 그 아래인가 (구분자 `/`·`\` 둘 다 + root의 후행
  * 구분자 정규화 — Windows·"C:\\"·"/xx/" 형태 대비, 리뷰 #7·감사 개선). */
 export const underRoot = (key: string, root: string) => {

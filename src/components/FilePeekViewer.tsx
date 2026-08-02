@@ -3,6 +3,7 @@ import { EditorView, basicSetup } from "codemirror";
 import { EditorState } from "@codemirror/state";
 import { useAppStore } from "../state/store";
 import { langFor, fileName } from "./cmLang";
+import { ViewModeToggle } from "./ViewModeToggle";
 import { cmThemeExt } from "./cmTheme";
 import { MarkdownText } from "./TimelineView";
 import { isMarkdownPath } from "./markdown";
@@ -151,15 +152,7 @@ export function FilePeekViewer({
       <div className="peek-head">
         <span className="peek-title">{memory ? memory.name : fileName(path ?? "")}</span>
         <span className="peek-path">{memory ? "드롭된 파일 — 읽기 전용" : path}</span>
-        {md && (
-          <button
-            className="claudeterm-viewmode-btn"
-            title="뷰모드 ↔ 원본 (단축키 v)"
-            onClick={() => setMarkdown((v) => !v)}
-          >
-            {markdown ? "원본 보기" : "뷰모드 보기"}
-          </button>
-        )}
+        {md && <ViewModeToggle markdown={markdown} onToggle={() => setMarkdown((v) => !v)} />}
         <span className="peek-hint">
           {md ? "v 뷰/원본 · " : ""}↑↓ 스크롤 · Ctrl+← 트리 · Esc 닫기
           {memory ? "" : " · Ctrl+E 에디터"}

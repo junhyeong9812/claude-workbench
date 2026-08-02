@@ -1851,50 +1851,6 @@ body {
   color: var(--fg);
   background: var(--bg-hover);
 }
-.claude-tab-backdrop {
-  position: fixed;
-  inset: 0;
-  z-index: var(--z-peek);
-}
-.claude-tab-menu {
-  position: absolute;
-  top: 100%;
-  right: 0;
-  z-index: var(--z-peek-above);
-  margin-top: 2px;
-  display: flex;
-  flex-direction: column;
-  min-width: 160px;
-  max-height: 60vh;
-  overflow-y: auto;
-  background: var(--bg-alt);
-  border: 1px solid var(--border);
-  border-radius: 4px;
-  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.4);
-}
-.claude-tab-opt {
-  display: flex;
-  justify-content: space-between;
-  align-items: baseline;
-  gap: 8px;
-  padding: 6px 10px;
-  background: none;
-  border: none;
-  color: var(--fg);
-  text-align: left;
-  cursor: pointer;
-}
-.claude-tab-opt:hover {
-  background: var(--bg-hover);
-}
-.claude-tab-del:hover {
-  color: var(--st-fail);
-}
-.claude-tab-hint {
-  font-size: 10px;
-  color: var(--fg-dim);
-}
-
 /* Claude close/delete modal (B3-1) */
 .claude-modal-backdrop {
   position: fixed;

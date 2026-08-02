@@ -61,6 +61,13 @@ pub fn contained_prospective(root: &Path, path: &str) -> Result<(), ContainErr> 
     }
 }
 
+// NOTE(P5 B-f descope): "존재 최심 조상" 탐색 3벌(이 파일 prospective 루프 ·
+// commands/files.rs effective_path · label.rs canonical_or_self)의 통합을
+// 시도했으나, `..` 꼬리 같은 퇴화 입력에서 세 구현의 의미가 3종으로 갈린다
+// (prospective=file_name 무관 상승 / effective_path=None / canonical_or_self=
+// ancestors+strip_prefix의 비정규 join) — 공통 핵으로 접으면 어느 한쪽의
+// 관측 동작이 바뀐다. 정책 상이 계열 통일 금지 원칙(P4)에 따라 유지.
+
 /// 프로젝트 경로의 canonical 키 — `.`/후행 슬래시/심링크 alias가 같은 키로
 /// 접히고, 해소 불가(디스크에 없음)면 원문 그대로(폴백 계약 보존).
 pub fn canonical_key(p: &str) -> String {

@@ -334,6 +334,8 @@ function AppMain() {
   useEffect(() => {
     if (reopenedRef.current) return;
     reopenedRef.current = true;
+    // 재오픈 대상 열거 전에 고아 geometry(레이아웃 없는 라벨) 정리 — P5 F-h.
+    useAppStore.getState().pruneOrphanPopoutGeometry();
     const { popoutLayouts, popoutGeometry } = useAppStore.getState();
     const labels = Object.keys(popoutLayouts);
     if (labels.length === 0) return;

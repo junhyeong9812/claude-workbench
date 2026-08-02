@@ -1,86 +1,17 @@
-// ---- Claude (architecture A: real terminal + session-JSONL tail) ----
-//
-// Instead of the ACP adapter, we spawn the **real** `claude` CLI in a PTY (so
-// xterm renders its full TUI — perfect terminal parity) and tail the session
-// JSONL transcript the CLI writes (`~/.claude/projects/<slug>/<uuid>.jsonl`) to
-// build the change timeline. `claude_start` does both: it reuses the PTY relay
-// (the `terminal-output` event, exactly like `terminal_create`) and spawns a
-// polling thread that drives a `SessionTail` and emits `claude-timeline` events.
+//! 타임라인 tail·폴링(payload 조립·완료 전이·부모 추론·스냅샷 debounce) —
+//! P5 B-c 분할. 순수 함수 5종(cap_content·file_sig·advance_stability·
+//! ordered_frames·subagent_parent[_memo])은 특성테스트가 고정(P0~P1).
 
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
-use core_lib::{SessionManager, TimelineItem, TokenUsage};
+use core_lib::{TimelineItem, TokenUsage};
 use serde::Serialize;
-use tauri::{AppHandle, Emitter, Manager, State, Window};
-
-use super::{io_message, AppError};
-
-/// One live Claude session shared across windows (multiwindow mirror, P6). A
-/// session is ONE PTY (`id`) + JSONL (`uuid`); multiple windows can render it,
-/// but only the `driver` window may type into it (single-writer). `attached` is
-/// the windows currently viewing, in attach order — when the driver detaches,
-/// the next in order takes over. `rev` monotonically tags driver changes so the
-/// frontend can drop stale `claude-driver-changed` events.
-struct Sess {
-    project: String,
-    uuid: String,
-    attached: Vec<String>,
-    driver: String,
-    rev: u64,
-    /// Poll-thread stop flag (set on real close / PTY death).
-    stop: Arc<AtomicBool>,
-}
-
-/// All live Claude sessions, behind ONE lock so `live`/`by_id` never tear
-/// (review R7-3). Mutations + the *actions* to run after unlocking (PTY remove,
-/// event emit) are computed under the lock; the side effects run after release.
-#[derive(Default)]
-struct ClaudeRuntime {
-    /// (project, uuid) -> live PTY id, so a 2nd window finds the running session.
-    live: HashMap<(String, String), u64>,
-    /// PTY id -> session.
-    by_id: HashMap<u64, Sess>,
-}
-
-/// Managed state: all live Claude sessions (single lock).
-#[derive(Default)]
-pub struct ClaudeState {
-    rt: Mutex<ClaudeRuntime>,
-}
-
-/// Result of opening a Claude session: whether we attached to an already-running
-/// PTY (mirror) or started a fresh one (driver), plus the current driver/rev.
-#[derive(Serialize)]
-pub struct ClaudeOpened {
-    id: u64,
-    session_uuid: String,
-    /// "driver" (we started it / first viewer) or "mirror" (read-only viewer).
-    role: String,
-    driver: String,
-    rev: u64,
-}
-
-/// Broadcast on `claude-driver-changed` + returned by driver-changing commands.
-#[derive(Clone, Serialize)]
-pub struct ClaudeDriver {
-    id: u64,
-    driver: String,
-    rev: u64,
-}
-
-/// Result of `claude_detach`: whether the PTY was actually closed (last viewer)
-/// and the resulting driver/rev.
-#[derive(Serialize)]
-pub struct ClaudeDetached {
-    closed: bool,
-    driver: String,
-    rev: u64,
-}
+use tauri::{AppHandle, Emitter, Manager};
 
 /// The full timeline snapshot for a Claude session, emitted as `claude-timeline`
 /// whenever a poll observed any change. Carries the change items **and** the
@@ -117,10 +48,10 @@ struct ClaudeTimelinePayload {
 /// P1: 표시 계층 content_text 상한 — payload·스냅샷에서만 절단(원본 JSONL·
 /// 아카이브는 전문 유지). 절단 아이템은 `content_truncated`로 표시되고
 /// 뷰어가 `claude_item_detail`로 원문을 lazy 조회한다.
-pub(crate) const CONTENT_CAP: usize = 32 * 1024;
+pub(super) const CONTENT_CAP: usize = 32 * 1024;
 
 /// UTF-8 경계 보존 절단 — 순수 (P1 특성테스트 대상).
-pub(crate) fn cap_content(items: &mut [TimelineItem]) {
+pub(super) fn cap_content(items: &mut [TimelineItem]) {
     for it in items.iter_mut() {
         if let Some(ct) = &it.content_text {
             if ct.len() > CONTENT_CAP {
@@ -137,7 +68,7 @@ pub(crate) fn cap_content(items: &mut [TimelineItem]) {
 
 /// 파일 서명 (len, mtime ns) — 완료 판정·재활성 감지 입력 (P0 B2, 리뷰
 /// 재수정: len 단독은 truncate·동일 길이 재작성·mtime-only 변경을 놓친다).
-pub(crate) type FileSig = (u64, u128);
+pub(super) type FileSig = (u64, u128);
 
 fn file_sig(p: &std::path::Path) -> Option<FileSig> {
     let m = std::fs::metadata(p).ok()?;
@@ -153,17 +84,17 @@ fn file_sig(p: &std::path::Path) -> Option<FileSig> {
 /// P0 B2: 완료된 서브에이전트의 보존 프레임 — tail(파서·버퍼·폴링)은 드롭하고
 /// payload에 계속 실릴 items만 남긴다. `sig`는 완료 판정 시점의 파일 서명 —
 /// 서명이 달라지면(성장·축소·재작성) tail을 재생성해 재개한다.
-pub(crate) struct DoneSub {
-    pub(crate) turn: u64,
-    pub(crate) sig: FileSig,
-    pub(crate) items: Vec<TimelineItem>,
-    pub(crate) rev: u32,
+pub(super) struct DoneSub {
+    pub(super) turn: u64,
+    pub(super) sig: FileSig,
+    pub(super) items: Vec<TimelineItem>,
+    pub(super) rev: u32,
 }
 
 /// 파일 서명 안정 스트릭 전이 — 순수 (P0 B2 특성테스트 대상).
 /// 서명 동일 → +1 · 서명 변화 → 리셋 · **metadata 실패(None) → 진행하지
 /// 않고 리셋**(리뷰: 실패 40회 누적으로 완료 오판하던 경로 차단).
-pub(crate) fn advance_stability(
+pub(super) fn advance_stability(
     prev: (Option<FileSig>, u32),
     sig: Option<FileSig>,
 ) -> (Option<FileSig>, u32) {
@@ -180,7 +111,7 @@ pub(crate) fn advance_stability(
 /// 정밀화 — spec §2 B2 순서 명세는 log에 기록).
 /// 보존 계약: 완료 에이전트의 (aid, turn, items)가 계속 포함되고, 재활성
 /// 재파싱이 끝나 active items가 비어 있지 않으면 active가 우선한다.
-pub(crate) fn ordered_frames(
+pub(super) fn ordered_frames(
     order: &[String],
     mut active: HashMap<String, (u64, Vec<TimelineItem>)>,
     done: &HashMap<String, DoneSub>,
@@ -202,7 +133,7 @@ pub(crate) fn ordered_frames(
 }
 
 #[cfg_attr(not(test), allow(dead_code))] // 특성테스트의 naive 기준 구현(메모판과 동치 검증용)
-pub(crate) fn subagent_parent(
+pub(super) fn subagent_parent(
     aid: &str,
     main_items: &[TimelineItem],
     sub_raw: &[(String, u64, Vec<TimelineItem>)],
@@ -226,7 +157,7 @@ pub(crate) fn subagent_parent(
 /// 동반하므로(TimelineItem.revision: "Bumped on every merged update"),
 /// 결과는 naive 스캔과 **완전 동일**하고 비용만 변경된 아이템으로 국한된다
 /// (특성테스트: memo vs naive 동치·revision bump 반영).
-pub(crate) fn subagent_parent_memo(
+pub(super) fn subagent_parent_memo(
     aid: &str,
     main_items: &[TimelineItem],
     sub_raw: &[(String, u64, Vec<TimelineItem>)],
@@ -270,405 +201,11 @@ pub(crate) fn subagent_parent_memo(
     None
 }
 
-/// Generate a fresh session UUID for `--session-id`. Linux-only (the app's
-/// platform): reads the kernel's random UUID source.
-fn new_session_uuid() -> Result<String, AppError> {
-    std::fs::read_to_string("/proc/sys/kernel/random/uuid")
-        .map(|s| s.trim().to_string())
-        .map_err(|_| AppError::new("Cannot generate a session id"))
-}
-
-/// Spawn the real `claude` CLI in a PTY rooted at `cwd` and start (a) relaying
-/// its output to `terminal-output` (xterm) and (b) tailing its session JSONL to
-/// emit `claude-timeline` items. Does NOT register into `ClaudeRuntime` — the
-/// caller does that under its lock. `resume` continues an existing session by
-/// UUID; None starts a fresh `--session-id`. Returns (id, uuid, poll-stop flag).
-fn spawn_claude(
-    app: &AppHandle,
-    mgr: &SessionManager,
-    cwd: String,
-    resume: Option<String>,
-    name: String,
-    cols: u16,
-    rows: u16,
-) -> Result<(u64, String, Arc<AtomicBool>), AppError> {
-    let session_uuid = match &resume {
-        Some(u) => u.clone(),
-        None => new_session_uuid()?,
-    };
-    // Resume only if the transcript already exists; otherwise `--resume` would
-    // fork a *different* new session, so create with this exact id via
-    // `--session-id` (keeps the id stable across restarts).
-    let resuming = resume.is_some()
-        && core_lib::jsonl::claude_projects_root()
-            .and_then(|root| core_lib::jsonl::find_session_jsonl(&root, &session_uuid).ok().flatten())
-            .is_some();
-    let flag = if resuming { "--resume" } else { "--session-id" };
-    let mut cmd = vec!["claude".to_string(), flag.to_string(), session_uuid.clone()];
-
-    // hook-status: 수신기가 살아 있으면 세션 한정 hook 설정을 주입한다
-    // (--settings 인자 — 사용자 ~/.claude 무수정, spec §2). 세션별 토큰은
-    // 0600 헤더 파일로 쓰고 경로만 env로 전달 — claude/curl 어느 쪽 argv에도
-    // 토큰 값이 실리지 않는다(리뷰 H1·H4). 수신기 기동/등록 실패는 주입
-    // 생략 = 프론트 화면 스캔 폴백 (기능 저하, 세션은 정상).
-    let mut envs: Vec<(String, String)> = Vec::new();
-    if let Some(hook) = super::hookserver::ensure_started(app) {
-        if let Some(hdr_path) = hook.register_session(&session_uuid) {
-            cmd.push("--settings".to_string());
-            cmd.push(super::hookserver::hook_settings_json());
-            envs.push(("WORKBENCH_HOOK_PORT".to_string(), hook.port.to_string()));
-            envs.push(("WORKBENCH_HOOK_HDR".to_string(), hdr_path));
-        }
-    }
-
-    let id = mgr
-        .create_with_env(Some(cmd), Some(cwd.clone()), cols, rows, envs)
-        .map_err(AppError::new)?;
-    // Clean up the orphan PTY if we can't subscribe to it (review P6-impl #4).
-    let rx = match mgr.subscribe(id) {
-        Ok(rx) => rx,
-        Err(e) => {
-            let _ = mgr.remove(id);
-            return Err(AppError::new(e));
-        }
-    };
-    let stop = Arc::new(AtomicBool::new(false));
-
-    // (a) Relay PTY output -> webview (공용 헬퍼, P4). When the PTY dies the
-    // sender drops, the loop ends, and `on_end`가 `stop`을 세워 poll 스레드를
-    // 멈춘다.
-    {
-        let stop = stop.clone();
-        super::spawn_output_relay(
-            app.clone(),
-            id,
-            rx,
-            Some(Box::new(move || stop.store(true, Ordering::Relaxed))),
-        );
-    }
-    // (b) Tail the JSONL -> claude-timeline + persist snapshot.
-    {
-        let app = app.clone();
-        let uuid = session_uuid.clone();
-        let stop = stop.clone();
-        thread::spawn(move || run_timeline_poll(app, id, cwd, uuid, name, stop));
-    }
-    Ok((id, session_uuid, stop))
-}
-
-/// Open a Claude session for THIS window: if its PTY is already live (another
-/// window started it), attach as a read-only **mirror**; otherwise start a fresh
-/// PTY and become the **driver**. Atomic under the runtime lock so two windows
-/// can't both start the same session (review R7-2/R7-3). `uuid` None = brand new.
-#[tauri::command]
-#[allow(clippy::too_many_arguments)]
-pub fn claude_open_or_attach(
-    window: Window,
-    app: AppHandle,
-    mgr: State<'_, SessionManager>,
-    claude: State<'_, ClaudeState>,
-    project: String,
-    uuid: Option<String>,
-    cwd: Option<String>,
-    name: Option<String>,
-    cols: u16,
-    rows: u16,
-) -> Result<ClaudeOpened, AppError> {
-    let label = window.label().to_string();
-    let cwd = cwd.ok_or_else(|| AppError::new("Claude requires an active project"))?;
-    let mut rt = claude.rt.lock().map_err(|_| AppError::new("Claude state unavailable"))?;
-
-    // Mirror: attach to the running PTY if this uuid is live.
-    if let Some(u) = &uuid {
-        let key = (project.clone(), u.clone());
-        if let Some(&id) = rt.live.get(&key) {
-            if mgr.exists(id) {
-                if let Some(sess) = rt.by_id.get_mut(&id) {
-                    if !sess.attached.contains(&label) {
-                        sess.attached.push(label.clone());
-                    }
-                    // Promote this window to driver if the current driver is gone
-                    // (e.g. it detached during a transfer, leaving a stale label) —
-                    // else the new viewer is locked as a mirror with no driver
-                    // (review P6-impl #1). `role` is computed from the real driver (#5).
-                    let mut handoff = None;
-                    if !sess.attached.iter().any(|l| l == &sess.driver) {
-                        sess.driver = label.clone();
-                        sess.rev += 1;
-                        handoff = Some((sess.driver.clone(), sess.rev));
-                    }
-                    let role = if sess.driver == label { "driver" } else { "mirror" };
-                    let opened = ClaudeOpened {
-                        id,
-                        session_uuid: u.clone(),
-                        role: role.into(),
-                        driver: sess.driver.clone(),
-                        rev: sess.rev,
-                    };
-                    drop(rt);
-                    if let Some((driver, rev)) = handoff {
-                        let _ = app.emit("claude-driver-changed", ClaudeDriver { id, driver, rev });
-                    }
-                    return Ok(opened);
-                }
-            }
-            // Stale live entry (PTY gone): clean BOTH maps + stop flag so
-            // `claude_live_uuids` can't keep reporting it (review P6-impl #3).
-            if let Some(s) = rt.by_id.remove(&id) {
-                s.stop.store(true, Ordering::Relaxed);
-            }
-            rt.live.remove(&key);
-        }
-    }
-
-    // 이 프로젝트에 아카이브 지식이 있으면 .mcp.json 등록을 보장 — 새로 뜨는
-    // claude가 지식 서버(search_knowledge)를 바로 쓸 수 있게 (best-effort).
-    super::archive::ensure_mcp_registration(&app, &cwd);
-
-    // Driver: start a fresh PTY (lock held so a concurrent open can't double-start).
-    let (id, session_uuid, stop) = spawn_claude(
-        &app,
-        &mgr,
-        cwd,
-        uuid,
-        name.unwrap_or_else(|| "Claude".to_string()),
-        cols,
-        rows,
-    )?;
-    rt.live.insert((project.clone(), session_uuid.clone()), id);
-    rt.by_id.insert(
-        id,
-        Sess {
-            project,
-            uuid: session_uuid.clone(),
-            attached: vec![label.clone()],
-            driver: label.clone(),
-            rev: 0,
-            stop,
-        },
-    );
-    Ok(ClaudeOpened { id, session_uuid, role: "driver".into(), driver: label, rev: 0 })
-}
-
-/// Driver-only input: write to the PTY only if `window` is the session's current
-/// driver (single-writer — a mirror's stray input is a silent no-op, review
-/// R7-1). Claude panels call this instead of `terminal_write`.
-#[tauri::command]
-pub fn claude_write(
-    window: Window,
-    mgr: State<'_, SessionManager>,
-    claude: State<'_, ClaudeState>,
-    id: u64,
-    data: Vec<u8>,
-) -> Result<(), AppError> {
-    let is_driver = {
-        let rt = claude.rt.lock().map_err(|_| AppError::new("Claude state unavailable"))?;
-        rt.by_id.get(&id).map(|s| s.driver == window.label()).unwrap_or(false)
-    };
-    if is_driver {
-        mgr.write(id, &data).map_err(AppError::new)
-    } else {
-        Ok(()) // not the driver — ignore
-    }
-}
-
-/// Driver-only resize (the PTY size is shared; only the driver drives it).
-#[tauri::command]
-pub fn claude_resize(
-    window: Window,
-    mgr: State<'_, SessionManager>,
-    claude: State<'_, ClaudeState>,
-    id: u64,
-    cols: u16,
-    rows: u16,
-) -> Result<(), AppError> {
-    let is_driver = {
-        let rt = claude.rt.lock().map_err(|_| AppError::new("Claude state unavailable"))?;
-        rt.by_id.get(&id).map(|s| s.driver == window.label()).unwrap_or(false)
-    };
-    if is_driver {
-        mgr.resize(id, cols, rows).map_err(AppError::new)
-    } else {
-        Ok(())
-    }
-}
-
-/// Take over input control of a session (mirror → driver). No-op if `window`
-/// isn't attached. Bumps `rev` and broadcasts `claude-driver-changed` so every
-/// window locks/unlocks accordingly (review R7-4).
-#[tauri::command]
-pub fn claude_set_driver(
-    window: Window,
-    app: AppHandle,
-    claude: State<'_, ClaudeState>,
-    id: u64,
-) -> Result<ClaudeDriver, AppError> {
-    let label = window.label().to_string();
-    let changed = {
-        let mut rt = claude.rt.lock().map_err(|_| AppError::new("Claude state unavailable"))?;
-        match rt.by_id.get_mut(&id) {
-            Some(s) if s.attached.contains(&label) && s.driver != label => {
-                s.driver = label.clone();
-                s.rev += 1;
-                Some((s.driver.clone(), s.rev))
-            }
-            Some(s) => Some((s.driver.clone(), s.rev)), // already driver / not attached
-            None => None,
-        }
-    };
-    match changed {
-        Some((driver, rev)) => {
-            if driver == label {
-                let _ = app.emit("claude-driver-changed", ClaudeDriver { id, driver: driver.clone(), rev });
-            }
-            Ok(ClaudeDriver { id, driver, rev })
-        }
-        None => Err(AppError::new("no such session")),
-    }
-}
-
-/// `window` stops viewing session `id`. Removes it from `attached`; when
-/// `close_if_last` and no viewers remain, really closes the PTY (refcount). If
-/// the leaver was the driver and viewers remain, the next-in-order takes over
-/// (broadcast). Claude panels call this instead of `claude_close` (review R7-5/7).
-#[tauri::command]
-pub fn claude_detach(
-    window: Window,
-    app: AppHandle,
-    mgr: State<'_, SessionManager>,
-    claude: State<'_, ClaudeState>,
-    id: u64,
-    close_if_last: bool,
-) -> Result<ClaudeDetached, AppError> {
-    let label = window.label().to_string();
-    enum Act {
-        None,
-        Close(Arc<AtomicBool>),
-        Handoff(String, u64),
-    }
-    let (act, driver, rev) = {
-        let mut rt = claude.rt.lock().map_err(|_| AppError::new("Claude state unavailable"))?;
-        let Some(sess) = rt.by_id.get_mut(&id) else {
-            return Ok(ClaudeDetached { closed: false, driver: String::new(), rev: 0 });
-        };
-        sess.attached.retain(|l| l != &label);
-        if sess.attached.is_empty() {
-            if close_if_last {
-                let key = (sess.project.clone(), sess.uuid.clone());
-                let stop = sess.stop.clone();
-                rt.by_id.remove(&id);
-                rt.live.remove(&key);
-                (Act::Close(stop), String::new(), 0)
-            } else {
-                // Transfer in progress: keep the PTY (target will attach); leave
-                // driver as-is (target will set_driver).
-                (Act::None, sess.driver.clone(), sess.rev)
-            }
-        } else if sess.driver == label {
-            sess.driver = sess.attached[0].clone();
-            sess.rev += 1;
-            (Act::Handoff(sess.driver.clone(), sess.rev), sess.driver.clone(), sess.rev)
-        } else {
-            (Act::None, sess.driver.clone(), sess.rev)
-        }
-    };
-    match act {
-        Act::Close(stop) => {
-            stop.store(true, Ordering::Relaxed);
-            mgr.remove(id).map_err(AppError::new)?;
-            Ok(ClaudeDetached { closed: true, driver, rev })
-        }
-        Act::Handoff(d, r) => {
-            let _ = app.emit("claude-driver-changed", ClaudeDriver { id, driver: d, rev: r });
-            Ok(ClaudeDetached { closed: false, driver, rev })
-        }
-        Act::None => Ok(ClaudeDetached { closed: false, driver, rev }),
-    }
-}
-
-/// One live session's identity + the directory it runs in (its `project` = cwd,
-/// which may be a git worktree). Read-only — for the worktree panel's session
-/// badges (which worktree has a live session).
-#[derive(Serialize)]
-pub struct SessionCwd {
-    uuid: String,
-    cwd: String,
-    /// The worktree root containing `cwd` (git-canonicalized), so the panel matches
-    /// a session to its worktree even when the session runs in a subdirectory and
-    /// without symlink/`..`/trailing-slash false-misses. Falls back to `cwd`.
-    root: String,
-}
-
-/// All currently-live Claude sessions (any window) as (uuid, cwd, worktree root).
-/// The worktree panel matches each worktree's path against `root` to badge "a
-/// session runs here". The runtime lock is read-only and brief (just clone the
-/// cwds); the per-session git `show-toplevel` runs *after* releasing the lock so a
-/// subprocess never blocks session mutations.
-#[tauri::command]
-pub fn claude_session_cwds(claude: State<'_, ClaudeState>) -> Vec<SessionCwd> {
-    let cwds: Vec<(String, String)> = claude
-        .rt
-        .lock()
-        .map(|rt| {
-            rt.by_id
-                .values()
-                .map(|s| (s.uuid.clone(), s.project.clone()))
-                .collect()
-        })
-        .unwrap_or_default();
-    // P0 B3(리뷰 재수정): cwd → worktree root 캐시. 세션 수명 동안 불변이
-    // 전제(spec 가정①)이므로 ①**성공(Some) 결과만** 캐시(비-repo 폴백을
-    // 캐시하면 이후 git init을 영구히 못 본다 — B1과 대칭) ②라이브 세션에
-    // 없는 cwd 엔트리는 매 호출 prune — 캐시 수명이 세션 수명을 넘지 않는다.
-    static ROOT_CACHE: std::sync::OnceLock<Mutex<HashMap<String, String>>> =
-        std::sync::OnceLock::new();
-    let cache = ROOT_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-    let live: std::collections::HashSet<&String> = cwds.iter().map(|(_, c)| c).collect();
-    if let Ok(mut c) = cache.lock() {
-        c.retain(|k, _| live.contains(k));
-    }
-    cwds.into_iter()
-        .map(|(uuid, cwd)| {
-            let cached = cache.lock().ok().and_then(|c| c.get(&cwd).cloned());
-            let root = match cached {
-                Some(r) => r,
-                None => match core_lib::git::worktree_root(&cwd) {
-                    Some(r) => {
-                        if let Ok(mut c) = cache.lock() {
-                            c.insert(cwd.clone(), r.clone());
-                        }
-                        r
-                    }
-                    None => cwd.clone(), // 비-repo/실패 — 캐시하지 않고 매번 재시도
-                },
-            };
-            SessionCwd { uuid, cwd, root }
-        })
-        .collect()
-}
-
-/// UUIDs of sessions currently live (any window) in `project` — lets the picker
-/// mark "running in another window — open as mirror".
-#[tauri::command]
-pub fn claude_live_uuids(claude: State<'_, ClaudeState>, project: String) -> Vec<String> {
-    claude
-        .rt
-        .lock()
-        .map(|rt| {
-            rt.by_id
-                .values()
-                .filter(|s| s.project == project)
-                .map(|s| s.uuid.clone())
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
 /// The polling loop for one Claude session (its own thread). Waits for the
 /// session JSONL to appear (the CLI creates it after init), then polls a
 /// `SessionTail` every ~150ms, emitting and persisting newly-touched items.
 /// Ends when the stop flag is set (`claude_close`).
-fn run_timeline_poll(
+pub(super) fn run_timeline_poll(
     app: AppHandle,
     id: u64,
     cwd: String,
@@ -1021,12 +558,9 @@ fn run_timeline_poll(
     // The PTY died on its own (claude exited) — drop the runtime entry so a later
     // id collision can't see stale live/driver state (review R7-3 cleanup).
     let mut existed = false;
-    if let Some(state) = app.try_state::<ClaudeState>() {
+    if let Some(state) = app.try_state::<super::runtime::ClaudeState>() {
         if let Ok(mut rt) = state.rt.lock() {
-            if let Some(sess) = rt.by_id.remove(&id) {
-                rt.live.remove(&(sess.project, sess.uuid));
-                existed = true;
-            }
+            existed = rt.remove_session(id).is_some(); // T7 (전이표 순수 메서드)
         }
     }
     // Notify any mirror windows that the session ended (review P6-impl #2).
@@ -1035,168 +569,6 @@ fn run_timeline_poll(
     }
 }
 
-/// P1: 절단된 아이템의 원문 상세 — 전문 스냅샷 우선, 부재 시 원본 JSONL
-/// (+서브에이전트 transcript)에서 재추출(read-only, mapper 결정적 — spec
-/// 가정②). 뷰어가 `content_truncated` 아이템 선택 시 lazy 호출.
-#[derive(Serialize)]
-pub struct ItemDetail {
-    pub content_text: Option<String>,
-    pub raw_input: Option<serde_json::Value>,
-}
-
-#[tauri::command]
-pub async fn claude_item_detail(
-    app: AppHandle,
-    project: String,
-    uuid: String,
-    tool_call_id: String,
-) -> Result<ItemDetail, AppError> {
-    // 커맨드 경계에서 uuid를 명시 검증(#6) — 아래 경로 탐색(find_session_jsonl·
-    // 서브에이전트 dir join)에 통제 밖 문자열이 들어가지 않게 한 줄로 막는다.
-    if !core_lib::snapshot::is_safe_uuid(&uuid) {
-        return Err(AppError::new("Invalid session id"));
-    }
-    tauri::async_runtime::spawn_blocking(move || {
-        let detail_of = |it: &TimelineItem| ItemDetail {
-            content_text: it.content_text.clone(),
-            raw_input: it.raw_input.clone(),
-        };
-        // 1) 스냅샷 우선(#3·#20) — 디스크 본문은 전문이므로 대부분 여기서 끝난다
-        //    (수 MB 파싱 1회, transcript 수십 MB 재파싱 회피). 구버전(절단 저장)
-        //    스냅샷의 아이템은 content_truncated가 남아 있으므로 폴백으로 넘긴다.
-        if let Ok(base) = app.path().app_data_dir() {
-            if let Some(snap) = core_lib::snapshot::load(&base, &project, &uuid) {
-                if let Some(it) = snap
-                    .items
-                    .iter()
-                    .find(|i| i.tool_call_id == tool_call_id && !i.content_truncated)
-                {
-                    return Ok(detail_of(it));
-                }
-            }
-        }
-        // 2) 원본 JSONL 폴백 — 스냅샷 부재/미포함(서브에이전트 아이템 등).
-        let root = core_lib::jsonl::claude_projects_root()
-            .ok_or_else(|| AppError::new("Cannot locate the Claude projects root"))?;
-        let jsonl = core_lib::jsonl::find_session_jsonl(&root, &uuid)
-            .map_err(|e| AppError::new(io_message("Locate transcript", &e)))?
-            .ok_or_else(|| AppError::new("Session transcript not found"))?;
-        // 본 세션 transcript 전체 재파싱(온디맨드 1회 — 클릭당 수십~수백 ms).
-        let mut t = core_lib::jsonl::SessionTail::new(project.clone(), uuid.clone(), jsonl.clone());
-        t.poll().map_err(|e| AppError::new(io_message("Read transcript", &e)))?;
-        if let Some(it) = t.timeline().items().iter().find(|i| i.tool_call_id == tool_call_id) {
-            return Ok(detail_of(it));
-        }
-        // 서브에이전트 transcript들 (poll 루프와 동일 규칙: <jsonl stem>/subagents/*.jsonl).
-        let sub_dir = jsonl.with_extension("").join("subagents");
-        if let Ok(entries) = std::fs::read_dir(&sub_dir) {
-            for entry in entries.flatten() {
-                let f = entry.path();
-                if f.extension().and_then(|e| e.to_str()) != Some("jsonl") {
-                    continue;
-                }
-                let aid = f
-                    .file_stem()
-                    .and_then(|s| s.to_str())
-                    .map(|s| s.trim_start_matches("agent-").to_string())
-                    .unwrap_or_default();
-                let mut st = core_lib::jsonl::SessionTail::new(project.clone(), aid, f);
-                let _ = st.poll();
-                if let Some(it) =
-                    st.timeline().items().iter().find(|i| i.tool_call_id == tool_call_id)
-                {
-                    return Ok(detail_of(it));
-                }
-            }
-        }
-        Err(AppError::new("Timeline item not found in the transcript"))
-    })
-    .await
-    .map_err(|_| AppError::new("Detail lookup task failed"))?
-}
-
-/// List the saved Claude (A) sessions for `project`, newest first (for the
-/// "+ Claude(A)" reopen picker).
-#[tauri::command]
-pub fn claude_sessions(app: AppHandle, project: String) -> Vec<core_lib::snapshot::SnapshotSummary> {
-    let Ok(base) = app.path().app_data_dir() else {
-        return vec![];
-    };
-    core_lib::snapshot::list(&base, &project)
-}
-
-/// Load a saved session's full timeline snapshot, to seed the panel on reopen.
-#[tauri::command]
-pub fn claude_session_snapshot(
-    app: AppHandle,
-    project: String,
-    uuid: String,
-) -> Option<core_lib::snapshot::SessionSnapshot> {
-    let base = app.path().app_data_dir().ok()?;
-    let mut snap = core_lib::snapshot::load(&base, &project, &uuid)?;
-    // P1(#3): 절단은 IPC 반환 경계에서만 — 디스크 본문은 전문 유지.
-    cap_content(&mut snap.items);
-    Some(snap)
-}
-
-/// Rename a saved session (persists in its snapshot; the poll thread reads the
-/// name back so it isn't clobbered).
-#[tauri::command]
-pub fn claude_rename(
-    app: AppHandle,
-    project: String,
-    uuid: String,
-    name: String,
-) -> Result<(), AppError> {
-    let base = app
-        .path()
-        .app_data_dir()
-        .map_err(|_| AppError::new("Cannot resolve app data directory"))?;
-    // Write only the name override file — decoupled from the timeline body the
-    // poll thread writes, so neither clobbers the other (codex F1).
-    core_lib::snapshot::save_name(&base, &project, &uuid, &name)
-        .map_err(|e| AppError::new(io_message("Cannot rename session", &e)))
-}
-
-/// Delete a saved session's snapshot (the `삭제` action). The live session, if
-/// any, should be closed separately via `claude_close`.
-#[tauri::command]
-pub fn claude_delete(app: AppHandle, project: String, uuid: String) -> Result<(), AppError> {
-    let base = app
-        .path()
-        .app_data_dir()
-        .map_err(|_| AppError::new("Cannot resolve app data directory"))?;
-    core_lib::snapshot::delete(&base, &project, &uuid)
-        .map_err(|e| AppError::new(io_message("Cannot delete session", &e)))
-}
-
-/// Force-close a Claude session regardless of viewers: stop the poll thread and
-/// kill the PTY (every attached window's relay ends). Used by "삭제" and as a
-/// hard close; the normal per-window close is `claude_detach` (refcount). The
-/// persisted timeline is kept unless separately deleted.
-#[tauri::command]
-pub fn claude_close(
-    app: AppHandle,
-    mgr: State<'_, SessionManager>,
-    claude: State<'_, ClaudeState>,
-    id: u64,
-) -> Result<(), AppError> {
-    let stop = {
-        let mut rt = claude.rt.lock().map_err(|_| AppError::new("Claude state unavailable"))?;
-        rt.by_id.remove(&id).map(|s| {
-            rt.live.remove(&(s.project.clone(), s.uuid.clone()));
-            s.stop
-        })
-    };
-    if let Some(stop) = stop {
-        stop.store(true, Ordering::Relaxed);
-    }
-    let res = mgr.remove(id).map_err(AppError::new);
-    // Tell every window the session is gone so mirrors don't linger as dead UI
-    // (review P6-impl #2).
-    let _ = app.emit("claude-session-closed", id);
-    res
-}
 
 #[cfg(test)]
 mod tests {

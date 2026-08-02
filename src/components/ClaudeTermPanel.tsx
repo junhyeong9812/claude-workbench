@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { buildItemIndex } from "./timelineIndex";
 import { decodePtyData, ptyEventName, pushPendingCapped } from "./pty";
+import { ViewModeToggle } from "./ViewModeToggle";
 import { errText } from "../utils/error";
 import type { TerminalOutputEvent, SnapshotResult } from "../types";
 import type { IDockviewPanelProps } from "dockview-react";
@@ -1207,13 +1208,7 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
                 {textView ? textView.title : `변경 상세 — ${selectedItem!.title || selectedItem!.kind}`}
               </span>
               {/* 뷰모드↔원본 토글: 항상 표시(일관성) + 단축키 v. */}
-              <button
-                className="claudeterm-viewmode-btn"
-                title="뷰모드 ↔ 원본 (단축키 v)"
-                onClick={() => setDetailMarkdown((v) => !v)}
-              >
-                {detailMarkdown ? "원본 보기" : "뷰모드 보기"}
-              </button>
+              <ViewModeToggle markdown={detailMarkdown} onToggle={() => setDetailMarkdown((v) => !v)} />
               <span
                 className="claudeterm-viewer-x"
                 title="닫기"

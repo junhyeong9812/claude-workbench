@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } fro
 import { errText } from "../utils/error";
 import { invoke } from "@tauri-apps/api/core";
 import { useAppStore } from "../state/store";
+import { useShallow } from "zustand/react/shallow";
 import type { DirEntry } from "../types";
 import { ContextMenu, copyText, type MenuItem } from "./ContextMenu";
 
@@ -33,20 +34,41 @@ export function StudyTree({
   root: string;
   onActivate: (path: string) => void;
   onPreview?: (path: string) => void;
-  id?: string;
+  /** 트리 인스턴스 키(좌/우 독립의 전제 — studyExpanded 키. 리뷰 P3-3:
+   * optional이면 좌우 동일 root에서 확장이 연동되는 충돌이 가능해 필수). */
+  id: string;
   /** Bump to force an immediate disk re-read (manual refresh button). */
   reloadSignal?: number;
 }) {
-  const childrenCache = useAppStore((s) => s.childrenCache);
   const loadChildren = useAppStore((s) => s.loadChildren);
   const reloadDir = useAppStore((s) => s.reloadDir);
   const closeStudyTabsUnder = useAppStore((s) => s.closeStudyTabsUnder);
-  const [expanded, setExpanded] = useState<Set<string>>(() => new Set());
+  // P5 F-g: expanded를 store로 승격(키 = 인스턴스 id ?? root — 좌/우 독립 유지).
+  // 캐시 상한 keep-set이 스터디 확장 dir를 볼 수 있게 하는 전제. 수명 계약은
+  // 기존대로 ephemeral(비영속) + root 전환 시 리셋.
+  const expandedKey = id;
+  const EMPTY_EXPANDED = useMemo<string[]>(() => [], []);
+  const expandedArr = useAppStore((s) => s.studyExpanded[expandedKey]) ?? EMPTY_EXPANDED;
+  const setStudyExpanded = useAppStore((s) => s.setStudyExpanded);
+  const expanded = useMemo(() => new Set(expandedArr), [expandedArr]);
+  // P5 F-g: childrenCache 통째 구독 제거 — 이 트리가 실제로 그리는 dir
+  // (root + 확장 목록)의 슬라이스만 구독한다. 다른 프로젝트/dir 폴링이 이
+  // 트리를 리렌더하지 못한다(P2 identity 보존과 결합해 무변화 폴링은 완전
+  // 무비용). useShallow = 원소 identity 비교.
+  const visibleDirs = useMemo(() => [root, ...expandedArr], [root, expandedArr]);
+  const childrenSlices = useAppStore(
+    useShallow((s) => visibleDirs.map((d) => s.childrenCache[d])),
+  );
+  const cacheOf = useMemo(() => {
+    const m = new Map<string, DirEntry[] | undefined>();
+    visibleDirs.forEach((d, i) => m.set(d, childrenSlices[i]));
+    return m;
+  }, [visibleDirs, childrenSlices]);
   const [cursor, setCursor] = useState<string | null>(null);
   const [menu, setMenu] = useState<{ x: number; y: number; entry: DirEntry } | null>(null);
   // Re-read the root + every expanded dir from disk (reflects external add/delete).
-  const expandedRef = useRef(expanded);
-  expandedRef.current = expanded;
+  const expandedRef = useRef(expandedArr);
+  expandedRef.current = expandedArr;
   const refreshFromDisk = useCallback(() => {
     void reloadDir(root);
     expandedRef.current.forEach((d) => void reloadDir(d));
@@ -63,17 +85,29 @@ export function StudyTree({
   const onPreviewRef = useRef(onPreview);
   onPreviewRef.current = onPreview;
 
+  // 언마운트 시 확장 목록 정리 — 승격 전 컴포넌트 로컬 Set의 수명 계약 복원
+  // (리뷰: 잔존 시 keep-set이 비표시 dir를 축출 금지로 고정 + 재진입 첫
+  // 렌더에 구 확장이 깜빡).
+  useEffect(
+    () => () => {
+      useAppStore.getState().setStudyExpanded(expandedKey, []);
+    },
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [],
+  );
+
   useEffect(() => {
     void loadChildren(root);
-    setExpanded(new Set());
+    setStudyExpanded(expandedKey, []);
     setCursor(null);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [root, loadChildren]);
 
   // Flattened list of currently-visible nodes (for ↑/↓ traversal).
   const visible = useMemo<VisNode[]>(() => {
     const out: VisNode[] = [];
     const walk = (dir: string, depth: number, parentIgnored: boolean) => {
-      for (const e of childrenCache[dir] ?? []) {
+      for (const e of cacheOf.get(dir) ?? []) {
         const ignored = parentIgnored || !!e.is_ignored;
         out.push({ entry: e, depth, ignored });
         if (e.is_dir && expanded.has(e.path)) walk(e.path, depth + 1, ignored);
@@ -81,23 +115,20 @@ export function StudyTree({
     };
     walk(root, 0, false);
     return out;
-  }, [root, childrenCache, expanded]);
+  }, [root, cacheOf, expanded]);
 
-  const expand = (dir: string) =>
-    setExpanded((prev) => {
-      if (prev.has(dir)) return prev;
-      const next = new Set(prev);
-      next.add(dir);
-      void loadChildren(dir);
-      return next;
-    });
-  const collapse = (dir: string) =>
-    setExpanded((prev) => {
-      if (!prev.has(dir)) return prev;
-      const next = new Set(prev);
-      next.delete(dir);
-      return next;
-    });
+  const expand = (dir: string) => {
+    if (expanded.has(dir)) return;
+    void loadChildren(dir);
+    setStudyExpanded(expandedKey, [...expandedArr, dir]); // 항상 새 배열(메모 계약)
+  };
+  const collapse = (dir: string) => {
+    if (!expanded.has(dir)) return;
+    setStudyExpanded(
+      expandedKey,
+      expandedArr.filter((d) => d !== dir),
+    );
+  };
 
   // Move the cursor by delta over the visible list; in viewer mode, preview it.
   const moveCursor = (delta: number) => {

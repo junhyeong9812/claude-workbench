@@ -61,7 +61,7 @@ export function StudySidebar({ side, focusId }: { side: "left" | "right"; focusI
         root={folder}
         onActivate={onActivate}
         onPreview={onPreview}
-        id={focusId}
+        id={focusId ?? `study-${side}`}
         reloadSignal={reloadSignal}
       />
     </div>

@@ -1,0 +1,141 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>__TITLE__</title>
+<style>
+:root { color-scheme: dark; }
+* { box-sizing: border-box; }
+body { margin: 0; background: #14161a; color: #d7dae0; font: 14px/1.6 -apple-system, "Noto Sans KR", sans-serif; }
+header { position: sticky; top: 0; background: #1a1d23; border-bottom: 1px solid #2a2e36; padding: 10px 16px; z-index: 2; }
+header h1 { font-size: 15px; margin: 0 0 2px; }
+header .meta { font-size: 12px; color: #8b93a1; }
+main { max-width: 900px; margin: 0 auto; padding: 16px 16px 90px; }
+.turn { border: 1px solid #2a2e36; border-radius: 8px; margin: 14px 0; overflow: hidden; }
+.turn-head { background: #1a1d23; color: #8b93a1; font-size: 12px; padding: 4px 12px; }
+.prompt, .answer, .item { border-top: 1px solid #23262d; }
+.prompt { background: #1c2230; }
+.answer { background: #19211c; }
+.role { font-size: 11px; font-weight: 600; padding: 6px 12px 0; }
+.prompt .role { color: #7aa2f7; }
+.answer .role { color: #9ece6a; }
+pre.text, pre.out { margin: 4px 0 10px; padding: 0 12px; white-space: pre-wrap; overflow-wrap: anywhere; font: inherit; }
+pre.out { font: 12px/1.5 ui-monospace, monospace; color: #9aa3b2; max-height: 320px; overflow: auto; }
+details.item summary { cursor: pointer; padding: 6px 12px; font-size: 13px; color: #b6bdc9; list-style: none; }
+details.item summary::before { content: "▸ "; color: #565f6e; }
+details.item[open] summary::before { content: "▾ "; }
+details.item.failed summary { color: #f7768e; }
+details.item.canceled summary { color: #7b8496; text-decoration: line-through; }
+.diff { margin: 4px 12px 10px; border: 1px solid #2a2e36; border-radius: 6px; overflow: hidden; }
+.diff .path { font: 11px ui-monospace, monospace; background: #1a1d23; padding: 3px 8px; color: #8b93a1; }
+.diff pre { margin: 0; padding: 6px 8px; font: 12px/1.5 ui-monospace, monospace; white-space: pre-wrap; overflow-wrap: anywhere; }
+.diff pre.old { background: #2a1a1e; color: #e0a3ad; }
+.diff pre.new { background: #16251b; color: #a8d5b0; }
+footer { position: fixed; bottom: 0; left: 0; right: 0; background: #1a1d23; border-top: 1px solid #2a2e36; display: flex; gap: 10px; align-items: center; justify-content: center; padding: 8px; }
+footer button { background: #23262d; color: #d7dae0; border: 1px solid #343945; border-radius: 6px; padding: 4px 14px; cursor: pointer; font: inherit; }
+footer button:hover { background: #2b303a; }
+#pos { font-size: 12px; color: #8b93a1; min-width: 90px; text-align: center; }
+.step.hidden { display: none; }
+.step.current { outline: 1px solid #7aa2f7; outline-offset: -1px; }
+</style>
+</head>
+<body>
+<header><h1 id="t"></h1><div class="meta" id="m"></div></header>
+<main id="book"></main>
+<footer>
+<button id="prev" title="이전 (←)">←</button>
+<span id="pos"></span>
+<button id="next" title="다음 (→)">→</button>
+<button id="mode">단계 보기</button>
+</footer>
+<script>
+"use strict";
+const DATA = __DATA__;
+const ICON = { read: "📖", edit: "✏️", delete: "🗑", move: "📦", search: "🔎", execute: "▶", think: "💭", fetch: "🌐", question: "❓", plan: "🗺", other: "🔧" };
+function el(tag, cls, text) {
+  const e = document.createElement(tag);
+  if (cls) e.className = cls;
+  if (text != null) e.textContent = text;
+  return e;
+}
+function clip(s, max) { return s.length > max ? s.slice(0, max) + "\n… (생략)" : s; }
+function fmtTokens(u) { return u ? "in " + (u.input + u.cache_read + u.cache_creation).toLocaleString() + " · out " + u.output.toLocaleString() : ""; }
+
+document.getElementById("t").textContent = DATA.title;
+document.title = DATA.title;
+document.getElementById("m").textContent =
+  [DATA.project, DATA.date, DATA.model, fmtTokens(DATA.total_tokens)].filter(Boolean).join("  ·  ");
+
+const book = document.getElementById("book");
+const steps = [];
+function addStep(node) { node.classList.add("step"); steps.push(node); }
+
+for (const t of DATA.turns) {
+  const sec = el("section", "turn");
+  const head = t.turn === 0 ? "시작 전" : "Turn " + t.turn;
+  sec.appendChild(el("div", "turn-head", head + (t.date ? " · " + t.date : "") + (t.tokens ? " · " + fmtTokens(t.tokens) : "")));
+  if (t.prompt) {
+    const p = el("div", "prompt");
+    p.appendChild(el("div", "role", "사용자"));
+    p.appendChild(el("pre", "text", t.prompt));
+    sec.appendChild(p);
+    addStep(p);
+  }
+  for (const it of t.items) {
+    const d = el("details", "item " + it.agent_status);
+    d.appendChild(el("summary", null, (ICON[it.kind] || ICON.other) + " " + (it.title || it.kind)));
+    if (it.content_text) d.appendChild(el("pre", "out", clip(it.content_text, 20000)));
+    for (const df of it.diffs) {
+      const dv = el("div", "diff");
+      dv.appendChild(el("div", "path", df.path));
+      if (df.old_text != null) dv.appendChild(el("pre", "old", clip(df.old_text, 20000)));
+      dv.appendChild(el("pre", "new", clip(df.new_text, 20000)));
+      d.appendChild(dv);
+    }
+    sec.appendChild(d);
+    addStep(d);
+  }
+  if (t.answer) {
+    const a = el("div", "answer");
+    a.appendChild(el("div", "role", "Claude"));
+    a.appendChild(el("pre", "text", t.answer));
+    sec.appendChild(a);
+    addStep(a);
+  }
+  book.appendChild(sec);
+}
+
+let cur = 0;
+let stepMode = false;
+const pos = document.getElementById("pos");
+const modeBtn = document.getElementById("mode");
+function apply() {
+  steps.forEach((n, i) => {
+    n.classList.toggle("hidden", stepMode && i > cur);
+    n.classList.toggle("current", stepMode && i === cur);
+  });
+  pos.textContent = stepMode ? (cur + 1) + " / " + steps.length : steps.length + " steps";
+  if (stepMode && steps[cur]) steps[cur].scrollIntoView({ block: "center" });
+}
+function move(d) {
+  if (!stepMode) { stepMode = true; modeBtn.textContent = "전체 보기"; cur = d > 0 ? 0 : steps.length - 1; }
+  else cur = Math.min(steps.length - 1, Math.max(0, cur + d));
+  apply();
+}
+document.getElementById("prev").addEventListener("click", () => move(-1));
+document.getElementById("next").addEventListener("click", () => move(1));
+modeBtn.addEventListener("click", () => {
+  stepMode = !stepMode;
+  modeBtn.textContent = stepMode ? "전체 보기" : "단계 보기";
+  if (stepMode) cur = 0;
+  apply();
+});
+document.addEventListener("keydown", (e) => {
+  if (e.key === "ArrowLeft") move(-1);
+  else if (e.key === "ArrowRight") move(1);
+});
+apply();
+</script>
+</body>
+</html>

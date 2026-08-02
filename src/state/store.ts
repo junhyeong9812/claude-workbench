@@ -4,7 +4,7 @@ import { emit, listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import type { ITheme } from "@xterm/xterm";
 import type { DirEntry, Project, ProjectType, SshConnection, WorkspaceState } from "../types";
-import { pruneTreeCache, sameEntries, underRoot } from "./treeSelectors";
+import { capTreeCache, computeTreeKeepSet, pruneTreeCache, sameEntries, underRoot } from "./treeSelectors";
 import { basename } from "../utils/path";
 
 /** Clamp a font size to the allowed range (also normalizes NaN). */
@@ -349,6 +349,10 @@ interface AppState {
   devUuids: Record<string, string>;
   /** Study view: root folder per side (persisted). */
   studyFolders: { left: string | null; right: string | null };
+  /** 스터디 트리별 확장 dir 목록(키 = 트리 인스턴스 id ?? root). P5 F-g:
+   * 컴포넌트 로컬 Set이던 것을 승격 — 캐시 상한 keep-set·구독 분리의 전제.
+   * 비영속(ephemeral — savePersisted에 넣지 않는다, 기존 수명 계약 유지). */
+  studyExpanded: Record<string, string[]>;
   /** Study view: open file tabs per side, MRU order (most recent first). */
   studyTabs: { left: string[]; right: string[] };
   /** Study view: active tab path per side. */
@@ -443,6 +447,8 @@ interface AppState {
   popoutGeometry: Record<string, PopoutGeo>;
   /** Save a popout window's geometry (persists). */
   setPopoutGeometry: (windowLabel: string, geo: PopoutGeo) => void;
+  /** 레이아웃 없는 고아 popout geometry 정리 (기동 시 1회 — P5 F-h). */
+  pruneOrphanPopoutGeometry: () => void;
   /** Move the folder-tree keyboard cursor. */
   setTreeCursor: (path: string | null) => void;
   /** Open/close the peek viewer on a file (null closes it). */
@@ -499,6 +505,8 @@ interface AppState {
   ensureDevUuid: (project: string) => string;
   /** Set (or clear) a study side's root folder (resets that side's tabs). */
   setStudyFolder: (side: "left" | "right", path: string | null) => void;
+  /** 스터디 트리(key)의 확장 목록 교체 — 항상 새 배열(메모 계약). */
+  setStudyExpanded: (key: string, dirs: string[]) => void;
   /** Open a file in a study side's viewer (front of MRU + active). */
   openStudyTab: (side: "left" | "right", path: string) => void;
   /** Close a study tab (fixes the active tab if it was the one closed). */
@@ -555,6 +563,24 @@ let treeCycleGen = 0;
  * 4초 폴링(확장 dir 전부 포함)이 복원한다. */
 let treeCacheEpoch = 0;
 
+
+/** P5 F-g: 상한 적용 + 축출 발생 시 epoch 증가(리뷰 P2-3 — 축출은 in-flight
+ * 응답의 부활 차단 가드(epoch)와 한 몸이어야 pruneTreeCache와 일관된다).
+ * FIFO(삽입순) 축출 — LRU 아님(spec 하향 정정: 목적은 메모리 바운드, keep-set이
+ * 표시를 보호한다). */
+function capTreeCacheBumping<T>(
+  cache: Record<string, T>,
+  s: {
+    projects: { path: string; tree_state: { expanded: string[] } }[];
+    studyFolders: { left: string | null; right: string | null };
+    studyExpanded: Record<string, string[]>;
+  },
+): Record<string, T> {
+  const capped = capTreeCache(cache, computeTreeKeepSet(s.projects, s.studyFolders, s.studyExpanded));
+  if (capped !== cache) treeCacheEpoch++;
+  return capped;
+}
+
 /** dir별 미해결 read_dir 추적 — hang한 dir는 미해결 1건만 남기고 이후
  * 사이클에서 제외한다(감사 B2: 10초마다 새 배치가 hang dir에 invoke를
  * 무한 누적하던 경로 차단). 나머지 dir는 계속 갱신된다. */
@@ -605,6 +631,7 @@ export const useAppStore = create<AppState>((set, get) => ({
   projectModes: loadProjectModes(),
   devUuids: loadStringMap("devUuids"),
   studyFolders: STUDY0.folders,
+  studyExpanded: {},
   studyTabs: STUDY0.tabs,
   studyActive: STUDY0.active,
   studyMode: STUDY0.mode,
@@ -846,6 +873,8 @@ export const useAppStore = create<AppState>((set, get) => ({
     }));
     saveStudyView(get());
   },
+  setStudyExpanded: (key, dirs) =>
+    set((s) => ({ studyExpanded: { ...s.studyExpanded, [key]: dirs } })),
   openStudyTab: (side, path) => {
     set((s) => ({
       studyTabs: { ...s.studyTabs, [side]: [path, ...s.studyTabs[side].filter((p) => p !== path)] },
@@ -948,7 +977,10 @@ export const useAppStore = create<AppState>((set, get) => ({
       const entries = await invoke<DirEntry[]>("read_dir", { path: dirPath });
       set((s) =>
         epoch === treeCacheEpoch && treeWriteAllowed(s, dirPath)
-          ? { childrenCache: { ...s.childrenCache, [dirPath]: entries } }
+          ? {
+              // P5 F-g: 성장 지점에서 상한 강제(keep-set 밖 접힌 dir만 축출).
+              childrenCache: capTreeCacheBumping({ ...s.childrenCache, [dirPath]: entries }, s),
+            }
           : s,
       );
     } catch (err) {
@@ -956,7 +988,7 @@ export const useAppStore = create<AppState>((set, get) => ({
       console.error("read_dir failed", err);
       set((s) =>
         epoch === treeCacheEpoch && treeWriteAllowed(s, dirPath)
-          ? { childrenCache: { ...s.childrenCache, [dirPath]: [] } }
+          ? { childrenCache: capTreeCacheBumping({ ...s.childrenCache, [dirPath]: [] }, s) }
           : s,
       );
     } finally {
@@ -980,7 +1012,7 @@ export const useAppStore = create<AppState>((set, get) => ({
         !treeWriteAllowed(s, dirPath) ||
         sameEntries(s.childrenCache[dirPath], entries)
           ? s
-          : { childrenCache: { ...s.childrenCache, [dirPath]: entries } },
+          : { childrenCache: capTreeCacheBumping({ ...s.childrenCache, [dirPath]: entries }, s) },
       );
     } catch (err) {
       console.error("reloadDir failed", err);
@@ -1044,7 +1076,7 @@ export const useAppStore = create<AppState>((set, get) => ({
                 changed = true;
               }
             }
-            return changed ? { childrenCache: next } : s;
+            return changed ? { childrenCache: capTreeCacheBumping(next, s) } : s;
           });
         })();
         // hang한 read_dir 하나가 폴링을 영구 정지시키지 않게 가드 점유만
@@ -1092,6 +1124,23 @@ export const useAppStore = create<AppState>((set, get) => ({
     set((s) => {
       persistPopoutGeometry(windowLabel, geo);
       return { popoutGeometry: { ...s.popoutGeometry, [windowLabel]: geo } };
+    }),
+  // P5 F-h(P2 이관): 레이아웃 없는 고아 geometry 정리 — geometry는 레이아웃
+  // 라벨을 재열 때만 읽히므로(App 재오픈 흐름) 레이아웃이 사라진 라벨의
+  // geometry는 영구 잔존하는 죽은 데이터다. 기동 시 1회 호출(App.tsx).
+  pruneOrphanPopoutGeometry: () =>
+    set(() => {
+      // label-granular 지속 계약(위 persist* 3형제와 동형 — 리뷰 P2-2): 공유
+      // localStorage를 **신선 읽기**한 뒤 고아만 지운다. 인메모리 전체 덮어
+      // 쓰기는 다른 창이 그 사이 쓴 엔트리를 소실시킨다(last-writer-wins).
+      const freshGeo = loadPopoutGeometry();
+      const freshLayouts = loadPopoutLayouts();
+      const orphans = Object.keys(freshGeo).filter((l) => !(l in freshLayouts));
+      for (const l of orphans) delete freshGeo[l];
+      if (orphans.length > 0) savePopoutGeometry(freshGeo);
+      // 판정에 쓴 fresh 스냅샷을 인메모리에도 반영 — 직후 App 재오픈 루프가
+      // 레이아웃/좌표를 같은 시점으로 읽게(감사 ①: 한쪽만 갱신하면 어긋난다).
+      return { popoutGeometry: freshGeo, popoutLayouts: freshLayouts };
     }),
 
   upsertConnection: (conn) => {

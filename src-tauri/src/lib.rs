@@ -93,7 +93,7 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_notification::init())
         .manage(core_lib::SessionManager::new())
-        .manage(commands::claude::ClaudeState::default())
+        .manage(commands::claude::runtime::ClaudeState::default())
         .manage(commands::ssh::SshState::default())
         .manage(commands::ScrollbackState::default())
         .invoke_handler(tauri::generate_handler![
@@ -115,17 +115,17 @@ pub fn run() {
             commands::ssh::ssh_store_secret,
             commands::ssh::ssh_delete_secret,
             commands::terminal::scrollback_set_enabled,
-            commands::claude::claude_open_or_attach,
-            commands::claude::claude_write,
-            commands::claude::claude_resize,
-            commands::claude::claude_set_driver,
-            commands::claude::claude_detach,
-            commands::claude::claude_live_uuids,
-            commands::claude::claude_session_cwds,
-            commands::claude::claude_close,
-            commands::claude::claude_sessions,
-            commands::claude::claude_item_detail,
-            commands::claude::claude_session_snapshot,
+            commands::claude::runtime::claude_open_or_attach,
+            commands::claude::runtime::claude_write,
+            commands::claude::runtime::claude_resize,
+            commands::claude::runtime::claude_set_driver,
+            commands::claude::runtime::claude_detach,
+            commands::claude::runtime::claude_live_uuids,
+            commands::claude::runtime::claude_session_cwds,
+            commands::claude::runtime::claude_close,
+            commands::claude::store::claude_sessions,
+            commands::claude::store::claude_item_detail,
+            commands::claude::store::claude_session_snapshot,
             commands::archive::archive_session,
             commands::archive::archive_list,
             commands::archive::archive_open_path,
@@ -135,8 +135,8 @@ pub fn run() {
             commands::graph::graph_list,
             commands::graph::graph_marked_folders,
             commands::graph::graph_open_path,
-            commands::claude::claude_rename,
-            commands::claude::claude_delete,
+            commands::claude::store::claude_rename,
+            commands::claude::store::claude_delete,
             commands::files::acp_read_file,
             commands::files::write_file,
             commands::files::delete_path,
