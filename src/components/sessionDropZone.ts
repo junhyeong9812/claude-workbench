@@ -153,7 +153,7 @@ export function computeSessionDropTarget(
 ): SessionDropTarget | null {
   let best: { ref: string; rect: ZoneRect; zone: DropZone; area: number } | null = null;
   for (const g of groups) {
-    if (!g.ref) continue;
+    if (!g.ref) continue; // id===""는 도달 불가(앱/dockview id 규칙) — 원본의 객체 truthy와 동치
     const r = g.rect;
     const zone = resolveDropZone(r, x, y);
     if (zone === null) continue;

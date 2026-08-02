@@ -7,7 +7,9 @@ use tauri::{AppHandle, Manager};
 
 use crate::commands::{io_message, AppError};
 
-/// P1: 절단된 아이템의 원문 상세 payload (detail 커맨드 반환).
+/// P1: 절단된 아이템의 원문 상세 — 전문 스냅샷 우선, 부재 시 원본 JSONL
+/// (+서브에이전트 transcript)에서 재추출(read-only, mapper 결정적 — spec
+/// 가정②). 뷰어가 `content_truncated` 아이템 선택 시 lazy 호출.
 #[derive(Serialize)]
 pub struct ItemDetail {
     pub content_text: Option<String>,

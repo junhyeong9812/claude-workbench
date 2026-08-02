@@ -9,6 +9,7 @@ use tauri::AppHandle;
 
 use crate::commands::AppError;
 
+/// Fresh session uuid (v4-형): the JSONL file name the CLI will create.
 fn new_session_uuid() -> Result<String, AppError> {
     std::fs::read_to_string("/proc/sys/kernel/random/uuid")
         .map(|s| s.trim().to_string())

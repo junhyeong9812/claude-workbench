@@ -207,6 +207,10 @@ pub struct ClaudeDetached {
 /// (no tool calls) too — not only tool items. Re-sending the whole (modest)
 /// state keeps the frontend a simple replace.
 
+/// Open a Claude session for THIS window: if its PTY is already live (another
+/// window started it), attach as a read-only **mirror**; otherwise start a fresh
+/// PTY and become the **driver**. Atomic under the runtime lock so two windows
+/// can't both start the same session (review R7-2/R7-3). `uuid` None = brand new.
 #[tauri::command]
 #[allow(clippy::too_many_arguments)]
 pub fn claude_open_or_attach(
@@ -451,6 +455,10 @@ pub fn claude_live_uuids(claude: State<'_, ClaudeState>, project: String) -> Vec
 /// `SessionTail` every ~150ms, emitting and persisting newly-touched items.
 /// Ends when the stop flag is set (`claude_close`).
 
+/// Force-close a Claude session regardless of viewers: stop the poll thread and
+/// kill the PTY (every attached window's relay ends). Used by "삭제" and as a
+/// hard close; the normal per-window close is `claude_detach` (refcount). The
+/// persisted timeline is kept unless separately deleted.
 #[tauri::command]
 pub fn claude_close(
     app: AppHandle,
@@ -614,14 +622,10 @@ mod transition_tests {
     fn rev_is_monotonic_across_transitions() {
         let (mut rt, _s) = rt_with(1, "/p", "u1", "main");
         rt.attach_live("/p", Some("u1"), "w2", |_| true);
-        let mut last = 0u64;
-        let mut check = |rev: u64| {
-            assert!(rev >= last, "rev 역행: {last} -> {rev}");
-            last = rev;
-        };
-        check(rt.set_driver(1, "w2").unwrap().1); // 1
-        check(rt.set_driver(1, "main").unwrap().1); // 2
-        let (_, _, rev) = rt.detach(1, "main", true).unwrap(); // handoff → 3
-        check(rev);
+        // 값 단언(리뷰 P3-9: >=만 보면 rev가 영원히 0이어도 통과한다).
+        assert_eq!(rt.set_driver(1, "w2").unwrap().1, 1);
+        assert_eq!(rt.set_driver(1, "main").unwrap().1, 2);
+        let (_, _, rev) = rt.detach(1, "main", true).unwrap(); // handoff
+        assert_eq!(rev, 3);
     }
 }

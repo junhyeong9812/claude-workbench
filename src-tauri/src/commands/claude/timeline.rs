@@ -13,6 +13,9 @@ use core_lib::{TimelineItem, TokenUsage};
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager};
 
+/// Snapshot payload for `claude-timeline`: the whole (modest) session state —
+/// items + prompts + answers + dates + per-turn tokens + subagent frames — so
+/// plain Q&A turns render too, not just tool calls.
 #[derive(Clone, Serialize)]
 struct ClaudeTimelinePayload {
     id: u64,
@@ -43,10 +46,10 @@ struct ClaudeTimelinePayload {
 /// P1: 표시 계층 content_text 상한 — payload·스냅샷에서만 절단(원본 JSONL·
 /// 아카이브는 전문 유지). 절단 아이템은 `content_truncated`로 표시되고
 /// 뷰어가 `claude_item_detail`로 원문을 lazy 조회한다.
-pub(crate) const CONTENT_CAP: usize = 32 * 1024;
+pub(super) const CONTENT_CAP: usize = 32 * 1024;
 
 /// UTF-8 경계 보존 절단 — 순수 (P1 특성테스트 대상).
-pub(crate) fn cap_content(items: &mut [TimelineItem]) {
+pub(super) fn cap_content(items: &mut [TimelineItem]) {
     for it in items.iter_mut() {
         if let Some(ct) = &it.content_text {
             if ct.len() > CONTENT_CAP {
@@ -63,7 +66,7 @@ pub(crate) fn cap_content(items: &mut [TimelineItem]) {
 
 /// 파일 서명 (len, mtime ns) — 완료 판정·재활성 감지 입력 (P0 B2, 리뷰
 /// 재수정: len 단독은 truncate·동일 길이 재작성·mtime-only 변경을 놓친다).
-pub(crate) type FileSig = (u64, u128);
+pub(super) type FileSig = (u64, u128);
 
 fn file_sig(p: &std::path::Path) -> Option<FileSig> {
     let m = std::fs::metadata(p).ok()?;
@@ -79,17 +82,17 @@ fn file_sig(p: &std::path::Path) -> Option<FileSig> {
 /// P0 B2: 완료된 서브에이전트의 보존 프레임 — tail(파서·버퍼·폴링)은 드롭하고
 /// payload에 계속 실릴 items만 남긴다. `sig`는 완료 판정 시점의 파일 서명 —
 /// 서명이 달라지면(성장·축소·재작성) tail을 재생성해 재개한다.
-pub(crate) struct DoneSub {
-    pub(crate) turn: u64,
-    pub(crate) sig: FileSig,
-    pub(crate) items: Vec<TimelineItem>,
-    pub(crate) rev: u32,
+pub(super) struct DoneSub {
+    pub(super) turn: u64,
+    pub(super) sig: FileSig,
+    pub(super) items: Vec<TimelineItem>,
+    pub(super) rev: u32,
 }
 
 /// 파일 서명 안정 스트릭 전이 — 순수 (P0 B2 특성테스트 대상).
 /// 서명 동일 → +1 · 서명 변화 → 리셋 · **metadata 실패(None) → 진행하지
 /// 않고 리셋**(리뷰: 실패 40회 누적으로 완료 오판하던 경로 차단).
-pub(crate) fn advance_stability(
+pub(super) fn advance_stability(
     prev: (Option<FileSig>, u32),
     sig: Option<FileSig>,
 ) -> (Option<FileSig>, u32) {
@@ -106,7 +109,7 @@ pub(crate) fn advance_stability(
 /// 정밀화 — spec §2 B2 순서 명세는 log에 기록).
 /// 보존 계약: 완료 에이전트의 (aid, turn, items)가 계속 포함되고, 재활성
 /// 재파싱이 끝나 active items가 비어 있지 않으면 active가 우선한다.
-pub(crate) fn ordered_frames(
+pub(super) fn ordered_frames(
     order: &[String],
     mut active: HashMap<String, (u64, Vec<TimelineItem>)>,
     done: &HashMap<String, DoneSub>,
@@ -128,7 +131,7 @@ pub(crate) fn ordered_frames(
 }
 
 #[cfg_attr(not(test), allow(dead_code))] // 특성테스트의 naive 기준 구현(메모판과 동치 검증용)
-pub(crate) fn subagent_parent(
+pub(super) fn subagent_parent(
     aid: &str,
     main_items: &[TimelineItem],
     sub_raw: &[(String, u64, Vec<TimelineItem>)],
@@ -152,7 +155,7 @@ pub(crate) fn subagent_parent(
 /// 동반하므로(TimelineItem.revision: "Bumped on every merged update"),
 /// 결과는 naive 스캔과 **완전 동일**하고 비용만 변경된 아이템으로 국한된다
 /// (특성테스트: memo vs naive 동치·revision bump 반영).
-pub(crate) fn subagent_parent_memo(
+pub(super) fn subagent_parent_memo(
     aid: &str,
     main_items: &[TimelineItem],
     sub_raw: &[(String, u64, Vec<TimelineItem>)],
@@ -199,6 +202,9 @@ pub(crate) fn subagent_parent_memo(
 /// Generate a fresh session UUID for `--session-id`. Linux-only (the app's
 /// platform): reads the kernel's random UUID source.
 
+/// The timeline poll loop: tail the session JSONL (+ per-subagent transcripts),
+/// emit `claude-timeline` on change (fp 게이트), debounce-persist the snapshot
+/// (트레일링 플러시 — P1), and clean the runtime entry when the PTY dies (T7).
 pub(super) fn run_timeline_poll(
     app: AppHandle,
     id: u64,

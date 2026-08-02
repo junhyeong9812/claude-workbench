@@ -34,7 +34,9 @@ export function StudyTree({
   root: string;
   onActivate: (path: string) => void;
   onPreview?: (path: string) => void;
-  id?: string;
+  /** 트리 인스턴스 키(좌/우 독립의 전제 — studyExpanded 키. 리뷰 P3-3:
+   * optional이면 좌우 동일 root에서 확장이 연동되는 충돌이 가능해 필수). */
+  id: string;
   /** Bump to force an immediate disk re-read (manual refresh button). */
   reloadSignal?: number;
 }) {
@@ -44,7 +46,7 @@ export function StudyTree({
   // P5 F-g: expanded를 store로 승격(키 = 인스턴스 id ?? root — 좌/우 독립 유지).
   // 캐시 상한 keep-set이 스터디 확장 dir를 볼 수 있게 하는 전제. 수명 계약은
   // 기존대로 ephemeral(비영속) + root 전환 시 리셋.
-  const expandedKey = id ?? root;
+  const expandedKey = id;
   const EMPTY_EXPANDED = useMemo<string[]>(() => [], []);
   const expandedArr = useAppStore((s) => s.studyExpanded[expandedKey]) ?? EMPTY_EXPANDED;
   const setStudyExpanded = useAppStore((s) => s.setStudyExpanded);
@@ -82,6 +84,17 @@ export function StudyTree({
   }, [reloadSignal, refreshFromDisk]);
   const onPreviewRef = useRef(onPreview);
   onPreviewRef.current = onPreview;
+
+  // 언마운트 시 확장 목록 정리 — 승격 전 컴포넌트 로컬 Set의 수명 계약 복원
+  // (리뷰: 잔존 시 keep-set이 비표시 dir를 축출 금지로 고정 + 재진입 첫
+  // 렌더에 구 확장이 깜빡).
+  useEffect(
+    () => () => {
+      useAppStore.getState().setStudyExpanded(expandedKey, []);
+    },
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [],
+  );
 
   useEffect(() => {
     void loadChildren(root);

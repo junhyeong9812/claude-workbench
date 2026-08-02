@@ -563,6 +563,24 @@ let treeCycleGen = 0;
  * 4초 폴링(확장 dir 전부 포함)이 복원한다. */
 let treeCacheEpoch = 0;
 
+
+/** P5 F-g: 상한 적용 + 축출 발생 시 epoch 증가(리뷰 P2-3 — 축출은 in-flight
+ * 응답의 부활 차단 가드(epoch)와 한 몸이어야 pruneTreeCache와 일관된다).
+ * FIFO(삽입순) 축출 — LRU 아님(spec 하향 정정: 목적은 메모리 바운드, keep-set이
+ * 표시를 보호한다). */
+function capTreeCacheBumping<T>(
+  cache: Record<string, T>,
+  s: {
+    projects: { path: string; tree_state: { expanded: string[] } }[];
+    studyFolders: { left: string | null; right: string | null };
+    studyExpanded: Record<string, string[]>;
+  },
+): Record<string, T> {
+  const capped = capTreeCache(cache, computeTreeKeepSet(s.projects, s.studyFolders, s.studyExpanded));
+  if (capped !== cache) treeCacheEpoch++;
+  return capped;
+}
+
 /** dir별 미해결 read_dir 추적 — hang한 dir는 미해결 1건만 남기고 이후
  * 사이클에서 제외한다(감사 B2: 10초마다 새 배치가 hang dir에 invoke를
  * 무한 누적하던 경로 차단). 나머지 dir는 계속 갱신된다. */
@@ -961,10 +979,7 @@ export const useAppStore = create<AppState>((set, get) => ({
         epoch === treeCacheEpoch && treeWriteAllowed(s, dirPath)
           ? {
               // P5 F-g: 성장 지점에서 상한 강제(keep-set 밖 접힌 dir만 축출).
-              childrenCache: capTreeCache(
-                { ...s.childrenCache, [dirPath]: entries },
-                computeTreeKeepSet(s.projects, s.studyFolders, s.studyExpanded),
-              ),
+              childrenCache: capTreeCacheBumping({ ...s.childrenCache, [dirPath]: entries }, s),
             }
           : s,
       );
@@ -973,7 +988,7 @@ export const useAppStore = create<AppState>((set, get) => ({
       console.error("read_dir failed", err);
       set((s) =>
         epoch === treeCacheEpoch && treeWriteAllowed(s, dirPath)
-          ? { childrenCache: { ...s.childrenCache, [dirPath]: [] } }
+          ? { childrenCache: capTreeCacheBumping({ ...s.childrenCache, [dirPath]: [] }, s) }
           : s,
       );
     } finally {
@@ -997,7 +1012,7 @@ export const useAppStore = create<AppState>((set, get) => ({
         !treeWriteAllowed(s, dirPath) ||
         sameEntries(s.childrenCache[dirPath], entries)
           ? s
-          : { childrenCache: { ...s.childrenCache, [dirPath]: entries } },
+          : { childrenCache: capTreeCacheBumping({ ...s.childrenCache, [dirPath]: entries }, s) },
       );
     } catch (err) {
       console.error("reloadDir failed", err);
@@ -1061,14 +1076,7 @@ export const useAppStore = create<AppState>((set, get) => ({
                 changed = true;
               }
             }
-            return changed
-              ? {
-                  childrenCache: capTreeCache(
-                    next,
-                    computeTreeKeepSet(s.projects, s.studyFolders, s.studyExpanded),
-                  ),
-                }
-              : s;
+            return changed ? { childrenCache: capTreeCacheBumping(next, s) } : s;
           });
         })();
         // hang한 read_dir 하나가 폴링을 영구 정지시키지 않게 가드 점유만
@@ -1121,13 +1129,17 @@ export const useAppStore = create<AppState>((set, get) => ({
   // 라벨을 재열 때만 읽히므로(App 재오픈 흐름) 레이아웃이 사라진 라벨의
   // geometry는 영구 잔존하는 죽은 데이터다. 기동 시 1회 호출(App.tsx).
   pruneOrphanPopoutGeometry: () =>
-    set((s) => {
-      const orphans = Object.keys(s.popoutGeometry).filter((l) => !(l in s.popoutLayouts));
-      if (orphans.length === 0) return s;
-      const nextGeo = { ...s.popoutGeometry };
-      for (const l of orphans) delete nextGeo[l];
-      savePopoutGeometry(nextGeo);
-      return { popoutGeometry: nextGeo };
+    set(() => {
+      // label-granular 지속 계약(위 persist* 3형제와 동형 — 리뷰 P2-2): 공유
+      // localStorage를 **신선 읽기**한 뒤 고아만 지운다. 인메모리 전체 덮어
+      // 쓰기는 다른 창이 그 사이 쓴 엔트리를 소실시킨다(last-writer-wins).
+      const freshGeo = loadPopoutGeometry();
+      const freshLayouts = loadPopoutLayouts();
+      const orphans = Object.keys(freshGeo).filter((l) => !(l in freshLayouts));
+      if (orphans.length === 0) return {};
+      for (const l of orphans) delete freshGeo[l];
+      savePopoutGeometry(freshGeo);
+      return { popoutGeometry: freshGeo };
     }),
 
   upsertConnection: (conn) => {

@@ -239,9 +239,8 @@ describe("submitSshForm", () => {
       passphrase: "",
       save: true,
     });
-    // 폼 상수는 매번 복제해 쓰므로 참조 공유로 오염되지 않아야 한다.
-    const copy = { ...EMPTY_SSH_FORM, host: "x" };
-    expect(EMPTY_SSH_FORM.host).toBe("");
-    expect(copy.host).toBe("x");
+    // NOTE(리뷰 P3-8): 스프레드 불변성 단언은 JS 자체를 테스트하는 동어반복
+    // 이라 제거 — 실계약(useSsh가 EMPTY_SSH_FORM을 복제해 폼을 리셋)은 렌더
+    // 인프라 없이는 통과할 수 없어 기록로 남긴다.
   });
 });
