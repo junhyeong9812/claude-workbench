@@ -169,7 +169,8 @@ export function dockPanelToWindow(api: DockviewApi, panelId: string, targetLabel
   if (inFlight.has(panelId)) return;
   const panel = api.getPanel(panelId);
   if (!panel) return;
-  // 단발성 패널(타임라인 peek·프롬프트 정리)은 옮기지 않고 여기서 닫는다 — 근거는 ephemeralPanels.
+  // 단발성 패널은 창을 넘지 않는다 — peek는 그 자리에서 닫고 정리 세션은 전송만
+  // 취소한다(초안 보존). 근거는 ephemeralPanels.
   if (closeIfEphemeralPanel(panel)) return;
   inFlight.add(panelId);
   const { spec, project } = panelSpecOf(panel);
@@ -187,7 +188,7 @@ export async function movePanelToNewWindow(
   if (inFlight.has(panelId)) return;
   const panel = api.getPanel(panelId);
   if (!panel) return;
-  // 단발성 패널(타임라인 peek·프롬프트 정리)은 새 창으로도 나가지 않는다 — 그 자리에서 닫힘.
+  // 단발성 패널은 새 창으로도 나가지 않는다 — peek는 닫히고 정리 세션은 제자리에 남는다.
   if (closeIfEphemeralPanel(panel)) return;
   inFlight.add(panelId);
   const { spec, project } = panelSpecOf(panel);
