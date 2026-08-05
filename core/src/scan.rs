@@ -172,7 +172,7 @@ pub fn probe_transcript(text: &str) -> Probe {
 /// comes first. `date` is therefore the last timestamp *in the head*, not in the
 /// file — listers should use the file mtime for "last active" instead.
 pub fn probe_head(path: &Path, max_records: usize, max_bytes: u64) -> io::Result<Probe> {
-    fold_head(path, max_records, max_bytes, |_| false)
+    Ok(fold_head(path, max_records, max_bytes, |_| false)?.probe)
 }
 
 /// Read only far enough to learn **which directory** the session ran in.
@@ -181,37 +181,71 @@ pub fn probe_head(path: &Path, max_records: usize, max_bytes: u64) -> io::Result
 /// just to find the handful belonging to one project, so it must be cheap: the
 /// first record carrying a `cwd` ends the read. Measured on a real 341-file /
 /// 1.5 GB corpus this is the difference between ~5 s and ~50 ms for a listing.
+///
+/// A transcript whose budget runs out before any `cwd` appears is dropped from
+/// the listing, which is invisible to the user — so say so on stderr rather than
+/// letting a session disappear in silence.
 pub fn probe_cwd(path: &Path) -> io::Result<Option<String>> {
-    Ok(fold_head(path, CWD_RECORDS, CWD_BYTES, |p| p.cwd.is_some())?.cwd)
+    let scan = fold_head(path, CWD_RECORDS, CWD_BYTES, |p| p.cwd.is_some())?;
+    if scan.probe.cwd.is_none() && scan.exhausted {
+        eprintln!(
+            "scan: cwd를 찾기 전에 예산({CWD_RECORDS}레코드/{CWD_BYTES}바이트)이 소진돼 \
+             건너뜁니다 — {}",
+            path.display()
+        );
+    }
+    Ok(scan.probe.cwd)
+}
+
+/// [`fold_head`]'s outcome: the folded probe, plus whether the read stopped
+/// because a budget ran out (as opposed to reaching EOF or the caller's `stop`).
+struct HeadScan {
+    probe: Probe,
+    exhausted: bool,
 }
 
 /// Fold the head of `path` into a [`Probe`], stopping at the record budget, the
-/// byte budget, or when `stop` is satisfied.
+/// **total** byte budget, or when `stop` is satisfied.
+///
+/// `max_bytes` is a ceiling on the whole scan, not a reason to abandon it at the
+/// first big record. An earlier version broke out as soon as one record pushed
+/// the total past the limit, which made the budget a lottery: the largest single
+/// record in the real corpus is 253 KB against a 256 KB budget, so any transcript
+/// with a slightly fatter preamble would have been dropped from the listing with
+/// no trace (review #5). Now an oversized record is *skipped* — it is far too big
+/// to be the small `cwd`-carrying record, and parsing it is pure waste — and the
+/// scan continues until the total budget is actually spent.
 fn fold_head(
     path: &Path,
     max_records: usize,
     max_bytes: u64,
     stop: impl Fn(&Probe) -> bool,
-) -> io::Result<Probe> {
-    let mut p = Probe::default();
+) -> io::Result<HeadScan> {
+    let mut probe = Probe::default();
     let mut reader = BufReader::new(File::open(path)?);
     let mut consumed: u64 = 0;
     let mut buf = Vec::new();
-    for _ in 0..max_records {
+    let mut records = 0usize;
+    loop {
+        if records >= max_records || consumed >= max_bytes {
+            return Ok(HeadScan { probe, exhausted: true });
+        }
         buf.clear();
         // Read by byte so an arbitrarily long record (hook attachments run to
         // hundreds of KB) can't be split mid-line into invalid JSON.
         let n = reader.read_until(b'\n', &mut buf)?;
         if n == 0 {
-            break;
+            return Ok(HeadScan { probe, exhausted: false }); // EOF
         }
+        records += 1;
         consumed += n as u64;
-        p.feed_line(&String::from_utf8_lossy(&buf));
-        if stop(&p) || consumed >= max_bytes {
-            break;
+        if n as u64 <= MAX_RECORD_BYTES {
+            probe.feed_line(&String::from_utf8_lossy(&buf));
+            if stop(&probe) {
+                return Ok(HeadScan { probe, exhausted: false });
+            }
         }
     }
-    Ok(p)
 }
 
 /// Head-probe budget used by the session listing: enough records to pass the
@@ -221,11 +255,16 @@ pub const HEAD_RECORDS: usize = 400;
 /// Byte ceiling for [`probe_head`] — a single hook attachment record can be
 /// huge, so cap the work per file regardless of record count.
 pub const HEAD_BYTES: u64 = 2 * 1024 * 1024;
-/// [`probe_cwd`] budget: the `cwd` sits within the first few records, but the
-/// preamble (`last-prompt`/`mode`/`permission-mode`/`attachment`) carries none,
-/// so allow some slack before giving up.
-const CWD_RECORDS: usize = 64;
-const CWD_BYTES: u64 = 256 * 1024;
+/// [`probe_cwd`] budget. The `cwd` sits within the first few records (median
+/// offset in the real corpus: ~4 KB), but the preamble carries none, so the
+/// budget is generous — it is a backstop against a pathological file, not a
+/// tuning knob, and a normal transcript stops at its first `cwd` long before it.
+const CWD_RECORDS: usize = 256;
+const CWD_BYTES: u64 = 1024 * 1024;
+/// Records bigger than this are counted against the budget but not parsed: a
+/// record this size is a hook attachment or a pasted blob, never the small
+/// `cwd`/title record we are looking for.
+const MAX_RECORD_BYTES: u64 = 256 * 1024;
 
 #[cfg(test)]
 mod tests {
@@ -393,6 +432,45 @@ mod tests {
         // on the record budget.
         let none = write(&root, "-p", "v", "{\"type\":\"mode\"}\n");
         assert_eq!(probe_cwd(&none).unwrap(), None);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Regression (review #5): a fat preamble used to end the scan at the first
+    /// record that crossed the byte budget, so the `cwd` that came right after it
+    /// was never seen and the session vanished from the listing without a trace.
+    #[test]
+    fn probe_cwd_survives_a_huge_preamble_record() {
+        let root = temp_root("fatpreamble");
+        // One hook-attachment-sized record (bigger than the per-record parse cap),
+        // then the ordinary record that actually carries the cwd.
+        let blob = "x".repeat(600_000);
+        let body = format!(
+            "{}\n{}\n",
+            format_args!(r#"{{"type":"attachment","content":"{blob}"}}"#),
+            r#"{"type":"user","cwd":"/home/jun/proj","message":{"role":"user","content":"안녕"}}"#
+        );
+        let path = write(&root, "-p", "u", &body);
+        assert_eq!(probe_cwd(&path).unwrap().as_deref(), Some("/home/jun/proj"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn fold_head_reports_whether_a_budget_ran_out() {
+        let root = temp_root("exhausted");
+        let path = write(&root, "-p", "u", SAMPLE);
+        // Stops on the caller's condition → not exhausted.
+        let hit = fold_head(&path, 64, 1 << 20, |p| p.cwd.is_some()).unwrap();
+        assert!(!hit.exhausted);
+        // Reaches EOF without ever matching → not exhausted either (the file
+        // genuinely has nothing, which is not a budget problem).
+        let none = fold_head(&path, 64, 1 << 20, |_| false).unwrap();
+        assert!(!none.exhausted);
+        // Runs out of records → exhausted.
+        let cut = fold_head(&path, 1, 1 << 20, |p| p.first_prompt.is_some()).unwrap();
+        assert!(cut.exhausted);
+        // Runs out of bytes → exhausted.
+        let cut = fold_head(&path, 64, 1, |p| p.first_prompt.is_some()).unwrap();
+        assert!(cut.exhausted);
         let _ = std::fs::remove_dir_all(&root);
     }
 

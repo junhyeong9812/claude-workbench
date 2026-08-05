@@ -116,6 +116,7 @@ pub async fn claude_external_sessions(
         let (Ok(base), Some(projects_root)) =
             (app.path().app_data_dir(), core_lib::jsonl::claude_projects_root())
         else {
+            eprintln!("claude_external_sessions: app data dir 또는 Claude projects root를 찾을 수 없어 목록을 비웁니다");
             return Vec::new();
         };
         core_lib::external::list_external(
@@ -130,7 +131,12 @@ pub async fn claude_external_sessions(
         )
     })
     .await
-    .unwrap_or_default()
+    .unwrap_or_else(|e| {
+        // An empty list is indistinguishable from "no external sessions" in the
+        // UI, so a panicked/cancelled task must not vanish without a word.
+        eprintln!("claude_external_sessions: 조회 태스크 실패 — 빈 목록으로 응답합니다 ({e})");
+        Vec::new()
+    })
 }
 
 /// Load a saved session's full timeline snapshot, to seed the panel on reopen.
