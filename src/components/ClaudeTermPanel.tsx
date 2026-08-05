@@ -786,6 +786,10 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
           project,
           uuid: openUuid,
           cwd: props.params.spawnCwd ?? project,
+          // 외부 세션 인수 경로에서만 백엔드가 스폰 직전 live 재검증을 한다.
+          // 앱이 원래 몰던 세션에는 걸지 않는다 — 우리 자신의 argv에 uuid가
+          // 실려 있어 스스로를 "사용 중"으로 막게 된다.
+          adopt: props.params.spawnCwd != null,
           name: (props.params.title as string) ?? null,
           cols: term.cols,
           rows: term.rows,
@@ -833,8 +837,19 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
           // (tab switch / reopen) doesn't re-inject it.
           seed: undefined,
         });
-      } catch {
-        sessionId = null; // open failed (no project, etc.)
+      } catch (e) {
+        sessionId = null; // open failed (no project, adopt refused, …)
+        // 조용히 빈 패널만 남기면 왜 아무 일도 안 일어났는지 알 길이 없다.
+        // 대표 사례가 adopt 거부(그 세션이 다른 곳에서 열려 있음)라, 이유를
+        // 터미널 화면에 그대로 띄우고 목록을 다시 열도록 안내한다.
+        if (!disposed) {
+          term.write(`\r\n\x1b[31m[세션을 열지 못했습니다]\x1b[0m ${errText(e)}\r\n`);
+          if (props.params.spawnCwd != null) {
+            term.write(
+              "\x1b[2m이 탭을 닫고 \"+ Claude\" 목록을 다시 열면 최신 상태로 다시 확인합니다.\x1b[0m\r\n",
+            );
+          }
+        }
       }
       if (disposed) return;
       // Backfill scrollback. 구독(세션별 이벤트)이 스냅샷보다 먼저이므로 live
