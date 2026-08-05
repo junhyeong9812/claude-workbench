@@ -131,9 +131,18 @@ export function refineSeedPrompt(): string {
  * 훨씬 나쁘다 — 사용자는 잘렸다는 사실을 알아채기 어렵다. 미완 블록은 그냥
  * 없는 것으로 보고, 버튼은 비활성으로 남는다.
  *
+ * **여는 펜스는 {@link PROMPT_FENCE} 이상이어야 한다**(감사 G3). 3중 ```prompt은
+ * 인정하지 않는다 — "관대하게 받아 주자"가 곧 계약 불일치였다: 3중으로 열린
+ * 블록은 본문의 코드 예제 ```에서 잘리므로, 받아 주는 순간 **잘린 프롬프트를
+ * 최종본이라고 부르게 된다**. 규약을 어긴 응답은 최종본이 없는 것으로 보고
+ * ([적용] 비활성 + 안내) 도우미가 규약대로 다시 내게 하는 편이 옳다.
+ *
  * 빈 블록도 null. 백틱 펜스만 다룬다 — 물결(~~~) 펜스는 claude가 쓰지 않는다.
  */
-export function extractPromptBlock(text: string | null | undefined): string | null {
+export function extractPromptBlock(
+  text: string | null | undefined,
+  minFence: number = PROMPT_FENCE.length,
+): string | null {
   if (!text) return null;
   const lines = text.split("\n");
   let last: string | null = null;
@@ -173,7 +182,9 @@ export function extractPromptBlock(text: string | null | undefined): string | nu
       }
       body.push(lines[j]);
     }
-    if (closed && info === "prompt") {
+    // 펜스 길이 미달은 최종본으로 인정하지 않는다(블록 자체는 위에서 이미
+    // 소비했으므로 안쪽이 다시 스캔되지는 않는다).
+    if (closed && info === "prompt" && fence.length >= minFence) {
       const content = body.join("\n").replace(/\s+$/, "");
       if (content.trim() !== "") last = content;
     }
@@ -204,6 +215,7 @@ export function extractLatestPromptBlock(
     const block = extractPromptBlock(text);
     if (block) return block;
   }
+  // 규약(4중 펜스)을 지킨 블록이 어디에도 없으면 최종본은 없는 것이다.
   return null;
 }
 
@@ -263,6 +275,77 @@ export function applyBlockReason(g: ApplyGate): string | null {
   if (g.slotBusy)
     return "다른 프롬프트 주입이 아직 처리되지 않았습니다 — 잠시 뒤 다시 시도하세요.";
   return null;
+}
+
+/** 주입 요청 하나를 지금 배달할 수 있는지에 대한 판정. */
+export type InjectDecision =
+  /** 내 요청이 아니다 / 이미 처리했다 — 아무것도 하지 않는다. */
+  | "ignore"
+  /** 지금은 못 쓴다 — **요청을 소비하지 말고** 조건이 풀리기를 기다린다. */
+  | "defer"
+  /** 쓴다. */
+  | "write";
+
+export interface InjectDeliveryInput {
+  /** 슬롯에 올라온 요청 (없으면 null). */
+  request: { id: string; uuid: string } | null;
+  /** 이 패널이 대표하는 세션 uuid. */
+  myUuid: string | null;
+  /** 이 창이 그 세션의 입력 driver인가. */
+  isDriver: boolean;
+  /** PTY가 열려 있는가. */
+  sessionOpen: boolean;
+  /** 대상 세션이 권한·선택 프롬프트에 걸려 있는가. */
+  blocked: boolean;
+  /** 이 패널이 이미 착수한 요청 id. */
+  handledId: string | null;
+}
+
+/**
+ * 소비 패널이 주입 요청을 만났을 때의 판정 — **미배달과 소비를 갈라 두는 규칙**.
+ *
+ * `defer`와 `ignore`의 차이가 핵심이다: `defer`인 동안 요청은 슬롯에 그대로 남고,
+ * 조건(driver·세션 오픈·blocked 해소)이 풀리면 호출부의 deps가 다시 물어본다.
+ * 여기서 조용히 소비해 버리면 정리 세션은 이미 닫혔는데 텍스트만 증발한다.
+ *
+ * `blocked`가 마지막 관문인 이유(감사 G2): 클릭 시점의 게이트는 빠른 피드백일
+ * 뿐이고, 실제 배달까지는 얼마든지 시간이 흐른다(미러였다가 driver가 되거나,
+ * 배경 탭이 뒤늦게 마운트되거나). 그 사이 권한 프롬프트가 뜨면 페이스트가 키
+ * 입력으로 소비되므로 **쓰기 직전에 다시 본다**.
+ */
+export function injectDeliveryDecision(i: InjectDeliveryInput): InjectDecision {
+  if (!i.request || !i.myUuid) return "ignore";
+  if (i.request.uuid !== i.myUuid) return "ignore";
+  if (!i.isDriver || !i.sessionOpen) return "defer";
+  if (i.blocked) return "defer";
+  if (i.handledId === i.request.id) return "ignore";
+  return "write";
+}
+
+/** [적용]을 낸 쪽이 배달 결과를 보고 내리는 결론. */
+export type ApplyAckOutcome =
+  /** 아직 내 결과가 아니다 — 계속 기다린다. */
+  | { kind: "wait" }
+  /** 배달 확인 — 정리 세션을 끝내도 된다. */
+  | { kind: "delivered" }
+  /** 실패 — 정리 세션을 **보존**하고 사유를 보여준다. */
+  | { kind: "failed"; reason: string };
+
+/**
+ * 내 요청 id의 결과만 신뢰한다(감사 G1).
+ *
+ * 예전에는 "슬롯이 비면 성공"으로 추론했는데 그 추론은 두 곳에서 틀렸다:
+ * 백엔드 `claude_write`가 driver가 아닌 창의 쓰기를 조용히 무시하고도 성공을
+ * 반환했고, 슬롯을 비운 주체가 내 요청의 소비자였다는 보장도 없었다. 이제
+ * 소비자가 실제 쓰기 결과를 id와 함께 남기고, 여기서 그 id만 본다.
+ */
+export function resolveApplyAck(
+  pendingId: string | null,
+  ack: { id: string; ok: boolean; reason?: string } | null,
+): ApplyAckOutcome {
+  if (!pendingId || !ack || ack.id !== pendingId) return { kind: "wait" };
+  if (ack.ok) return { kind: "delivered" };
+  return { kind: "failed", reason: ack.reason ?? "알 수 없는 이유" };
 }
 
 /** dock api 중 이 모듈이 쓰는 최소 표면 (실제 인자는 DockviewApi). */

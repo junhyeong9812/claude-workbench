@@ -7,10 +7,12 @@ import {
   bracketedPaste,
   extractLatestPromptBlock,
   extractPromptBlock,
+  injectDeliveryDecision,
   isRefineParams,
   openPromptRefine,
   refinePanelId,
   refineSeedPrompt,
+  resolveApplyAck,
   type RefineDock,
 } from "./promptRefine";
 
@@ -129,10 +131,16 @@ describe("extractPromptBlock — 마지막으로 닫힌 prompt 블록", () => {
     expect(extractPromptBlock(text)).toBe("본문");
   });
 
-  it("3중 fence도 읽는다(모델이 규약을 덜 지켰을 때의 하위호환)", () => {
-    expect(extractPromptBlock("```prompt\n로그인 버그를 고쳐라.\n재현: 1) …\n```")).toBe(
-      "로그인 버그를 고쳐라.\n재현: 1) …",
-    );
+  it("**3중 fence는 인정하지 않는다** — 규약 미준수 응답은 최종본 없음으로 본다", () => {
+    // 받아 주면 본문의 코드 예제 ```에서 잘린 프롬프트를 최종본이라 부르게 된다.
+    expect(extractPromptBlock("```prompt\n로그인 버그를 고쳐라.\n재현: 1) …\n```")).toBeNull();
+    expect(
+      extractLatestPromptBlock(new Map([[1, "```prompt\n3중으로 낸 최종본\n```"]])),
+    ).toBeNull();
+  });
+
+  it("5중 이상으로 더 크게 열어도 인정한다(하한만 강제)", () => {
+    expect(extractPromptBlock("`````prompt\n본문\n`````")).toBe("본문");
   });
 
   it("여러 개면 **마지막** 것을 고른다 (수정 라운드마다 새 블록이 붙으므로)", () => {
@@ -203,7 +211,7 @@ describe("extractPromptBlock — 마지막으로 닫힌 prompt 블록", () => {
   });
 
   it("info string에 백틱이 섞인 줄은 펜스가 아니다", () => {
-    expect(extractPromptBlock("```prompt `x`\n본문\n```")).toBeNull();
+    expect(extractPromptBlock("````prompt `x`\n본문\n````")).toBeNull();
   });
 
   it("병리적 입력에서도 즉시 끝난다(정규식 백트래킹 완화)", () => {
@@ -315,5 +323,76 @@ describe("refineSeedPrompt — 기계 추출 규약", () => {
 
   it("시드 자체가 추출 대상이 되지 않는다(정리 세션 첫 답변 전 [적용] 오작동 방지)", () => {
     expect(extractPromptBlock(refineSeedPrompt())).toBeNull();
+  });
+});
+
+describe("injectDeliveryDecision — 미배달과 소비를 가르는 규칙", () => {
+  const base = {
+    request: { id: "r1", uuid: "u-main" },
+    myUuid: "u-main",
+    isDriver: true,
+    sessionOpen: true,
+    blocked: false,
+    handledId: null,
+  };
+
+  it("조건이 다 맞으면 쓴다", () => {
+    expect(injectDeliveryDecision(base)).toBe("write");
+  });
+
+  it("남의 세션 요청·요청 없음·내 uuid 미확정은 무시", () => {
+    expect(injectDeliveryDecision({ ...base, request: null })).toBe("ignore");
+    expect(injectDeliveryDecision({ ...base, myUuid: null })).toBe("ignore");
+    expect(injectDeliveryDecision({ ...base, request: { id: "r1", uuid: "other" } })).toBe(
+      "ignore",
+    );
+  });
+
+  it("이미 착수한 요청은 무시 (리마운트·deps 재평가로 두 번 쓰지 않는다)", () => {
+    expect(injectDeliveryDecision({ ...base, handledId: "r1" })).toBe("ignore");
+    // 다른 id면 새 요청이니 쓴다.
+    expect(injectDeliveryDecision({ ...base, handledId: "r0" })).toBe("write");
+  });
+
+  it("미러·세션 미오픈은 **defer** — 요청을 소비하지 않는다", () => {
+    expect(injectDeliveryDecision({ ...base, isDriver: false })).toBe("defer");
+    expect(injectDeliveryDecision({ ...base, sessionOpen: false })).toBe("defer");
+  });
+
+  it("blocked면 쓰기 직전이라도 **defer** — 페이스트가 키 입력으로 소비되는 것을 막는다", () => {
+    expect(injectDeliveryDecision({ ...base, blocked: true })).toBe("defer");
+    // 해소되면 (호출부의 deps가 다시 물어) 바로 쓴다.
+    expect(injectDeliveryDecision({ ...base, blocked: false })).toBe("write");
+  });
+
+  it("defer는 착수 여부보다 우선한다 — 보류 중인 요청이 '처리됨'으로 굳지 않는다", () => {
+    expect(injectDeliveryDecision({ ...base, blocked: true, handledId: "r1" })).toBe("defer");
+  });
+});
+
+describe("resolveApplyAck — 내 요청 id의 결과만 신뢰", () => {
+  it("id가 맞고 ok면 배달 확인", () => {
+    expect(resolveApplyAck("r1", { id: "r1", ok: true })).toEqual({ kind: "delivered" });
+  });
+
+  it("id가 맞고 실패면 사유와 함께 실패 (정리 세션 보존)", () => {
+    expect(resolveApplyAck("r1", { id: "r1", ok: false, reason: "권한 없음" })).toEqual({
+      kind: "failed",
+      reason: "권한 없음",
+    });
+    expect(resolveApplyAck("r1", { id: "r1", ok: false })).toEqual({
+      kind: "failed",
+      reason: "알 수 없는 이유",
+    });
+  });
+
+  it("남의 id·결과 없음·대기 id 없음은 계속 대기", () => {
+    expect(resolveApplyAck("r1", { id: "r2", ok: true })).toEqual({ kind: "wait" });
+    expect(resolveApplyAck("r1", null)).toEqual({ kind: "wait" });
+    expect(resolveApplyAck(null, { id: "r1", ok: true })).toEqual({ kind: "wait" });
+  });
+
+  it("남의 성공 결과를 내 성공으로 오인하지 않는다 (슬롯 추론 회귀 방지)", () => {
+    expect(resolveApplyAck("mine", { id: "dev-seed", ok: true }).kind).toBe("wait");
   });
 });
