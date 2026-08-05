@@ -79,7 +79,8 @@ pub fn create_run_scratch_dir() -> Result<std::path::PathBuf, String> {
         let dir = std::path::PathBuf::from(format!("{REFINE_WORKDIR}-{}", random_suffix()));
         match std::fs::create_dir(&dir) {
             Ok(()) => {
-                let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
+                std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
+                    .map_err(|_| "작업 디렉토리 권한을 설정할 수 없습니다.".to_string())?;
                 return Ok(dir);
             }
             // 이름이 이미 있다 = 충돌이거나 선점 — 다른 이름으로 다시 시도한다.
@@ -163,7 +164,10 @@ pub fn ensure_scratch_dir(dir: &std::path::Path) -> Result<std::path::PathBuf, S
         Err(_) => return Err("작업 디렉토리를 만들 수 없습니다.".to_string()),
     }
     // 우리 소유임을 확인한 뒤에만 권한을 조인다(남의 디렉토리를 건드리지 않는다).
-    let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
+    // 실패를 삼키지 않는다: 0700을 걸지 못했다면 다른 로컬 사용자가 초안을 읽거나
+    // 파일을 떨어뜨릴 수 있는 상태라는 뜻이고, 그건 이 디렉토리를 쓰지 않을 이유다.
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
+        .map_err(|_| "작업 디렉토리 권한을 설정할 수 없습니다.".to_string())?;
     Ok(dir.to_path_buf())
 }
 
