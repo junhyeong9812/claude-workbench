@@ -74,8 +74,13 @@ pub struct ProcInfo {
     /// Resolved `/proc/<pid>/cwd`. `None` when the link isn't readable (another
     /// user's process, or the process exited mid-scan).
     pub cwd: Option<PathBuf>,
-    /// `/proc/<pid>/cmdline` split on NUL.
+    /// `/proc/<pid>/cmdline` split on NUL. Empty when [`Self::opaque`].
     pub argv: Vec<String>,
+    /// We could not read this process's command line at all, so we cannot say
+    /// whether it is a `claude` or what it is running. Dropping such a process
+    /// from the scan would let it resolve to "safe", so it is kept and treated
+    /// as ambiguous (audit B3).
+    pub opaque: bool,
 }
 
 impl ProcInfo {
@@ -106,7 +111,11 @@ impl ProcInfo {
     /// contains `--resume <uuid>`, is then read as a pin; that is contrived, and
     /// it errs toward reporting that session Live.)
     pub fn session_ids(&self) -> Vec<&str> {
-        const FLAGS: [&str; 2] = ["--resume", "--session-id"];
+        // `-r` is the CLI's short form for `--resume` and is what people
+        // actually type. A non-CLI process that happens to use `-r` for
+        // something else (`grep -r <uuid>`) can only over-report that one
+        // session as Live, never under-report.
+        const FLAGS: [&str; 3] = ["--resume", "--session-id", "-r"];
         let mut out = Vec::new();
         let mut want_value = false;
         for word in self.argv.iter().flat_map(|a| a.split_whitespace()) {
@@ -139,11 +148,14 @@ impl ProcInfo {
 
     /// Could this process be running the session in `cwd`? True when it is a
     /// `claude` that names no session and either sits in that directory or is
-    /// somewhere we could not read (fail-closed — review #3).
+    /// somewhere we could not read (fail-closed — review #3), and also whenever
+    /// the process is [`Self::opaque`]: a command line we could not read might
+    /// be any `claude` anywhere (audit B3).
     fn may_be_in(&self, cwd: &Path) -> bool {
-        self.is_claude()
-            && !self.names_a_session()
-            && self.cwd.as_deref().map(|c| c == cwd).unwrap_or(true)
+        self.opaque
+            || (self.is_claude()
+                && !self.names_a_session()
+                && self.cwd.as_deref().map(|c| c == cwd).unwrap_or(true))
     }
 }
 
@@ -169,11 +181,22 @@ pub struct ProcScan {
     pub ok: bool,
 }
 
-/// Snapshot every readable process under `proc_root`, excluding `self_pid`.
+/// Snapshot every process under `proc_root`, excluding `self_pid`.
 ///
-/// Processes that vanish mid-scan, and links we may not read, are skipped
-/// silently — a partial view is normal and is exactly why an un-establishable
-/// verdict is `Unknown` rather than `Free`.
+/// Three outcomes per pid, and the distinction is the whole point:
+///
+/// - **gone** (`NotFound`) — the process exited between listing `/proc` and
+///   reading it. Dropped, and that is a *positive* fact: something that has
+///   exited holds nothing.
+/// - **opaque** (any other read error) — it exists but we may not look at it.
+///   Kept with [`ProcInfo::opaque`] set, so it blocks rather than disappears.
+///   Dropping it, as an earlier version did, let an uninspectable process
+///   resolve to "nothing is running here" (audit B3).
+/// - **readable** — the normal case.
+///
+/// An empty command line is a kernel thread and is dropped, not treated as
+/// opaque; kernel threads never run a CLI and blocking on them would make every
+/// verdict `Unknown` forever.
 pub fn scan_processes(proc_root: &Path, self_pid: u32) -> ProcScan {
     let Ok(entries) = std::fs::read_dir(proc_root) else {
         return ProcScan { procs: Vec::new(), ok: false };
@@ -186,7 +209,14 @@ pub fn scan_processes(proc_root: &Path, self_pid: u32) -> ProcScan {
             continue;
         }
         let dir = e.path();
-        let Ok(raw) = std::fs::read(dir.join("cmdline")) else { continue };
+        let raw = match std::fs::read(dir.join("cmdline")) {
+            Ok(raw) => raw,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue, // exited
+            Err(_) => {
+                procs.push(ProcInfo { pid, cwd: None, argv: Vec::new(), opaque: true });
+                continue;
+            }
+        };
         if raw.is_empty() {
             continue; // kernel thread
         }
@@ -195,7 +225,12 @@ pub fn scan_processes(proc_root: &Path, self_pid: u32) -> ProcScan {
             .filter(|s| !s.is_empty())
             .map(|s| String::from_utf8_lossy(s).into_owned())
             .collect();
-        procs.push(ProcInfo { pid, cwd: std::fs::read_link(dir.join("cwd")).ok(), argv });
+        procs.push(ProcInfo {
+            pid,
+            cwd: std::fs::read_link(dir.join("cwd")).ok(),
+            argv,
+            opaque: false,
+        });
     }
     ProcScan { procs, ok: true }
 }
@@ -279,7 +314,13 @@ mod tests {
             pid,
             cwd: cwd.map(PathBuf::from),
             argv: argv.iter().map(|s| s.to_string()).collect(),
+            opaque: false,
         }
+    }
+
+    /// A process whose command line we could not read at all.
+    fn opaque(pid: u32) -> ProcInfo {
+        ProcInfo { pid, cwd: None, argv: Vec::new(), opaque: true }
     }
 
     fn probe(procs: Vec<ProcInfo>, holders: &[&str]) -> LiveProbe {
@@ -389,6 +430,33 @@ mod tests {
         // …and a non-claude process with an unreadable cwd is irrelevant.
         let p = probe(vec![proc(9, None, &["vim", "notes.md"])], &[]);
         assert_eq!(p.classify(U, Path::new(J), Path::new("/home/jun/p")), Liveness::Free);
+    }
+
+    #[test]
+    fn an_unreadable_command_line_blocks_rather_than_vanishing() {
+        // Audit B3: a process we may not inspect used to be dropped from the
+        // scan entirely, so it resolved to "nothing is running here".
+        let p = probe(vec![opaque(9)], &[]);
+        assert_eq!(p.classify(U, Path::new(J), Path::new("/home/jun/p")), Liveness::Unknown);
+        // It is not claimed to be running any particular session, though.
+        assert!(opaque(9).session_ids().is_empty());
+        assert!(!opaque(9).is_claude());
+    }
+
+    #[test]
+    fn the_short_resume_flag_pins_too() {
+        for argv in [["claude", "-r", U].as_slice(), ["claude", "-r=88b05349-b927-42aa-ad5c-57155ed29ec5"].as_slice()] {
+            let p = probe(vec![proc(9, Some("/home/jun/p"), argv)], &[]);
+            assert_eq!(
+                p.classify(U, Path::new(J), Path::new("/home/jun/p")),
+                Liveness::Live,
+                "{argv:?}"
+            );
+        }
+        // `-r` with a non-uuid value (`grep -r pattern`) pins nothing.
+        assert!(proc(9, None, &["grep", "-r", "TODO", "."]).session_ids().is_empty());
+        // A bundled short flag isn't `-r`.
+        assert!(proc(9, None, &["rm", "-rf", U]).session_ids().is_empty());
     }
 
     #[test]
