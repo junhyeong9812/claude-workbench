@@ -52,6 +52,13 @@ export interface ClaudeTermParams {
    * panel uses that task's project; falls back to the active project for
    * freshly-created panels. */
   project?: string;
+  /** Directory to root the PTY in, when it must differ from `project`. Only the
+   * external-session adopt path sets this: the CLI finds a session to `--resume`
+   * only from the directory that session was created in (measured — resuming
+   * from anywhere else fails with "No conversation found"), while `project`
+   * stays the app's own project so the snapshot, archive and session list all
+   * agree on one key. Absent = same as `project` (every other caller). */
+  spawnCwd?: string;
   /** One-shot prompt injected once when this session first starts (review/dev
    * modes seed it with "이 커밋 리뷰하자" / "이 파일 검토해줘"). Cleared from the
    * persisted params after injection so a tab-switch remount won't re-send it. */
@@ -778,7 +785,7 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
         const opened = await invoke<ClaudeOpened>("claude_open_or_attach", {
           project,
           uuid: openUuid,
-          cwd: project,
+          cwd: props.params.spawnCwd ?? project,
           name: (props.params.title as string) ?? null,
           cols: term.cols,
           rows: term.rows,

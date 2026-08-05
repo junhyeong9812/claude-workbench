@@ -252,6 +252,7 @@ pub fn claude_open_or_attach(
     let (id, session_uuid, stop) = super::spawn::spawn_claude(
         &app,
         &mgr,
+        project.clone(),
         cwd,
         uuid,
         name.unwrap_or_else(|| "Claude".to_string()),

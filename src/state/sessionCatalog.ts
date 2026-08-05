@@ -78,6 +78,54 @@ export function buildSessionSummaries(
   });
 }
 
+/**
+ * `claude_external_sessions` 백엔드 행 — 터미널에서 직접 연 세션(전사는 있고
+ * 앱 스냅샷은 없는 uuid). 앱이 붙으면(adopt) 스냅샷이 생겨 저절로 목록에서
+ * 빠진다.
+ */
+export interface ExternalSessionRow {
+  uuid: string;
+  title: string;
+  /** 세션이 시작된 디렉토리 — resume 스폰은 **반드시** 여기서 해야 한다
+   * (CLI가 원 디렉토리에서만 세션을 찾는다). */
+  cwd: string;
+  /** 전사 mtime (unix 초). */
+  modified: number;
+  /** free = 붙어도 안전 · live = 다른 곳에서 열려 있음 · unknown = 판정 불가. */
+  live: "free" | "live" | "unknown";
+}
+
+/** 지금 붙어도 되는 세션인가. `unknown`은 **막는다** — 판정 못 한 세션에 붙으면
+ * 같은 전사에 두 프로세스가 append해서 세션이 깨진다(복구 불가). */
+export const adoptable = (row: ExternalSessionRow): boolean => row.live === "free";
+
+/** 막힌 이유 배지. 붙을 수 있는 행은 배지가 없다. */
+export function liveBadge(row: ExternalSessionRow): { label: string; hint: string } | null {
+  switch (row.live) {
+    case "live":
+      return {
+        label: "사용 중",
+        hint: "이 세션이 다른 터미널에서 열려 있습니다 — 그 창을 닫으면 붙일 수 있습니다",
+      };
+    case "unknown":
+      return {
+        label: "확인 불가",
+        hint: "이 세션이 열려 있는지 확인할 수 없습니다 (같은 디렉토리에서 세션을 특정할 수 없는 claude가 돌고 있습니다). 안전을 위해 막습니다",
+      };
+    default:
+      return null;
+  }
+}
+
+/** 외부 세션 행: 이미 열려 있는 세션 제외 + 최신순. 백엔드도 최신순으로 주지만
+ * 정렬 규칙은 저장 세션과 같은 자리(이 모듈)에 둔다. */
+export function externalRows(
+  rows: ExternalSessionRow[],
+  open: ReadonlySet<string>,
+): ExternalSessionRow[] {
+  return rows.filter((r) => !open.has(r.uuid)).sort((a, b) => b.modified - a.modified);
+}
+
 /** dockview 패널 params 중 세션 식별에 쓰이는 부분. */
 export interface SessionPanelParams {
   /** claude 패널은 문자열 세션 id; claudeterm은 숫자 PTY id다. */

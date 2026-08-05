@@ -13,17 +13,21 @@ import { listen } from "@tauri-apps/api/event";
 import { SESSION_DRAG_MIME, encodeSessionDrag } from "./sessionDropZone";
 import {
   PICKER_GROUPS,
+  adoptable,
   archBusyUpdate,
   buildSessionSummaries,
+  externalRows,
+  liveBadge,
   openSessionIds,
   pickerRows,
   type ArchState,
   type ArchiveStatusRow,
+  type ExternalSessionRow,
   type RawSessionRow,
   type SessionPanelParams,
   type SessionSummary,
 } from "../state/sessionCatalog";
-import { fmtUnix } from "../utils/time";
+import { fmtAgo, fmtUnix } from "../utils/time";
 
 export interface SessionPickerController {
   /** null = 피커 닫힘. */
@@ -36,6 +40,8 @@ export interface SessionPickerController {
   archBusy: boolean;
   /** 열린 세션 제외 + 최신순 (B3-2) — 렌더 시점의 live dock 조회. */
   rows: () => SessionSummary[];
+  /** 터미널에서 연 세션(앱 스냅샷 없음) — 열린 것 제외 + 최신순. */
+  externals: () => ExternalSessionRow[];
   collapsed: Set<ArchState>;
   toggleGroup: (key: ArchState) => void;
   newName: string;
@@ -45,7 +51,7 @@ export interface SessionPickerController {
 /** 피커가 쓰는 addPanel의 최소 형태 (MainArea가 주입). */
 type PickerAddPanel = (
   kind: "claudeterm",
-  opts: { loadSessionId: string; project?: string; title: string },
+  opts: { loadSessionId: string; project?: string; title: string; spawnCwd?: string },
 ) => unknown;
 
 export function useSessionPicker(deps: {
@@ -72,6 +78,9 @@ export function useSessionPicker(deps: {
   const [pickerCollapsed, setPickerCollapsed] = useState<Set<ArchState>>(new Set());
   // Which kind the open picker creates/reopens: ACP `claude` or A `claudeterm`.
   const [newName, setNewName] = useState("Claude 1");
+  // 터미널에서 연 세션(외부). 피커를 열 때마다 새로 조회한다 — live 판정은
+  // 지금 이 순간의 프로세스 상태라서 캐시하면 틀린 값을 보여준다.
+  const [external, setExternal] = useState<ExternalSessionRow[]>([]);
 
   /** Open panels of `kind` (for numbering): empty sessions never persist, so the
    * next number is saved sessions + currently-open panels of that kind + 1. */
@@ -87,14 +96,21 @@ export function useSessionPicker(deps: {
     let sessions: SessionSummary[] = [];
     if (activeProject) {
       const myReq = ++archReqRef.current;
-      const [raw, statuses, inFlight] = await Promise.all([
+      const [raw, statuses, inFlight, ext] = await Promise.all([
         invoke<RawSessionRow[]>("claude_sessions", { project: activeProject }).catch(() => []),
         invoke<ArchiveStatusRow[]>("archive_status", { project: activeProject }).catch(() => []),
         invoke<boolean>("archive_in_flight", { project: activeProject }).catch(() => false),
+        // 실패는 섹션 미표시 — 외부 세션은 부가 기능이라 피커 자체를 막지 않는다.
+        invoke<ExternalSessionRow[]>("claude_external_sessions", { project: activeProject }).catch(
+          () => [],
+        ),
       ]);
       sessions = buildSessionSummaries(raw, statuses, activeProject);
+      setExternal(ext);
       const busy = archBusyUpdate(archReqRef.current, myReq, { ok: true, value: inFlight });
       if (busy !== null) setArchBusy(busy);
+    } else {
+      setExternal([]);
     }
     setNewName(`Claude ${sessions.length + openKindCount("claudeterm") + 1}`);
     setPicker(sessions); // open-session filtering happens at render
@@ -145,6 +161,14 @@ export function useSessionPicker(deps: {
     return pickerRows(picker, open);
   };
 
+  const externals = (): ExternalSessionRow[] => {
+    if (picker == null) return [];
+    const open = openSessionIds(
+      (getApi()?.panels ?? []).map((p) => p.params as SessionPanelParams | undefined),
+    );
+    return externalRows(external, open);
+  };
+
   const toggleGroup = (key: ArchState) =>
     setPickerCollapsed((prev) => {
       const next = new Set(prev);
@@ -159,6 +183,7 @@ export function useSessionPicker(deps: {
     openPicker,
     archBusy,
     rows,
+    externals,
     collapsed: pickerCollapsed,
     toggleGroup,
     newName,
@@ -299,6 +324,73 @@ export function SessionPicker({
                     {g.label} ({members.length})
                   </button>
                   {!isCollapsed && members.map(renderRow)}
+                </div>
+              );
+            })}
+          </>
+        );
+      })()}
+      {(() => {
+        // 터미널에서 연 세션 — 전사는 있는데 앱 스냅샷이 없는 것들. 붙이면(adopt)
+        // 스냅샷이 생겨 다음 조회부터 "저장된 세션"으로 넘어간다.
+        const ext = ctl.externals();
+        if (ext.length === 0) return null;
+        return (
+          <>
+            <div
+              className="claude-picker-sep"
+              title="이 프로젝트에서 터미널로 직접 연 claude 세션입니다. 클릭하면 앱 탭으로 이어서 엽니다(--resume)."
+            >
+              외부 세션 ({ext.length})
+            </div>
+            {ext.map((s) => {
+              const badge = liveBadge(s);
+              const can = adoptable(s);
+              return (
+                <div
+                  key={`ext:${s.uuid}`}
+                  className="claude-picker-row"
+                  // 이유 설명은 행에 건다 — 비활성 버튼은 마우스 이벤트를 받지
+                  // 않아 tooltip이 안 뜨는 브라우저가 있고, 그러면 "왜 못 누르지"
+                  // 를 알 길이 없어진다.
+                  title={badge ? badge.hint : `${s.cwd}\n클릭하면 이 세션을 이어서 엽니다`}
+                >
+                  <button
+                    className="claude-picker-item"
+                    disabled={!can}
+                    onClick={() => {
+                      if (!can) return;
+                      // 스폰 디렉토리는 전사의 원 cwd다(CLI가 거기서만 resume한다).
+                      // 앱이 보는 프로젝트 경로와 문자열이 다르면 — 같은 디렉토리를
+                      // 심링크 등으로 다르게 부르는 경우 — 한 번 확인받는다.
+                      if (
+                        activeProject &&
+                        s.cwd !== activeProject &&
+                        !window.confirm(
+                          `이 세션은 다음 디렉토리에서 시작됐습니다:\n${s.cwd}\n\n` +
+                            `현재 프로젝트(${activeProject})와 경로 표기가 다릅니다. ` +
+                            `원래 디렉토리에서 이어 열까요?`,
+                        )
+                      ) {
+                        return;
+                      }
+                      setPicker(null);
+                      addPanel("claudeterm", {
+                        loadSessionId: s.uuid,
+                        project: activeProject ?? s.cwd,
+                        spawnCwd: s.cwd,
+                        title: s.title.slice(0, 24) || "외부 세션",
+                      });
+                    }}
+                  >
+                    <span className="claude-picker-title">{s.title || "(제목 없음)"}</span>
+                    <span className="claude-picker-meta">
+                      {fmtAgo(s.modified)}
+                      {badge ? (
+                        <span className="claude-picker-badge"> · {badge.label}</span>
+                      ) : null}
+                    </span>
+                  </button>
                 </div>
               );
             })}

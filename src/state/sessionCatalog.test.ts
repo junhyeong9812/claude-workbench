@@ -1,9 +1,13 @@
 import { describe, expect, it } from "vitest";
 import {
+  adoptable,
   archBusyUpdate,
   buildSessionSummaries,
+  externalRows,
+  liveBadge,
   openSessionIds,
   pickerRows,
+  type ExternalSessionRow,
   type SessionSummary,
 } from "./sessionCatalog";
 
@@ -106,5 +110,52 @@ describe("archBusyUpdate — in_flight 세대 가드", () => {
 
   it("최신 세대의 실패는 fail-soft로 미표시 — busy 고착 금지", () => {
     expect(archBusyUpdate(7, 7, { ok: false })).toBe(false);
+  });
+});
+
+describe("외부 세션 — adoptable / liveBadge", () => {
+  const ext = (live: ExternalSessionRow["live"]): ExternalSessionRow => ({
+    uuid: "u1",
+    title: "터미널 세션",
+    cwd: "/home/jun/proj",
+    modified: 1_784_000_000,
+    live,
+  });
+
+  it("free만 붙일 수 있다", () => {
+    expect(adoptable(ext("free"))).toBe(true);
+    expect(adoptable(ext("live"))).toBe(false);
+  });
+
+  it("unknown은 막는다 — 판정 실패는 보수적으로 차단(전사 이중 append 방지)", () => {
+    expect(adoptable(ext("unknown"))).toBe(false);
+    expect(liveBadge(ext("unknown"))?.label).toBe("확인 불가");
+  });
+
+  it("붙을 수 있는 행에는 배지가 없다", () => {
+    expect(liveBadge(ext("free"))).toBeNull();
+    expect(liveBadge(ext("live"))?.label).toBe("사용 중");
+  });
+});
+
+describe("externalRows — 최신순 + 열린 세션 제외", () => {
+  const rows: ExternalSessionRow[] = [
+    { uuid: "a", title: "A", cwd: "/p", modified: 100, live: "free" },
+    { uuid: "b", title: "B", cwd: "/p", modified: 300, live: "live" },
+    { uuid: "c", title: "C", cwd: "/p", modified: 200, live: "free" },
+  ];
+
+  it("mtime 내림차순", () => {
+    expect(externalRows(rows, new Set()).map((r) => r.uuid)).toEqual(["b", "c", "a"]);
+  });
+
+  it("이미 열린 세션은 빠진다", () => {
+    expect(externalRows(rows, new Set(["b"])).map((r) => r.uuid)).toEqual(["c", "a"]);
+  });
+
+  it("입력 배열을 변형하지 않는다", () => {
+    const before = rows.map((r) => r.uuid);
+    externalRows(rows, new Set());
+    expect(rows.map((r) => r.uuid)).toEqual(before);
   });
 });
