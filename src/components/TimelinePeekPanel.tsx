@@ -35,25 +35,31 @@ export function TimelinePeekPanel(props: IDockviewPanelProps<TimelinePeekParams>
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [selectedTurn, setSelectedTurn] = useState<number | null>(null);
 
-  // 원 Claude 탭이 닫혔는지. PTY 종료 브로드캐스트(claude-session-closed)는 강제
-  // 종료·claude 자체 종료에서만 오고, **탭 닫기(claude_detach → DetachAct::Close,
-  // runtime.rs)는 이벤트를 내지 않는다** — 그래서 가장 흔한 경로를 덮으려면 dock
-  // 패널의 존재 여부까지 봐야 한다. 둘 다 "기존 신호"라 백엔드 변경은 없다.
+  // peek는 원 Claude 탭의 **동반 뷰**다 — 그 탭이 dock에서 사라지면(닫기, 또는
+  // 다른 창으로 전송) peek도 같이 닫는다. 배지로 남겨 두면 세션은 멀쩡한데 죽은
+  // 화면만 떠 있는 상태가 되고, 단발성이라는 의미와도 어긋난다.
+  //
+  // 탭 닫기 경로(claude_detach → DetachAct::Close, runtime.rs)는 종료 이벤트를
+  // 내지 않으므로, 이 dock 신호가 그 경로를 덮는 짝이다. "세션 종료" 배지는
+  // claude-session-closed 브로드캐스트(강제 종료·claude 자체 종료)에만 쓴다.
   const sourceId = props.params.sourcePanelId ?? null;
-  const [sourceGone, setSourceGone] = useState(false);
+  const panelApi = props.api;
   useEffect(() => {
     if (!sourceId) return;
     const containerApi = props.containerApi;
-    // 마운트 시점 재확인 — 언마운트(탭 전환) 중 사라진 경우를 복구한다.
-    setSourceGone(!containerApi.getPanel(sourceId));
+    const closeSelf = () => panelApi.close();
+    // 닫기는 마이크로태스크로 미룬다 — dock 이벤트 콜백/마운트 도중의 재진입 제거
+    // 를 피하고, 언마운트(탭 전환) 중 원본이 사라진 경우도 이 재확인이 복구한다.
+    const closeLater = () => queueMicrotask(() => closeSelf());
+    if (!containerApi.getPanel(sourceId)) closeLater();
     const d = containerApi.onDidRemovePanel((p) => {
-      if (p.id === sourceId) setSourceGone(true);
+      if (p.id === sourceId) closeLater();
     });
     return () => d.dispose();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [sourceId]);
 
-  const note = ended ? "세션 종료" : sourceGone ? "원본 탭 닫힘" : null;
+  const note = ended ? "세션 종료" : null;
 
   return (
     <div className="claudeterm">
@@ -65,11 +71,7 @@ export function TimelinePeekPanel(props: IDockviewPanelProps<TimelinePeekParams>
           {note && (
             <span
               className="claudeterm-peek-ended"
-              title={
-                ended
-                  ? "이 세션의 claude 프로세스가 종료되었습니다 — 마지막 상태를 보여줍니다"
-                  : "이 타임라인을 연 Claude 탭이 닫혔습니다 (세션은 살아 있을 수 있습니다)"
-              }
+              title="이 세션의 claude 프로세스가 종료되었습니다 — 마지막 상태를 보여줍니다"
             >
               {note}
             </span>
