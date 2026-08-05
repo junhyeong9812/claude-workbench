@@ -25,25 +25,6 @@ struct Sess {
     rev: u64,
     /// Poll-thread stop flag (set on real close / PTY death).
     stop: Arc<AtomicBool>,
-    /// Recently delivered `request_id`s, newest last — the at-most-once ledger
-    /// for identified writes (audit H1). Bounded: only the tail matters, since a
-    /// retry follows its original within seconds.
-    delivered: std::collections::VecDeque<String>,
-}
-
-/// How many delivered request ids one session remembers.
-const DELIVERED_MEMORY: usize = 16;
-
-/// Verdict of [`ClaudeRuntime::claim_write`] — what the command should do next.
-#[derive(Debug, PartialEq, Eq)]
-pub(super) enum WriteClaim {
-    /// Not this window's session to write to (mirror, or unknown id).
-    NotDriver,
-    /// These exact bytes already went in under this `request_id` — do nothing,
-    /// and report success: the caller's intent is satisfied exactly once.
-    AlreadyDelivered,
-    /// Go ahead and write; on failure call [`ClaudeRuntime::release_write`].
-    Fresh,
 }
 
 /// All live Claude sessions, behind ONE lock so `live`/`by_id` never tear
@@ -129,56 +110,8 @@ impl ClaudeRuntime {
         self.live.insert((project.clone(), uuid.clone()), id);
         self.by_id.insert(
             id,
-            Sess {
-                project,
-                uuid,
-                attached: vec![label.clone()],
-                driver: label,
-                rev: 0,
-                stop,
-                delivered: std::collections::VecDeque::new(),
-            },
+            Sess { project, uuid, attached: vec![label.clone()], driver: label, rev: 0, stop },
         );
-    }
-
-    /// Decide whether `label` may write to session `id`, and — when the write
-    /// carries a `request_id` — whether it has already been delivered.
-    ///
-    /// **At-most-once for identified writes (audit H1).** A [적용] that times out
-    /// on the frontend cannot cancel a `claude_write` already in flight, so the
-    /// bytes may land *after* the requester gave up; if the user then retries,
-    /// the prompt would be pasted twice. The frontend keeps the same
-    /// `request_id` across a retry, and this ledger turns the second call into a
-    /// no-op that still reports success — so exactly one copy lands no matter how
-    /// the late-success and the retry interleave.
-    ///
-    /// The id is recorded **here**, before the write, so two concurrent calls
-    /// can't both see "fresh"; a failed write calls [`Self::release_write`] to
-    /// take it back (a write that never landed must stay retryable).
-    ///
-    /// `request_id: None` (keystrokes, seeds) skips the ledger entirely — those
-    /// callers have always been fire-and-forget and their behaviour is unchanged.
-    fn claim_write(&mut self, id: u64, label: &str, request_id: Option<&str>) -> WriteClaim {
-        let Some(sess) = self.by_id.get_mut(&id) else { return WriteClaim::NotDriver };
-        if sess.driver != label {
-            return WriteClaim::NotDriver;
-        }
-        let Some(rid) = request_id else { return WriteClaim::Fresh };
-        if sess.delivered.iter().any(|d| d == rid) {
-            return WriteClaim::AlreadyDelivered;
-        }
-        if sess.delivered.len() >= DELIVERED_MEMORY {
-            sess.delivered.pop_front();
-        }
-        sess.delivered.push_back(rid.to_string());
-        WriteClaim::Fresh
-    }
-
-    /// Undo a claim whose write failed, so the same `request_id` can be retried.
-    fn release_write(&mut self, id: u64, request_id: &str) {
-        if let Some(sess) = self.by_id.get_mut(&id) {
-            sess.delivered.retain(|d| d != request_id);
-        }
     }
 
     /// T4 — 인수(테이크오버). None = 세션 없음. Some((driver, rev)):
@@ -438,28 +371,16 @@ pub fn claude_write(
     claude: State<'_, ClaudeState>,
     id: u64,
     data: Vec<u8>,
-    request_id: Option<String>,
 ) -> Result<bool, AppError> {
-    let claim = {
-        let mut rt = claude.rt.lock().map_err(|_| AppError::new("Claude state unavailable"))?;
-        rt.claim_write(id, window.label(), request_id.as_deref())
+    let is_driver = {
+        let rt = claude.rt.lock().map_err(|_| AppError::new("Claude state unavailable"))?;
+        rt.by_id.get(&id).map(|s| s.driver == window.label()).unwrap_or(false)
     };
-    match claim {
-        WriteClaim::NotDriver => Ok(false), // ignored, and the caller is told so
-        // 같은 request_id로 이미 들어간 바이트 — 아무것도 쓰지 않고 성공을 알린다.
-        WriteClaim::AlreadyDelivered => Ok(true),
-        WriteClaim::Fresh => match mgr.write(id, &data) {
-            Ok(()) => Ok(true),
-            Err(e) => {
-                // 실패한 쓰기는 배달이 아니다 — 원장에서 빼 재시도 가능하게 되돌린다.
-                if let Some(rid) = request_id.as_deref() {
-                    if let Ok(mut rt) = claude.rt.lock() {
-                        rt.release_write(id, rid);
-                    }
-                }
-                Err(AppError::new(e))
-            }
-        },
+    if is_driver {
+        mgr.write(id, &data).map_err(AppError::new)?;
+        Ok(true)
+    } else {
+        Ok(false) // not the driver — ignored, and the caller is told so
     }
 }
 
@@ -659,67 +580,6 @@ mod transition_tests {
         let stop = Arc::new(AtomicBool::new(false));
         rt.register(id, project.into(), uuid.into(), label.into(), stop.clone());
         (rt, stop)
-    }
-
-    // ---- H1: request_id 배달 원장 (같은 id는 정확히 한 번만 실린다) ----
-
-    #[test]
-    fn same_request_id_delivers_once() {
-        let (mut rt, _) = rt_with(1, "/p", "u", "main");
-        assert_eq!(rt.claim_write(1, "main", Some("r1")), WriteClaim::Fresh);
-        // 늦은 실쓰기 뒤의 재시도 — 두 번째는 쓰지 않고 성공으로 보고된다.
-        assert_eq!(rt.claim_write(1, "main", Some("r1")), WriteClaim::AlreadyDelivered);
-        assert_eq!(rt.claim_write(1, "main", Some("r1")), WriteClaim::AlreadyDelivered);
-    }
-
-    #[test]
-    fn different_request_ids_each_deliver() {
-        let (mut rt, _) = rt_with(1, "/p", "u", "main");
-        assert_eq!(rt.claim_write(1, "main", Some("r1")), WriteClaim::Fresh);
-        assert_eq!(rt.claim_write(1, "main", Some("r2")), WriteClaim::Fresh);
-        assert_eq!(rt.claim_write(1, "main", Some("r1")), WriteClaim::AlreadyDelivered);
-        assert_eq!(rt.claim_write(1, "main", Some("r2")), WriteClaim::AlreadyDelivered);
-    }
-
-    #[test]
-    fn writes_without_request_id_are_never_deduped() {
-        let (mut rt, _) = rt_with(1, "/p", "u", "main");
-        // 키 입력·시드 — 원장을 타지 않으므로 몇 번이든 그대로 쓰인다(기존 동작).
-        for _ in 0..3 {
-            assert_eq!(rt.claim_write(1, "main", None), WriteClaim::Fresh);
-        }
-        // 원장이 오염되지 않아 식별된 쓰기도 정상.
-        assert_eq!(rt.claim_write(1, "main", Some("r1")), WriteClaim::Fresh);
-    }
-
-    #[test]
-    fn failed_write_can_be_retried_with_the_same_id() {
-        let (mut rt, _) = rt_with(1, "/p", "u", "main");
-        assert_eq!(rt.claim_write(1, "main", Some("r1")), WriteClaim::Fresh);
-        rt.release_write(1, "r1"); // 쓰기 실패 — 배달이 아니다
-        assert_eq!(rt.claim_write(1, "main", Some("r1")), WriteClaim::Fresh);
-    }
-
-    #[test]
-    fn mirror_and_unknown_session_never_claim() {
-        let (mut rt, _) = rt_with(1, "/p", "u", "main");
-        assert_eq!(rt.claim_write(1, "other-window", Some("r1")), WriteClaim::NotDriver);
-        assert_eq!(rt.claim_write(99, "main", Some("r1")), WriteClaim::NotDriver);
-        // 미러의 시도는 원장을 건드리지 않는다 — driver가 같은 id로 쓸 수 있어야 한다.
-        assert_eq!(rt.claim_write(1, "main", Some("r1")), WriteClaim::Fresh);
-    }
-
-    #[test]
-    fn delivered_memory_is_bounded_and_keeps_the_newest() {
-        let (mut rt, _) = rt_with(1, "/p", "u", "main");
-        for i in 0..(DELIVERED_MEMORY + 4) {
-            assert_eq!(rt.claim_write(1, "main", Some(&format!("r{i}"))), WriteClaim::Fresh);
-        }
-        assert_eq!(rt.by_id[&1].delivered.len(), DELIVERED_MEMORY);
-        // 가장 오래된 것은 잊혀도(재시도는 초 단위라 도달 불가) 최신은 남는다.
-        let newest = format!("r{}", DELIVERED_MEMORY + 3);
-        assert_eq!(rt.claim_write(1, "main", Some(&newest)), WriteClaim::AlreadyDelivered);
-        assert_eq!(rt.claim_write(1, "main", Some("r0")), WriteClaim::Fresh);
     }
 
     fn maps_consistent(rt: &ClaudeRuntime) -> bool {

@@ -396,6 +396,23 @@ describe("resolveApplyAck — 내 요청 id의 결과만 신뢰", () => {
     expect(resolveApplyAck("mine", [{ id: "dev-seed", ok: true }]).kind).toBe("wait");
   });
 
+  it("무소식은 영원히 wait — 자동 조치(타임아웃·재시도)가 없다는 계약", () => {
+    // at-least-once + 수동 재시도로 재슬라이스한 결과다: 배달 보장을 코드로
+    // 흉내내는 대신 사용자가 [다시 적용]을 누른다. 중복 배달은 자동 제출이 없는
+    // "입력창 채우기"라 무해하다(보이면 지우면 된다).
+    expect(resolveApplyAck("mine", []).kind).toBe("wait");
+  });
+
+  it("수동 재시도는 새 id — 이전 시도의 ack가 새 대기를 끝내지 않는다", () => {
+    const acks = [{ id: "try-1", ok: false, reason: "권한 없음" }];
+    // 사용자가 [다시 적용]을 누르면 새 요청 id가 발급된다.
+    expect(resolveApplyAck("try-2", acks).kind).toBe("wait");
+    // 그 뒤 새 id의 결과가 오면 그때 끝난다.
+    expect(resolveApplyAck("try-2", [...acks, { id: "try-2", ok: true }])).toEqual({
+      kind: "delivered",
+    });
+  });
+
   it("다른 주입의 결과가 섞여 있어도 내 것을 찾아낸다 (단일 슬롯 덮임 회귀 방지)", () => {
     const acks = [
       { id: "dev-seed", ok: true },

@@ -237,22 +237,15 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
    * **에러를 삼키지 않는다** — 호출부가 배달 성공을 알아야 하는 경로가 있다
    * (프롬프트 정리 [적용]은 write ACK 뒤에야 정리 세션을 끝낸다, 리뷰 #4). 그냥
    * 쏘고 잊는 자리는 각자 `.catch(() => {})`를 붙인다. */
-  const writeToSession = (text: string, requestId?: string): Promise<boolean> => {
+  const writeToSession = (text: string): Promise<boolean> => {
     const id = sessionIdRef.current;
     if (id == null) return Promise.reject(new Error("세션이 아직 열리지 않았습니다."));
-    // 반환값 = **이 요청의 바이트가 PTY에 들어갔는가**. 이 창이 driver가 아니면
+    // 반환값 = **바이트가 실제로 PTY에 들어갔는가**. 이 창이 driver가 아니면
     // 백엔드가 조용히 무시하고 false를 준다(감사 G1) — 성공으로 오인하면 정리
     // 세션이 아무것도 배달되지 않은 채 종료된다.
-    //
-    // `requestId`가 있으면 백엔드가 세션별 배달 원장으로 **정확히 한 번**을
-    // 보장한다(감사 H1): 타임아웃이 이미 시작된 쓰기를 취소할 수 없으므로 늦은
-    // 성공과 재시도가 겹칠 수 있는데, 같은 id의 두 번째 호출은 쓰지 않고 성공만
-    // 돌려준다. 그래서 **재시도는 반드시 같은 id를 유지해야 한다** — 새 id를
-    // 발급하면 dedupe가 무력화되고 프롬프트가 두 번 붙는다.
     return invoke<boolean>("claude_write", {
       id,
       data: Array.from(new TextEncoder().encode(text)),
-      ...(requestId ? { requestId } : {}),
     });
   };
 
@@ -266,8 +259,7 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
    * 붙이지 않는다(`promptRefine.bracketedPaste`가 그 불변식을 소유하고 테스트가
    * 고정한다). 실측(2026-08-05, claude CLI 2.1.222): 이 형태로 여러 줄을 넣으면
    * 입력창에 그대로 채워지고 전사 파일조차 생기지 않는다(=제출 안 됨). */
-  const fillInput = (text: string, requestId?: string) =>
-    writeToSession(bracketedPaste(text), requestId);
+  const fillInput = (text: string) => writeToSession(bracketedPaste(text));
 
   /** 한 줄 프롬프트를 채우고 **제출**한다 (정리 세션의 규약 시드 전용).
    *
@@ -305,18 +297,13 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
     if (decision !== "write" || !req) return;
     injectHandledRef.current = req.id;
     void (async () => {
-      // 늦게 도착한 처리: 그 사이 요청이 치워졌으면([적용] 타임아웃 등) 쓰지 않는다.
-      // 타임아웃된 id를 소비 측에서 폐기하는 지점이 여기다 — 남은 창은 write
-      // 자체의 길이뿐이라, 10초짜리 창이 밀리초로 줄어든다.
+      // 그 사이 요청이 치워지거나 다른 것으로 바뀌었으면 쓰지 않는다.
       if (useAppStore.getState().claudeInjectRequest?.id !== req.id) return;
       let ok = false;
       let reason: string | undefined;
       try {
         // "fill" = 프롬프트 정리 [적용] — 채우기만 하고 제출하지 않는다.
-        ok =
-          (await (req.mode === "fill"
-            ? fillInput(req.text, req.id) // id를 실어 백엔드가 중복 배달을 막는다
-            : injectSeed(req.text))) === true;
+        ok = (await (req.mode === "fill" ? fillInput(req.text) : injectSeed(req.text))) === true;
         if (!ok) reason = "이 창이 세션의 입력 권한을 갖고 있지 않습니다.";
       } catch (e) {
         reason = errText(e);
@@ -1104,8 +1091,6 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
   const [applyPending, setApplyPending] = useState(false);
   const [applyNote, setApplyNote] = useState<string | null>(null);
   const applyReqIdRef = useRef<string | null>(null);
-  // 마지막 [적용] 시도의 (id, 본문) — 같은 본문의 재시도는 같은 id를 재사용한다.
-  const lastApplyRef = useRef<{ id: string; text: string } | null>(null);
   const claudeInjectAcks = useAppStore((s) => s.claudeInjectAcks);
   const applyReason = isRefine
     ? applyBlockReason({
@@ -1174,17 +1159,25 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
     });
   };
 
-  /** [적용]: 최종본을 **원본 세션 입력창에 채우고**(제출 없음) 정리 세션을 끝낸다.
+  /**
+   * [적용]: 최종본을 **원본 세션 입력창에 채우고**(제출 없음) 정리 세션을 끝낸다.
    *
-   * 순서가 계약이다(리뷰 #4): 요청을 올려놓고 **배달 ACK(claude_write 성공)를 본
-   * 뒤에야** 패널을 닫는다. 예전처럼 먼저 닫으면 배달이 실패했을 때 정리 세션은
-   * 이미 사라졌는데 텍스트만 증발한다 — 사용자가 복구할 방법이 없는 손실이다.
-   * ACK 신호는 슬롯이 비는 것: 원본 패널의 소비 이펙트가 write를 await한 뒤에만
-   * 요청을 지운다.
+   * 배달 보장은 **at-least-once + 수동 재시도**다. exactly-once(요청 id 원장으로
+   * 중복 배달을 막는 설계)를 두 번 시도했고 두 번 다 수명 관리에서 깨졌다 —
+   * 선기록 race, 축출된 id의 오삭제, 재시도 이펙트 미재실행. 세 번째로 같은
+   * 토대를 다듬는 대신 요구를 다시 봤다: **이 주입은 자동 제출이 없는 "입력창
+   * 채우기"라 중복 배달이 파괴적이지 않다.** 두 번 붙으면 사용자가 그걸 보고
+   * 지우면 그만이고, 그 대가로 자동 재시도·타임아웃·배달 원장이 전부 사라진다.
    *
-   * 주입은 기존 요청 버스(claudeInjectRequest)를 탄다 — 원본 패널이 driver·live일
-   * 때만 쓰고, 그 탭이 잠시 언마운트돼 있으면 요청이 남아 있다가 마운트 때
-   * 배달된다(유실≠소비, DevView 선례). */
+   * 그래서 여기엔 타이머가 없다. 요청을 올리고 **자기 id의 ack만** 기다린다:
+   * - `ok` → 배달 확인, 정리 세션 종료(패널 제거 → claude_detach).
+   * - 실패(쓰기 오류 / driver 아님) → 정리 세션을 **보존**하고 사유 + [다시 적용].
+   * - 무소식 → "전달 대기 중"을 그대로 둔다. 자동 조치는 하지 않는다. 원본 탭이
+   *   언마운트라 보류 중인 상태가 대부분이고, 그건 그 탭을 활성화하면 풀린다.
+   *
+   * 남는 중복 가능성은 "실패로 보고됐지만 실제로는 늦게 성공한" 희귀 케이스에서
+   * 사용자가 스스로 [다시 적용]을 누를 때뿐이고, 채우기 전용이라 무해하다.
+   */
   const applyRefined = () => {
     if (applyReason) {
       setApplyNote(applyReason);
@@ -1193,16 +1186,9 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
     const text = refinedPrompt;
     const target = refineTargetUuid;
     if (!text || !target) return;
-    // **재시도는 같은 id를 유지한다**(감사 H1). 타임아웃은 이미 시작된 쓰기를
-    // 취소하지 못하므로, 새 id로 다시 보내면 늦게 성공한 첫 쓰기와 재시도가 둘 다
-    // 실려 프롬프트가 두 번 붙는다. 같은 id면 백엔드 원장이 두 번째를 no-op으로
-    // 만든다. 본문이 달라졌다면 다른 요청이므로 새 id를 뽑는다.
-    const prev = lastApplyRef.current;
-    const reqId = prev && prev.text === text ? prev.id : crypto.randomUUID();
-    lastApplyRef.current = { id: reqId, text };
-    const req = { id: reqId, uuid: target, text, mode: "fill" as const };
+    // 매 시도는 새 요청이다 — 재시도 id를 재사용하며 dedupe를 노리던 설계는 폐기.
+    const req = { id: crypto.randomUUID(), uuid: target, text, mode: "fill" as const };
     setApplyNote(null);
-    useAppStore.getState().clearClaudeInjectAck(reqId); // 지난 시도의 결과 청소
     useAppStore.getState().requestClaudeInject(req);
     // 슬롯을 실제로 잡았을 때만 대기 상태로 — 잡지 못했으면 남의 요청의 결과를
     // 기다리게 된다.
@@ -1215,47 +1201,30 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
   };
 
   /**
-   * 적용 배달 감시 — **우리 요청 id의 결과만** 신뢰한다(감사 G1).
+   * 적용 배달 확인 — **우리 요청 id의 ack만** 신뢰한다(감사 G1).
    *
-   * 예전에는 "슬롯이 비면 성공"으로 추론했는데, 그 추론이 두 곳에서 틀렸다:
-   * `claude_write`는 이 창이 driver가 아니면 아무것도 쓰지 않고도 성공을 반환했고
-   * (이제 백엔드가 bool로 사실을 준다), 슬롯을 비운 주체가 우리 소비자였다는
-   * 보장도 없었다. 이제 소비 패널이 실제 쓰기 결과를 ack로 남기고 여기서 id로
-   * 짝짓는다 — ok면 정리 세션을 끝내고, 실패면 **세션을 보존한 채** 사유를 띄운다.
+   * "슬롯이 비면 성공"이라는 추론은 두 곳에서 틀렸었다: `claude_write`는 이 창이
+   * driver가 아니면 아무것도 쓰지 않고도 성공을 반환했고(이제 백엔드가 bool로
+   * 사실을 준다), 슬롯을 비운 주체가 우리 소비자였다는 보장도 없었다. 이제
+   * 소비 패널이 실제 쓰기 결과를 ack로 남기고 여기서 id로 짝짓는다.
    *
-   * 타임아웃은 "아무 소식 없음"에만 쓴다: 슬롯에 남은 우리 요청을 치워
-   * (소비 측이 쓰기 직전 id를 재확인하므로 그 순간부터 늦은 중복 주입이 불가능해진다)
-   * 다른 주입도 막지 않게 한다.
+   * 타이머는 없다(위 at-least-once 근거). ack가 올 때까지 대기 표시가 유지된다.
    */
   useEffect(() => {
     if (!applyPending) return;
     const myId = applyReqIdRef.current;
     const outcome = resolveApplyAck(myId, claudeInjectAcks);
-    if (outcome.kind !== "wait") {
-      setApplyPending(false);
-      applyReqIdRef.current = null;
-      if (myId) useAppStore.getState().clearClaudeInjectAck(myId); // 결과 확인 완료
-      if (outcome.kind === "delivered") {
-        props.api.close();
-        return;
-      }
-      setApplyNote(
-        `원래 세션에 전달하지 못했습니다: ${outcome.reason}\n다시 [적용]해 보세요. (정리 세션은 그대로 둡니다)`,
-      );
+    if (outcome.kind === "wait") return;
+    setApplyPending(false);
+    applyReqIdRef.current = null;
+    if (myId) useAppStore.getState().clearClaudeInjectAck(myId); // 결과 확인 완료
+    if (outcome.kind === "delivered") {
+      props.api.close();
       return;
     }
-    const t = setTimeout(() => {
-      setApplyPending(false);
-      applyReqIdRef.current = null;
-      // 우리 요청이 아직 슬롯에 남아 있으면 치운다 — 남겨 두면 다른 주입까지 막고,
-      // 치우는 순간 소비 측의 id 재확인이 늦은 중복 주입도 막는다.
-      const st = useAppStore.getState();
-      if (st.claudeInjectRequest?.id === myId) st.requestClaudeInject(null);
-      setApplyNote(
-        "원래 세션에 전달하지 못했습니다 — 그 탭이 열려 있고, 이 창이 입력 권한을 가졌으며, 그 세션이 권한 프롬프트에 걸려 있지 않은지 확인한 뒤 다시 [적용]하세요. (정리 세션은 그대로 둡니다)",
-      );
-    }, 10000);
-    return () => clearTimeout(t);
+    setApplyNote(
+      `원래 세션에 전달하지 못했습니다: ${outcome.reason}\n정리 세션은 그대로 둡니다 — [다시 적용]을 눌러 보세요.`,
+    );
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [applyPending, claudeInjectAcks]);
 
@@ -1447,7 +1416,7 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
                   }
                   onClick={applyRefined}
                 >
-                  {applyPending ? "적용 중…" : "적용"}
+                  {applyPending ? "전달 대기 중…" : applyNote ? "다시 적용" : "적용"}
                 </button>
                 <button
                   className="claudeterm-head-btn"
@@ -1515,13 +1484,26 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
             )}
           </span>
         </div>
-        {isRefine && applyNote && (
+        {isRefine && (applyPending || applyNote) && (
           <div className="claudeterm-refine-note" role="status">
-            {applyNote}
+            {applyPending
+              ? "전달 대기 중 — 원래 Claude 탭이 열려 있어야 전달됩니다. 그 탭을 활성화해 주세요.\n(전달이 확인되면 이 정리 세션은 자동으로 닫힙니다.)"
+              : applyNote}
             <span
               className="claudeterm-refine-note-x"
-              title="닫기"
-              onClick={() => setApplyNote(null)}
+              title={applyPending ? "전달 대기를 그만둡니다 (이미 보낸 요청은 취소되지 않습니다)" : "닫기"}
+              onClick={() => {
+                if (applyPending) {
+                  // 대기를 접는다. 이미 보낸 요청을 취소하지는 못하므로(그건
+                  // exactly-once 설계가 필요했던 지점) 슬롯만 우리 것이면 치운다.
+                  const myId = applyReqIdRef.current;
+                  const st = useAppStore.getState();
+                  if (myId && st.claudeInjectRequest?.id === myId) st.requestClaudeInject(null);
+                  applyReqIdRef.current = null;
+                  setApplyPending(false);
+                }
+                setApplyNote(null);
+              }}
             >
               ×
             </span>
