@@ -205,10 +205,17 @@ pub(super) fn subagent_parent_memo(
 /// session JSONL to appear (the CLI creates it after init), then polls a
 /// `SessionTail` every ~150ms, emitting and persisting newly-touched items.
 /// Ends when the stop flag is set (`claude_close`).
+///
+/// `project` keys everything this loop persists (the snapshot and its name
+/// override) and doubles as the timeline's root for project labels. It used to
+/// be the PTY's cwd, which was the same string until external-session adoption
+/// let the two differ: an adopted session's PTY runs in the transcript's own
+/// directory, but its snapshot must be filed under the app's project like every
+/// other session (see `spawn::spawn_claude`).
 pub(super) fn run_timeline_poll(
     app: AppHandle,
     id: u64,
-    cwd: String,
+    project: String,
     uuid: String,
     initial_name: String,
     stop: Arc<AtomicBool>,
@@ -265,7 +272,7 @@ pub(super) fn run_timeline_poll(
             if let Ok(Some(path)) = core_lib::jsonl::find_session_jsonl(&root, &uuid) {
                 sub_dir = Some(path.with_extension("").join("subagents"));
                 tail = Some(core_lib::jsonl::SessionTail::new(
-                    cwd.clone(),
+                    project.clone(),
                     uuid.clone(),
                     path,
                 ));
@@ -290,7 +297,7 @@ pub(super) fn run_timeline_poll(
             if let Ok(base) = app.path().app_data_dir() {
                 // Read the rename override (decoupled file) rather than the
                 // body's own name, so a concurrent rename isn't clobbered (F1).
-                let name = core_lib::snapshot::read_name(&base, &cwd, &uuid)
+                let name = core_lib::snapshot::read_name(&base, &project, &uuid)
                     .unwrap_or_else(|| initial_name.clone());
                 let date = chrono::Local::now().format("%Y-%m-%d").to_string();
                 // 스냅샷 본문은 **전문**(절단 없음 — 듀얼 리뷰 #3). 절단은 IPC
@@ -321,7 +328,7 @@ pub(super) fn run_timeline_poll(
                 // 하나로 좁힌다(구 구현과 동급 이하). 완전 봉쇄는 delete와의
                 // 락 공유가 필요해 P6(session 락 정리) 후보로 기록(고유 잔존).
                 if !stop.load(Ordering::Relaxed)
-                    && core_lib::snapshot::save(&base, &cwd, &snap).is_ok()
+                    && core_lib::snapshot::save(&base, &project, &snap).is_ok()
                 {
                     snap_dirty = false;
                 }
@@ -371,7 +378,7 @@ pub(super) fn run_timeline_poll(
                                         !stale.contains(&(sid.as_str(), tcid.as_str()))
                                     });
                                     let mut st = core_lib::jsonl::SessionTail::new(
-                                        cwd.clone(),
+                                        project.clone(),
                                         aid.clone(),
                                         f.clone(),
                                     );
@@ -400,7 +407,7 @@ pub(super) fn run_timeline_poll(
                     }
                     sub_path.insert(aid.clone(), f.clone());
                     let st = subagents.entry(aid.clone()).or_insert_with(|| {
-                        core_lib::jsonl::SessionTail::new(cwd.clone(), aid.clone(), f)
+                        core_lib::jsonl::SessionTail::new(project.clone(), aid.clone(), f)
                     });
                     let _ = st.poll();
                 }

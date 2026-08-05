@@ -32,6 +32,11 @@ pub struct RawRecord {
     pub git_branch: Option<String>,
     pub version: Option<String>,
     pub timestamp: Option<String>,
+    /// The CLI's own generated session title, carried on `ai-title` records.
+    /// Not mapped to a timeline item — read by [`crate::scan`] as the best
+    /// available display title for a transcript we never opened ourselves.
+    #[serde(rename = "aiTitle")]
+    pub ai_title: Option<String>,
     pub message: Option<Message>,
     /// The richer structured result the CLI attaches to a `tool_result` record
     /// (file object, exit code, …). Parsed but optional in Phase A — completion

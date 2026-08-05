@@ -91,48 +91,9 @@ fn parse_args() -> Args {
     a
 }
 
-/// A session picked up by the scan.
-struct Candidate {
-    uuid: String,
-    jsonl_path: PathBuf,
-    mtime: SystemTime,
-}
-
-/// First `cwd` + last timestamp date (YYYY-MM-DD) + whether this transcript is
-/// one of OUR extraction runs (첫 사용자 프롬프트가 추출 마커로 시작 — 되먹임
-/// 루프 방어선 2중: cwd 격리가 1차, 이 필터가 2차).
-fn probe_transcript(text: &str) -> (Option<String>, Option<String>, bool) {
-    let mut cwd = None;
-    let mut date = None;
-    let mut is_extraction = false;
-    let mut seen_first_prompt = false;
-    for line in text.lines() {
-        let Some(rec) = core_lib::jsonl::RawRecord::parse_line(line) else { continue };
-        if cwd.is_none() {
-            cwd = rec.cwd.clone();
-        }
-        if let Some(ts) = rec.timestamp.as_deref().and_then(|t| t.get(..10)) {
-            date = Some(ts.to_string());
-        }
-        if !seen_first_prompt {
-            if let Some(msg) = &rec.message {
-                if msg.role.as_deref() == Some("user") {
-                    let prompt_text = match &msg.content {
-                        Some(core_lib::jsonl::Content::Text(s)) => Some(s.as_str()),
-                        _ => None,
-                    };
-                    if let Some(p) = prompt_text {
-                        seen_first_prompt = true;
-                        is_extraction = p
-                            .trim_start()
-                            .starts_with(core_lib::knowledge::EXTRACTION_MARKER);
-                    }
-                }
-            }
-        }
-    }
-    (cwd, date, is_extraction)
-}
+/// A session picked up by the scan. `core::scan::Transcript` plus nothing — the
+/// alias keeps the pipeline's vocabulary while the scan itself lives in core.
+type Candidate = core_lib::scan::Transcript;
 
 fn main() {
     let args = parse_args();
@@ -180,43 +141,28 @@ fn main() {
         None
     };
 
-    // 스캔: projects_root 1단계 하위의 *.jsonl, mtime 필터.
+    // 스캔: projects_root 1단계 하위의 *.jsonl, mtime 필터 — 로직 정본은
+    // core::scan(앱의 외부 세션 목록과 같은 코드). /tmp cwd의 슬러그("-tmp-…")
+    // 제외는 스캔 레벨 옵션: 추출 스크래치 트랜스크립트가 mtime 최신이라
+    // --limit 슬롯을 전부 삼키는 것을 막는다(limit은 probe 전에 걸린다).
+    let scanned = core_lib::scan::scan_transcripts(
+        &args.projects_root,
+        &core_lib::scan::ScanOpts {
+            skip_tmp_slugs: true,
+            modified_since: Some(cutoff),
+        },
+    )
+    .unwrap_or_else(|e| die(&format!("projects root 읽기 실패: {e}")));
     let mut candidates: Vec<Candidate> = Vec::new();
-    let dirs = std::fs::read_dir(&args.projects_root)
-        .unwrap_or_else(|e| die(&format!("projects root 읽기 실패: {e}")));
-    for dir in dirs.flatten() {
-        if !dir.path().is_dir() {
-            continue;
-        }
-        // /tmp cwd의 슬러그("-tmp-…")는 스캔 자체에서 제외 — 추출 스크래치
-        // 트랜스크립트가 mtime 최신이라 --limit 슬롯을 전부 삼키는 것 방지
-        // (limit은 probe 전에 걸리므로 스캔 레벨 필터가 정위치).
-        if dir.file_name().to_string_lossy().starts_with("-tmp-") {
-            continue;
-        }
-        let Ok(files) = std::fs::read_dir(dir.path()) else { continue };
-        for f in files.flatten() {
-            let path = f.path();
-            if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+    for c in scanned {
+        // 완료여도 전사가 자랐으면 후보 유지 — GUI is_unchanged_complete와
+        // 같은 내용 비교(라이브 stat vs 아카이브 meta).
+        if let Some(Some(entry)) = complete.get(&c.uuid) {
+            if core_lib::archive::live_matches_archive(&c.path, entry) {
                 continue;
             }
-            let Ok(meta) = f.metadata() else { continue };
-            let Ok(mtime) = meta.modified() else { continue };
-            if mtime < cutoff {
-                continue;
-            }
-            let Some(uuid) = path.file_stem().map(|s| s.to_string_lossy().to_string()) else {
-                continue;
-            };
-            // 완료여도 전사가 자랐으면 후보 유지 — GUI is_unchanged_complete와
-            // 같은 내용 비교(라이브 stat vs 아카이브 meta).
-            if let Some(Some(entry)) = complete.get(&uuid) {
-                if core_lib::archive::live_matches_archive(&path, entry) {
-                    continue;
-                }
-            }
-            candidates.push(Candidate { uuid, jsonl_path: path, mtime });
         }
+        candidates.push(c);
     }
     // --limit N: 최신 세션부터 N개만 (0 = 무제한) — "최근 것 50개 더" 류의
     // 점진 백필용.
@@ -240,12 +186,13 @@ fn main() {
     let mut by_project: BTreeMap<String, Vec<(Candidate, String)>> = BTreeMap::new();
     let mut skipped_probe = 0usize;
     for c in candidates {
-        let Ok(text) = std::fs::read_to_string(&c.jsonl_path) else {
-            eprintln!("skip(읽기 실패): {}", c.jsonl_path.display());
+        let Ok(text) = std::fs::read_to_string(&c.path) else {
+            eprintln!("skip(읽기 실패): {}", c.path.display());
             skipped_probe += 1;
             continue;
         };
-        let (cwd, date, is_extraction) = probe_transcript(&text);
+        let core_lib::scan::Probe { cwd, date, is_extraction, .. } =
+            core_lib::scan::probe_transcript(&text);
         drop(text);
         if is_extraction {
             eprintln!("skip(추출 세션 — 우리 도구의 부산물): {}", c.uuid);
@@ -350,7 +297,7 @@ fn archive_one(
     // NOTE(P6 단일화의 CLI 동작 변경 — 문서화): 구 CLI는 read_to_string이라
     // 비-UTF8 전사를 스킵했지만, 이제 GUI와 같이 바이트로 읽어 verbatim 복사
     // 계약을 지킨다(normalized만 lossy).
-    let jsonl_bytes = std::fs::read(&c.jsonl_path).map_err(|e| format!("트랜스크립트 읽기: {e}"))?;
+    let jsonl_bytes = std::fs::read(&c.path).map_err(|e| format!("트랜스크립트 읽기: {e}"))?;
     // fallback 제목: 앱 사이드카(.title/.name), 없으면 "Claude".
     let title = core_lib::snapshot::read_title(&args.snapshot_base, project, &c.uuid)
         .or_else(|| core_lib::snapshot::read_name(&args.snapshot_base, project, &c.uuid))

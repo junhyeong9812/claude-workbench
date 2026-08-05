@@ -97,6 +97,48 @@ pub fn claude_sessions(app: AppHandle, project: String) -> Vec<core_lib::snapsho
     core_lib::snapshot::list(&base, &project)
 }
 
+/// Sessions of `project` that exist as CLI transcripts but have **no snapshot**
+/// here — i.e. started from a terminal, outside the app. The picker offers them
+/// for adoption (`--resume`).
+///
+/// Difference-only: adopting one makes the poll thread write a snapshot, which
+/// removes it from this list on the next call. Nothing is persisted about the
+/// adoption itself (`core::external`).
+///
+/// Runs off the UI thread — it stats every transcript in the projects root and
+/// walks `/proc` for the liveness verdict (~0.2 s on a 340-transcript corpus).
+#[tauri::command]
+pub async fn claude_external_sessions(
+    app: AppHandle,
+    project: String,
+) -> Vec<core_lib::external::ExternalSession> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let (Ok(base), Some(projects_root)) =
+            (app.path().app_data_dir(), core_lib::jsonl::claude_projects_root())
+        else {
+            eprintln!("claude_external_sessions: app data dir 또는 Claude projects root를 찾을 수 없어 목록을 비웁니다");
+            return Vec::new();
+        };
+        core_lib::external::list_external(
+            &projects_root,
+            &base,
+            &project,
+            std::path::Path::new("/proc"),
+            // Our own pid: the app tails transcripts and spawns `claude` with the
+            // uuid on the command line, so counting ourselves would report every
+            // session we drive as "busy elsewhere".
+            std::process::id(),
+        )
+    })
+    .await
+    .unwrap_or_else(|e| {
+        // An empty list is indistinguishable from "no external sessions" in the
+        // UI, so a panicked/cancelled task must not vanish without a word.
+        eprintln!("claude_external_sessions: 조회 태스크 실패 — 빈 목록으로 응답합니다 ({e})");
+        Vec::new()
+    })
+}
+
 /// Load a saved session's full timeline snapshot, to seed the panel on reopen.
 #[tauri::command]
 pub fn claude_session_snapshot(

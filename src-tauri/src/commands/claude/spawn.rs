@@ -22,9 +22,17 @@ fn new_session_uuid() -> Result<String, AppError> {
 /// emit `claude-timeline` items. Does NOT register into `ClaudeRuntime` — the
 /// caller does that under its lock. `resume` continues an existing session by
 /// UUID; None starts a fresh `--session-id`. Returns (id, uuid, poll-stop flag).
+///
+/// `project` and `cwd` are normally the same string, and were a single argument
+/// until adoption of external sessions split them: the CLI only finds a session
+/// to `--resume` from the directory that session was created in, so the PTY must
+/// be rooted at the transcript's own cwd — while the snapshot the poll thread
+/// writes must stay keyed by the **app's** project, or the adopted session would
+/// be filed under a name nothing else in the app uses.
 pub(super) fn spawn_claude(
     app: &AppHandle,
     mgr: &SessionManager,
+    project: String,
     cwd: String,
     resume: Option<String>,
     name: String,
@@ -61,7 +69,7 @@ pub(super) fn spawn_claude(
     }
 
     let id = mgr
-        .create_with_env(Some(cmd), Some(cwd.clone()), cols, rows, envs)
+        .create_with_env(Some(cmd), Some(cwd), cols, rows, envs)
         .map_err(AppError::new)?;
     // Clean up the orphan PTY if we can't subscribe to it (review P6-impl #4).
     let rx = match mgr.subscribe(id) {
@@ -90,7 +98,9 @@ pub(super) fn spawn_claude(
         let app = app.clone();
         let uuid = session_uuid.clone();
         let stop = stop.clone();
-        thread::spawn(move || super::timeline::run_timeline_poll(app, id, cwd, uuid, name, stop));
+        thread::spawn(move || {
+            super::timeline::run_timeline_poll(app, id, project, uuid, name, stop)
+        });
     }
     Ok((id, session_uuid, stop))
 }

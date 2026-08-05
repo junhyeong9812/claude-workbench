@@ -9,7 +9,7 @@ use core_lib::SessionManager;
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, State, Window};
 
-use crate::commands::AppError;
+use crate::commands::{io_message, AppError};
 
 /// One live Claude session shared across windows (multiwindow mirror, P6). A
 /// session is ONE PTY (`id`) + JSONL (`uuid`); multiple windows can render it,
@@ -201,10 +201,70 @@ pub struct ClaudeDetached {
     rev: u64,
 }
 
+/// Refuse to take over a transcript that something else is — or might be —
+/// already running, checked at the last possible moment before the PTY starts.
+///
+/// The picker's verdict is a snapshot of `/proc` from when it was opened; a user
+/// can leave it sitting while they go and resume that same session in a
+/// terminal, and the adopt would then append to a transcript another CLI owns
+/// (review #1: time-of-check/time-of-use). Re-establishing it here shrinks that
+/// window to the spawn itself.
+///
+/// **Only the adopt path calls this.** The app's own sessions must never be
+/// checked: we spawn them with `--resume <uuid>` on our own command line, so the
+/// very act of running one makes it read as `Live` — a reopen after a crash, or
+/// any path that races its own leftover process, would block itself forever.
+///
+/// Every failure here is a refusal, never a pass. In particular a **missing**
+/// transcript is fatal on this path: adopt means continuing a session that
+/// exists, and `spawn_claude` falls back to `--session-id` when it can't find
+/// the file — so letting a missing transcript through would quietly create a
+/// brand-new session wearing the id of the one the user clicked (audit B2).
+fn recheck_adoptable(uuid: &str, cwd: &str) -> Result<(), AppError> {
+    let Some(root) = core_lib::jsonl::claude_projects_root() else {
+        return Err(AppError::new("Claude 전사 디렉토리를 찾을 수 없어 세션을 열지 않았습니다."));
+    };
+    let jsonl = match core_lib::jsonl::find_session_jsonl(&root, uuid) {
+        Ok(Some(p)) => p,
+        Ok(None) => {
+            return Err(AppError::new(
+                "이 세션의 전사를 찾을 수 없습니다 — 그 사이 지워졌거나 옮겨진 것 같습니다. \
+                 목록을 다시 열어 확인하세요.",
+            ))
+        }
+        Err(e) => {
+            return Err(AppError::new(io_message("이 세션의 전사를 찾지 못했습니다", &e)))
+        }
+    };
+    let jsonl = jsonl.canonicalize().unwrap_or(jsonl);
+    let dir = std::fs::canonicalize(cwd).unwrap_or_else(|_| std::path::PathBuf::from(cwd));
+    let targets = std::iter::once(jsonl.clone()).collect();
+    let probe = core_lib::live::LiveProbe::gather(
+        std::path::Path::new("/proc"),
+        &targets,
+        std::process::id(),
+    );
+    match probe.classify(uuid, &jsonl, &dir) {
+        core_lib::live::Liveness::Free => Ok(()),
+        core_lib::live::Liveness::Live => Err(AppError::new(
+            "이 세션은 지금 다른 곳에서 열려 있습니다 — 그 창을 닫은 뒤 다시 시도하세요. \
+             (같은 전사에 두 프로세스가 쓰면 세션이 깨집니다)",
+        )),
+        core_lib::live::Liveness::Unknown => Err(AppError::new(
+            "이 세션이 열려 있는지 확인할 수 없어 열지 않았습니다 \
+             (같은 디렉토리에서 세션을 특정할 수 없는 claude가 돌고 있습니다).",
+        )),
+    }
+}
+
 /// Open a Claude session for THIS window: if its PTY is already live (another
 /// window started it), attach as a read-only **mirror**; otherwise start a fresh
 /// PTY and become the **driver**. Atomic under the runtime lock so two windows
 /// can't both start the same session (review R7-2/R7-3). `uuid` None = brand new.
+///
+/// `adopt` marks the one path that takes over a transcript the app never drove
+/// (the picker's external-session section). Only that path re-checks liveness
+/// here; see [`recheck_adoptable`].
 #[tauri::command]
 #[allow(clippy::too_many_arguments)]
 pub fn claude_open_or_attach(
@@ -216,6 +276,7 @@ pub fn claude_open_or_attach(
     uuid: Option<String>,
     cwd: Option<String>,
     name: Option<String>,
+    adopt: Option<bool>,
     cols: u16,
     rows: u16,
 ) -> Result<ClaudeOpened, AppError> {
@@ -248,10 +309,23 @@ pub fn claude_open_or_attach(
     // claude가 지식 서버(search_knowledge)를 바로 쓸 수 있게 (best-effort).
     crate::commands::archive::ensure_mcp_registration(&app, &cwd);
 
+    // Adopt only: the liveness verdict the picker showed was computed when the
+    // picker opened, and the user may have sat on it for minutes — long enough to
+    // go start that very session in a terminal. Re-establish it here, *after* the
+    // side work above and immediately before the spawn, so nothing runs between
+    // the check and the PTY (review #1, audit B2). The runtime lock is held
+    // throughout. One /proc pass, measured at ~0.12 s.
+    if adopt.unwrap_or(false) {
+        if let Some(uuid) = uuid.as_deref() {
+            recheck_adoptable(uuid, &cwd)?;
+        }
+    }
+
     // Driver: start a fresh PTY (lock held so a concurrent open can't double-start).
     let (id, session_uuid, stop) = super::spawn::spawn_claude(
         &app,
         &mgr,
+        project.clone(),
         cwd,
         uuid,
         name.unwrap_or_else(|| "Claude".to_string()),

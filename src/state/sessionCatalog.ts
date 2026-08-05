@@ -78,6 +78,54 @@ export function buildSessionSummaries(
   });
 }
 
+/**
+ * `claude_external_sessions` 백엔드 행 — 터미널에서 직접 연 세션(전사는 있고
+ * 앱 스냅샷은 없는 uuid). 앱이 붙으면(adopt) 스냅샷이 생겨 저절로 목록에서
+ * 빠진다.
+ */
+export interface ExternalSessionRow {
+  uuid: string;
+  title: string;
+  /** 세션이 시작된 디렉토리 — resume 스폰은 **반드시** 여기서 해야 한다
+   * (CLI가 원 디렉토리에서만 세션을 찾는다). */
+  cwd: string;
+  /** 전사 mtime (unix 초). */
+  modified: number;
+  /** free = 붙어도 안전 · live = 다른 곳에서 열려 있음 · unknown = 판정 불가. */
+  live: "free" | "live" | "unknown";
+}
+
+/** 지금 붙어도 되는 세션인가. `unknown`은 **막는다** — 판정 못 한 세션에 붙으면
+ * 같은 전사에 두 프로세스가 append해서 세션이 깨진다(복구 불가). */
+export const adoptable = (row: ExternalSessionRow): boolean => row.live === "free";
+
+/** 막힌 이유 배지. 붙을 수 있는 행은 배지가 없다. */
+export function liveBadge(row: ExternalSessionRow): { label: string; hint: string } | null {
+  switch (row.live) {
+    case "live":
+      return {
+        label: "사용 중",
+        hint: "이 세션이 다른 터미널에서 열려 있습니다 — 그 창을 닫으면 붙일 수 있습니다",
+      };
+    case "unknown":
+      return {
+        label: "확인 불가",
+        hint: "이 세션이 열려 있는지 확인할 수 없습니다 (같은 디렉토리에서 세션을 특정할 수 없는 claude가 돌고 있습니다). 안전을 위해 막습니다",
+      };
+    default:
+      return null;
+  }
+}
+
+/** 외부 세션 행: 이미 열려 있는 세션 제외 + 최신순. 백엔드도 최신순으로 주지만
+ * 정렬 규칙은 저장 세션과 같은 자리(이 모듈)에 둔다. */
+export function externalRows(
+  rows: ExternalSessionRow[],
+  open: ReadonlySet<string>,
+): ExternalSessionRow[] {
+  return rows.filter((r) => !open.has(r.uuid)).sort((a, b) => b.modified - a.modified);
+}
+
 /** dockview 패널 params 중 세션 식별에 쓰이는 부분. */
 export interface SessionPanelParams {
   /** claude 패널은 문자열 세션 id; claudeterm은 숫자 PTY id다. */
@@ -108,6 +156,28 @@ export function pickerRows(
   open: ReadonlySet<string>,
 ): SessionSummary[] {
   return sessions.filter((s) => !open.has(s.id)).sort((a, b) => b.date.localeCompare(a.date));
+}
+
+/**
+ * 피커 조회 응답을 화면에 반영해도 되는가.
+ *
+ * `apply` = 반영 · `stale` = 더 새 조회가 시작됨(버림) · `switched` = 조회하는
+ * 사이 사용자가 프로젝트를 바꿈(버리고 재조회).
+ *
+ * 세션 목록과 외부 세션은 **프로젝트별** 데이터라, 늦게 도착한 응답이 그대로
+ * set되면 A 프로젝트를 보면서 B의 세션 목록이 뜬다. 배지(archBusyUpdate)와 달리
+ * 여기서는 세대만으로 부족하다 — 프로젝트 전환은 새 조회를 동반하지 않을 수도
+ * 있어서, 응답이 어느 프로젝트 것인지 함께 확인해야 한다.
+ */
+export function pickerLoadOutcome(
+  current: number,
+  mine: number,
+  requestedProject: string | null,
+  currentProject: string | null,
+): "apply" | "stale" | "switched" {
+  if (current !== mine) return "stale";
+  if (requestedProject !== currentProject) return "switched";
+  return "apply";
 }
 
 /**

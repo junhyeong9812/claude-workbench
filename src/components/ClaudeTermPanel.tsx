@@ -13,6 +13,7 @@ import "@xterm/xterm/css/xterm.css";
 import { useAppStore } from "../state/store";
 import { xtermTheme } from "./xtermTheme";
 import { recallArea, rememberArea, type PanelArea } from "../state/panelFocus";
+import { openArgs, paramsAfterOpen } from "../state/claudeTermParams";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { TimelineView, ItemDetail, MarkdownText, type TimelineItem } from "./TimelineView";
 import { SubagentsPane } from "./SubagentsPane";
@@ -52,6 +53,25 @@ export interface ClaudeTermParams {
    * panel uses that task's project; falls back to the active project for
    * freshly-created panels. */
   project?: string;
+  /** Directory to root the PTY in, when it must differ from `project`. Only the
+   * external-session adopt path sets this: the CLI finds a session to `--resume`
+   * only from the directory that session was created in (measured — resuming
+   * from anywhere else fails with "No conversation found"), while `project`
+   * stays the app's own project so the snapshot, archive and session list all
+   * agree on one key. Absent = same as `project` (every other caller).
+   *
+   * **Persistent** — a restored layout must still spawn in the right directory. */
+  spawnCwd?: string;
+  /** Ask the backend to re-check liveness before spawning. **One-shot**: set by
+   * the picker when the user adopts an external session, and cleared the moment
+   * the session opens.
+   *
+   * It cannot be derived from `spawnCwd`, which has to persist: the taking-over
+   * *is* a one-time event, and after it the session is ours like any other. A
+   * persistent trigger would re-check on every remount and app restart, so an
+   * unrelated bare `claude` in the same directory would make the app refuse to
+   * reopen its own session (audit B1). */
+  adoptPending?: boolean;
   /** One-shot prompt injected once when this session first starts (review/dev
    * modes seed it with "이 커밋 리뷰하자" / "이 파일 검토해줘"). Cleared from the
    * persisted params after injection so a tab-switch remount won't re-send it. */
@@ -775,10 +795,16 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
       const project = props.params.project ?? useAppStore.getState().activeProject ?? null;
       const openUuid = props.params.loadSessionId ?? props.params.sessionUuid ?? null;
       try {
+        // cwd(유지)와 adopt(1회성)의 수명 규칙은 순수 모듈 소유 — 인수하는 그
+        // 한 번만 백엔드가 스폰 직전 live 재검증을 한다. 앱이 이미 소유한
+        // 세션에는 걸지 않는다: 우리 자신의 argv에 uuid가 실려 있어 스스로를
+        // "사용 중"으로 막게 된다(B1).
+        const { cwd, adopt } = openArgs(props.params, project);
         const opened = await invoke<ClaudeOpened>("claude_open_or_attach", {
           project,
           uuid: openUuid,
-          cwd: project,
+          cwd,
+          adopt,
           name: (props.params.title as string) ?? null,
           cols: term.cols,
           rows: term.rows,
@@ -818,16 +844,22 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
           pendingSeedRef.current = props.params.seed;
           setLastSeed(props.params.seed);
         }
-        props.api.updateParameters({
-          ...props.params,
-          sessionId: opened.id,
-          sessionUuid: opened.session_uuid,
-          // A seed is one-shot — drop it from the persisted params so a remount
-          // (tab switch / reopen) doesn't re-inject it.
-          seed: undefined,
-        });
-      } catch {
-        sessionId = null; // open failed (no project, etc.)
+        // 1회성 필드(seed 주입·adopt 재검증)는 지우고 나머지는 보존 —
+        // `spawnCwd`는 **남는다**(재시작 후에도 원 디렉토리에서 띄워야 한다).
+        props.api.updateParameters(paramsAfterOpen(props.params, opened));
+      } catch (e) {
+        sessionId = null; // open failed (no project, adopt refused, …)
+        // 조용히 빈 패널만 남기면 왜 아무 일도 안 일어났는지 알 길이 없다.
+        // 대표 사례가 adopt 거부(그 세션이 다른 곳에서 열려 있음)라, 이유를
+        // 터미널 화면에 그대로 띄우고 목록을 다시 열도록 안내한다.
+        if (!disposed) {
+          term.write(`\r\n\x1b[31m[세션을 열지 못했습니다]\x1b[0m ${errText(e)}\r\n`);
+          if (props.params.adoptPending === true) {
+            term.write(
+              "\x1b[2m이 탭을 닫고 \"+ Claude\" 목록을 다시 열면 최신 상태로 다시 확인합니다.\x1b[0m\r\n",
+            );
+          }
+        }
       }
       if (disposed) return;
       // Backfill scrollback. 구독(세션별 이벤트)이 스냅샷보다 먼저이므로 live

@@ -2233,6 +2233,18 @@ body {
   color: var(--accent);
   font-size: 10px;
 }
+/* 외부 세션(터미널에서 연 세션) 행 — 붙을 수 없는 이유 배지 + 비활성.
+   비활성은 커서·투명도로만 알리고 배지가 이유를 말한다. */
+.claude-picker-badge {
+  color: var(--st-warn);
+}
+.claude-picker-item:disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
+}
+.claude-picker-item:disabled:hover {
+  background: none;
+}
 
 .main-dock {
   /* dockview needs a sized parent; take the rest of the column. */
