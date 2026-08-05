@@ -290,8 +290,14 @@ interface AppState {
     referencePanelId?: string;
   } | null;
   /** Inject a prompt into an already-live Claude session (dev mode's 확인 button
-   * re-uses the project's dev session). Matched by session uuid in ClaudeTermPanel. */
-  claudeInjectRequest: { uuid: string; text: string } | null;
+   * re-uses the project's dev session). Matched by session uuid in ClaudeTermPanel.
+   *
+   * `mode` decides the bytes written to the PTY, and it is the whole safety
+   * boundary of the prompt-refine [적용] path:
+   * - `"submit"` (default, 기존 동작 그대로) — 텍스트 + LF.
+   * - `"fill"` — bracketed paste로 **입력창에 채우기만**. CR을 절대 만들지 않는다
+   *   (`promptRefine.bracketedPaste`). 정리 세션의 최종본이 이 길로만 간다. */
+  claudeInjectRequest: { uuid: string; text: string; mode?: "submit" | "fill" } | null;
   /** Dev mode 확인/🧪: review (or generate a test for) the just-saved file. The
    * project's own DevView consumes it — injecting into its live dev Claude
    * session, or seeding a fresh one. No panel-positioning field: the dev session
@@ -470,7 +476,7 @@ interface AppState {
     req: { project: string; seed?: string; title?: string; referencePanelId?: string } | null,
   ) => void;
   /** Inject a prompt into a live Claude session (consumed by the matching panel). */
-  requestClaudeInject: (req: { uuid: string; text: string } | null) => void;
+  requestClaudeInject: (req: { uuid: string; text: string; mode?: "submit" | "fill" } | null) => void;
   /** Enqueue a dev-mode review of a saved file (the project's DevView consumes by
    * id). Mints a stable id and appends to the FIFO queue. */
   requestDevReview: (req: { project: string; prompt: string }) => void;

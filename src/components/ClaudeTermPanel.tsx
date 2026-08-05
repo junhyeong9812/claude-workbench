@@ -23,6 +23,15 @@ import {
   type TimelineSnapshotLike,
 } from "../hooks/useClaudeTimeline";
 import { openTimelinePeek } from "../state/timelinePeek";
+import {
+  DEFAULT_REFINE_MODEL,
+  REFINE_MODELS,
+  bracketedPaste,
+  extractPromptBlock,
+  isRefineParams,
+  openPromptRefine,
+  type RefineModel,
+} from "../state/promptRefine";
 import { SubagentsPane } from "./SubagentsPane";
 import { handleScrollKey } from "./scrollKeys";
 import {
@@ -83,6 +92,18 @@ export interface ClaudeTermParams {
    * modes seed it with "이 커밋 리뷰하자" / "이 파일 검토해줘"). Cleared from the
    * persisted params after injection so a tab-switch remount won't re-send it. */
   seed?: string;
+  /** 이 패널이 **프롬프트 정리 세션**임을 나타내는 표식(`state/promptRefine`).
+   * `kind`는 claudeterm 그대로 둔다 — 세션 수명 경로를 물려받아야 PTY가 새지
+   * 않는다. **유지**(패널의 성격이지 1회성 사건이 아니다). */
+  refineKind?: string;
+  /** 정리 세션 전용: 이 패널을 연 Claude 탭의 패널 id. 적용 대상 앵커이자
+   * "원본 탭이 닫히면 같이 닫힌다"의 판정 키. **유지**. */
+  sourcePanelId?: string;
+  /** 정리 세션 전용: [적용]이 최종본을 채워 넣을 원본 세션의 uuid. **유지**. */
+  targetUuid?: string;
+  /** 스폰 시 `--model` 별칭(`opus`/`fable`). 정리 세션만 설정한다 — 없으면 CLI
+   * 기본값(기존 모든 세션의 동작). **유지**: 재시작 후에도 같은 모델로 떠야 한다. */
+  model?: string;
 }
 
 /** Result of `claude_open_or_attach`: attached to a live PTY (mirror) or started
@@ -192,15 +213,44 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
   // stays live (closing the tab is a separate, archive-free action).
   const [archiveBusy, setArchiveBusy] = useState(false);
 
-  /** Write the seed (+Enter) to the current session — submits it as a prompt. */
-  const injectSeed = (text: string) => {
+  // ---- 프롬프트 정리 세션 (state/promptRefine) ---------------------------
+  // 이 패널이 정리 세션인가. 패널의 성격이라 수명 내내 불변 — 마운트 이펙트가
+  // 그대로 읽어도 안전하다.
+  const isRefine = isRefineParams(props.params);
+  const refineModel = (props.params.model as RefineModel | undefined) ?? DEFAULT_REFINE_MODEL;
+  // codex 2차 의견 — 적용과 무관한 참고용(하단 접이식).
+  const [codexBusy, setCodexBusy] = useState(false);
+  const [codexResult, setCodexResult] = useState<string | null>(null);
+  const [codexOpen, setCodexOpen] = useState(true);
+
+  /** Raw bytes to this session's PTY (driver-gated in the backend). */
+  const writeToSession = (text: string) => {
     const id = sessionIdRef.current;
     if (id == null) return;
     invoke("claude_write", {
       id,
-      data: Array.from(new TextEncoder().encode(text + "\n")),
+      data: Array.from(new TextEncoder().encode(text)),
     }).catch(() => {});
   };
+
+  /** Write the seed (+Enter) to the current session — the review/dev one-shot
+   * prompt path, byte-for-byte unchanged. */
+  const injectSeed = (text: string) => writeToSession(text + "\n");
+
+  /** 입력창에 **채우기만** 한다 — 제출 없음.
+   *
+   * 프롬프트 정리 [적용]의 유일한 주입 경로다. bracketed paste로 감싸고 CR을 절대
+   * 붙이지 않는다(`promptRefine.bracketedPaste`가 그 불변식을 소유하고 테스트가
+   * 고정한다). 실측(2026-08-05, claude CLI 2.1.222): 이 형태로 여러 줄을 넣으면
+   * 입력창에 그대로 채워지고 전사 파일조차 생기지 않는다(=제출 안 됨). */
+  const fillInput = (text: string) => writeToSession(bracketedPaste(text));
+
+  /** 한 줄 프롬프트를 채우고 **제출**한다 (정리 세션의 규약 시드 전용).
+   *
+   * 실측(같은 날): claude TUI는 `\r`만 제출로 읽고 — `\n`은 소프트 개행이다 —
+   * 그나마도 입력 버퍼가 **한 줄일 때만** 제출된다. 그래서 시드는 한 줄이고
+   * (`refineSeedPrompt`), 개행이 섞여 들어와도 공백으로 접어 계약을 지킨다. */
+  const submitSingleLine = (text: string) => writeToSession(`${text.replace(/\s*\n\s*/g, " ")}\r`);
 
   // Dev mode 확인: inject a review prompt into THIS session if it's the target
   // (matched by uuid) and we're its driver and live. The first "open + seed" goes
@@ -213,7 +263,9 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
     const myUuid = props.params.sessionUuid ?? props.params.loadSessionId;
     if (!myUuid || claudeInjectRequest.uuid !== myUuid) return;
     if (!isDriverRef.current || sessionIdRef.current == null) return;
-    injectSeed(claudeInjectRequest.text);
+    // "fill" = 프롬프트 정리 [적용] — 채우기만 하고 제출하지 않는다.
+    if (claudeInjectRequest.mode === "fill") fillInput(claudeInjectRequest.text);
+    else injectSeed(claudeInjectRequest.text);
     requestClaudeInject(null);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [claudeInjectRequest]);
@@ -747,6 +799,9 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
           uuid: openUuid,
           cwd,
           adopt,
+          // 정리 세션만 모델을 못박는다. null이면 백엔드가 `--model`을 아예 붙이지
+          // 않으므로 기존 세션의 동작은 그대로다.
+          model: (props.params.model as string | undefined) ?? null,
           name: (props.params.title as string) ?? null,
           cols: term.cols,
           rows: term.rows,
@@ -847,7 +902,11 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
         const seed = pendingSeedRef.current;
         setTimeout(() => {
           if (!disposed && pendingSeedRef.current === seed) {
-            injectSeed(seed);
+            // 정리 세션의 규약 시드는 대화를 **시작**시켜야 하므로 제출까지 한다
+            // (한 줄 + CR — 실측 근거는 submitSingleLine). 나머지 시드는 기존
+            // 경로 그대로(바이트 무변경).
+            if (isRefine) submitSingleLine(seed);
+            else injectSeed(seed);
             pendingSeedRef.current = null;
           }
         }, 1800);
@@ -952,6 +1011,128 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
   // 타임라인 peek 대상 = 이 패널의 세션 (열리기 전에는 resume/신규 uuid가 곧 그
   // 세션의 uuid — claude_open_or_attach가 그 값을 못박는다).
   const peekUuid = detailUuid;
+
+  // ---- 프롬프트 정리: 최종본 추출 · 적용 · codex 검증 --------------------
+  // 마지막 assistant 답변 = 가장 큰 turn 번호의 answers 엔트리. `answers`는
+  // 백엔드가 절단하지 않는다(cap_content는 items 전용)라 최종본이 잘릴 일이 없다.
+  const lastAnswer = useMemo(() => {
+    let best: string | null = null;
+    let bestTurn = -1;
+    answers.forEach((text, turn) => {
+      if (turn > bestTurn) {
+        bestTurn = turn;
+        best = text;
+      }
+    });
+    return best as string | null;
+  }, [answers]);
+  const refinedPrompt = useMemo(
+    () => (isRefine ? extractPromptBlock(lastAnswer) : null),
+    [isRefine, lastAnswer],
+  );
+
+  /** 이 Claude 탭 오른쪽에 프롬프트 정리 세션을 연다(탭당 1개). */
+  const openRefinePanel = async (model: RefineModel) => {
+    if (!peekUuid) return;
+    try {
+      // 격리 디렉토리는 백엔드가 정본이다 — 프론트가 /tmp를 짓지 않는다.
+      const workdir = await invoke<string>("prompt_refine_workdir");
+      openPromptRefine(props.containerApi, {
+        sourcePanelId: props.api.id,
+        targetUuid: peekUuid,
+        workdir,
+        sessionUuid: crypto.randomUUID(),
+        model,
+        title: (props.params.title as string) ?? "세션",
+      });
+    } catch (e) {
+      alert(`프롬프트 정리 세션을 열지 못했습니다: ${errText(e)}`);
+    }
+  };
+
+  /** 모델 세그 선택. 스폰 전이면 params만 갈아끼우고, 이미 떠 있으면 재스폰 확인
+   * (돌고 있는 PTY의 모델은 바꿀 수 없다 — `--model`은 스폰 인자다). */
+  const chooseRefineModel = (model: RefineModel) => {
+    if (model === refineModel) return;
+    if (sessionIdRef.current == null) {
+      props.api.updateParameters({ ...props.params, model });
+      return;
+    }
+    if (
+      !confirm(
+        "모델은 세션을 시작할 때 정해집니다.\n지금 바꾸려면 이 정리 세션을 닫고 새로 시작해야 합니다 — 지금까지의 대화는 사라집니다. 진행할까요?",
+      )
+    )
+      return;
+    const sourcePanelId = props.params.sourcePanelId;
+    const targetUuid = props.params.targetUuid;
+    const workdir = props.params.project;
+    const containerApi = props.containerApi;
+    const title = ((props.params.title as string) ?? "").replace(/^프롬프트 정리 — /, "") || "세션";
+    props.api.close();
+    // 재생성은 제거가 반영된 뒤에 — 패널 id가 결정적이라 같은 틱에 다시 추가하면
+    // 중복 id가 된다.
+    queueMicrotask(() => {
+      if (!sourcePanelId || !targetUuid || !workdir) return;
+      openPromptRefine(containerApi, {
+        sourcePanelId,
+        targetUuid,
+        workdir,
+        sessionUuid: crypto.randomUUID(),
+        model,
+        title,
+      });
+    });
+  };
+
+  /** [적용]: 최종본을 **원본 세션 입력창에 채우고**(제출 없음) 정리 세션을 끝낸다.
+   *
+   * 주입은 기존 요청 버스(claudeInjectRequest)를 탄다 — 원본 패널이 driver·live일
+   * 때만 쓰고, 그 탭이 잠시 언마운트돼 있으면 요청이 남아 있다가 마운트 때 배달된다
+   * (유실≠소비, DevView 선례). 패널을 닫으면 MainArea의 onDidRemovePanel이
+   * claude_detach로 정리 세션 PTY까지 끝낸다. */
+  const applyRefined = () => {
+    const text = refinedPrompt;
+    const target = props.params.targetUuid;
+    if (!text || !target) return;
+    useAppStore.getState().requestClaudeInject({ uuid: target, text, mode: "fill" });
+    props.api.close();
+  };
+
+  /** [codex 검증]: 현재 최종본을 codex에 비판시켜 하단에 표시(적용과 무관). */
+  const runCodexCheck = async () => {
+    const text = refinedPrompt;
+    if (!text || codexBusy) return;
+    setCodexBusy(true);
+    setCodexOpen(true);
+    setCodexResult(null);
+    try {
+      setCodexResult(await invoke<string>("run_codex_check", { prompt: text }));
+    } catch (e) {
+      // 실패는 무해 — 검증을 건너뛴다는 안내만 남기고 정리 세션은 계속된다.
+      setCodexResult(`codex 검증을 건너뜁니다: ${errText(e)}`);
+    } finally {
+      setCodexBusy(false);
+    }
+  };
+
+  // 정리 세션은 원본 Claude 탭의 **동반 패널**이다 — 그 탭이 dock에서 사라지면
+  // (닫기, 또는 다른 창으로 전송) 같이 닫는다. 남겨 두면 적용 대상이 없는 세션이
+  // 혼자 돌게 되고, 단발성이라는 의미와도 어긋난다. (peek와 같은 규약 —
+  // TimelinePeekPanel 참조. 닫기는 마이크로태스크로 미뤄 dock 콜백 재진입을 피한다.)
+  const refineSourceId = isRefine ? (props.params.sourcePanelId ?? null) : null;
+  const panelApi = props.api;
+  const containerApi = props.containerApi;
+  useEffect(() => {
+    if (!refineSourceId) return;
+    const closeLater = () => queueMicrotask(() => panelApi.close());
+    if (!containerApi.getPanel(refineSourceId)) closeLater();
+    const d = containerApi.onDidRemovePanel((p) => {
+      if (p.id === refineSourceId) closeLater();
+    });
+    return () => d.dispose();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [refineSourceId]);
   const detailProject = props.params.project ?? useAppStore.getState().activeProject ?? null;
   const detailKey =
     selectedItem?.content_truncated && detailUuid
@@ -1082,7 +1263,48 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
                 })()}
               </button>
             )}
-            {peekUuid && (
+            {isRefine && (
+              <>
+                <span className="seg" role="group" aria-label="정리 세션 모델">
+                  {REFINE_MODELS.map((m) => (
+                    <button
+                      key={m.id}
+                      className={`seg-item${refineModel === m.id ? " seg-on" : ""}`}
+                      aria-pressed={refineModel === m.id}
+                      title="정리 세션을 띄울 모델 — 스폰 이후에는 세션을 다시 시작해야 바뀝니다"
+                      onClick={() => chooseRefineModel(m.id)}
+                    >
+                      {m.label}
+                    </button>
+                  ))}
+                </span>
+                <button
+                  className="claudeterm-head-btn"
+                  disabled={!refinedPrompt}
+                  title={
+                    refinedPrompt
+                      ? "최종본을 원래 세션 입력창에 채웁니다 (제출하지 않습니다) — 이 정리 세션은 종료됩니다"
+                      : "아직 최종본이 없습니다 — 정리 도우미가 ```prompt 블록을 출력하면 활성화됩니다"
+                  }
+                  onClick={applyRefined}
+                >
+                  적용
+                </button>
+                <button
+                  className="claudeterm-head-btn"
+                  disabled={!refinedPrompt || codexBusy}
+                  title={
+                    refinedPrompt
+                      ? "현재 최종본을 codex에 비판시켜 아래에 보여줍니다 (적용과 무관 · 실패해도 무해)"
+                      : "아직 최종본이 없습니다"
+                  }
+                  onClick={() => void runCodexCheck()}
+                >
+                  {codexBusy ? "codex 검증 중…" : "codex 검증"}
+                </button>
+              </>
+            )}
+            {!isRefine && peekUuid && (
               <button
                 className="claudeterm-head-btn"
                 title="이 세션의 타임라인을 오른쪽에 임시 패널로 엽니다 (같은 세션은 1개 · 앱을 다시 켜면 복원되지 않습니다)"
@@ -1098,26 +1320,60 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
                 ⧉ 타임라인
               </button>
             )}
+            {!isRefine && peekUuid && (
+              <button
+                className="claudeterm-head-btn"
+                title="프롬프트 정리 세션을 오른쪽에 엽니다 — 대화로 다듬은 뒤 [적용]하면 이 세션 입력창에 채워집니다 (자동 제출 없음 · 앱을 다시 켜면 복원되지 않습니다)"
+                onClick={() => void openRefinePanel(DEFAULT_REFINE_MODEL)}
+              >
+                ✏ 프롬프트 정리
+              </button>
+            )}
             {lastSeed && (
               <button
                 className="claudeterm-head-btn"
                 title="시드 프롬프트를 현재 세션에 다시 보냅니다 (자동 주입이 빗나갔을 때)"
-                onClick={() => injectSeed(lastSeed)}
+                onClick={() => (isRefine ? submitSingleLine(lastSeed) : injectSeed(lastSeed))}
               >
                 시드 재주입
               </button>
             )}
-            <button
-              className="claudeterm-head-btn"
-              title="세션 아카이브: JSONL 원본 + 책(book.html) + 요약 + 지식(issue/method/domain) 추출 — 세션은 종료되지 않고 계속 사용 가능"
-              disabled={archiveBusy || !props.params.sessionUuid}
-              onClick={archiveSession}
-            >
-              {archiveBusy ? "아카이브 중…" : "아카이브"}
-            </button>
+            {/* 아카이브는 정리 세션에 없다 — 스크래치 세션을 아카이브하면 격리해
+                둔 전사가 그대로 지식베이스로 들어간다(spec ④ 금지영역). */}
+            {!isRefine && (
+              <button
+                className="claudeterm-head-btn"
+                title="세션 아카이브: JSONL 원본 + 책(book.html) + 요약 + 지식(issue/method/domain) 추출 — 세션은 종료되지 않고 계속 사용 가능"
+                disabled={archiveBusy || !props.params.sessionUuid}
+                onClick={archiveSession}
+              >
+                {archiveBusy ? "아카이브 중…" : "아카이브"}
+              </button>
+            )}
           </span>
         </div>
         <div className="claudeterm-term" ref={hostRef} />
+        {isRefine && (codexBusy || codexResult) && (
+          <div className="claudeterm-codex">
+            <button
+              className="claudeterm-codex-head"
+              aria-expanded={codexOpen}
+              title="codex 2차 의견 접기/펼치기"
+              onClick={() => setCodexOpen((v) => !v)}
+            >
+              <span>{codexOpen ? "▾" : "▸"} codex 검증{codexBusy ? " — 실행 중…" : ""}</span>
+            </button>
+            {codexOpen && (
+              <div className="claudeterm-codex-body">
+                {codexResult ? (
+                  <MarkdownText text={codexResult} />
+                ) : (
+                  <span className="claudeterm-codex-wait">codex에게 물어보는 중입니다…</span>
+                )}
+              </div>
+            )}
+          </div>
+        )}
       </div>
 
       {(selectedItem || textView) && (

@@ -2426,6 +2426,45 @@ body {
   opacity: 0.4;
   cursor: default;
 }
+/* 프롬프트 정리 세션 하단의 codex 2차 의견 — 접이식. 터미널이 남는 공간을
+   가지므로(claudeterm-term은 flex:1) 여기는 고정 높이 상한만 두고 스스로
+   스크롤한다: 긴 리뷰가 터미널을 밀어내면 정작 정리 대화가 안 보인다. */
+.claudeterm-codex {
+  flex: 0 0 auto;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  max-height: 40%;
+  border-top: 1px solid var(--border, #333);
+  background: var(--bg, #1e1e1e);
+}
+.claudeterm-codex-head {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 8px;
+  font-size: 0.78em;
+  text-align: left;
+  color: var(--fg-dim);
+  background: rgba(127, 127, 127, 0.08);
+  border: none;
+  border-bottom: 1px solid var(--border, #333);
+  cursor: pointer;
+}
+.claudeterm-codex-head:hover {
+  color: var(--fg, #cdd6f4);
+}
+.claudeterm-codex-body {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow: auto;
+  padding: 6px 10px;
+  font-size: 0.85em;
+}
+.claudeterm-codex-wait {
+  color: var(--fg-dim);
+}
 /* Subagent (Task) groups nested under their turn — collapsible (B1). Indented
  * to read as "during this question, this agent did …". */
 .timeline-agent {
