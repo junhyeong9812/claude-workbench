@@ -13,6 +13,7 @@
 //! agent message, which is the only thing we show.
 
 use std::io::Read;
+use std::os::unix::process::CommandExt; // process_group
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::thread;
@@ -91,6 +92,9 @@ pub fn run_codex_exec(cwd: &std::path::Path, prompt: &str, timeout: Duration) ->
     let mut child = Command::new(&bin)
         .arg("exec")
         .arg("--skip-git-repo-check")
+        // 세션 파일을 남기지 않는다 — 이건 대화가 아니라 일회성 2차 의견이고,
+        // codex의 `resume` 목록에 정리 프롬프트가 쌓일 이유가 없다 (리뷰 #12).
+        .arg("--ephemeral")
         .arg("--sandbox")
         .arg("read-only")
         .arg("--color")
@@ -102,6 +106,11 @@ pub fn run_codex_exec(cwd: &std::path::Path, prompt: &str, timeout: Duration) ->
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
+        // 자기 자신을 리더로 하는 **프로세스 그룹**에 넣는다(리뷰 #10). codex는
+        // 자식(MCP 서버·훅)을 띄우므로 리더만 죽이면 그 자식들이 살아남아 우리
+        // 파이프를 붙든 채 고아가 된다. 그룹으로 두면 아래 kill 한 번이 전부를
+        // 정리하고, 앱의 시그널(Ctrl+C 등)이 codex에 새어 들어가지도 않는다.
+        .process_group(0)
         .spawn()
         .map_err(|_| "codex를 실행하지 못했습니다.".to_string())?;
 
@@ -126,19 +135,38 @@ pub fn run_codex_exec(cwd: &std::path::Path, prompt: &str, timeout: Duration) ->
         }));
     }
 
+    // The spawned child is its own process-group leader (`process_group(0)`), so
+    // its pgid == its pid.
+    let pgid = child.id() as i32;
+    /// Kill the whole group, then reap the leader. `SIGKILL` (not TERM) because
+    /// this only runs on paths where we have already given up on the run.
+    fn kill_group(child: &mut std::process::Child, pgid: i32) {
+        // SAFETY: `killpg` on a pgid we created ourselves; the only effect is
+        // signalling that group. A dead group returns ESRCH, which we ignore.
+        unsafe {
+            libc::killpg(pgid, libc::SIGKILL);
+        }
+        let _ = child.kill(); // 그룹 신호가 어떤 이유로든 안 닿았을 때의 백스톱
+        let _ = child.wait(); // reap — no zombie
+    }
+
     let start = Instant::now();
     let status = loop {
         match child.try_wait() {
             Ok(Some(st)) => break Some(st),
             Ok(None) => {
                 if start.elapsed() >= timeout {
-                    let _ = child.kill();
-                    let _ = child.wait(); // reap — no zombie
+                    kill_group(&mut child, pgid);
                     break None;
                 }
                 thread::sleep(Duration::from_millis(50));
             }
-            Err(_) => break None,
+            // try_wait 자체가 실패하면 자식의 상태를 더는 알 수 없다 — 그대로
+            // 빠져나가면 codex와 그 자식들이 영원히 돈다(리뷰 #10).
+            Err(_) => {
+                kill_group(&mut child, pgid);
+                break None;
+            }
         }
     };
 

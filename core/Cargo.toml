@@ -20,6 +20,9 @@ name = "archive-backfill"
 path = "src/bin/archive_backfill.rs"
 
 [dependencies]
+# `killpg` only — a one-shot `codex exec` spawns its own children (MCP servers,
+# hooks), so a timeout must kill the whole process group, not just the leader.
+libc = "0.2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # gitignore-aware traversal + project-wide search (ripgrep's crates).
