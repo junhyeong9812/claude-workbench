@@ -176,9 +176,14 @@ export function useTimelineState(
  *   if a live event already landed — that one is newer).
  * - `ended`: the session's PTY died / was force-closed (`claude-session-closed`),
  *   matched by the numeric id we last resolved — the broadcast's uuid mapping may
- *   already be gone by the time it arrives. That broadcast can also pass while
- *   this consumer is unmounted (a backgrounded peek tab), so each mount also asks
- *   `claude_live_uuids` once; a later live timeline event clears the flag again.
+ *   already be gone by the time it arrives.
+ *
+ *   **적극 신호(브로드캐스트)만 쓴다.** 마운트 시 `claude_live_uuids`로 생존을
+ *   조회하던 백스톱은 뺐다: 스폰 직후(runtime 등록 전)에 peek를 열면 살아 있는
+ *   세션을 "종료"로 오판하는 race만 남기 때문이다. 그 백스톱이 덮던 경우(언마운트
+ *   중 지나간 종료)는 이제 필요 없다 — peek는 재시작으로 부활하지 않고(복원 시
+ *   제거), 창 간 이동도 하지 않으며(전송 시 닫힘), 원본 탭이 사라지면 스스로
+ *   닫히므로(TimelinePeekPanel) "종료를 놓친 채 오래 떠 있는 peek"가 성립하지 않는다.
  */
 export function useClaudeTimeline({
   uuid,
@@ -208,8 +213,9 @@ export function useClaudeTimeline({
         if (lookupSessionUuid(e.payload.id) !== uuid) return;
         numericId = e.payload.id;
         gotLive = true;
-        // 폴 스레드는 세션이 살아 있을 때만 emit한다 — 이벤트 자체가 생존 증거라,
-        // 초기 생존 조회가 스폰과 경합해 잘못 붙인 종료 표시를 스스로 푼다.
+        // 폴 스레드는 세션이 살아 있을 때만 emit한다 — 이벤트 자체가 생존 증거다.
+        // 같은 uuid를 다시 열면(resume) 새 PTY id로 이벤트가 재개되므로 종료
+        // 표시도 여기서 풀린다.
         setEnded(false);
         applySnapshot(e.payload, "live");
         setSubagents(e.payload.subagents ?? []);
@@ -234,14 +240,6 @@ export function useClaudeTimeline({
           if (snap && !gotLive && !disposed) applySnapshot(snap, "snapshot");
         } catch {
           /* no snapshot yet (fresh session) — live events will fill it */
-        }
-        // 생존 조회(기존 커맨드): `claude-session-closed`는 이 소비자가 언마운트된
-        // 동안(백그라운드 탭) 지나갈 수 있어, 마운트마다 현재 상태를 한 번 확인한다.
-        try {
-          const live = await invoke<string[]>("claude_live_uuids", { project });
-          if (!disposed && !gotLive && !live.includes(uuid)) setEnded(true);
-        } catch {
-          /* 조회 실패는 무해 — 종료 표시를 붙이지 않는다(오탐보다 침묵) */
         }
       }
     })();
