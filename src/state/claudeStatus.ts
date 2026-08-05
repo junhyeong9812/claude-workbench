@@ -442,6 +442,12 @@ export function hasSessionMapping(uuid: string): boolean {
   return uuidToNumeric.has(uuid);
 }
 
+/** uuid → 숫자 PTY id (없으면 undefined). uuid만 아는 소비자(타임라인 peek)가
+ * 숫자 id로만 오는 `claude-session-closed`를 자기 세션과 맞추는 데 쓴다. */
+export function lookupSessionId(uuid: string): number | undefined {
+  return uuidToNumeric.get(uuid);
+}
+
 interface StatusStore {
   entries: Record<string, SessionEntry>;
   /** uuid → number of mounted panels currently showing it (per window). While
