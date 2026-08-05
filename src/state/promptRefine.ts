@@ -341,9 +341,13 @@ export type ApplyAckOutcome =
  */
 export function resolveApplyAck(
   pendingId: string | null,
-  ack: { id: string; ok: boolean; reason?: string } | null,
+  acks: readonly { id: string; ok: boolean; reason?: string }[],
 ): ApplyAckOutcome {
-  if (!pendingId || !ack || ack.id !== pendingId) return { kind: "wait" };
+  if (!pendingId) return { kind: "wait" };
+  // 목록에서 **내 id만** 고른다 — 다른 주입의 결과가 섞여 있어도, 내 결과가
+  // 아직 없어도 그냥 기다린다(감사 H1: 단일 슬롯이면 남의 결과가 내 것을 덮었다).
+  const ack = acks.find((a) => a.id === pendingId);
+  if (!ack) return { kind: "wait" };
   if (ack.ok) return { kind: "delivered" };
   return { kind: "failed", reason: ack.reason ?? "알 수 없는 이유" };
 }

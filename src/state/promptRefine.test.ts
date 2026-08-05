@@ -372,27 +372,37 @@ describe("injectDeliveryDecision — 미배달과 소비를 가르는 규칙", (
 
 describe("resolveApplyAck — 내 요청 id의 결과만 신뢰", () => {
   it("id가 맞고 ok면 배달 확인", () => {
-    expect(resolveApplyAck("r1", { id: "r1", ok: true })).toEqual({ kind: "delivered" });
+    expect(resolveApplyAck("r1", [{ id: "r1", ok: true }])).toEqual({ kind: "delivered" });
   });
 
   it("id가 맞고 실패면 사유와 함께 실패 (정리 세션 보존)", () => {
-    expect(resolveApplyAck("r1", { id: "r1", ok: false, reason: "권한 없음" })).toEqual({
+    expect(resolveApplyAck("r1", [{ id: "r1", ok: false, reason: "권한 없음" }])).toEqual({
       kind: "failed",
       reason: "권한 없음",
     });
-    expect(resolveApplyAck("r1", { id: "r1", ok: false })).toEqual({
+    expect(resolveApplyAck("r1", [{ id: "r1", ok: false }])).toEqual({
       kind: "failed",
       reason: "알 수 없는 이유",
     });
   });
 
   it("남의 id·결과 없음·대기 id 없음은 계속 대기", () => {
-    expect(resolveApplyAck("r1", { id: "r2", ok: true })).toEqual({ kind: "wait" });
-    expect(resolveApplyAck("r1", null)).toEqual({ kind: "wait" });
-    expect(resolveApplyAck(null, { id: "r1", ok: true })).toEqual({ kind: "wait" });
+    expect(resolveApplyAck("r1", [{ id: "r2", ok: true }])).toEqual({ kind: "wait" });
+    expect(resolveApplyAck("r1", [])).toEqual({ kind: "wait" });
+    expect(resolveApplyAck(null, [{ id: "r1", ok: true }])).toEqual({ kind: "wait" });
   });
 
   it("남의 성공 결과를 내 성공으로 오인하지 않는다 (슬롯 추론 회귀 방지)", () => {
-    expect(resolveApplyAck("mine", { id: "dev-seed", ok: true }).kind).toBe("wait");
+    expect(resolveApplyAck("mine", [{ id: "dev-seed", ok: true }]).kind).toBe("wait");
+  });
+
+  it("다른 주입의 결과가 섞여 있어도 내 것을 찾아낸다 (단일 슬롯 덮임 회귀 방지)", () => {
+    const acks = [
+      { id: "dev-seed", ok: true },
+      { id: "mine", ok: false, reason: "권한 없음" },
+      { id: "other", ok: true },
+    ];
+    expect(resolveApplyAck("mine", acks)).toEqual({ kind: "failed", reason: "권한 없음" });
+    expect(resolveApplyAck("dev-seed", acks)).toEqual({ kind: "delivered" });
   });
 });

@@ -237,15 +237,22 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
    * **에러를 삼키지 않는다** — 호출부가 배달 성공을 알아야 하는 경로가 있다
    * (프롬프트 정리 [적용]은 write ACK 뒤에야 정리 세션을 끝낸다, 리뷰 #4). 그냥
    * 쏘고 잊는 자리는 각자 `.catch(() => {})`를 붙인다. */
-  const writeToSession = (text: string): Promise<boolean> => {
+  const writeToSession = (text: string, requestId?: string): Promise<boolean> => {
     const id = sessionIdRef.current;
     if (id == null) return Promise.reject(new Error("세션이 아직 열리지 않았습니다."));
-    // 반환값 = **실제로 PTY에 쓰였는가**. 이 창이 driver가 아니면 백엔드가
-    // 조용히 무시하고 false를 준다(감사 G1) — 성공으로 오인하면 정리 세션이
-    // 아무것도 배달되지 않은 채 종료된다.
+    // 반환값 = **이 요청의 바이트가 PTY에 들어갔는가**. 이 창이 driver가 아니면
+    // 백엔드가 조용히 무시하고 false를 준다(감사 G1) — 성공으로 오인하면 정리
+    // 세션이 아무것도 배달되지 않은 채 종료된다.
+    //
+    // `requestId`가 있으면 백엔드가 세션별 배달 원장으로 **정확히 한 번**을
+    // 보장한다(감사 H1): 타임아웃이 이미 시작된 쓰기를 취소할 수 없으므로 늦은
+    // 성공과 재시도가 겹칠 수 있는데, 같은 id의 두 번째 호출은 쓰지 않고 성공만
+    // 돌려준다. 그래서 **재시도는 반드시 같은 id를 유지해야 한다** — 새 id를
+    // 발급하면 dedupe가 무력화되고 프롬프트가 두 번 붙는다.
     return invoke<boolean>("claude_write", {
       id,
       data: Array.from(new TextEncoder().encode(text)),
+      ...(requestId ? { requestId } : {}),
     });
   };
 
@@ -259,7 +266,8 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
    * 붙이지 않는다(`promptRefine.bracketedPaste`가 그 불변식을 소유하고 테스트가
    * 고정한다). 실측(2026-08-05, claude CLI 2.1.222): 이 형태로 여러 줄을 넣으면
    * 입력창에 그대로 채워지고 전사 파일조차 생기지 않는다(=제출 안 됨). */
-  const fillInput = (text: string) => writeToSession(bracketedPaste(text));
+  const fillInput = (text: string, requestId?: string) =>
+    writeToSession(bracketedPaste(text), requestId);
 
   /** 한 줄 프롬프트를 채우고 **제출**한다 (정리 세션의 규약 시드 전용).
    *
@@ -305,7 +313,10 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
       let reason: string | undefined;
       try {
         // "fill" = 프롬프트 정리 [적용] — 채우기만 하고 제출하지 않는다.
-        ok = (await (req.mode === "fill" ? fillInput(req.text) : injectSeed(req.text))) === true;
+        ok =
+          (await (req.mode === "fill"
+            ? fillInput(req.text, req.id) // id를 실어 백엔드가 중복 배달을 막는다
+            : injectSeed(req.text))) === true;
         if (!ok) reason = "이 창이 세션의 입력 권한을 갖고 있지 않습니다.";
       } catch (e) {
         reason = errText(e);
@@ -1093,7 +1104,9 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
   const [applyPending, setApplyPending] = useState(false);
   const [applyNote, setApplyNote] = useState<string | null>(null);
   const applyReqIdRef = useRef<string | null>(null);
-  const claudeInjectAck = useAppStore((s) => s.claudeInjectAck);
+  // 마지막 [적용] 시도의 (id, 본문) — 같은 본문의 재시도는 같은 id를 재사용한다.
+  const lastApplyRef = useRef<{ id: string; text: string } | null>(null);
+  const claudeInjectAcks = useAppStore((s) => s.claudeInjectAcks);
   const applyReason = isRefine
     ? applyBlockReason({
         block: refinedPrompt,
@@ -1180,9 +1193,16 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
     const text = refinedPrompt;
     const target = refineTargetUuid;
     if (!text || !target) return;
-    const req = { id: crypto.randomUUID(), uuid: target, text, mode: "fill" as const };
+    // **재시도는 같은 id를 유지한다**(감사 H1). 타임아웃은 이미 시작된 쓰기를
+    // 취소하지 못하므로, 새 id로 다시 보내면 늦게 성공한 첫 쓰기와 재시도가 둘 다
+    // 실려 프롬프트가 두 번 붙는다. 같은 id면 백엔드 원장이 두 번째를 no-op으로
+    // 만든다. 본문이 달라졌다면 다른 요청이므로 새 id를 뽑는다.
+    const prev = lastApplyRef.current;
+    const reqId = prev && prev.text === text ? prev.id : crypto.randomUUID();
+    lastApplyRef.current = { id: reqId, text };
+    const req = { id: reqId, uuid: target, text, mode: "fill" as const };
     setApplyNote(null);
-    useAppStore.getState().reportClaudeInjectAck(null); // 지난 결과 청소
+    useAppStore.getState().clearClaudeInjectAck(reqId); // 지난 시도의 결과 청소
     useAppStore.getState().requestClaudeInject(req);
     // 슬롯을 실제로 잡았을 때만 대기 상태로 — 잡지 못했으면 남의 요청의 결과를
     // 기다리게 된다.
@@ -1210,11 +1230,11 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
   useEffect(() => {
     if (!applyPending) return;
     const myId = applyReqIdRef.current;
-    const outcome = resolveApplyAck(myId, claudeInjectAck);
+    const outcome = resolveApplyAck(myId, claudeInjectAcks);
     if (outcome.kind !== "wait") {
       setApplyPending(false);
       applyReqIdRef.current = null;
-      useAppStore.getState().reportClaudeInjectAck(null); // 결과 확인 완료
+      if (myId) useAppStore.getState().clearClaudeInjectAck(myId); // 결과 확인 완료
       if (outcome.kind === "delivered") {
         props.api.close();
         return;
@@ -1237,7 +1257,7 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
     }, 10000);
     return () => clearTimeout(t);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [applyPending, claudeInjectAck]);
+  }, [applyPending, claudeInjectAcks]);
 
   /** [codex 검증]: 현재 최종본을 codex에 비판시켜 하단에 표시(적용과 무관). */
   const runCodexCheck = async () => {

@@ -305,15 +305,19 @@ interface AppState {
     mode?: "submit" | "fill";
   } | null;
   /**
-   * 마지막 주입의 **배달 결과** — 요청 id로 짝짓는다.
+   * 최근 주입의 **배달 결과들** — 요청 id로 짝짓는다(최신이 뒤).
    *
    * 슬롯이 비는 것을 성공 신호로 삼던 추론을 대체한다(감사 G1). 그 추론은 두 군데
    * 서 틀렸다: `claude_write`는 이 창이 driver가 아니면 아무것도 쓰지 않고도
-   * 성공을 반환했고(백엔드가 이제 bool로 사실을 돌려준다), 슬롯을 비운 주체가
-   * 우리 요청의 소비자였다는 보장도 없었다. 소비 패널이 실제 쓰기 결과를 여기
-   * 기록하고, 요청을 낸 쪽은 **자기 id의 결과만** 신뢰한다.
+   * 성공을 반환했고(백엔드가 이제 사실을 돌려준다), 슬롯을 비운 주체가 우리
+   * 요청의 소비자였다는 보장도 없었다. 소비 패널이 실제 쓰기 결과를 여기 남기고,
+   * 요청을 낸 쪽은 **자기 id의 결과만** 신뢰한다.
+   *
+   * 단일 슬롯이 아니라 **목록**인 이유(감사 H1): 결과를 확인하기 전에 다른 주입
+   * (dev 시드 등)이 끝나면 단일 슬롯은 덮여 버리고, 기다리던 쪽은 아무 소식 없이
+   * 타임아웃까지 간다. 상한을 둔 목록이면 서로의 결과를 지우지 않는다.
    */
-  claudeInjectAck: { id: string; ok: boolean; reason?: string } | null;
+  claudeInjectAcks: readonly { id: string; ok: boolean; reason?: string }[];
   /** Dev mode 확인/🧪: review (or generate a test for) the just-saved file. The
    * project's own DevView consumes it — injecting into its live dev Claude
    * session, or seeding a fresh one. No panel-positioning field: the dev session
@@ -495,8 +499,10 @@ interface AppState {
   requestClaudeInject: (
     req: { id: string; uuid: string; text: string; mode?: "submit" | "fill" } | null,
   ) => void;
-  /** 배달 결과를 기록한다 (null = 요청자가 확인 후 비움). */
-  reportClaudeInjectAck: (ack: { id: string; ok: boolean; reason?: string } | null) => void;
+  /** 배달 결과를 남긴다 (같은 id가 있으면 갈아끼운다). */
+  reportClaudeInjectAck: (ack: { id: string; ok: boolean; reason?: string }) => void;
+  /** 확인이 끝난 결과를 치운다. */
+  clearClaudeInjectAck: (id: string) => void;
   /** Enqueue a dev-mode review of a saved file (the project's DevView consumes by
    * id). Mints a stable id and appends to the FIFO queue. */
   requestDevReview: (req: { project: string; prompt: string }) => void;
@@ -641,7 +647,7 @@ export const useAppStore = create<AppState>((set, get) => ({
   diffRequest: null,
   claudeOpenRequest: null,
   claudeInjectRequest: null,
-  claudeInjectAck: null,
+  claudeInjectAcks: [],
   devReviewQueue: [],
   runRequest: null,
   focusMainRequest: 0,
@@ -839,7 +845,13 @@ export const useAppStore = create<AppState>((set, get) => ({
   requestDiff: (spec) => set({ diffRequest: spec }),
   requestClaudeOpen: (req) => set({ claudeOpenRequest: req }),
   requestClaudeInject: (req) => set({ claudeInjectRequest: req }),
-  reportClaudeInjectAck: (ack) => set({ claudeInjectAck: ack }),
+  reportClaudeInjectAck: (ack) =>
+    set((s) => ({
+      // 상한 8 — 확인되지 않은 결과가 무한히 쌓이지 않게(오래된 것부터 버린다).
+      claudeInjectAcks: [...s.claudeInjectAcks.filter((a) => a.id !== ack.id), ack].slice(-8),
+    })),
+  clearClaudeInjectAck: (id) =>
+    set((s) => ({ claudeInjectAcks: s.claudeInjectAcks.filter((a) => a.id !== id) })),
   requestDevReview: (req) =>
     set((s) => ({
       devReviewQueue: [...s.devReviewQueue, { id: crypto.randomUUID(), ...req }],
