@@ -262,14 +262,18 @@ fn fold_head(
         // Bounded read: at most one record's cap lands in `buf`, and a record is
         // never split mid-line into invalid JSON (hook attachments run to
         // hundreds of KB, so a split would be silent corruption, not an error).
-        let n = (&mut reader).take(MAX_RECORD_BYTES).read_until(b'\n', &mut buf)? as u64;
+        // The cap also never exceeds what is left of the total budget — without
+        // that, the read for the last record could overshoot `max_bytes` by up
+        // to a full record cap (2차 감사 B4: 상한은 1.25MiB가 아니라 1MiB다).
+        let cap = MAX_RECORD_BYTES.min(max_bytes - consumed);
+        let n = (&mut reader).take(cap).read_until(b'\n', &mut buf)? as u64;
         if n == 0 {
             done!(false); // EOF
         }
         records += 1;
         consumed += n;
         peak_buffer = peak_buffer.max(n);
-        if buf.last() != Some(&b'\n') && n == MAX_RECORD_BYTES {
+        if buf.last() != Some(&b'\n') && n == cap {
             // The record outgrew the buffer cap: throw the rest away unread
             // rather than growing to hold it.
             let (skipped, end) =
@@ -558,9 +562,10 @@ mod tests {
             scan.peak_buffer
         );
         // IO: stopped inside the record instead of reading all 8 MiB to find its
-        // newline. The bound is the budget plus the one buffer already in hand.
+        // newline. The budget is a hard ceiling — the per-record cap shrinks to
+        // the remaining budget, so there is no +MAX_RECORD_BYTES overshoot.
         assert!(
-            scan.bytes_read <= CWD_BYTES + MAX_RECORD_BYTES,
+            scan.bytes_read <= CWD_BYTES,
             "read {} bytes for a {CWD_BYTES}-byte budget",
             scan.bytes_read
         );
@@ -635,11 +640,18 @@ mod tests {
             r#"{"type":"ai-title","aiTitle":"뒷줄 제목"}"#
         );
         let path = write(&root, "-p", "u", &body);
-        // max_bytes is below the first record's length: it is still read whole
-        // (so the JSON parses), and the scan then stops.
-        let head = probe_head(&path, HEAD_RECORDS, 1024).unwrap();
+        // With budget to spare the record is read whole — a long line is never
+        // split mid-record into invalid JSON.
+        let head = probe_head(&path, 1, CWD_BYTES).unwrap();
         assert_eq!(head.cwd.as_deref(), Some("/home/jun/p"));
-        assert_eq!(head.ai_title, None); // stopped before the second record
+        assert_eq!(head.ai_title, None); // record budget stopped before line 2
+        // With the budget *below* the record, the whole record is out of reach:
+        // it is discarded unparsed rather than parsed from a truncated line —
+        // the budget is a hard IO ceiling, not a suggestion (2차 감사 B4 — 구
+        // 계약 "예산보다 커도 통째로 읽는다"가 바로 그 overshoot였다).
+        let cut = probe_head(&path, HEAD_RECORDS, 1024).unwrap();
+        assert_eq!(cut.cwd, None);
+        assert_eq!(cut.ai_title, None);
         let _ = std::fs::remove_dir_all(&root);
     }
 }
