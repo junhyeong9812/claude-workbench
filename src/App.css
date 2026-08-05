@@ -2484,6 +2484,24 @@ body {
   flex: 0 0 auto;
   overflow-y: visible;
 }
+/* 우측 단발성 타임라인 peek: 패널 하나가 타임라인만 채운다(터미널 없음). */
+.claudeterm-peek-pane {
+  flex: 1 1 0;
+  min-width: 0;
+}
+/* 세션 종료 / 원본 탭 닫힘 표시 — 헤더 제목과 × 사이. */
+.claudeterm-peek-ended {
+  flex: 0 0 auto;
+  padding: 0 6px;
+  border-radius: 3px;
+  color: var(--fg-dim);
+  background: rgba(127, 127, 127, 0.14);
+  white-space: nowrap;
+}
+.claudeterm-peek-empty {
+  padding: 12px;
+  color: var(--fg-dim);
+}
 .claudeterm-viewer-body {
   flex: 1 1 0;
   min-height: 0;

@@ -22,6 +22,7 @@ import {
   type ClaudeTimelineEvent,
   type TimelineSnapshotLike,
 } from "../hooks/useClaudeTimeline";
+import { openTimelinePeek } from "../state/timelinePeek";
 import { SubagentsPane } from "./SubagentsPane";
 import { handleScrollKey } from "./scrollKeys";
 import {
@@ -948,6 +949,9 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
   const detailInFlight = useRef<Set<string>>(new Set());
   const [detailRetry, setDetailRetry] = useState(0);
   const detailUuid = props.params.sessionUuid ?? props.params.loadSessionId ?? null;
+  // 타임라인 peek 대상 = 이 패널의 세션 (열리기 전에는 resume/신규 uuid가 곧 그
+  // 세션의 uuid — claude_open_or_attach가 그 값을 못박는다).
+  const peekUuid = detailUuid;
   const detailProject = props.params.project ?? useAppStore.getState().activeProject ?? null;
   const detailKey =
     selectedItem?.content_truncated && detailUuid
@@ -1076,6 +1080,22 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
                   }).length;
                   return running > 0 ? `${running}▶` : subagents.length;
                 })()}
+              </button>
+            )}
+            {peekUuid && (
+              <button
+                className="claudeterm-head-btn"
+                title="이 세션의 타임라인을 오른쪽에 임시 패널로 엽니다 (같은 세션은 1개 · 앱을 다시 켜면 복원되지 않습니다)"
+                onClick={() =>
+                  openTimelinePeek(props.containerApi, {
+                    sourcePanelId: props.api.id,
+                    uuid: peekUuid,
+                    project: props.params.project ?? useAppStore.getState().activeProject ?? null,
+                    title: (props.params.title as string) ?? "세션",
+                  })
+                }
+              >
+                ⧉ 타임라인
               </button>
             )}
             {lastSeed && (

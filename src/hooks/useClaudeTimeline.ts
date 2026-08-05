@@ -174,9 +174,11 @@ export function useTimelineState(
  *   streams here.
  * - seed: the stored snapshot fills the list before the next live change (skipped
  *   if a live event already landed — that one is newer).
- * - `ended`: the session's PTY died / was force-closed (`claude-session-closed`).
- *   Matched by the numeric id we last resolved, because the broadcast's uuid
- *   mapping may already be gone by the time it arrives.
+ * - `ended`: the session's PTY died / was force-closed (`claude-session-closed`),
+ *   matched by the numeric id we last resolved — the broadcast's uuid mapping may
+ *   already be gone by the time it arrives. That broadcast can also pass while
+ *   this consumer is unmounted (a backgrounded peek tab), so each mount also asks
+ *   `claude_live_uuids` once; a later live timeline event clears the flag again.
  */
 export function useClaudeTimeline({
   uuid,
@@ -206,6 +208,9 @@ export function useClaudeTimeline({
         if (lookupSessionUuid(e.payload.id) !== uuid) return;
         numericId = e.payload.id;
         gotLive = true;
+        // 폴 스레드는 세션이 살아 있을 때만 emit한다 — 이벤트 자체가 생존 증거라,
+        // 초기 생존 조회가 스폰과 경합해 잘못 붙인 종료 표시를 스스로 푼다.
+        setEnded(false);
         applySnapshot(e.payload, "live");
         setSubagents(e.payload.subagents ?? []);
       });
@@ -229,6 +234,14 @@ export function useClaudeTimeline({
           if (snap && !gotLive && !disposed) applySnapshot(snap, "snapshot");
         } catch {
           /* no snapshot yet (fresh session) — live events will fill it */
+        }
+        // 생존 조회(기존 커맨드): `claude-session-closed`는 이 소비자가 언마운트된
+        // 동안(백그라운드 탭) 지나갈 수 있어, 마운트마다 현재 상태를 한 번 확인한다.
+        try {
+          const live = await invoke<string[]>("claude_live_uuids", { project });
+          if (!disposed && !gotLive && !live.includes(uuid)) setEnded(true);
+        } catch {
+          /* 조회 실패는 무해 — 종료 표시를 붙이지 않는다(오탐보다 침묵) */
         }
       }
     })();

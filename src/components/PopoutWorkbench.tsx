@@ -17,6 +17,7 @@ import { installDragOut, hasInFlight } from "../state/windowTransfer";
 import { installTransferTarget } from "../state/panelTransferTarget";
 import { DropTargetOverlay } from "./DropTargetOverlay";
 import { components, AppTab } from "./panelRegistry";
+import { closePeekPanels } from "../state/timelinePeek";
 import { initClaudeStatusGlobal } from "../state/claudeStatusGlobal";
 import { initNotify } from "../state/notify";
 
@@ -241,6 +242,9 @@ export function PopoutWorkbench() {
         }
       }
     }
+    // 단발성 타임라인 peek는 되살리지 않는다 — 메인 dock과 같은 규칙(패널을
+    // 이 창으로 끌어다 놓은 경우에도 재시작 부활이 없도록 여기서도 건다).
+    closePeekPanels(api);
     if (api.panels.length > 0) everHadPanelRef.current = true;
     // Dispose listeners from a previous mount (project-keyed remount) so a stale
     // dock can't save the wrong project's layout (review P2-impl #4).
