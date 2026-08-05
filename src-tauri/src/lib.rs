@@ -127,6 +127,8 @@ pub fn run() {
             commands::claude::store::claude_external_sessions,
             commands::claude::store::claude_item_detail,
             commands::claude::store::claude_session_snapshot,
+            commands::refine::prompt_refine_workdir,
+            commands::refine::run_codex_check,
             commands::archive::archive_session,
             commands::archive::archive_list,
             commands::archive::archive_open_path,
