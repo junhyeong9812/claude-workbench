@@ -29,6 +29,13 @@ fn new_session_uuid() -> Result<String, AppError> {
 /// be rooted at the transcript's own cwd — while the snapshot the poll thread
 /// writes must stay keyed by the **app's** project, or the adopted session would
 /// be filed under a name nothing else in the app uses.
+///
+/// `model` pins the session's model (`--model <alias>`, e.g. `opus`/`fable`).
+/// **None = the flag is not passed at all**, which is what every pre-existing
+/// caller does: the CLI then picks its own default exactly as before, so adding
+/// this parameter changed no existing session's behaviour. Only the prompt-refine
+/// panel sets it (the user picks the model before the session is spawned).
+#[allow(clippy::too_many_arguments)]
 pub(super) fn spawn_claude(
     app: &AppHandle,
     mgr: &SessionManager,
@@ -36,6 +43,7 @@ pub(super) fn spawn_claude(
     cwd: String,
     resume: Option<String>,
     name: String,
+    model: Option<String>,
     cols: u16,
     rows: u16,
 ) -> Result<(u64, String, Arc<AtomicBool>), AppError> {
@@ -52,6 +60,12 @@ pub(super) fn spawn_claude(
             .is_some();
     let flag = if resuming { "--resume" } else { "--session-id" };
     let mut cmd = vec!["claude".to_string(), flag.to_string(), session_uuid.clone()];
+    // Empty/blank is treated as "unset" so a stray "" from the frontend can never
+    // become `--model ""` (which the CLI rejects, killing the session outright).
+    if let Some(m) = model.as_deref().map(str::trim).filter(|m| !m.is_empty()) {
+        cmd.push("--model".to_string());
+        cmd.push(m.to_string());
+    }
 
     // hook-status: 수신기가 살아 있으면 세션 한정 hook 설정을 주입한다
     // (--settings 인자 — 사용자 ~/.claude 무수정, spec §2). 세션별 토큰은

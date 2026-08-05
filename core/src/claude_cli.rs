@@ -25,6 +25,36 @@ pub fn extraction_workdir() -> std::path::PathBuf {
     dir
 }
 
+/// The cwd for the **prompt-refine** session — a second scratch directory with
+/// the same rationale as [`extraction_workdir`], kept separate only so the two
+/// kinds of throwaway transcript don't share a slug.
+///
+/// The refine session is a full interactive `claude` PTY, so its transcript is
+/// written like any other session's; rooting it here is what keeps it out of the
+/// user's projects. The exclusion is not a filter we have to remember to apply —
+/// it falls out of the path: the CLI files the transcript under a `-tmp-…` slug,
+/// which [`crate::scan::ScanOpts::skip_tmp_slugs`] drops at scan level, and the
+/// backfill additionally skips any transcript whose recorded `cwd` is under
+/// `/tmp`. Measured 2026-08-05: slug `-tmp-claude-workbench-refine`.
+pub fn refine_workdir() -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join("claude-workbench-refine");
+    let _ = std::fs::create_dir_all(&dir);
+    dir
+}
+
+/// Is `path` one of our throwaway scratch directories (i.e. under the system
+/// temp dir)? Callers use it to skip per-project side effects — writing a
+/// `.mcp.json` into a scratch dir would be pure litter.
+///
+/// Compares canonicalized paths so `/tmp/x` and a symlinked `/private/tmp/x`
+/// agree; if either side can't be canonicalized we fall back to the raw path
+/// (a non-existent cwd is about to fail the spawn anyway).
+pub fn is_scratch_dir(path: &std::path::Path) -> bool {
+    let tmp = std::env::temp_dir();
+    let canon = |p: &std::path::Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    canon(path).starts_with(canon(&tmp))
+}
+
 /// Model/effort selection for one invocation. `None` = let the CLI use its
 /// session default. Values are passed verbatim as `--model` / `--effort`.
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]

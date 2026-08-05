@@ -265,6 +265,12 @@ fn recheck_adoptable(uuid: &str, cwd: &str) -> Result<(), AppError> {
 /// `adopt` marks the one path that takes over a transcript the app never drove
 /// (the picker's external-session section). Only that path re-checks liveness
 /// here; see [`recheck_adoptable`].
+///
+/// `model` is passed straight through to the spawn (`--model`), and is therefore
+/// meaningful **only on the driver path**: attaching to an already-running PTY
+/// cannot change the model it was started with, so the mirror branch above
+/// ignores it. The one caller that sets it (prompt refine) always opens a brand
+/// new uuid, which never takes the mirror branch.
 #[tauri::command]
 #[allow(clippy::too_many_arguments)]
 pub fn claude_open_or_attach(
@@ -277,6 +283,7 @@ pub fn claude_open_or_attach(
     cwd: Option<String>,
     name: Option<String>,
     adopt: Option<bool>,
+    model: Option<String>,
     cols: u16,
     rows: u16,
 ) -> Result<ClaudeOpened, AppError> {
@@ -307,7 +314,15 @@ pub fn claude_open_or_attach(
 
     // 이 프로젝트에 아카이브 지식이 있으면 .mcp.json 등록을 보장 — 새로 뜨는
     // claude가 지식 서버(search_knowledge)를 바로 쓸 수 있게 (best-effort).
-    crate::commands::archive::ensure_mcp_registration(&app, &cwd);
+    //
+    // /tmp 스크래치 cwd(프롬프트 정리 세션)는 제외한다: 그 디렉토리는 프로젝트가
+    // 아니라 격리용 빈 폴더이고, 등록이 성사되면 거기에 `.mcp.json`이 남는다
+    // (spec ②·survey R2-3). 지식 디렉토리가 없어 실제로도 조기 반환하겠지만,
+    // "정리 세션은 어떤 프로젝트 파일도 건드리지 않는다"는 불변식은 우연이 아니라
+    // 명시적 조건이어야 한다.
+    if !core_lib::claude_cli::is_scratch_dir(std::path::Path::new(&cwd)) {
+        crate::commands::archive::ensure_mcp_registration(&app, &cwd);
+    }
 
     // Adopt only: the liveness verdict the picker showed was computed when the
     // picker opened, and the user may have sat on it for minutes — long enough to
@@ -329,6 +344,7 @@ pub fn claude_open_or_attach(
         cwd,
         uuid,
         name.unwrap_or_else(|| "Claude".to_string()),
+        model,
         cols,
         rows,
     )?;
