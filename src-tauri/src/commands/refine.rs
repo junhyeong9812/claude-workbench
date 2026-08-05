@@ -17,10 +17,8 @@ use crate::commands::AppError;
 /// (`core_lib::claude_cli::refine_workdir`).
 #[tauri::command]
 pub fn prompt_refine_workdir() -> Result<String, AppError> {
-    let dir = core_lib::claude_cli::refine_workdir();
-    if !dir.is_dir() {
-        return Err(AppError::new("정리 세션 작업 디렉토리를 만들 수 없습니다."));
-    }
+    // 심링크 선점을 거부한다(리뷰 #7) — 실패는 세션을 열지 않는 쪽으로 끝난다.
+    let dir = core_lib::claude_cli::ensure_refine_workdir().map_err(AppError::new)?;
     dir.to_str()
         .map(str::to_string)
         .ok_or_else(|| AppError::new("정리 세션 작업 디렉토리 경로를 읽을 수 없습니다."))
@@ -42,7 +40,7 @@ pub async fn run_codex_check(prompt: String) -> Result<String, AppError> {
         return Err(AppError::new("검증할 프롬프트가 비어 있습니다."));
     }
     tauri::async_runtime::spawn_blocking(move || {
-        let cwd = core_lib::claude_cli::refine_workdir();
+        let cwd = core_lib::claude_cli::ensure_refine_workdir().map_err(AppError::new)?;
         core_lib::codex_cli::run_codex_exec(&cwd, &critique_prompt(&prompt), Duration::from_secs(120))
             .map_err(AppError::new)
     })
@@ -73,10 +71,11 @@ mod tests {
 
     #[test]
     fn workdir_is_a_tmp_slug_source() {
-        let dir = core_lib::claude_cli::refine_workdir();
+        let dir = core_lib::claude_cli::ensure_refine_workdir().expect("스크래치 디렉토리 생성");
         assert!(dir.is_dir(), "작업 디렉토리는 호출만으로 만들어져야 한다");
-        // 격리의 근거: 이 경로가 임시 디렉토리 아래에 있어야 CLI가 `-tmp-…`
-        // 슬러그를 만들고, 백필 스캔이 통째로 건너뛴다.
+        // 격리의 근거: 이 경로가 리터럴 /tmp 아래여야 CLI가 `-tmp-…` 슬러그를
+        // 만들고 백필 스캔이 통째로 건너뛴다.
+        assert!(dir.starts_with("/tmp/"));
         assert!(core_lib::claude_cli::is_scratch_dir(&dir));
     }
 
