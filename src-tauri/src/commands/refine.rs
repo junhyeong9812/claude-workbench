@@ -40,9 +40,18 @@ pub async fn run_codex_check(prompt: String) -> Result<String, AppError> {
         return Err(AppError::new("검증할 프롬프트가 비어 있습니다."));
     }
     tauri::async_runtime::spawn_blocking(move || {
-        let cwd = core_lib::claude_cli::ensure_refine_workdir().map_err(AppError::new)?;
-        core_lib::codex_cli::run_codex_exec(&cwd, &critique_prompt(&prompt), Duration::from_secs(120))
-            .map_err(AppError::new)
+        // 일회용 디렉토리 — 이름이 예측 불가하고 원자적으로 만들어지므로 선점이
+        // 원천 불가능하다. codex는 trust 다이얼로그가 없어 매번 새로 만들어도
+        // 대가가 없다(정리 세션이 고정 경로를 쓰는 이유와 대비 — claude_cli 참조).
+        let cwd = core_lib::claude_cli::create_run_scratch_dir().map_err(AppError::new)?;
+        let out = core_lib::codex_cli::run_codex_exec(
+            &cwd,
+            &critique_prompt(&prompt),
+            Duration::from_secs(120),
+        )
+        .map_err(AppError::new);
+        let _ = std::fs::remove_dir_all(&cwd);
+        out
     })
     .await
     .map_err(|_| AppError::new("codex 검증 작업을 실행하지 못했습니다."))?

@@ -62,41 +62,109 @@ pub fn ensure_refine_workdir() -> Result<std::path::PathBuf, String> {
     ensure_scratch_dir(&refine_workdir_path())
 }
 
-/// Create `dir` if absent and return it — but **never follow a symlink** sitting
-/// at that path (review #7).
+/// A **fresh, single-use** scratch directory `…-refine-<random>`.
 ///
-/// The path is fixed and world-writable (`/tmp`), so any local process can win
-/// the race to create it first. `create_dir_all` is happy with a symlink that
-/// resolves to a directory, which would silently root the refine session — and
-/// everything it writes — inside whatever the attacker pointed at. `symlink_metadata`
-/// is the check that does *not* follow the link, so it is the only one that can
-/// see the substitution.
+/// This is the squat-proof-by-construction variant: the name is unpredictable and
+/// `create_dir` is atomic, so nothing can be sitting at the path when we win.
+/// Used where a per-run directory costs nothing — the codex check, which is a
+/// one-shot subprocess. The interactive refine session cannot use it: `claude`
+/// re-asks its workspace-trust dialog in every new directory (see
+/// [`ensure_scratch_dir`]).
 ///
-/// Checked twice on purpose: once before creating (the ordinary case, where the
-/// directory already exists from a previous run) and once after, because the
-/// window between "not found" and our `create_dir_all` is exactly when a symlink
-/// could be planted.
-pub fn ensure_scratch_dir(dir: &std::path::Path) -> Result<std::path::PathBuf, String> {
-    fn verify(dir: &std::path::Path) -> Result<Option<()>, String> {
-        match std::fs::symlink_metadata(dir) {
-            Ok(md) if md.file_type().is_symlink() => Err(
-                "작업 디렉토리 자리에 심볼릭 링크가 있습니다 — 안전하지 않아 사용하지 않습니다."
-                    .to_string(),
-            ),
-            Ok(md) if md.is_dir() => Ok(Some(())),
-            Ok(_) => Err("작업 디렉토리 자리에 디렉토리가 아닌 파일이 있습니다.".to_string()),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(_) => Err("작업 디렉토리 상태를 확인할 수 없습니다.".to_string()),
+/// The caller removes it when done; a leftover is harmless (it is excluded from
+/// every scan by its `/tmp` path just like the fixed one).
+pub fn create_run_scratch_dir() -> Result<std::path::PathBuf, String> {
+    use std::os::unix::fs::PermissionsExt;
+    for _ in 0..8 {
+        let dir = std::path::PathBuf::from(format!("{REFINE_WORKDIR}-{}", random_suffix()));
+        match std::fs::create_dir(&dir) {
+            Ok(()) => {
+                let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
+                return Ok(dir);
+            }
+            // 이름이 이미 있다 = 충돌이거나 선점 — 다른 이름으로 다시 시도한다.
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(_) => return Err("작업 디렉토리를 만들 수 없습니다.".to_string()),
         }
     }
-    if verify(dir)?.is_some() {
-        return Ok(dir.to_path_buf());
+    Err("작업 디렉토리를 만들 수 없습니다.".to_string())
+}
+
+/// Unpredictable suffix — the kernel's UUID source (the same one session ids come
+/// from), with pid+nanos as a fallback so a missing `/proc` degrades to "unique"
+/// rather than failing.
+fn random_suffix() -> String {
+    if let Ok(s) = std::fs::read_to_string("/proc/sys/kernel/random/uuid") {
+        let hex: String = s.chars().filter(|c| c.is_ascii_hexdigit()).take(16).collect();
+        if hex.len() == 16 {
+            return hex;
+        }
     }
-    std::fs::create_dir_all(dir).map_err(|_| "작업 디렉토리를 만들 수 없습니다.".to_string())?;
-    match verify(dir)? {
-        Some(()) => Ok(dir.to_path_buf()),
-        None => Err("작업 디렉토리를 만들 수 없습니다.".to_string()),
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    format!("{}-{nanos}", std::process::id())
+}
+
+/// Create `dir` and return it, **never accepting a directory we do not own**.
+///
+/// The path lives in a world-writable `/tmp`, so any local process can try to win
+/// the race to create it first — as a symlink pointing at somewhere else, or as
+/// its own directory it can then read. Three checks, in this order, close that:
+///
+/// 1. **`create_dir`, not `create_dir_all`.** The plain call is atomic and fails
+///    with `AlreadyExists` if *anything* is at the path — including a symlink
+///    that resolves to a directory, which `create_dir_all` happily accepts. So
+///    the success path means "we just made it", full stop.
+/// 2. On `AlreadyExists` (the ordinary case — a previous run's directory), the
+///    entry is inspected with **`symlink_metadata`**, the only stat that does not
+///    follow a link, and rejected unless it is a real directory.
+/// 3. **Ownership + mode.** A real directory planted by another local user would
+///    pass (2), so it must also be owned by us; and we force `0700` so nothing
+///    outside this account can read the drafts or drop files in.
+///
+/// Why the path stays fixed instead of one directory per run (which would make
+/// squatting impossible by construction): measured 2026-08-05 — `claude` shows
+/// its workspace-trust dialog on the first interactive run in *any* new
+/// directory, and there is no flag to skip it (the CLI's own help offers only
+/// non-interactive `-p` or hand-editing `hasTrustDialogAccepted`). With a fresh
+/// directory per session the dialog is on screen when the protocol seed is
+/// injected, the seed's Enter answers the *dialog*, and the seed itself is lost —
+/// `SEED_DELIVERED=false`, no transcript at all. The refine session would start
+/// with no instructions every time. Checks (1)–(3) give the same guarantee
+/// against other local users, which is the threat the squat is; an attacker
+/// already running as this user can read `~/.claude` directly.
+pub fn ensure_scratch_dir(dir: &std::path::Path) -> Result<std::path::PathBuf, String> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    match std::fs::create_dir(dir) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            let md = std::fs::symlink_metadata(dir)
+                .map_err(|_| "작업 디렉토리 상태를 확인할 수 없습니다.".to_string())?;
+            if md.file_type().is_symlink() {
+                return Err(
+                    "작업 디렉토리 자리에 심볼릭 링크가 있습니다 — 안전하지 않아 사용하지 않습니다."
+                        .to_string(),
+                );
+            }
+            if !md.is_dir() {
+                return Err("작업 디렉토리 자리에 디렉토리가 아닌 파일이 있습니다.".to_string());
+            }
+            // SAFETY: `geteuid` has no preconditions and cannot fail.
+            if md.uid() != unsafe { libc::geteuid() } {
+                return Err(
+                    "작업 디렉토리가 다른 사용자 소유입니다 — 안전하지 않아 사용하지 않습니다."
+                        .to_string(),
+                );
+            }
+        }
+        Err(_) => return Err("작업 디렉토리를 만들 수 없습니다.".to_string()),
     }
+    // 우리 소유임을 확인한 뒤에만 권한을 조인다(남의 디렉토리를 건드리지 않는다).
+    let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
+    Ok(dir.to_path_buf())
 }
 
 /// Is `path` **exactly** one of our two throwaway scratch directories? Callers
@@ -110,9 +178,18 @@ pub fn ensure_scratch_dir(dir: &std::path::Path) -> Result<std::path::PathBuf, S
 pub fn is_scratch_dir(path: &std::path::Path) -> bool {
     let canon = |p: &std::path::Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
     let target = canon(path);
-    [refine_workdir_path(), extraction_workdir_path()]
+    if [refine_workdir_path(), extraction_workdir_path()]
         .iter()
         .any(|d| canon(d) == target)
+    {
+        return true;
+    }
+    // 실행별 스크래치(`…-refine-<suffix>`)도 우리 것이다 — codex 검증이 매번 새로
+    // 만들고 지우는 디렉토리가 여기 걸린다. 접두사가 `refine-`까지 포함하므로
+    // /tmp 아래 일반 프로젝트가 잘못 걸리지 않는다(리뷰 #8의 과광 방지 유지).
+    target
+        .to_str()
+        .is_some_and(|s| s.starts_with(&format!("{REFINE_WORKDIR}-")))
 }
 
 /// Model/effort selection for one invocation. `None` = let the CLI use its
@@ -279,18 +356,23 @@ mod tests {
         assert!(!is_scratch_dir(std::path::Path::new("/home/u/project")));
     }
 
-    /// 고정 경로 + world-writable = 선점 가능. 심링크는 따라가지 않고 거부한다.
+    /// 고정 경로 + world-writable = 선점 가능. 심링크는 따라가지 않고 거부하고,
+    /// 우리가 만든 디렉토리는 0700으로 조인다.
     #[test]
-    fn ensure_scratch_dir_refuses_a_symlink() {
+    fn ensure_scratch_dir_refuses_a_symlink_and_locks_permissions() {
+        use std::os::unix::fs::PermissionsExt;
         let base = std::env::temp_dir().join(format!("cwb-scratch-{}", std::process::id()));
         std::fs::remove_dir_all(&base).ok();
         let real = base.join("real");
         std::fs::create_dir_all(&real).unwrap();
 
-        // 정상: 없으면 만들고, 있으면 그대로 통과.
+        // 정상: 없으면 만들고(create_dir — 원자적), 두 번째 호출은 AlreadyExists
+        // 경로로 들어가 소유자 검사를 통과해야 한다.
         let fresh = base.join("fresh");
         assert_eq!(ensure_scratch_dir(&fresh).unwrap(), fresh);
         assert_eq!(ensure_scratch_dir(&fresh).unwrap(), fresh);
+        let mode = std::fs::metadata(&fresh).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700, "스크래치는 이 계정만 읽을 수 있어야 한다");
 
         // 심링크가 (디렉토리로 잘 해소되더라도) 자리에 있으면 거부.
         let link = base.join("link");
@@ -305,6 +387,26 @@ mod tests {
         assert!(ensure_scratch_dir(&file).is_err());
 
         std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// 일회용 스크래치는 매번 다른 이름으로 새로 만들어지고, 격리 방어선(슬러그
+    /// `-tmp-`·cwd `/tmp/`)에 그대로 걸린다.
+    #[test]
+    fn create_run_scratch_dir_is_unique_and_still_isolated() {
+        use std::os::unix::fs::PermissionsExt;
+        let a = create_run_scratch_dir().unwrap();
+        let b = create_run_scratch_dir().unwrap();
+        assert_ne!(a, b, "실행별 디렉토리는 이름이 겹치면 안 된다");
+        for d in [&a, &b] {
+            assert!(d.is_dir());
+            assert!(d.starts_with("/tmp/"), "backfill의 cwd 방어선");
+            let slug = d.to_str().unwrap().replace('/', "-");
+            assert!(slug.starts_with("-tmp-"), "scan의 슬러그 방어선: {slug}");
+            assert!(is_scratch_dir(d), "mcp 등록 스킵 대상이어야 한다");
+            assert_eq!(std::fs::metadata(d).unwrap().permissions().mode() & 0o777, 0o700);
+        }
+        std::fs::remove_dir_all(&a).ok();
+        std::fs::remove_dir_all(&b).ok();
     }
 
     #[test]
