@@ -4,7 +4,7 @@ import { emit, listen } from "@tauri-apps/api/event";
 import type { DockviewApi, IDockviewPanel } from "dockview-react";
 import { useAppStore } from "./store";
 import { beginTransfer, endTransfer } from "./panelTransfer";
-import { closeIfEphemeralPanel } from "./timelinePeek";
+import { closeIfEphemeralPanel } from "./ephemeralPanels";
 
 /** P6 D3: 전송 커밋(target ok) 알림 — claudeStatus로의 직접 의존을 역전한다.
  * 등록자는 claudeStatusGlobal.init(창당 1회, 앱 마운트 시 — 전송은 사용자
@@ -169,7 +169,7 @@ export function dockPanelToWindow(api: DockviewApi, panelId: string, targetLabel
   if (inFlight.has(panelId)) return;
   const panel = api.getPanel(panelId);
   if (!panel) return;
-  // 단발성 패널(타임라인 peek)은 옮기지 않고 여기서 닫는다 — 근거는 timelinePeek.
+  // 단발성 패널(타임라인 peek·프롬프트 정리)은 옮기지 않고 여기서 닫는다 — 근거는 ephemeralPanels.
   if (closeIfEphemeralPanel(panel)) return;
   inFlight.add(panelId);
   const { spec, project } = panelSpecOf(panel);
@@ -187,7 +187,7 @@ export async function movePanelToNewWindow(
   if (inFlight.has(panelId)) return;
   const panel = api.getPanel(panelId);
   if (!panel) return;
-  // 단발성 패널(타임라인 peek)은 새 창으로도 나가지 않는다 — 그 자리에서 닫힘.
+  // 단발성 패널(타임라인 peek·프롬프트 정리)은 새 창으로도 나가지 않는다 — 그 자리에서 닫힘.
   if (closeIfEphemeralPanel(panel)) return;
   inFlight.add(panelId);
   const { spec, project } = panelSpecOf(panel);

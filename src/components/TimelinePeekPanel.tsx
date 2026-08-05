@@ -6,7 +6,7 @@
  * Claude 탭이 **백그라운드 탭이어도**(언마운트) 라이브로 이어진다 — 이벤트는
  * 창 전역 브로드캐스트고 숫자 id↔uuid 매핑은 패널 언마운트보다 오래 산다.
  *
- * 단발성: 레이아웃에 남더라도 복원 직후 제거된다(timelinePeek.closePeekPanels).
+ * 단발성: 레이아웃에 남더라도 복원 직후 제거된다(ephemeralPanels.closeEphemeralPanels).
  */
 import { useEffect, useState } from "react";
 import type { IDockviewPanelProps } from "dockview-react";

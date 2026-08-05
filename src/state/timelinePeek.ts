@@ -7,12 +7,14 @@
  * 두 가지 성질이 규칙으로 고정된다:
  * 1. **세션당 1개** — 패널 id가 uuid로 결정적이라, 이미 열려 있으면 새로 만들지
  *    않고 그 패널을 활성화한다(diff 패널의 결정적 id 선례와 같은 방식).
- * 2. **단발성(persist 없음)** — dockview의 `toJSON()`은 모든 패널을 담으므로 peek도
- *    저장은 된다. 되살아나지 않게 하는 지점은 **복원 직후**다: `fromJSON` 뒤에
- *    {@link closePeekPanels}가 peek 패널을 즉시 닫는다(레이아웃 저장 구독 전에
- *    호출하므로 재저장도 유발하지 않는다). 저장을 막는 대신 복원을 막는 이유는
- *    저장 시점의 직렬화 blob을 재구성하는 것보다 안전하고(그리드 트리 손대지 않음)
- *    전송·팝아웃으로 옮겨간 peek까지 같은 규칙으로 걸리기 때문.
+ * 2. **단발성(persist 없음)** — 복원 시 제거·창 간 이동 차단. 그 실행부는
+ *    `state/ephemeralPanels`가 소유한다(정리 세션 패널과 공유하는 계약이라
+ *    규칙을 한 곳에 뒀다). 여기 남는 건 "peek인가"를 판정하는 술어뿐이다.
+ *
+ * **peek는 창 간 이동 대상이 아니다** — 절제가 아니라 정확성 요건이다: 타임라인
+ * 구독이 쓰는 숫자 id↔uuid 매핑(claudeStatus)은 **웹뷰 로컬**이라 다른 창으로
+ * 옮긴 peek는 라이브·종료 이벤트를 전부 놓치고(죽은 화면), 중복 판정(dock 조회 +
+ * surfaceRegistry)도 창을 넘지 못해 "세션당 1개"가 깨진다.
  */
 import { findPanelById } from "./surfaceRegistry";
 
@@ -85,30 +87,3 @@ export function openTimelinePeek(dock: PeekDock, args: PeekOpenArgs): "focused" 
   return "opened";
 }
 
-/**
- * peek는 **창 간 이동 대상이 아니다** — 옮기려 하면 그 자리에서 닫는다(반환 true =
- * 전송 중단). 절제가 아니라 정확성 요건이다: 타임라인 구독이 쓰는 숫자 id↔uuid
- * 매핑(claudeStatus)은 **웹뷰 로컬**이라 다른 창으로 옮긴 peek는 라이브·종료
- * 이벤트를 전부 놓치고(죽은 화면), 중복 판정(dock 조회 + surfaceRegistry)도 창을
- * 넘지 못해 "세션당 1개"가 깨진다. 여기서 이동을 막으면 두 결함이 원천 소멸하고,
- * 복원 경로의 {@link closePeekPanels}는 방어선으로 남는다.
- */
-export function closeIfEphemeralPanel(panel: {
-  params?: unknown;
-  api: { close(): void };
-}): boolean {
-  if (!isPeekParams(panel.params)) return false;
-  panel.api.close();
-  return true;
-}
-
-/** 복원된 레이아웃에서 단발성 peek 패널을 전부 닫는다 (닫은 개수 반환). */
-export function closePeekPanels(dock: Pick<PeekDock, "panels">): number {
-  let n = 0;
-  for (const p of [...dock.panels]) {
-    if (!isPeekParams(p.params)) continue;
-    p.api.close();
-    n++;
-  }
-  return n;
-}
