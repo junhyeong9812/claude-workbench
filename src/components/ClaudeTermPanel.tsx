@@ -945,8 +945,9 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
             // 정리 세션의 규약 시드는 대화를 **시작**시켜야 하므로 제출까지 한다
             // (한 줄 + CR — 실측 근거는 submitSingleLine). 나머지 시드는 기존
             // 경로 그대로(바이트 무변경).
-            if (isRefine) submitSingleLine(seed);
-            else injectSeed(seed);
+            // 쏘고 잊는 자리 — writeToSession은 더 이상 에러를 삼키지 않으므로
+            // 여기서 명시적으로 흘린다(실패해도 "시드 재주입" 버튼이 남는다).
+            void (isRefine ? submitSingleLine(seed) : injectSeed(seed)).catch(() => {});
             pendingSeedRef.current = null;
           }
         }, 1800);
@@ -1433,7 +1434,11 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
               <button
                 className="claudeterm-head-btn"
                 title="시드 프롬프트를 현재 세션에 다시 보냅니다 (자동 주입이 빗나갔을 때)"
-                onClick={() => (isRefine ? submitSingleLine(lastSeed) : injectSeed(lastSeed))}
+                onClick={() =>
+                  void (isRefine ? submitSingleLine(lastSeed) : injectSeed(lastSeed)).catch(
+                    () => {},
+                  )
+                }
               >
                 시드 재주입
               </button>
