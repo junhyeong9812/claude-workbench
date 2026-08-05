@@ -52,7 +52,13 @@ export interface SessionPickerController {
 /** 피커가 쓰는 addPanel의 최소 형태 (MainArea가 주입). */
 type PickerAddPanel = (
   kind: "claudeterm",
-  opts: { loadSessionId: string; project?: string; title: string; spawnCwd?: string },
+  opts: {
+    loadSessionId: string;
+    project?: string;
+    title: string;
+    spawnCwd?: string;
+    adoptPending?: boolean;
+  },
 ) => unknown;
 
 export function useSessionPicker(deps: {
@@ -401,6 +407,8 @@ export function SessionPicker({
                         loadSessionId: s.uuid,
                         project: activeProject ?? s.cwd,
                         spawnCwd: s.cwd,
+                        // 인수는 이 클릭 한 번뿐 — 패널이 세션을 열면서 지운다.
+                        adoptPending: true,
                         title: s.title.slice(0, 24) || "외부 세션",
                       });
                     }}

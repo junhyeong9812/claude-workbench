@@ -282,6 +282,9 @@ export function MainArea({
       /** claudeterm 전용: PTY를 띄울 디렉토리가 `project`와 달라야 할 때
        * (외부 세션 adopt — CLI는 세션이 만들어진 디렉토리에서만 resume한다). */
       spawnCwd?: string;
+      /** claudeterm 전용: 인수 직전 live 재검증 요청 (1회성 — 세션이 열리면
+       * 패널이 스스로 지운다). */
+      adoptPending?: boolean;
       /** "within" = referencePanel의 그룹에 탭으로 추가 (드롭 존 중앙). */
       position?: {
         referencePanel: string;
@@ -326,6 +329,7 @@ export function MainArea({
         ...(opts?.runCmd ? { runCmd: opts.runCmd } : {}),
         ...(opts?.cwd ? { cwd: opts.cwd } : {}),
         ...(opts?.spawnCwd ? { spawnCwd: opts.spawnCwd } : {}),
+        ...(opts?.adoptPending ? { adoptPending: true } : {}),
       },
     });
     return id;
