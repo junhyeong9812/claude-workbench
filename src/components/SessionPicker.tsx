@@ -19,6 +19,7 @@ import {
   externalRows,
   liveBadge,
   openSessionIds,
+  pickerLoadOutcome,
   pickerRows,
   type ArchState,
   type ArchiveStatusRow,
@@ -81,6 +82,14 @@ export function useSessionPicker(deps: {
   // 터미널에서 연 세션(외부). 피커를 열 때마다 새로 조회한다 — live 판정은
   // 지금 이 순간의 프로세스 상태라서 캐시하면 틀린 값을 보여준다.
   const [external, setExternal] = useState<ExternalSessionRow[]>([]);
+  // 피커 조회 세대. archReqRef와 **분리**한다: 아카이브 이벤트 리스너가
+  // archReqRef를 올리므로 공유하면 이벤트 하나가 사용자의 피커 열기를 통째로
+  // 취소해 버린다.
+  const loadReqRef = useRef(0);
+  // 렌더 시점의 activeProject — await 도중 사용자가 프로젝트를 바꿨는지
+  // 비동기 클로저가 볼 수 있는 유일한 창(클로저가 붙든 값은 호출 시점 것이다).
+  const activeProjectRef = useRef(activeProject);
+  activeProjectRef.current = activeProject;
 
   /** Open panels of `kind` (for numbering): empty sessions never persist, so the
    * next number is saved sessions + currently-open panels of that kind + 1. */
@@ -92,26 +101,39 @@ export function useSessionPicker(deps: {
   // "+ Claude(A)": open the picker — name a new session or reopen a saved
   // (not-already-open) one. Per-project (active project). Sessions are a flat,
   // newest-first list — 새 태스크 = 순수 새 세션 (아카이브 모델, 체인 없음).
-  const openPicker = async () => {
+  const openPicker = async (attempt = 0): Promise<void> => {
+    const myReq = ++loadReqRef.current;
+    // 이 조회가 어느 프로젝트 것인지 고정 — 응답을 여기에 묶는다.
+    const project = activeProject;
     let sessions: SessionSummary[] = [];
-    if (activeProject) {
-      const myReq = ++archReqRef.current;
+    let extRows: ExternalSessionRow[] = [];
+    if (project) {
+      const myArch = ++archReqRef.current;
       const [raw, statuses, inFlight, ext] = await Promise.all([
-        invoke<RawSessionRow[]>("claude_sessions", { project: activeProject }).catch(() => []),
-        invoke<ArchiveStatusRow[]>("archive_status", { project: activeProject }).catch(() => []),
-        invoke<boolean>("archive_in_flight", { project: activeProject }).catch(() => false),
+        invoke<RawSessionRow[]>("claude_sessions", { project }).catch(() => []),
+        invoke<ArchiveStatusRow[]>("archive_status", { project }).catch(() => []),
+        invoke<boolean>("archive_in_flight", { project }).catch(() => false),
         // 실패는 섹션 미표시 — 외부 세션은 부가 기능이라 피커 자체를 막지 않는다.
-        invoke<ExternalSessionRow[]>("claude_external_sessions", { project: activeProject }).catch(
-          () => [],
-        ),
+        invoke<ExternalSessionRow[]>("claude_external_sessions", { project }).catch(() => []),
       ]);
-      sessions = buildSessionSummaries(raw, statuses, activeProject);
-      setExternal(ext);
-      const busy = archBusyUpdate(archReqRef.current, myReq, { ok: true, value: inFlight });
+      switch (pickerLoadOutcome(loadReqRef.current, myReq, project, activeProjectRef.current)) {
+        case "stale":
+          return; // 더 새 조회가 이미 돌고 있다
+        case "switched":
+          // 조회하는 사이 프로젝트가 바뀌었다. 남의 프로젝트 목록을 보여주느니
+          // 새 프로젝트로 한 번 다시 조회한다(1회 제한 — 사용자가 계속 전환하면
+          // 전환이 멎은 뒤의 조회가 이긴다).
+          if (attempt === 0) await openPicker(1);
+          return;
+        case "apply":
+          break;
+      }
+      sessions = buildSessionSummaries(raw, statuses, project);
+      extRows = ext;
+      const busy = archBusyUpdate(archReqRef.current, myArch, { ok: true, value: inFlight });
       if (busy !== null) setArchBusy(busy);
-    } else {
-      setExternal([]);
     }
+    setExternal(extRows);
     setNewName(`Claude ${sessions.length + openKindCount("claudeterm") + 1}`);
     setPicker(sessions); // open-session filtering happens at render
   };

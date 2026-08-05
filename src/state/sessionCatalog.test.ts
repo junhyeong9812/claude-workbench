@@ -6,6 +6,7 @@ import {
   externalRows,
   liveBadge,
   openSessionIds,
+  pickerLoadOutcome,
   pickerRows,
   type ExternalSessionRow,
   type SessionSummary,
@@ -157,5 +158,26 @@ describe("externalRows — 최신순 + 열린 세션 제외", () => {
     const before = rows.map((r) => r.uuid);
     externalRows(rows, new Set());
     expect(rows.map((r) => r.uuid)).toEqual(before);
+  });
+});
+
+describe("pickerLoadOutcome — 피커 조회 세대 + 프로젝트 바인딩", () => {
+  it("최신 세대이고 프로젝트가 그대로면 반영", () => {
+    expect(pickerLoadOutcome(3, 3, "/a", "/a")).toBe("apply");
+    expect(pickerLoadOutcome(1, 1, null, null)).toBe("apply");
+  });
+
+  it("더 새 조회가 시작됐으면 낡은 응답 — 버린다", () => {
+    expect(pickerLoadOutcome(5, 3, "/a", "/a")).toBe("stale");
+  });
+
+  it("조회 사이 프로젝트가 바뀌었으면 남의 목록 — 버리고 재조회", () => {
+    // 세대는 최신이지만 응답은 /a 것이고 화면은 /b다. 세대만으로는 못 막는다.
+    expect(pickerLoadOutcome(3, 3, "/a", "/b")).toBe("switched");
+    expect(pickerLoadOutcome(3, 3, "/a", null)).toBe("switched");
+  });
+
+  it("세대 판정이 프로젝트 판정보다 우선 — 낡은 응답은 프로젝트와 무관하게 버린다", () => {
+    expect(pickerLoadOutcome(5, 3, "/a", "/b")).toBe("stale");
   });
 });

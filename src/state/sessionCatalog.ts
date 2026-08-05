@@ -159,6 +159,28 @@ export function pickerRows(
 }
 
 /**
+ * 피커 조회 응답을 화면에 반영해도 되는가.
+ *
+ * `apply` = 반영 · `stale` = 더 새 조회가 시작됨(버림) · `switched` = 조회하는
+ * 사이 사용자가 프로젝트를 바꿈(버리고 재조회).
+ *
+ * 세션 목록과 외부 세션은 **프로젝트별** 데이터라, 늦게 도착한 응답이 그대로
+ * set되면 A 프로젝트를 보면서 B의 세션 목록이 뜬다. 배지(archBusyUpdate)와 달리
+ * 여기서는 세대만으로 부족하다 — 프로젝트 전환은 새 조회를 동반하지 않을 수도
+ * 있어서, 응답이 어느 프로젝트 것인지 함께 확인해야 한다.
+ */
+export function pickerLoadOutcome(
+  current: number,
+  mine: number,
+  requestedProject: string | null,
+  currentProject: string | null,
+): "apply" | "stale" | "switched" {
+  if (current !== mine) return "stale";
+  if (requestedProject !== currentProject) return "switched";
+  return "apply";
+}
+
+/**
  * in_flight 조회 세대 가드 — 늦게 도착한 낡은 응답이 "아카이브 진행 중" 배지를
  * 되돌리지 못하게 한다(started/finished 연속 발생 시 응답 역전, post-fix P4).
  *
