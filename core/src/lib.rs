@@ -23,6 +23,7 @@ pub mod pathguard;
 pub mod persist;
 pub mod project_type;
 pub mod runner;
+pub mod scan;
 pub mod scrollback_store;
 pub mod search;
 pub mod session;
