@@ -101,9 +101,12 @@ pub fn run_codex_exec(cwd: &std::path::Path, prompt: &str, timeout: Duration) ->
         .arg("never")
         .arg("-o")
         .arg(&out_path)
-        .arg(prompt)
+        // **프롬프트를 argv에 싣지 않는다**(감사 G5): argv는 `/proc/<pid>/cmdline`
+        // 으로 같은 머신의 누구에게나 보이고, 정리 중인 프롬프트에는 사내 맥락이나
+        // 자격증명 조각이 들어 있을 수 있다. 인자를 생략하면 codex가 stdin을
+        // 프롬프트로 읽는다(실측 2026-08-05: 파이프로만 준 프롬프트에 정상 응답).
         .current_dir(cwd)
-        .stdin(Stdio::null())
+        .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         // 자기 자신을 리더로 하는 **프로세스 그룹**에 넣는다(리뷰 #10). codex는
@@ -113,6 +116,18 @@ pub fn run_codex_exec(cwd: &std::path::Path, prompt: &str, timeout: Duration) ->
         .process_group(0)
         .spawn()
         .map_err(|_| "codex를 실행하지 못했습니다.".to_string())?;
+
+    // Feed the prompt and close stdin (EOF) on its own thread, so a large prompt
+    // can't deadlock against pipes we haven't started draining yet. codex waits
+    // for EOF before it starts, so the drop is load-bearing, not tidiness.
+    if let Some(mut stdin) = child.stdin.take() {
+        let p = prompt.to_string();
+        thread::spawn(move || {
+            use std::io::Write;
+            let _ = stdin.write_all(p.as_bytes());
+            // `stdin` drops here -> EOF.
+        });
+    }
 
     // Drain both pipes to sinks — we read the answer from the file, but a full
     // pipe would block the child forever.
