@@ -9,7 +9,7 @@ use core_lib::SessionManager;
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, State, Window};
 
-use crate::commands::AppError;
+use crate::commands::{io_message, AppError};
 
 /// One live Claude session shared across windows (multiwindow mirror, P6). A
 /// session is ONE PTY (`id`) + JSONL (`uuid`); multiple windows can render it,
@@ -215,15 +215,26 @@ pub struct ClaudeDetached {
 /// very act of running one makes it read as `Live` — a reopen after a crash, or
 /// any path that races its own leftover process, would block itself forever.
 ///
-/// A transcript that doesn't exist yet is not an adopt at all (`spawn_claude`
-/// creates it with `--session-id` instead of resuming), so there is nothing to
-/// collide with and the check passes.
+/// Every failure here is a refusal, never a pass. In particular a **missing**
+/// transcript is fatal on this path: adopt means continuing a session that
+/// exists, and `spawn_claude` falls back to `--session-id` when it can't find
+/// the file — so letting a missing transcript through would quietly create a
+/// brand-new session wearing the id of the one the user clicked (audit B2).
 fn recheck_adoptable(uuid: &str, cwd: &str) -> Result<(), AppError> {
     let Some(root) = core_lib::jsonl::claude_projects_root() else {
         return Err(AppError::new("Claude 전사 디렉토리를 찾을 수 없어 세션을 열지 않았습니다."));
     };
-    let Ok(Some(jsonl)) = core_lib::jsonl::find_session_jsonl(&root, uuid) else {
-        return Ok(()); // 전사 없음 = resume이 아니라 새 세션 — 충돌 대상이 없다
+    let jsonl = match core_lib::jsonl::find_session_jsonl(&root, uuid) {
+        Ok(Some(p)) => p,
+        Ok(None) => {
+            return Err(AppError::new(
+                "이 세션의 전사를 찾을 수 없습니다 — 그 사이 지워졌거나 옮겨진 것 같습니다. \
+                 목록을 다시 열어 확인하세요.",
+            ))
+        }
+        Err(e) => {
+            return Err(AppError::new(io_message("이 세션의 전사를 찾지 못했습니다", &e)))
+        }
     };
     let jsonl = jsonl.canonicalize().unwrap_or(jsonl);
     let dir = std::fs::canonicalize(cwd).unwrap_or_else(|_| std::path::PathBuf::from(cwd));
@@ -294,21 +305,21 @@ pub fn claude_open_or_attach(
         AttachLive::NotLive | AttachLive::Cleaned => {}
     }
 
+    // 이 프로젝트에 아카이브 지식이 있으면 .mcp.json 등록을 보장 — 새로 뜨는
+    // claude가 지식 서버(search_knowledge)를 바로 쓸 수 있게 (best-effort).
+    crate::commands::archive::ensure_mcp_registration(&app, &cwd);
+
     // Adopt only: the liveness verdict the picker showed was computed when the
-    // picker opened, and the user may have sat on it for minutes — long enough
-    // to go start that very session in a terminal. Re-establish it immediately
-    // before spawning, while the runtime lock is held, so the window between the
-    // check and the PTY is as small as we can make it (review #1). One /proc
-    // pass, measured at ~0.12 s.
+    // picker opened, and the user may have sat on it for minutes — long enough to
+    // go start that very session in a terminal. Re-establish it here, *after* the
+    // side work above and immediately before the spawn, so nothing runs between
+    // the check and the PTY (review #1, audit B2). The runtime lock is held
+    // throughout. One /proc pass, measured at ~0.12 s.
     if adopt.unwrap_or(false) {
         if let Some(uuid) = uuid.as_deref() {
             recheck_adoptable(uuid, &cwd)?;
         }
     }
-
-    // 이 프로젝트에 아카이브 지식이 있으면 .mcp.json 등록을 보장 — 새로 뜨는
-    // claude가 지식 서버(search_knowledge)를 바로 쓸 수 있게 (best-effort).
-    crate::commands::archive::ensure_mcp_registration(&app, &cwd);
 
     // Driver: start a fresh PTY (lock held so a concurrent open can't double-start).
     let (id, session_uuid, stop) = super::spawn::spawn_claude(
