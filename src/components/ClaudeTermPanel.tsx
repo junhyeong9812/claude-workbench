@@ -30,9 +30,11 @@ import {
   applyBlockReason,
   bracketedPaste,
   extractLatestPromptBlock,
+  injectDeliveryDecision,
   isRefineParams,
   loadLastRefineModel,
   openPromptRefine,
+  resolveApplyAck,
   saveLastRefineModel,
   type RefineModel,
 } from "../state/promptRefine";
@@ -235,10 +237,13 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
    * **에러를 삼키지 않는다** — 호출부가 배달 성공을 알아야 하는 경로가 있다
    * (프롬프트 정리 [적용]은 write ACK 뒤에야 정리 세션을 끝낸다, 리뷰 #4). 그냥
    * 쏘고 잊는 자리는 각자 `.catch(() => {})`를 붙인다. */
-  const writeToSession = (text: string): Promise<void> => {
+  const writeToSession = (text: string): Promise<boolean> => {
     const id = sessionIdRef.current;
     if (id == null) return Promise.reject(new Error("세션이 아직 열리지 않았습니다."));
-    return invoke("claude_write", {
+    // 반환값 = **실제로 PTY에 쓰였는가**. 이 창이 driver가 아니면 백엔드가
+    // 조용히 무시하고 false를 준다(감사 G1) — 성공으로 오인하면 정리 세션이
+    // 아무것도 배달되지 않은 채 종료된다.
+    return invoke<boolean>("claude_write", {
       id,
       data: Array.from(new TextEncoder().encode(text)),
     });
@@ -268,41 +273,59 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
   // through the seed mechanism; this handles subsequent injects into the already-
   // live per-project dev session.
   const claudeInjectRequest = useAppStore((s) => s.claudeInjectRequest);
-  const requestClaudeInject = useAppStore((s) => s.requestClaudeInject);
-  // 처리에 착수한 요청 — 리마운트·deps 재평가로 같은 요청을 두 번 쓰지 않게.
-  const injectHandledRef = useRef<object | null>(null);
+  // 처리에 착수한 요청 id — 리마운트·deps 재평가로 같은 요청을 두 번 쓰지 않게.
+  const injectHandledRef = useRef<string | null>(null);
+  // 이 세션이 지금 권한/선택 프롬프트에 걸려 있는가. **구독**이라 상태가 풀리면
+  // 아래 이펙트가 다시 돌아 보류해 둔 주입이 자동으로 재시도된다(감사 G2).
+  const myInjectUuid = props.params.sessionUuid ?? props.params.loadSessionId ?? null;
+  const myBlocked = useClaudeStatus((s) =>
+    myInjectUuid ? s.entries[myInjectUuid]?.status === "blocked" : false,
+  );
   useEffect(() => {
-    if (!claudeInjectRequest) return;
-    const myUuid = props.params.sessionUuid ?? props.params.loadSessionId;
-    if (!myUuid || claudeInjectRequest.uuid !== myUuid) return;
-    // 아직 배달할 수 없다(미러이거나 세션이 안 열림) — **요청을 소비하지 않고**
-    // 그대로 둔다. 아래 deps가 두 조건의 변화를 각각 다시 태운다.
-    if (!isDriverRef.current || sessionIdRef.current == null) return;
-    if (injectHandledRef.current === claudeInjectRequest) return;
     const req = claudeInjectRequest;
-    injectHandledRef.current = req;
+    // 판정은 순수 모듈이 소유한다(테스트가 규칙을 고정). "defer"인 동안 요청은
+    // 슬롯에 그대로 남고, 아래 deps가 조건 해소를 다시 물어본다 — 여기서 조용히
+    // 소비하면 정리 세션은 닫혔는데 텍스트만 증발한다.
+    const decision = injectDeliveryDecision({
+      request: req,
+      myUuid: myInjectUuid,
+      isDriver: isDriverRef.current,
+      sessionOpen: sessionIdRef.current != null,
+      blocked: myBlocked,
+      handledId: injectHandledRef.current,
+    });
+    if (decision !== "write" || !req) return;
+    injectHandledRef.current = req.id;
     void (async () => {
+      // 늦게 도착한 처리: 그 사이 요청이 치워졌으면([적용] 타임아웃 등) 쓰지 않는다.
+      // 타임아웃된 id를 소비 측에서 폐기하는 지점이 여기다 — 남은 창은 write
+      // 자체의 길이뿐이라, 10초짜리 창이 밀리초로 줄어든다.
+      if (useAppStore.getState().claudeInjectRequest?.id !== req.id) return;
+      let ok = false;
+      let reason: string | undefined;
       try {
         // "fill" = 프롬프트 정리 [적용] — 채우기만 하고 제출하지 않는다.
-        if (req.mode === "fill") await fillInput(req.text);
-        else await injectSeed(req.text);
-      } catch {
-        // 쓰기 실패 = 미배달. 요청을 남겨 두고 재시도 가능 상태로 되돌린다 —
-        // 여기서 소비해 버리면 정리 세션은 이미 사라졌는데 텍스트만 증발한다.
-        injectHandledRef.current = null;
-        return;
+        ok = (await (req.mode === "fill" ? fillInput(req.text) : injectSeed(req.text))) === true;
+        if (!ok) reason = "이 창이 세션의 입력 권한을 갖고 있지 않습니다.";
+      } catch (e) {
+        reason = errText(e);
       }
-      // ACK 이후에만 소비한다. 그 사이 다른 요청이 슬롯을 덮었으면 건드리지 않는다.
-      if (useAppStore.getState().claudeInjectRequest === req) requestClaudeInject(null);
+      const st = useAppStore.getState();
+      // 소비는 우리 요청일 때만 (그 사이 다른 요청이 슬롯을 덮었으면 건드리지 않는다).
+      if (st.claudeInjectRequest?.id === req.id) st.requestClaudeInject(null);
+      st.reportClaudeInjectAck({ id: req.id, ok, reason });
+      // 실패는 재시도 여지를 남긴다(같은 id로 새 요청이 오는 경우는 없지만,
+      // 이 패널이 그 id를 다시 붙들고 있지 않게 한다).
+      if (!ok) injectHandledRef.current = null;
     })();
     // deps 근거:
     // - `isDriver` — 미러인 동안 도착한 요청은 위에서 그냥 반환한다. 없으면 입력
     //   권한을 가져와도 재평가가 없어 텍스트가 조용히 사라진다.
     // - `sessionOpened` — 소스 탭이 언마운트/마운트 중이면 sessionIdRef가 아직
-    //   null이라 같은 이유로 반환한다. 세션이 열린 사실을 **상태로** 노출해 이
-    //   이펙트를 다시 태운다(리뷰 #2 — 배달 시점까지 요청은 살아 있다).
+    //   null이라 같은 이유로 반환한다(리뷰 #2).
+    // - `myBlocked` — 프롬프트가 해소되면 보류해 둔 주입을 자동 재시도(G2).
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [claudeInjectRequest, isDriver, sessionOpened]);
+  }, [claudeInjectRequest, isDriver, sessionOpened, myBlocked]);
 
   // 종료(아카이브): copy the JSONL verbatim + normalized.json + book.html, then
   // claude extracts title/summary/knowledge (best-effort — extraction failure
@@ -1069,7 +1092,8 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
   // [적용] 진행 상태 — 배달 ACK를 기다리는 동안 true (리뷰 #4).
   const [applyPending, setApplyPending] = useState(false);
   const [applyNote, setApplyNote] = useState<string | null>(null);
-  const applyReqRef = useRef<object | null>(null);
+  const applyReqIdRef = useRef<string | null>(null);
+  const claudeInjectAck = useAppStore((s) => s.claudeInjectAck);
   const applyReason = isRefine
     ? applyBlockReason({
         block: refinedPrompt,
@@ -1156,50 +1180,64 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
     const text = refinedPrompt;
     const target = refineTargetUuid;
     if (!text || !target) return;
-    const req = { uuid: target, text, mode: "fill" as const };
+    const req = { id: crypto.randomUUID(), uuid: target, text, mode: "fill" as const };
     setApplyNote(null);
+    useAppStore.getState().reportClaudeInjectAck(null); // 지난 결과 청소
     useAppStore.getState().requestClaudeInject(req);
-    // 슬롯을 실제로 잡았을 때만 대기 상태로 — 잡지 못했으면 아래 감시가 우리 것도
-    // 아닌 요청의 소비를 보고 패널을 닫아 버린다.
-    if (useAppStore.getState().claudeInjectRequest !== req) {
+    // 슬롯을 실제로 잡았을 때만 대기 상태로 — 잡지 못했으면 남의 요청의 결과를
+    // 기다리게 된다.
+    if (useAppStore.getState().claudeInjectRequest?.id !== req.id) {
       setApplyNote("다른 프롬프트 주입이 먼저 슬롯을 차지했습니다 — 잠시 뒤 다시 시도하세요.");
       return;
     }
-    applyReqRef.current = req;
+    applyReqIdRef.current = req.id;
     setApplyPending(true);
   };
 
-  // 적용 배달 감시 — 슬롯이 비면 성공(패널 닫기), 남의 요청으로 바뀌었으면 취소,
-  // 오래 그대로면 미배달로 보고 **정리 세션을 보존한 채** 사유를 알린다.
+  /**
+   * 적용 배달 감시 — **우리 요청 id의 결과만** 신뢰한다(감사 G1).
+   *
+   * 예전에는 "슬롯이 비면 성공"으로 추론했는데, 그 추론이 두 곳에서 틀렸다:
+   * `claude_write`는 이 창이 driver가 아니면 아무것도 쓰지 않고도 성공을 반환했고
+   * (이제 백엔드가 bool로 사실을 준다), 슬롯을 비운 주체가 우리 소비자였다는
+   * 보장도 없었다. 이제 소비 패널이 실제 쓰기 결과를 ack로 남기고 여기서 id로
+   * 짝짓는다 — ok면 정리 세션을 끝내고, 실패면 **세션을 보존한 채** 사유를 띄운다.
+   *
+   * 타임아웃은 "아무 소식 없음"에만 쓴다: 슬롯에 남은 우리 요청을 치워
+   * (소비 측이 쓰기 직전 id를 재확인하므로 그 순간부터 늦은 중복 주입이 불가능해진다)
+   * 다른 주입도 막지 않게 한다.
+   */
   useEffect(() => {
     if (!applyPending) return;
-    const mine = applyReqRef.current;
-    if (claudeInjectRequest === null) {
-      // ACK — 이제서야 정리 세션을 끝낸다(패널 제거 → claude_detach).
+    const myId = applyReqIdRef.current;
+    const outcome = resolveApplyAck(myId, claudeInjectAck);
+    if (outcome.kind !== "wait") {
       setApplyPending(false);
-      applyReqRef.current = null;
-      props.api.close();
-      return;
-    }
-    if (claudeInjectRequest !== mine) {
-      setApplyPending(false);
-      applyReqRef.current = null;
-      setApplyNote("다른 프롬프트 주입이 끼어들어 적용이 취소되었습니다 — 다시 시도하세요.");
+      applyReqIdRef.current = null;
+      useAppStore.getState().reportClaudeInjectAck(null); // 결과 확인 완료
+      if (outcome.kind === "delivered") {
+        props.api.close();
+        return;
+      }
+      setApplyNote(
+        `원래 세션에 전달하지 못했습니다: ${outcome.reason}\n다시 [적용]해 보세요. (정리 세션은 그대로 둡니다)`,
+      );
       return;
     }
     const t = setTimeout(() => {
       setApplyPending(false);
-      applyReqRef.current = null;
-      // 우리 요청이 아직 슬롯에 남아 있으면 치운다 — 남겨 두면 다른 주입까지 막는다.
-      if (useAppStore.getState().claudeInjectRequest === mine)
-        useAppStore.getState().requestClaudeInject(null);
+      applyReqIdRef.current = null;
+      // 우리 요청이 아직 슬롯에 남아 있으면 치운다 — 남겨 두면 다른 주입까지 막고,
+      // 치우는 순간 소비 측의 id 재확인이 늦은 중복 주입도 막는다.
+      const st = useAppStore.getState();
+      if (st.claudeInjectRequest?.id === myId) st.requestClaudeInject(null);
       setApplyNote(
-        "원래 세션에 전달하지 못했습니다 — 그 탭이 열려 있고 이 창이 입력 권한을 가진 상태인지 확인한 뒤 다시 [적용]하세요. (정리 세션은 그대로 둡니다)",
+        "원래 세션에 전달하지 못했습니다 — 그 탭이 열려 있고, 이 창이 입력 권한을 가졌으며, 그 세션이 권한 프롬프트에 걸려 있지 않은지 확인한 뒤 다시 [적용]하세요. (정리 세션은 그대로 둡니다)",
       );
     }, 10000);
     return () => clearTimeout(t);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [applyPending, claudeInjectRequest]);
+  }, [applyPending, claudeInjectAck]);
 
   /** [codex 검증]: 현재 최종본을 codex에 비판시켜 하단에 표시(적용과 무관). */
   const runCodexCheck = async () => {

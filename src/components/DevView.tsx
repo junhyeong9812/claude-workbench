@@ -89,7 +89,7 @@ export function DevView({ project }: { project: string }) {
       `방금 \`${active}\` 를 편집·저장했어. 그 파일을 읽고 검토해줘 — ` +
       `오타·빠진 import·들여쓰기/포맷·맥락 적합성 위주로. ` +
       `직접 수정하지 말고 무엇을 어떻게 고치면 되는지 지적·설명만 해줘.`;
-    useAppStore.getState().requestClaudeInject({ uuid, text: prompt });
+    useAppStore.getState().requestClaudeInject({ id: crypto.randomUUID(), uuid, text: prompt });
   };
 
   // Open the embedded dev session panel with the project's persisted uuid (so it
@@ -138,7 +138,11 @@ export function DevView({ project }: { project: string }) {
       if (action.kind === "none" || action.kind === "wait") return; // done / blocked — queue keeps the rest
       if (action.kind === "inject") {
         const uuid = useAppStore.getState().ensureDevUuid(project);
-        useAppStore.getState().requestClaudeInject({ uuid, text: action.prompt });
+        useAppStore.getState().requestClaudeInject({
+          id: crypto.randomUUID(),
+          uuid,
+          text: action.prompt,
+        });
       } else {
         seedDevSession(api!, action.prompt); // "seed": pane was emptied — re-open it seeded
       }

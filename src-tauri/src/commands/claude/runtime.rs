@@ -355,6 +355,15 @@ pub fn claude_open_or_attach(
 /// Driver-only input: write to the PTY only if `window` is the session's current
 /// driver (single-writer — a mirror's stray input is a silent no-op, review
 /// R7-1). Claude panels call this instead of `terminal_write`.
+///
+/// **Returns whether the bytes were actually written.** A mirror's write is
+/// ignored, and that used to be reported as plain `Ok(())` — indistinguishable
+/// from a real write. Keystrokes don't care, but the prompt-refine [적용] path
+/// ends a session on the strength of the acknowledgement, so it needs the truth:
+/// the frontend checks its own driver flag before calling, but that flag can be
+/// one handover behind, and "the caller believed it was the driver" is not
+/// evidence that anything landed (audit G1). Callers that don't care simply
+/// ignore the value.
 #[tauri::command]
 pub fn claude_write(
     window: Window,
@@ -362,15 +371,16 @@ pub fn claude_write(
     claude: State<'_, ClaudeState>,
     id: u64,
     data: Vec<u8>,
-) -> Result<(), AppError> {
+) -> Result<bool, AppError> {
     let is_driver = {
         let rt = claude.rt.lock().map_err(|_| AppError::new("Claude state unavailable"))?;
         rt.by_id.get(&id).map(|s| s.driver == window.label()).unwrap_or(false)
     };
     if is_driver {
-        mgr.write(id, &data).map_err(AppError::new)
+        mgr.write(id, &data).map_err(AppError::new)?;
+        Ok(true)
     } else {
-        Ok(()) // not the driver — ignore
+        Ok(false) // not the driver — ignored, and the caller is told so
     }
 }
 

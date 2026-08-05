@@ -297,7 +297,23 @@ interface AppState {
    * - `"submit"` (default, 기존 동작 그대로) — 텍스트 + LF.
    * - `"fill"` — bracketed paste로 **입력창에 채우기만**. CR을 절대 만들지 않는다
    *   (`promptRefine.bracketedPaste`). 정리 세션의 최종본이 이 길로만 간다. */
-  claudeInjectRequest: { uuid: string; text: string; mode?: "submit" | "fill" } | null;
+  claudeInjectRequest: {
+    /** 이 요청의 고유 id — 배달 결과를 짝지어 확인하는 유일한 키. */
+    id: string;
+    uuid: string;
+    text: string;
+    mode?: "submit" | "fill";
+  } | null;
+  /**
+   * 마지막 주입의 **배달 결과** — 요청 id로 짝짓는다.
+   *
+   * 슬롯이 비는 것을 성공 신호로 삼던 추론을 대체한다(감사 G1). 그 추론은 두 군데
+   * 서 틀렸다: `claude_write`는 이 창이 driver가 아니면 아무것도 쓰지 않고도
+   * 성공을 반환했고(백엔드가 이제 bool로 사실을 돌려준다), 슬롯을 비운 주체가
+   * 우리 요청의 소비자였다는 보장도 없었다. 소비 패널이 실제 쓰기 결과를 여기
+   * 기록하고, 요청을 낸 쪽은 **자기 id의 결과만** 신뢰한다.
+   */
+  claudeInjectAck: { id: string; ok: boolean; reason?: string } | null;
   /** Dev mode 확인/🧪: review (or generate a test for) the just-saved file. The
    * project's own DevView consumes it — injecting into its live dev Claude
    * session, or seeding a fresh one. No panel-positioning field: the dev session
@@ -476,7 +492,11 @@ interface AppState {
     req: { project: string; seed?: string; title?: string; referencePanelId?: string } | null,
   ) => void;
   /** Inject a prompt into a live Claude session (consumed by the matching panel). */
-  requestClaudeInject: (req: { uuid: string; text: string; mode?: "submit" | "fill" } | null) => void;
+  requestClaudeInject: (
+    req: { id: string; uuid: string; text: string; mode?: "submit" | "fill" } | null,
+  ) => void;
+  /** 배달 결과를 기록한다 (null = 요청자가 확인 후 비움). */
+  reportClaudeInjectAck: (ack: { id: string; ok: boolean; reason?: string } | null) => void;
   /** Enqueue a dev-mode review of a saved file (the project's DevView consumes by
    * id). Mints a stable id and appends to the FIFO queue. */
   requestDevReview: (req: { project: string; prompt: string }) => void;
@@ -621,6 +641,7 @@ export const useAppStore = create<AppState>((set, get) => ({
   diffRequest: null,
   claudeOpenRequest: null,
   claudeInjectRequest: null,
+  claudeInjectAck: null,
   devReviewQueue: [],
   runRequest: null,
   focusMainRequest: 0,
@@ -818,6 +839,7 @@ export const useAppStore = create<AppState>((set, get) => ({
   requestDiff: (spec) => set({ diffRequest: spec }),
   requestClaudeOpen: (req) => set({ claudeOpenRequest: req }),
   requestClaudeInject: (req) => set({ claudeInjectRequest: req }),
+  reportClaudeInjectAck: (ack) => set({ claudeInjectAck: ack }),
   requestDevReview: (req) =>
     set((s) => ({
       devReviewQueue: [...s.devReviewQueue, { id: crypto.randomUUID(), ...req }],
