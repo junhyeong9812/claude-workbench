@@ -1,8 +1,11 @@
 import { describe, expect, it, vi } from "vitest";
 import {
   DEFAULT_REFINE_MODEL,
+  PROMPT_FENCE,
   REFINE_KIND,
+  applyBlockReason,
   bracketedPaste,
+  extractLatestPromptBlock,
   extractPromptBlock,
   isRefineParams,
   openPromptRefine,
@@ -59,7 +62,7 @@ describe("openPromptRefine — 우측 배치 · 탭당 1개", () => {
     // 격리: cwd는 프로젝트가 아니라 스크래치 디렉토리여야 한다.
     expect((added[0].params as { project: string }).project).toContain("refine");
     // 시드는 기계 추출 규약(```prompt)을 반드시 포함한다.
-    expect((added[0].params as { seed: string }).seed).toContain("```prompt");
+    expect((added[0].params as { seed: string }).seed).toContain(`${PROMPT_FENCE}prompt`);
   });
 
   it("같은 탭에서 다시 열면 새로 만들지 않고 기존 패널을 포커스한다", () => {
@@ -101,79 +104,175 @@ describe("isRefineParams", () => {
   });
 });
 
-describe("extractPromptBlock — 마지막 ```prompt 블록", () => {
-  it("블록이 하나면 그 본문(펜스 제외)", () => {
-    const text = "정리했어.\n\n```prompt\n로그인 버그를 고쳐라.\n재현: 1) …\n```\n\n어때?";
-    expect(extractPromptBlock(text)).toBe("로그인 버그를 고쳐라.\n재현: 1) …");
+describe("extractPromptBlock — 마지막으로 닫힌 prompt 블록", () => {
+  it("실계약: 4중 fence 안의 3중 코드블록이 최종본을 자르지 않는다", () => {
+    const text = [
+      "정리했어.",
+      "",
+      "````prompt",
+      "아래 코드를 고쳐라:",
+      "```ts",
+      "const x = 1;",
+      "```",
+      "완료 기준: 테스트 green.",
+      "````",
+      "",
+      "어때?",
+    ].join("\n");
+    expect(extractPromptBlock(text)).toBe(
+      "아래 코드를 고쳐라:\n```ts\nconst x = 1;\n```\n완료 기준: 테스트 green.",
+    );
+  });
+
+  it("시드가 요구한 형식(PROMPT_FENCE)으로 쓴 최종본을 읽는다", () => {
+    const text = `${PROMPT_FENCE}prompt\n본문\n${PROMPT_FENCE}`;
+    expect(extractPromptBlock(text)).toBe("본문");
+  });
+
+  it("3중 fence도 읽는다(모델이 규약을 덜 지켰을 때의 하위호환)", () => {
+    expect(extractPromptBlock("```prompt\n로그인 버그를 고쳐라.\n재현: 1) …\n```")).toBe(
+      "로그인 버그를 고쳐라.\n재현: 1) …",
+    );
   });
 
   it("여러 개면 **마지막** 것을 고른다 (수정 라운드마다 새 블록이 붙으므로)", () => {
     const text = [
       "1차:",
-      "```prompt",
+      "````prompt",
       "첫 번째",
-      "```",
+      "````",
       "2차로 다듬었다:",
-      "```prompt",
+      "````prompt",
       "두 번째",
-      "```",
+      "````",
     ].join("\n");
     expect(extractPromptBlock(text)).toBe("두 번째");
   });
 
   it("prompt가 아닌 펜스는 무시한다", () => {
-    const text = "```ts\nconst x = 1;\n```\n```\nplain\n```";
-    expect(extractPromptBlock(text)).toBeNull();
+    expect(extractPromptBlock("```ts\nconst x = 1;\n```\n```\nplain\n```")).toBeNull();
   });
 
-  it("긴 펜스로 감싼 예시 안의 ```prompt 는 열림으로 오인하지 않는다", () => {
+  it("더 긴 펜스로 감싼 예시 안의 prompt 블록은 열림으로 오인하지 않는다", () => {
     const text = [
-      "````markdown",
-      "```prompt",
+      "`````markdown",
+      "````prompt",
       "예시일 뿐 최종본이 아님",
-      "```",
       "````",
+      "`````",
       "",
       "진짜 최종본:",
-      "```prompt",
+      "````prompt",
       "진짜",
-      "```",
+      "````",
     ].join("\n");
     expect(extractPromptBlock(text)).toBe("진짜");
   });
 
   it("바깥이 긴 펜스 하나뿐이면(안쪽만 prompt) 아무것도 추출하지 않는다", () => {
-    const text = ["````markdown", "```prompt", "예시", "```", "````"].join("\n");
+    const text = ["`````markdown", "````prompt", "예시", "````", "`````"].join("\n");
     expect(extractPromptBlock(text)).toBeNull();
   });
 
-  it("본문 안의 코드 펜스는 더 긴 prompt 펜스로 감싸면 그대로 살아난다", () => {
-    const text = ["````prompt", "다음 코드를 고쳐라:", "```ts", "const x = 1;", "```", "````"].join(
+  it("**닫히지 않은 블록은 최종본이 아니다** (스트리밍 중 반쪽 적용 차단)", () => {
+    expect(extractPromptBlock("````prompt\n쓰는 중인 프롬프트")).toBeNull();
+    // 앞의 닫힌 블록이 있으면 그쪽이 남는다 — 미완 블록이 그것을 덮지 않는다.
+    const text = ["````prompt", "완성본", "````", "다시 쓰는 중:", "````prompt", "반쪽"].join(
       "\n",
     );
-    expect(extractPromptBlock(text)).toBe("다음 코드를 고쳐라:\n```ts\nconst x = 1;\n```");
+    expect(extractPromptBlock(text)).toBe("완성본");
   });
 
   it("블록 없음 · 빈 블록 · 빈 입력은 null (적용 버튼이 비활성으로 남는 신호)", () => {
     expect(extractPromptBlock("설명만 있고 블록이 없다")).toBeNull();
-    expect(extractPromptBlock("```prompt\n\n```")).toBeNull();
-    expect(extractPromptBlock("```prompt\n   \n```")).toBeNull();
+    expect(extractPromptBlock("````prompt\n\n````")).toBeNull();
+    expect(extractPromptBlock("````prompt\n   \n````")).toBeNull();
     expect(extractPromptBlock("")).toBeNull();
     expect(extractPromptBlock(null)).toBeNull();
     expect(extractPromptBlock(undefined)).toBeNull();
   });
 
-  it("아직 닫히지 않은 마지막 블록(스트리밍 중)도 보이는 만큼 준다", () => {
-    expect(extractPromptBlock("```prompt\n쓰는 중인 프롬프트")).toBe("쓰는 중인 프롬프트");
-  });
-
   it("들여쓴 펜스(목록 안)도 인식하고 본문 들여쓰기는 보존한다", () => {
-    const text = "  ```prompt\n  들여쓴 본문\n    더 들여씀\n  ```";
-    expect(extractPromptBlock(text)).toBe("  들여쓴 본문\n    더 들여씀");
+    expect(extractPromptBlock("  ````prompt\n  들여쓴 본문\n    더 들여씀\n  ````")).toBe(
+      "  들여쓴 본문\n    더 들여씀",
+    );
   });
 
   it("info string에 꼬리말이 붙어도 prompt로 본다", () => {
-    expect(extractPromptBlock("```prompt (최종)\n본문\n```")).toBe("본문");
+    expect(extractPromptBlock("````prompt (최종)\n본문\n````")).toBe("본문");
+  });
+
+  it("info string에 백틱이 섞인 줄은 펜스가 아니다", () => {
+    expect(extractPromptBlock("```prompt `x`\n본문\n```")).toBeNull();
+  });
+
+  it("병리적 입력에서도 즉시 끝난다(정규식 백트래킹 완화)", () => {
+    const pathological = "`".repeat(3) + "a".repeat(20000) + " ";
+    const t0 = Date.now();
+    expect(extractPromptBlock(pathological)).toBeNull();
+    expect(Date.now() - t0).toBeLessThan(500);
+  });
+});
+
+describe("extractLatestPromptBlock — 턴 역방향 탐색", () => {
+  it("최종본 뒤에 확인 턴이 더 붙어도 직전 최종본을 찾는다", () => {
+    const answers = new Map<number, string>([
+      [1, "질문부터 할게요."],
+      [2, "````prompt\n최종본 A\n````"],
+      [3, "이대로 적용하시겠어요?"],
+    ]);
+    expect(extractLatestPromptBlock(answers)).toBe("최종본 A");
+  });
+
+  it("여러 턴에 블록이 있으면 가장 큰 턴 번호 쪽", () => {
+    const answers: [number, string][] = [
+      [2, "````prompt\n구버전\n````"],
+      [5, "````prompt\n신버전\n````"],
+      [3, "````prompt\n중간\n````"],
+    ];
+    expect(extractLatestPromptBlock(answers)).toBe("신버전");
+  });
+
+  it("어디에도 닫힌 블록이 없으면 null", () => {
+    expect(extractLatestPromptBlock(new Map([[1, "설명뿐"]]))).toBeNull();
+    expect(extractLatestPromptBlock(new Map())).toBeNull();
+  });
+});
+
+describe("applyBlockReason — [적용] 게이트", () => {
+  const ok = {
+    block: "본문",
+    targetUuid: "u-main",
+    targetBlocked: false,
+    slotBusy: false,
+    pending: false,
+  };
+
+  it("모든 조건이 맞으면 막지 않는다", () => {
+    expect(applyBlockReason(ok)).toBeNull();
+  });
+
+  it("대상 세션이 blocked면 거부한다 (페이스트가 키 입력으로 소비되는 경로 차단)", () => {
+    const reason = applyBlockReason({ ...ok, targetBlocked: true });
+    expect(reason).toContain("입력을 기다리는 상태");
+    expect(reason).toContain("키 입력");
+  });
+
+  it("최종본 없음 · 대상 없음 · 슬롯 점유 · 이미 대기 중을 각각 구분해 안내한다", () => {
+    expect(applyBlockReason({ ...ok, block: null })).toContain("최종본이 없습니다");
+    expect(applyBlockReason({ ...ok, targetUuid: null })).toContain("찾을 수 없습니다");
+    expect(applyBlockReason({ ...ok, slotBusy: true })).toContain("아직 처리되지 않았습니다");
+    expect(applyBlockReason({ ...ok, pending: true })).toContain("기다리는 중");
+  });
+
+  it("우선순위: 대기 중 > 최종본 없음 > 대상 없음 > blocked > 슬롯 점유", () => {
+    expect(applyBlockReason({ ...ok, pending: true, block: null })).toContain("기다리는 중");
+    expect(applyBlockReason({ ...ok, block: null, targetBlocked: true })).toContain(
+      "최종본이 없습니다",
+    );
+    expect(applyBlockReason({ ...ok, targetBlocked: true, slotBusy: true })).toContain(
+      "입력을 기다리는 상태",
+    );
   });
 });
 
@@ -205,8 +304,9 @@ describe("bracketedPaste — 제출 금지 불변식", () => {
 });
 
 describe("refineSeedPrompt — 기계 추출 규약", () => {
-  it("추출기가 읽는 펜스 이름을 시드가 명시한다", () => {
-    expect(refineSeedPrompt()).toContain("```prompt");
+  it("추출기가 읽는 펜스(4중)를 시드가 그대로 명시한다 — 계약이 한 상수로 묶인다", () => {
+    expect(refineSeedPrompt()).toContain(`${PROMPT_FENCE}prompt`);
+    expect(PROMPT_FENCE).toBe("````");
   });
 
   it("한 줄이다 — 실측상 여러 줄 버퍼는 CR로 제출되지 않으므로 시드는 접혀 있어야 한다", () => {
