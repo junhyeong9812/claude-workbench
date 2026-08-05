@@ -22,18 +22,33 @@
 //! ## The signals, in order
 //!
 //! 1. **fd holder** — some process has the transcript open. Definite.
-//! 2. **uuid in argv** — some process's command line contains this exact session
-//!    uuid (`claude --resume <uuid>` / `--session-id <uuid>`, including through
-//!    wrappers like `script -c`). Definite.
-//! 3. **an un-pinned `claude` in the same cwd** — a `claude` process running in
-//!    the session's own directory whose argv names *no* session uuid (a plain
-//!    `claude`, or one that picked a session from the TUI). It could be this
-//!    session and we cannot tell → `Unknown`. If its argv *does* name some uuid,
-//!    it is pinned to a different session and is no threat.
+//! 2. **the session is pinned on a command line** — some process was launched
+//!    with `--resume <uuid>` / `--session-id <uuid>` naming *this* session.
+//!    Definite. See [`ProcInfo::session_ids`] for what counts as "named".
+//! 3. **an un-pinned `claude` that could be here** — a `claude` process whose
+//!    command line names no session at all (a plain `claude`, or one that picked
+//!    a session from the TUI) and whose cwd is this session's directory, or whose
+//!    cwd we could not read. It could be this session and we cannot tell →
+//!    `Unknown`. A `claude` pinned to a *different* session is no threat.
 //!
 //! Signal 3 is why the cwd matters: resuming a transcript only works from the
 //! directory it was created in, so the only processes that can collide with an
-//! adopt are the ones running there.
+//! adopt are the ones running there. A `claude` whose cwd is unreadable is
+//! therefore treated as if it *might* be there — an unreadable `/proc` entry
+//! must never resolve to "safe" (review #3).
+//!
+//! ## Known limits
+//!
+//! - **PID namespaces.** `scan.ok` only reports that *our* `/proc` was walked. A
+//!   `claude` inside a container or another PID namespace is invisible to it, and
+//!   its absence looks identical to "nothing is running". The fd scan has the
+//!   same blind spot. Sessions of a containerised CLI are out of scope for the
+//!   app (it spawns and lists host transcripts), but the guarantee here is "no
+//!   host process holds this", not "no process anywhere".
+//! - **Other users' processes.** `/proc/<pid>/cmdline` is world-readable but
+//!   `cwd` is not, so another user's `claude` is identified yet un-located, and
+//!   by the rule above blocks every row. That is the intended direction of
+//!   error, not an oversight.
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -74,10 +89,61 @@ impl ProcInfo {
             .unwrap_or(false)
     }
 
-    /// Does the command line name a specific session (any uuid-shaped token)?
-    /// Such a process is pinned to that session and can't be on another one.
+    /// The session ids this command line **pins itself to**.
+    ///
+    /// Only a uuid in `--resume` / `--session-id` flag position counts. An
+    /// earlier version accepted any uuid-shaped token anywhere in the argv,
+    /// which inverted the verdict for the most ordinary command there is:
+    /// `claude -p "... 88b05349-… ..."` — a prompt that merely quotes a session
+    /// id — looked "pinned to another session", so signal 3 skipped it and a
+    /// genuinely live session was reported adoptable (review #2). A uuid that
+    /// isn't in flag position tells us nothing, so such a process stays
+    /// un-pinned and converges on signal 3's `Unknown` instead.
+    ///
+    /// Tokens are split on whitespace first, so a wrapper that passes the whole
+    /// command as one argument — `script -c "claude --resume <uuid>"` — is read
+    /// the same as the flat form. (The mirror image, a *prompt* that literally
+    /// contains `--resume <uuid>`, is then read as a pin; that is contrived, and
+    /// it errs toward reporting that session Live.)
+    pub fn session_ids(&self) -> Vec<&str> {
+        const FLAGS: [&str; 2] = ["--resume", "--session-id"];
+        let mut out = Vec::new();
+        let mut want_value = false;
+        for word in self.argv.iter().flat_map(|a| a.split_whitespace()) {
+            if want_value {
+                want_value = false;
+                if is_uuid_shaped(word) {
+                    out.push(word);
+                    continue;
+                }
+                // Not a uuid — fall through; this word may itself be a flag.
+            }
+            if FLAGS.contains(&word) {
+                want_value = true;
+            } else if let Some(v) =
+                FLAGS.iter().find_map(|f| word.strip_prefix(f).and_then(|r| r.strip_prefix('=')))
+            {
+                if is_uuid_shaped(v) {
+                    out.push(v);
+                }
+            }
+        }
+        out
+    }
+
+    /// Whether this command line pins itself to *some* session — such a process
+    /// cannot also be on a different one.
     pub fn names_a_session(&self) -> bool {
-        self.argv.iter().any(|a| is_uuid_shaped(a))
+        !self.session_ids().is_empty()
+    }
+
+    /// Could this process be running the session in `cwd`? True when it is a
+    /// `claude` that names no session and either sits in that directory or is
+    /// somewhere we could not read (fail-closed — review #3).
+    fn may_be_in(&self, cwd: &Path) -> bool {
+        self.is_claude()
+            && !self.names_a_session()
+            && self.cwd.as_deref().map(|c| c == cwd).unwrap_or(true)
     }
 }
 
@@ -194,13 +260,10 @@ impl LiveProbe {
         if !self.scan.ok {
             return Liveness::Unknown; // we never saw the process table
         }
-        if self.scan.procs.iter().any(|p| p.argv.iter().any(|a| a == uuid)) {
+        if self.scan.procs.iter().any(|p| p.session_ids().contains(&uuid)) {
             return Liveness::Live; // signal 2
         }
-        let ambiguous = self.scan.procs.iter().any(|p| {
-            p.is_claude() && !p.names_a_session() && p.cwd.as_deref() == Some(cwd)
-        });
-        if ambiguous {
+        if self.scan.procs.iter().any(|p| p.may_be_in(cwd)) {
             return Liveness::Unknown; // signal 3
         }
         Liveness::Free
@@ -243,16 +306,55 @@ mod tests {
     }
 
     #[test]
-    fn the_uuid_on_any_command_line_is_live() {
-        // Directly…
-        let p = probe(vec![proc(9, Some("/home/jun/p"), &["claude", "--resume", U])], &[]);
+    fn a_session_named_in_flag_position_is_live() {
+        for argv in [
+            ["claude", "--resume", U].as_slice(),
+            ["claude", "--session-id", U].as_slice(),
+            ["claude", "--resume=88b05349-b927-42aa-ad5c-57155ed29ec5"].as_slice(),
+        ] {
+            let p = probe(vec![proc(9, Some("/home/jun/p"), argv)], &[]);
+            assert_eq!(
+                p.classify(U, Path::new(J), Path::new("/home/jun/p")),
+                Liveness::Live,
+                "{argv:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_wrapper_passing_the_command_as_one_token_is_read_the_same() {
+        // `script -c "claude --resume <uuid>"` — the whole command is a single
+        // argv entry. Splitting on whitespace makes the flat and wrapped forms
+        // identical (the module doc claimed this before the code did).
+        let wrapped = format!("claude --resume {U}");
+        let p = probe(vec![proc(9, Some("/elsewhere"), &["script", "-c", &wrapped])], &[]);
         assert_eq!(p.classify(U, Path::new(J), Path::new("/home/jun/p")), Liveness::Live);
-        // …and through a wrapper whose argv[0] isn't claude, from another cwd.
-        let p = probe(
-            vec![proc(9, Some("/elsewhere"), &["script", "-c", "claude --resume", U])],
-            &[],
-        );
-        assert_eq!(p.classify(U, Path::new(J), Path::new("/home/jun/p")), Liveness::Live);
+        assert_eq!(proc(9, None, &["script", "-c", &wrapped]).session_ids(), vec![U]);
+    }
+
+    #[test]
+    fn a_uuid_quoted_in_a_prompt_is_not_a_pin() {
+        // Regression (review #2): `claude -p "... <uuid> ..."` used to read as
+        // "pinned to another session", which skipped signal 3 and reported a
+        // genuinely live session adoptable. It names no session, so the verdict
+        // must fall through to Unknown.
+        let prompt = format!("이 세션 {OTHER} 좀 봐줘");
+        let p = probe(vec![proc(9, Some("/home/jun/p"), &["claude", "-p", &prompt])], &[]);
+        assert_eq!(p.classify(U, Path::new(J), Path::new("/home/jun/p")), Liveness::Unknown);
+        assert!(!proc(9, None, &["claude", "-p", &prompt]).names_a_session());
+
+        // Same for a bare uuid argument that isn't a session flag's value.
+        let p = probe(vec![proc(9, Some("/home/jun/p"), &["claude", "-p", OTHER])], &[]);
+        assert_eq!(p.classify(U, Path::new(J), Path::new("/home/jun/p")), Liveness::Unknown);
+    }
+
+    #[test]
+    fn a_dangling_session_flag_pins_nothing() {
+        let p = proc(9, None, &["claude", "--resume"]);
+        assert!(p.session_ids().is_empty());
+        // A non-uuid value doesn't pin, and the following word is still parsed.
+        let p = proc(9, None, &["claude", "--resume", "latest", "--session-id", U]);
+        assert_eq!(p.session_ids(), vec![U]);
     }
 
     #[test]
@@ -271,6 +373,21 @@ mod tests {
     fn a_claude_pinned_to_another_session_does_not_block() {
         // It names a uuid, so it cannot also be on ours — no blanket block.
         let p = probe(vec![proc(9, Some("/home/jun/p"), &["claude", "--resume", OTHER])], &[]);
+        assert_eq!(p.classify(U, Path::new(J), Path::new("/home/jun/p")), Liveness::Free);
+    }
+
+    #[test]
+    fn a_claude_whose_cwd_is_unreadable_blocks_every_row() {
+        // Fail-closed (review #3): identified as claude, un-pinned, but we can't
+        // say where it is — so it might be here, and here is every project.
+        let p = probe(vec![proc(9, None, &["claude"])], &[]);
+        assert_eq!(p.classify(U, Path::new(J), Path::new("/home/jun/p")), Liveness::Unknown);
+        assert_eq!(p.classify(U, Path::new(J), Path::new("/somewhere/else")), Liveness::Unknown);
+        // A *pinned* claude with an unreadable cwd is still no threat to others.
+        let p = probe(vec![proc(9, None, &["claude", "--resume", OTHER])], &[]);
+        assert_eq!(p.classify(U, Path::new(J), Path::new("/home/jun/p")), Liveness::Free);
+        // …and a non-claude process with an unreadable cwd is irrelevant.
+        let p = probe(vec![proc(9, None, &["vim", "notes.md"])], &[]);
         assert_eq!(p.classify(U, Path::new(J), Path::new("/home/jun/p")), Liveness::Free);
     }
 
@@ -333,6 +450,44 @@ mod tests {
         let after = scan_path_holders(Path::new("/proc"), &targets, 0);
         assert!(!after.contains(&path));
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// Signal 2 end-to-end against a **real** process rather than a hand-built
+    /// `ProcInfo` — the rest of the suite mocks the process table, so nothing
+    /// else checks that `/proc/<pid>/cmdline` actually parses into the argv the
+    /// classifier expects (review #8).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn signal_two_catches_a_real_process_holding_the_uuid() {
+        // `sh -c 'sleep 20' claude --resume <uuid>` — the words after the script
+        // become $0.. and land in argv verbatim, so this stands in for a CLI
+        // launched with the session pinned, without needing the CLI.
+        let mut child = std::process::Command::new("sh")
+            .args(["-c", "sleep 20", "claude", "--resume", U])
+            .spawn()
+            .expect("spawn stand-in process");
+        // Wait for the kernel to publish its cmdline.
+        let mut probe = None;
+        for _ in 0..100 {
+            let p = LiveProbe {
+                scan: scan_processes(Path::new("/proc"), std::process::id()),
+                holders: HashSet::new(),
+            };
+            if p.scan.procs.iter().any(|x| x.pid == child.id()) {
+                probe = Some(p);
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let probe = probe.expect("stand-in process never appeared in /proc");
+        let verdict = probe.classify(U, Path::new(J), Path::new("/home/jun/p"));
+        let other = probe.classify(OTHER, Path::new("/nope.jsonl"), Path::new("/home/jun/p"));
+        let _ = child.kill();
+        let _ = child.wait();
+
+        assert_eq!(verdict, Liveness::Live, "a real pinned process must read as Live");
+        // It pins one session, so it must not blanket-block a different one.
+        assert_eq!(other, Liveness::Free);
     }
 
     #[cfg(target_os = "linux")]
