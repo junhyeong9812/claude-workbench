@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import {
   PEEK_KIND,
+  closeIfEphemeralPanel,
   closePeekPanels,
   isPeekParams,
   openTimelinePeek,
@@ -98,6 +99,27 @@ describe("closePeekPanels — 복원 시 비부활", () => {
   it("peek가 없으면 아무것도 닫지 않는다", () => {
     const { dock, close } = fakeDock([{ id: "editor-m-1-2", params: { kind: "editor" } }]);
     expect(closePeekPanels(dock)).toBe(0);
+    expect(close).not.toHaveBeenCalled();
+  });
+});
+
+describe("closeIfEphemeralPanel — 창 간 전송 차단", () => {
+  it("peek는 옮기지 않고 그 자리에서 닫는다(전송 중단 신호 true)", () => {
+    const close = vi.fn();
+    const panel = { params: { kind: PEEK_KIND, uuid: "u-1" }, api: { close } };
+    expect(closeIfEphemeralPanel(panel)).toBe(true);
+    expect(close).toHaveBeenCalledTimes(1);
+  });
+
+  it("일반 패널은 건드리지 않는다(전송 계속)", () => {
+    const close = vi.fn();
+    for (const params of [
+      { kind: "claudeterm", sessionId: 7 },
+      { kind: "editor" },
+      undefined,
+    ]) {
+      expect(closeIfEphemeralPanel({ params, api: { close } })).toBe(false);
+    }
     expect(close).not.toHaveBeenCalled();
   });
 });

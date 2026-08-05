@@ -85,6 +85,23 @@ export function openTimelinePeek(dock: PeekDock, args: PeekOpenArgs): "focused" 
   return "opened";
 }
 
+/**
+ * peek는 **창 간 이동 대상이 아니다** — 옮기려 하면 그 자리에서 닫는다(반환 true =
+ * 전송 중단). 절제가 아니라 정확성 요건이다: 타임라인 구독이 쓰는 숫자 id↔uuid
+ * 매핑(claudeStatus)은 **웹뷰 로컬**이라 다른 창으로 옮긴 peek는 라이브·종료
+ * 이벤트를 전부 놓치고(죽은 화면), 중복 판정(dock 조회 + surfaceRegistry)도 창을
+ * 넘지 못해 "세션당 1개"가 깨진다. 여기서 이동을 막으면 두 결함이 원천 소멸하고,
+ * 복원 경로의 {@link closePeekPanels}는 방어선으로 남는다.
+ */
+export function closeIfEphemeralPanel(panel: {
+  params?: unknown;
+  api: { close(): void };
+}): boolean {
+  if (!isPeekParams(panel.params)) return false;
+  panel.api.close();
+  return true;
+}
+
 /** 복원된 레이아웃에서 단발성 peek 패널을 전부 닫는다 (닫은 개수 반환). */
 export function closePeekPanels(dock: Pick<PeekDock, "panels">): number {
   let n = 0;
