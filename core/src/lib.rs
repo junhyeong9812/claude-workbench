@@ -11,6 +11,7 @@
 pub mod archive;
 pub mod claude_cli;
 pub mod embed;
+pub mod external;
 pub mod fs;
 pub mod git;
 pub mod graph;
@@ -18,6 +19,7 @@ pub mod history;
 pub mod jsonl;
 pub mod knowledge;
 pub mod label;
+pub mod live;
 pub mod mcp;
 pub mod pathguard;
 pub mod persist;

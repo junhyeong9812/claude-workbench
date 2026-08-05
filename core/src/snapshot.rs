@@ -396,6 +396,32 @@ pub fn list(base: &Path, project: &str) -> Vec<SnapshotSummary> {
     out
 }
 
+/// The uuids of every session this app knows about in `project` — i.e. every
+/// snapshot **body** on disk.
+///
+/// This is the authoritative "we own this session" set, and the subtrahend of
+/// the external-session difference (`crate::external`): a transcript with no
+/// body here was opened outside the app. Deliberately cheaper and stricter than
+/// [`list`] — it never parses a body, and it takes the file *name* as the uuid
+/// (same rule `load` keys on), so a corrupt or unreadable snapshot still counts
+/// as known and can't reappear as "external".
+pub fn known_uuids(base: &Path, project: &str) -> std::collections::HashSet<String> {
+    let mut out = std::collections::HashSet::new();
+    let Ok(entries) = fs::read_dir(dir(base, project)) else { return out };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("json") {
+            continue; // *.json.tmp, .name, .title, …
+        }
+        let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else { continue };
+        if stem.ends_with(".meta") {
+            continue; // the derived sidecar, not a session
+        }
+        out.insert(stem.to_string());
+    }
+    out
+}
+
 /// Load one session's full snapshot (for reopen), applying the name override.
 /// `None` if absent/corrupt/unsafe id.
 pub fn load(base: &Path, project: &str, uuid: &str) -> Option<SessionSnapshot> {

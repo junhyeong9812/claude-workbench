@@ -124,6 +124,7 @@ pub fn run() {
             commands::claude::runtime::claude_session_cwds,
             commands::claude::runtime::claude_close,
             commands::claude::store::claude_sessions,
+            commands::claude::store::claude_external_sessions,
             commands::claude::store::claude_item_detail,
             commands::claude::store::claude_session_snapshot,
             commands::archive::archive_session,
