@@ -2426,6 +2426,31 @@ body {
   opacity: 0.4;
   cursor: default;
 }
+/* [적용] 거부·미배달 사유 — 정리 세션은 그대로 두고 이 줄만 알린다.
+   alert()가 아닌 이유: 사유가 상태(대상 세션이 blocked 등)라 해소되면 버튼이
+   스스로 살아나는데, 모달은 그 흐름을 끊는다. */
+.claudeterm-refine-note {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 4px 8px;
+  font-size: 0.8em;
+  line-height: 1.4;
+  white-space: pre-line;
+  color: var(--fg, #cdd6f4);
+  background: color-mix(in srgb, var(--st-warn, #e5c07b) 18%, transparent);
+  border-bottom: 1px solid var(--border, #333);
+}
+.claudeterm-refine-note-x {
+  margin-left: auto;
+  padding: 0 2px;
+  cursor: pointer;
+  opacity: 0.7;
+}
+.claudeterm-refine-note-x:hover {
+  opacity: 1;
+}
 /* 프롬프트 정리 세션 하단의 codex 2차 의견 — 접이식. 터미널이 남는 공간을
    가지므로(claudeterm-term은 flex:1) 여기는 고정 높이 상한만 두고 스스로
    스크롤한다: 긴 리뷰가 터미널을 밀어내면 정작 정리 대화가 안 보인다. */
