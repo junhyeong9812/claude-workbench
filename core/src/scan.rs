@@ -11,7 +11,7 @@
 //! listing and the backfill CLI cannot drift apart.
 
 use std::fs::File;
-use std::io::{self, BufRead, BufReader};
+use std::io::{self, BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
@@ -202,6 +202,12 @@ pub fn probe_cwd(path: &Path) -> io::Result<Option<String>> {
 struct HeadScan {
     probe: Probe,
     exhausted: bool,
+    /// Bytes actually pulled off the disk, including those drained and thrown
+    /// away. Exposed so the budget can be asserted rather than assumed.
+    bytes_read: u64,
+    /// Largest single record held in memory at once — the memory bound this
+    /// function promises, made observable for the same reason.
+    peak_buffer: u64,
 }
 
 /// Fold the head of `path` into a [`Probe`], stopping at the record budget, the
@@ -215,6 +221,14 @@ struct HeadScan {
 /// no trace (review #5). Now an oversized record is *skipped* — it is far too big
 /// to be the small `cwd`-carrying record, and parsing it is pure waste — and the
 /// scan continues until the total budget is actually spent.
+///
+/// The budget is enforced **on the read**, not after it. A plain `read_until`
+/// grows its buffer until it meets a newline, so one pathological record would
+/// be pulled into memory whole and only then measured against the limit — the
+/// cap would be a report, not a constraint (audit B4). Each record is therefore
+/// read through a `take(MAX_RECORD_BYTES)`, and a line that outgrows that is
+/// drained to the newline without ever being stored, with the drained bytes
+/// counted so the total budget still ends the scan.
 fn fold_head(
     path: &Path,
     max_records: usize,
@@ -224,25 +238,88 @@ fn fold_head(
     let mut probe = Probe::default();
     let mut reader = BufReader::new(File::open(path)?);
     let mut consumed: u64 = 0;
+    let mut peak_buffer: u64 = 0;
     let mut buf = Vec::new();
     let mut records = 0usize;
+    macro_rules! done {
+        ($exhausted:expr) => {
+            return Ok(HeadScan {
+                probe,
+                exhausted: $exhausted,
+                bytes_read: consumed,
+                peak_buffer,
+            })
+        };
+    }
     loop {
         if records >= max_records || consumed >= max_bytes {
-            return Ok(HeadScan { probe, exhausted: true });
+            done!(true);
         }
         buf.clear();
-        // Read by byte so an arbitrarily long record (hook attachments run to
-        // hundreds of KB) can't be split mid-line into invalid JSON.
-        let n = reader.read_until(b'\n', &mut buf)?;
+        // Bounded read: at most one record's cap lands in `buf`, and a record is
+        // never split mid-line into invalid JSON (hook attachments run to
+        // hundreds of KB, so a split would be silent corruption, not an error).
+        let n = (&mut reader).take(MAX_RECORD_BYTES).read_until(b'\n', &mut buf)? as u64;
         if n == 0 {
-            return Ok(HeadScan { probe, exhausted: false }); // EOF
+            done!(false); // EOF
         }
         records += 1;
-        consumed += n as u64;
-        if n as u64 <= MAX_RECORD_BYTES {
-            probe.feed_line(&String::from_utf8_lossy(&buf));
-            if stop(&probe) {
-                return Ok(HeadScan { probe, exhausted: false });
+        consumed += n;
+        peak_buffer = peak_buffer.max(n);
+        if buf.last() != Some(&b'\n') && n == MAX_RECORD_BYTES {
+            // The record outgrew the buffer cap: throw the rest away unread
+            // rather than growing to hold it.
+            let (skipped, end) =
+                discard_to_newline(&mut reader, max_bytes.saturating_sub(consumed))?;
+            consumed += skipped;
+            match end {
+                DrainEnd::Newline => continue, // truncated → nothing worth parsing
+                DrainEnd::Eof => done!(false), // file ended inside it — not a budget problem
+                DrainEnd::Budget => done!(true),
+            }
+        }
+        // A complete record, or the file's last line with no trailing newline.
+        probe.feed_line(&String::from_utf8_lossy(&buf));
+        if stop(&probe) {
+            done!(false);
+        }
+    }
+}
+
+/// Why [`discard_to_newline`] stopped. The caller reacts differently to each:
+/// only `Budget` means the scan was cut short.
+enum DrainEnd {
+    /// Reached the end of the record — carry on with the next one.
+    Newline,
+    /// The file ended inside the record; the scan is complete, not truncated.
+    Eof,
+    /// The byte budget ran out mid-record.
+    Budget,
+}
+
+/// Skip past the next newline **without storing anything**, reading at most
+/// `budget` bytes. The skipped count is returned in every case — the caller must
+/// charge those bytes to the budget even when giving up, or `bytes_read` would
+/// under-report the IO actually performed.
+fn discard_to_newline(reader: &mut impl BufRead, budget: u64) -> io::Result<(u64, DrainEnd)> {
+    let mut skipped: u64 = 0;
+    loop {
+        let chunk = reader.fill_buf()?;
+        if chunk.is_empty() {
+            return Ok((skipped, DrainEnd::Eof));
+        }
+        match chunk.iter().position(|b| *b == b'\n') {
+            Some(i) => {
+                reader.consume(i + 1);
+                return Ok((skipped + i as u64 + 1, DrainEnd::Newline));
+            }
+            None => {
+                let len = chunk.len();
+                reader.consume(len);
+                skipped += len as u64;
+                if skipped >= budget {
+                    return Ok((skipped, DrainEnd::Budget));
+                }
             }
         }
     }
@@ -451,6 +528,77 @@ mod tests {
         );
         let path = write(&root, "-p", "u", &body);
         assert_eq!(probe_cwd(&path).unwrap().as_deref(), Some("/home/jun/proj"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Audit B4: the byte budget has to constrain the read, not merely describe
+    /// it afterwards. One gigantic record must neither be pulled into memory in
+    /// full nor be drained all the way through.
+    #[test]
+    fn one_gigantic_record_neither_buffers_nor_reads_past_the_budget() {
+        let root = temp_root("giant");
+        // 8 MiB on a single line — 8× the total budget, 32× the per-record cap.
+        let giant = "x".repeat(8 * 1024 * 1024);
+        let body = format!(
+            "{}\n{}\n",
+            format_args!(r#"{{"type":"attachment","content":"{giant}"}}"#),
+            r#"{"type":"user","cwd":"/home/jun/proj","message":{"role":"user","content":"안녕"}}"#
+        );
+        let path = write(&root, "-p", "u", &body);
+        assert!(body.len() as u64 > 8 * CWD_BYTES, "fixture must dwarf the budget");
+
+        let scan = fold_head(&path, CWD_RECORDS, CWD_BYTES, |p| p.cwd.is_some()).unwrap();
+        // Memory: never held more than one record's cap at a time.
+        assert!(
+            scan.peak_buffer <= MAX_RECORD_BYTES,
+            "buffered {} bytes against a {MAX_RECORD_BYTES} cap",
+            scan.peak_buffer
+        );
+        // IO: stopped inside the record instead of reading all 8 MiB to find its
+        // newline. The bound is the budget plus the one buffer already in hand.
+        assert!(
+            scan.bytes_read <= CWD_BYTES + MAX_RECORD_BYTES,
+            "read {} bytes for a {CWD_BYTES}-byte budget",
+            scan.bytes_read
+        );
+        // The budget really was spent, so the record after it is out of reach —
+        // and probe_cwd says so on stderr instead of dropping it in silence.
+        assert!(scan.exhausted);
+        assert_eq!(scan.probe.cwd, None);
+        assert_eq!(probe_cwd(&path).unwrap(), None);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn an_oversized_record_is_drained_and_the_scan_continues() {
+        let root = temp_root("drain");
+        // Past the per-record cap, but draining it still leaves budget — so the
+        // cwd on the next line must be found, and nothing is buffered past cap.
+        let blob = "y".repeat(400 * 1024);
+        let body = format!(
+            "{}\n{}\n",
+            format_args!(r#"{{"type":"attachment","content":"{blob}"}}"#),
+            r#"{"type":"user","cwd":"/home/jun/proj","message":{"role":"user","content":"안녕"}}"#
+        );
+        let path = write(&root, "-p", "u", &body);
+        let scan = fold_head(&path, CWD_RECORDS, CWD_BYTES, |p| p.cwd.is_some()).unwrap();
+        assert_eq!(scan.probe.cwd.as_deref(), Some("/home/jun/proj"));
+        assert!(!scan.exhausted);
+        assert!(scan.peak_buffer <= MAX_RECORD_BYTES);
+        // Every byte of the record was accounted for, drained ones included.
+        assert!(scan.bytes_read >= blob.len() as u64);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_record_running_to_eof_without_a_newline_is_not_a_budget_failure() {
+        let root = temp_root("eofdrain");
+        // Oversized *and* unterminated: the scan ends because the file did, so
+        // probe_cwd must not report a spent budget for it.
+        let path = write(&root, "-p", "u", &format!("{{\"pad\":\"{}\"", "z".repeat(400 * 1024)));
+        let scan = fold_head(&path, CWD_RECORDS, CWD_BYTES, |p| p.cwd.is_some()).unwrap();
+        assert!(!scan.exhausted);
+        assert!(scan.peak_buffer <= MAX_RECORD_BYTES);
         let _ = std::fs::remove_dir_all(&root);
     }
 
