@@ -15,7 +15,14 @@ import { xtermTheme } from "./xtermTheme";
 import { recallArea, rememberArea, type PanelArea } from "../state/panelFocus";
 import { openArgs, paramsAfterOpen } from "../state/claudeTermParams";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import { TimelineView, ItemDetail, MarkdownText, type TimelineItem } from "./TimelineView";
+import { TimelineView, ItemDetail, MarkdownText } from "./TimelineView";
+import {
+  ctxWindow,
+  useTimelineState,
+  type ClaudeTimelineEvent,
+  type TimelineSnapshotLike,
+} from "../hooks/useClaudeTimeline";
+import { openTimelinePeek } from "../state/timelinePeek";
 import { SubagentsPane } from "./SubagentsPane";
 import { handleScrollKey } from "./scrollKeys";
 import {
@@ -92,40 +99,6 @@ interface DriverChanged {
   driver: string;
   rev: number;
 }
-interface TokenUsage {
-  input: number;
-  output: number;
-  cache_read: number;
-  cache_creation: number;
-}
-/** Full timeline snapshot for this session (the backend re-sends the whole
- * modest state on any change), so plain Q&A turns show too, not just tools. */
-interface ClaudeTimelineEvent {
-  id: number;
-  items: TimelineItem[];
-  turns: [number, string][];
-  answers: [number, string][];
-  dates: [number, string][];
-  tokens: [number, TokenUsage][];
-  /** Current assistant model id (sizes the context-window gauge), or null. */
-  model?: string | null;
-  /** Most recent assistant message's usage = current context occupancy (gauge
-   * numerator), distinct from `tokens` which sums a turn's tool round-trips. */
-  last_usage?: TokenUsage | null;
-  /** [agentId, parentToolCallId|null, turn, items] per subagent — nested under
-   * its spawning Agent item (parent), or its turn when there's no known parent. */
-  subagents: [string, string | null, number, TimelineItem[]][];
-}
-
-/** Context-window size (tokens) for a Claude model id. The `[1m]` variants carry
- * a 1M window; other Claude models default to 200k. Unknown / non-Claude → 0, so
- * the gauge is hidden rather than showing a made-up window. */
-function ctxWindow(model?: string | null): number {
-  if (!model || !model.includes("claude")) return 0;
-  if (model.includes("[1m]") || model.includes("-1m")) return 1_000_000;
-  return 200_000;
-}
-
 /** Compact token count: 1234 → "1.2k". */
 const kfmt = (n: number): string =>
   n >= 1_000_000 ? `${(n / 1_000_000).toFixed(1)}M` : n >= 1000 ? `${(n / 1000).toFixed(1)}k` : String(n);
@@ -138,10 +111,6 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
   const termRef = useRef<Terminal | null>(null);
   const viewerRef = useRef<HTMLDivElement | null>(null);
   const timelineRef = useRef<HTMLDivElement | null>(null);
-  const [items, setItems] = useState<TimelineItem[]>([]);
-  const [turns, setTurns] = useState<Map<number, string>>(new Map());
-  const [answers, setAnswers] = useState<Map<number, string>>(new Map());
-  const [dates, setDates] = useState<Map<number, string>>(new Map());
   const [selectedId, setSelectedId] = useState<string | null>(null);
   // The selected question turn (Q&A) — highlights its head and shows prompt+answer
   // in the detail pane. Mutually exclusive with selectedId. `selectedTurnScope`
@@ -155,20 +124,35 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
   // A plain text (e.g. a turn's full answer) shown in the detail viewer when the
   // timeline truncates it. Mutually exclusive with `selectedId`.
   const [textView, setTextView] = useState<{ title: string; text: string } | null>(null);
-  // Per-subagent change lists [agentId, parentToolCallId|null, turn, items] (B1).
-  const [subagents, setSubagents] = useState<[string, string | null, number, TimelineItem[]][]>(
-    [],
-  );
-  // Session token totals (B1): ↑ = new context processed (input + cache write),
-  // ↓ = generated output. Summed across turns.
-  const [tokenTotal, setTokenTotal] = useState<{ input: number; output: number }>({
-    input: 0,
-    output: 0,
+  // 타임라인 상태 + 스냅샷 적용은 공용 훅 소유 (peek 패널과 공유 — 순수 이동).
+  // 구독 배선(리스너 등록 순서·PTY 수명)은 아래 마운트 이펙트가 그대로 들고 있고,
+  // `onApply`(상태 반영 직후 실행)로 이 패널만의 attention 배지 파생을 붙인다.
+  const {
+    items,
+    turns,
+    answers,
+    dates,
+    subagents,
+    tokenTotal,
+    ctxModel,
+    ctxTokens,
+    applySnapshot,
+    setSubagents,
+  } = useTimelineState((s, origin) => {
+    // Derive the attention status from the same snapshot so a restart / reopen
+    // restores the badge (invariant ⑥) — not just live events (S5). A
+    // `snapshot` origin seeds the notifier silently (no restore re-alert);
+    // `live` (the timeline-event caller) edges normally.
+    const statusUuid = statusUuidRef.current;
+    if (statusUuid) {
+      useClaudeStatus.getState().updateFromTimeline(statusUuid, {
+        activity: deriveSessionActivity(s.turns, s.answers, s.items),
+        questionBlocked: hasOpenQuestion(s.items),
+        seenNow: props.api.isActive && document.hasFocus(),
+        origin,
+      });
+    }
   });
-  // Context-window gauge (P5): current occupancy = the latest assistant message's
-  // input+cache tokens (last_usage), sized by the session model's window.
-  const [ctxModel, setCtxModel] = useState<string | null>(null);
-  const [ctxTokens, setCtxTokens] = useState<number>(0);
   // Width (px) of the detail viewer + timeline panes; drag splitters to resize.
   const [viewerWidth, setViewerWidth] = useState(480);
   const [timelineWidth, setTimelineWidth] = useState(360);
@@ -607,48 +591,6 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
     let attachedUuid: string | null = null;
     const pending: TerminalOutputEvent[] = [];
 
-    const applySnapshot = (
-      s: {
-        items: TimelineItem[];
-        turns: [number, string][];
-        answers: [number, string][];
-        dates: [number, string][];
-        tokens?: [number, TokenUsage][];
-        model?: string | null;
-        last_usage?: TokenUsage | null;
-      },
-      origin: "snapshot" | "live",
-    ) => {
-      setItems([...s.items].sort((a, b) => a.seq - b.seq));
-      setTurns(new Map(s.turns));
-      setAnswers(new Map(s.answers));
-      setDates(new Map(s.dates));
-      const total = (s.tokens ?? []).reduce(
-        (acc, [, u]) => ({
-          input: acc.input + u.input + u.cache_creation,
-          output: acc.output + u.output,
-        }),
-        { input: 0, output: 0 },
-      );
-      setTokenTotal(total);
-      setCtxModel(s.model ?? null);
-      const lu = s.last_usage;
-      setCtxTokens(lu ? lu.input + lu.cache_read + lu.cache_creation : 0);
-      // Derive the attention status from the same snapshot so a restart / reopen
-      // restores the badge (invariant ⑥) — not just live events (S5). A
-      // `snapshot` origin seeds the notifier silently (no restore re-alert);
-      // `live` (the timeline-event caller) edges normally.
-      const statusUuid = statusUuidRef.current;
-      if (statusUuid) {
-        useClaudeStatus.getState().updateFromTimeline(statusUuid, {
-          activity: deriveSessionActivity(s.turns, s.answers, s.items),
-          questionBlocked: hasOpenQuestion(s.items),
-          seenNow: props.api.isActive && document.hasFocus(),
-          origin,
-        });
-      }
-    };
-
     // P2: after PTY output settles, scan the live screen bottom for an
     // input-waiting prompt (permission dialog / numbered menu) and set the
     // screen-blocked signal. No-op until a session is open (statusUuidRef).
@@ -916,13 +858,10 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
       // event already arrived (which is newer).
       const seedUuid = props.params.sessionUuid ?? props.params.loadSessionId;
       if (seedUuid && project) {
-        invoke<{
-          items: TimelineItem[];
-          turns: [number, string][];
-          answers: [number, string][];
-          dates: [number, string][];
-          tokens?: [number, TokenUsage][];
-        } | null>("claude_session_snapshot", { project, uuid: seedUuid })
+        invoke<TimelineSnapshotLike | null>("claude_session_snapshot", {
+          project,
+          uuid: seedUuid,
+        })
           .then((snap) => {
             if (snap && !gotLive && !disposed) applySnapshot(snap, "snapshot");
           })
@@ -1010,6 +949,9 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
   const detailInFlight = useRef<Set<string>>(new Set());
   const [detailRetry, setDetailRetry] = useState(0);
   const detailUuid = props.params.sessionUuid ?? props.params.loadSessionId ?? null;
+  // 타임라인 peek 대상 = 이 패널의 세션 (열리기 전에는 resume/신규 uuid가 곧 그
+  // 세션의 uuid — claude_open_or_attach가 그 값을 못박는다).
+  const peekUuid = detailUuid;
   const detailProject = props.params.project ?? useAppStore.getState().activeProject ?? null;
   const detailKey =
     selectedItem?.content_truncated && detailUuid
@@ -1138,6 +1080,22 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
                   }).length;
                   return running > 0 ? `${running}▶` : subagents.length;
                 })()}
+              </button>
+            )}
+            {peekUuid && (
+              <button
+                className="claudeterm-head-btn"
+                title="이 세션의 타임라인을 오른쪽에 임시 패널로 엽니다 (같은 세션은 1개 · 앱을 다시 켜면 복원되지 않습니다)"
+                onClick={() =>
+                  openTimelinePeek(props.containerApi, {
+                    sourcePanelId: props.api.id,
+                    uuid: peekUuid,
+                    project: props.params.project ?? useAppStore.getState().activeProject ?? null,
+                    title: (props.params.title as string) ?? "세션",
+                  })
+                }
+              >
+                ⧉ 타임라인
               </button>
             )}
             {lastSeed && (

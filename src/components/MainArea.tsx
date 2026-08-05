@@ -23,6 +23,7 @@ import {
 import { DropTargetOverlay } from "./DropTargetOverlay";
 import { installTransferTarget } from "../state/panelTransferTarget";
 import { components, AppTab, type PanelKind } from "./panelRegistry";
+import { closePeekPanels } from "../state/timelinePeek";
 import { type SessionDragPayload } from "./sessionDropZone";
 import { useSessionDropZone } from "../hooks/useSessionDropZone";
 import { resolveLayerMode, integratedIsFront } from "../state/layerRouting";
@@ -156,6 +157,11 @@ export function MainArea({
         console.error("dockview fromJSON failed; starting empty", err);
       }
     }
+    // 단발성 타임라인 peek는 되살리지 않는다 (spec §2 "persist 없음"): 레이아웃
+    // 직렬화는 모든 패널을 담으므로, 복원 **직후** 제거해 재시작 부활을 끊는다.
+    // onDidLayoutChange 구독 전에 호출하므로 이 제거 자체는 저장을 유발하지 않고,
+    // 다음 실제 레이아웃 변경 때 정리된 상태가 저장된다.
+    closePeekPanels(api);
 
     // Persist after restore so the restore itself does not redundantly re-save.
     api.onDidLayoutChange(() => {

@@ -7,6 +7,8 @@ import { TerminalPanel } from "./TerminalPanel";
 import { ClaudeTermPanel } from "./ClaudeTermPanel";
 import { EditorPanel } from "./EditorPanel";
 import { DiffPanel } from "./DiffPanel";
+import { TimelinePeekPanel } from "./TimelinePeekPanel";
+import { PEEK_KIND } from "../state/timelinePeek";
 import { ClaudeTab } from "./ClaudeTab";
 import { SshTab } from "./SshTab";
 
@@ -21,6 +23,8 @@ export const components = {
   claudeterm: ClaudeTermPanel,
   editor: EditorPanel,
   diff: DiffPanel,
+  // 우측 단발성 타임라인 peek — 세션을 소유하지 않는 읽기 전용 패널.
+  [PEEK_KIND]: TimelinePeekPanel,
 };
 
 /** Panel kinds that can be created/transferred. */
