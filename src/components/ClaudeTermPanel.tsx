@@ -267,8 +267,11 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
     if (claudeInjectRequest.mode === "fill") fillInput(claudeInjectRequest.text);
     else injectSeed(claudeInjectRequest.text);
     requestClaudeInject(null);
+    // `isDriver`가 deps에 있는 이유: 이 창이 미러인 동안 도착한 요청은 위에서
+    // 아무것도 하지 않고 반환하는데, 그대로면 입력 권한을 가져와도 재시도가
+    // 없어 텍스트가 조용히 사라진다. 권한 전환 때 다시 평가해 배달한다.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [claudeInjectRequest]);
+  }, [claudeInjectRequest, isDriver]);
 
   // 종료(아카이브): copy the JSONL verbatim + normalized.json + book.html, then
   // claude extracts title/summary/knowledge (best-effort — extraction failure
