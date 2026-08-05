@@ -23,6 +23,21 @@ import {
   type TimelineSnapshotLike,
 } from "../hooks/useClaudeTimeline";
 import { openTimelinePeek } from "../state/timelinePeek";
+import {
+  DEFAULT_REFINE_MODEL,
+  PROMPT_FENCE,
+  REFINE_MODELS,
+  applyBlockReason,
+  bracketedPaste,
+  extractLatestPromptBlock,
+  injectDeliveryDecision,
+  isRefineParams,
+  loadLastRefineModel,
+  openPromptRefine,
+  resolveApplyAck,
+  saveLastRefineModel,
+  type RefineModel,
+} from "../state/promptRefine";
 import { SubagentsPane } from "./SubagentsPane";
 import { handleScrollKey } from "./scrollKeys";
 import {
@@ -83,6 +98,18 @@ export interface ClaudeTermParams {
    * modes seed it with "이 커밋 리뷰하자" / "이 파일 검토해줘"). Cleared from the
    * persisted params after injection so a tab-switch remount won't re-send it. */
   seed?: string;
+  /** 이 패널이 **프롬프트 정리 세션**임을 나타내는 표식(`state/promptRefine`).
+   * `kind`는 claudeterm 그대로 둔다 — 세션 수명 경로를 물려받아야 PTY가 새지
+   * 않는다. **유지**(패널의 성격이지 1회성 사건이 아니다). */
+  refineKind?: string;
+  /** 정리 세션 전용: 이 패널을 연 Claude 탭의 패널 id. 적용 대상 앵커이자
+   * "원본 탭이 닫히면 같이 닫힌다"의 판정 키. **유지**. */
+  sourcePanelId?: string;
+  /** 정리 세션 전용: [적용]이 최종본을 채워 넣을 원본 세션의 uuid. **유지**. */
+  targetUuid?: string;
+  /** 스폰 시 `--model` 별칭(`opus`/`fable`). 정리 세션만 설정한다 — 없으면 CLI
+   * 기본값(기존 모든 세션의 동작). **유지**: 재시작 후에도 같은 모델로 떠야 한다. */
+  model?: string;
 }
 
 /** Result of `claude_open_or_attach`: attached to a live PTY (mirror) or started
@@ -185,6 +212,9 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
   const isDriverRef = useRef(true);
   const driverRevRef = useRef(-1);
   const [isDriver, setIsDriver] = useState(true);
+  // 세션이 실제로 열렸는가 — `sessionIdRef`의 **상태판**. ref만으로는 "아직 안
+  // 열려서 배달을 미룬" 이펙트를 다시 태울 신호가 없다(리뷰 #2).
+  const [sessionOpened, setSessionOpened] = useState(false);
   // The last one-shot seed (review/dev prompt), so the user can re-inject it if
   // the auto-attempt missed the prompt (ready detection is best-effort).
   const [lastSeed, setLastSeed] = useState<string | null>(null);
@@ -192,31 +222,108 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
   // stays live (closing the tab is a separate, archive-free action).
   const [archiveBusy, setArchiveBusy] = useState(false);
 
-  /** Write the seed (+Enter) to the current session — submits it as a prompt. */
-  const injectSeed = (text: string) => {
+  // ---- 프롬프트 정리 세션 (state/promptRefine) ---------------------------
+  // 이 패널이 정리 세션인가. 패널의 성격이라 수명 내내 불변 — 마운트 이펙트가
+  // 그대로 읽어도 안전하다.
+  const isRefine = isRefineParams(props.params);
+  const refineModel = (props.params.model as RefineModel | undefined) ?? DEFAULT_REFINE_MODEL;
+  // codex 2차 의견 — 적용과 무관한 참고용(하단 접이식).
+  const [codexBusy, setCodexBusy] = useState(false);
+  const [codexResult, setCodexResult] = useState<string | null>(null);
+  const [codexOpen, setCodexOpen] = useState(true);
+
+  /** Raw bytes to this session's PTY (driver-gated in the backend).
+   *
+   * **에러를 삼키지 않는다** — 호출부가 배달 성공을 알아야 하는 경로가 있다
+   * (프롬프트 정리 [적용]은 write ACK 뒤에야 정리 세션을 끝낸다, 리뷰 #4). 그냥
+   * 쏘고 잊는 자리는 각자 `.catch(() => {})`를 붙인다. */
+  const writeToSession = (text: string): Promise<boolean> => {
     const id = sessionIdRef.current;
-    if (id == null) return;
-    invoke("claude_write", {
+    if (id == null) return Promise.reject(new Error("세션이 아직 열리지 않았습니다."));
+    // 반환값 = **바이트가 실제로 PTY에 들어갔는가**. 이 창이 driver가 아니면
+    // 백엔드가 조용히 무시하고 false를 준다(감사 G1) — 성공으로 오인하면 정리
+    // 세션이 아무것도 배달되지 않은 채 종료된다.
+    return invoke<boolean>("claude_write", {
       id,
-      data: Array.from(new TextEncoder().encode(text + "\n")),
-    }).catch(() => {});
+      data: Array.from(new TextEncoder().encode(text)),
+    });
   };
+
+  /** Write the seed (+Enter) to the current session — the review/dev one-shot
+   * prompt path, byte-for-byte unchanged. */
+  const injectSeed = (text: string) => writeToSession(text + "\n");
+
+  /** 입력창에 **채우기만** 한다 — 제출 없음.
+   *
+   * 프롬프트 정리 [적용]의 유일한 주입 경로다. bracketed paste로 감싸고 CR을 절대
+   * 붙이지 않는다(`promptRefine.bracketedPaste`가 그 불변식을 소유하고 테스트가
+   * 고정한다). 실측(2026-08-05, claude CLI 2.1.222): 이 형태로 여러 줄을 넣으면
+   * 입력창에 그대로 채워지고 전사 파일조차 생기지 않는다(=제출 안 됨). */
+  const fillInput = (text: string) => writeToSession(bracketedPaste(text));
+
+  /** 한 줄 프롬프트를 채우고 **제출**한다 (정리 세션의 규약 시드 전용).
+   *
+   * 실측(같은 날): claude TUI는 `\r`만 제출로 읽고 — `\n`은 소프트 개행이다 —
+   * 그나마도 입력 버퍼가 **한 줄일 때만** 제출된다. 그래서 시드는 한 줄이고
+   * (`refineSeedPrompt`), 개행이 섞여 들어와도 공백으로 접어 계약을 지킨다. */
+  const submitSingleLine = (text: string) => writeToSession(`${text.replace(/\s*\n\s*/g, " ")}\r`);
 
   // Dev mode 확인: inject a review prompt into THIS session if it's the target
   // (matched by uuid) and we're its driver and live. The first "open + seed" goes
   // through the seed mechanism; this handles subsequent injects into the already-
   // live per-project dev session.
   const claudeInjectRequest = useAppStore((s) => s.claudeInjectRequest);
-  const requestClaudeInject = useAppStore((s) => s.requestClaudeInject);
+  // 처리에 착수한 요청 id — 리마운트·deps 재평가로 같은 요청을 두 번 쓰지 않게.
+  const injectHandledRef = useRef<string | null>(null);
+  // 이 세션이 지금 권한/선택 프롬프트에 걸려 있는가. **구독**이라 상태가 풀리면
+  // 아래 이펙트가 다시 돌아 보류해 둔 주입이 자동으로 재시도된다(감사 G2).
+  const myInjectUuid = props.params.sessionUuid ?? props.params.loadSessionId ?? null;
+  const myBlocked = useClaudeStatus((s) =>
+    myInjectUuid ? s.entries[myInjectUuid]?.status === "blocked" : false,
+  );
   useEffect(() => {
-    if (!claudeInjectRequest) return;
-    const myUuid = props.params.sessionUuid ?? props.params.loadSessionId;
-    if (!myUuid || claudeInjectRequest.uuid !== myUuid) return;
-    if (!isDriverRef.current || sessionIdRef.current == null) return;
-    injectSeed(claudeInjectRequest.text);
-    requestClaudeInject(null);
+    const req = claudeInjectRequest;
+    // 판정은 순수 모듈이 소유한다(테스트가 규칙을 고정). "defer"인 동안 요청은
+    // 슬롯에 그대로 남고, 아래 deps가 조건 해소를 다시 물어본다 — 여기서 조용히
+    // 소비하면 정리 세션은 닫혔는데 텍스트만 증발한다.
+    const decision = injectDeliveryDecision({
+      request: req,
+      myUuid: myInjectUuid,
+      isDriver: isDriverRef.current,
+      sessionOpen: sessionIdRef.current != null,
+      blocked: myBlocked,
+      handledId: injectHandledRef.current,
+    });
+    if (decision !== "write" || !req) return;
+    injectHandledRef.current = req.id;
+    void (async () => {
+      // 그 사이 요청이 치워지거나 다른 것으로 바뀌었으면 쓰지 않는다.
+      if (useAppStore.getState().claudeInjectRequest?.id !== req.id) return;
+      let ok = false;
+      let reason: string | undefined;
+      try {
+        // "fill" = 프롬프트 정리 [적용] — 채우기만 하고 제출하지 않는다.
+        ok = (await (req.mode === "fill" ? fillInput(req.text) : injectSeed(req.text))) === true;
+        if (!ok) reason = "이 창이 세션의 입력 권한을 갖고 있지 않습니다.";
+      } catch (e) {
+        reason = errText(e);
+      }
+      const st = useAppStore.getState();
+      // 소비는 우리 요청일 때만 (그 사이 다른 요청이 슬롯을 덮었으면 건드리지 않는다).
+      if (st.claudeInjectRequest?.id === req.id) st.requestClaudeInject(null);
+      st.reportClaudeInjectAck({ id: req.id, ok, reason });
+      // 실패는 재시도 여지를 남긴다(같은 id로 새 요청이 오는 경우는 없지만,
+      // 이 패널이 그 id를 다시 붙들고 있지 않게 한다).
+      if (!ok) injectHandledRef.current = null;
+    })();
+    // deps 근거:
+    // - `isDriver` — 미러인 동안 도착한 요청은 위에서 그냥 반환한다. 없으면 입력
+    //   권한을 가져와도 재평가가 없어 텍스트가 조용히 사라진다.
+    // - `sessionOpened` — 소스 탭이 언마운트/마운트 중이면 sessionIdRef가 아직
+    //   null이라 같은 이유로 반환한다(리뷰 #2).
+    // - `myBlocked` — 프롬프트가 해소되면 보류해 둔 주입을 자동 재시도(G2).
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [claudeInjectRequest]);
+  }, [claudeInjectRequest, isDriver, sessionOpened, myBlocked]);
 
   // 종료(아카이브): copy the JSONL verbatim + normalized.json + book.html, then
   // claude extracts title/summary/knowledge (best-effort — extraction failure
@@ -747,27 +854,34 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
           uuid: openUuid,
           cwd,
           adopt,
+          // 정리 세션만 모델을 못박는다. null이면 백엔드가 `--model`을 아예 붙이지
+          // 않으므로 기존 세션의 동작은 그대로다.
+          model: (props.params.model as string | undefined) ?? null,
           name: (props.params.title as string) ?? null,
           cols: term.cols,
           rows: term.rows,
         });
         sessionId = opened.id;
-        statusUuidRef.current = opened.session_uuid;
-        // Register this session's numeric↔uuid mapping so the app-level global
-        // listener can resolve its timeline events while this panel is a
-        // backgrounded (unmounted) tab, and mark it attached so the global
-        // listener defers to this panel's own (accurate-seenNow) updates (P3).
-        attachedUuid = opened.session_uuid;
-        useClaudeStatus.getState().registerSession(opened.session_uuid, opened.id);
-        useClaudeStatus.getState().attachPanel(opened.session_uuid);
-        // Audit gap: the mount-time markSeenIfLooking ran before statusUuidRef was
-        // set (uuid null → no-op), so an initially active+focused panel would set
-        // neither watchedUuid (alert suppression) nor activeClaudeUuid (roll-up
-        // cursor) until its next activate event. Establish them now the uuid is
-        // known (S8/S12). markSeen is a no-op until the first timeline tick creates
-        // the entry — the entry's seen flag is captured there via seenNow — so
-        // watched/active are the load-bearing part here.
-        {
+        // 프롬프트 정리 세션은 attention 체계에 **등록하지 않는다**(리뷰 #12):
+        // 사용자 바로 옆에 떠 있는 임시 보조 세션이라, 배지·롤업·알림에 끼면
+        // 실제 작업 세션의 신호를 희석한다. 등록을 건너뛰면 updateFromTimeline도
+        // statusUuidRef가 null이라 조용히 no-op이 된다.
+        if (!isRefine) {
+          statusUuidRef.current = opened.session_uuid;
+          // Register this session's numeric↔uuid mapping so the app-level global
+          // listener can resolve its timeline events while this panel is a
+          // backgrounded (unmounted) tab, and mark it attached so the global
+          // listener defers to this panel's own (accurate-seenNow) updates (P3).
+          attachedUuid = opened.session_uuid;
+          useClaudeStatus.getState().registerSession(opened.session_uuid, opened.id);
+          useClaudeStatus.getState().attachPanel(opened.session_uuid);
+          // Audit gap: the mount-time markSeenIfLooking ran before statusUuidRef was
+          // set (uuid null → no-op), so an initially active+focused panel would set
+          // neither watchedUuid (alert suppression) nor activeClaudeUuid (roll-up
+          // cursor) until its next activate event. Establish them now the uuid is
+          // known (S8/S12). markSeen is a no-op until the first timeline tick creates
+          // the entry — the entry's seen flag is captured there via seenNow — so
+          // watched/active are the load-bearing part here.
           const st = useClaudeStatus.getState();
           if (props.api.isActive) st.setActiveClaudeUuid(opened.session_uuid);
           if (props.api.isActive && document.hasFocus()) {
@@ -819,6 +933,8 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
       }
 
       sessionIdRef.current = sessionId;
+      // 대기 중인 주입 요청을 깨우는 신호 (리뷰 #2).
+      if (!disposed) setSessionOpened(sessionId != null);
       await healDroppedGap();
       ready = true;
       for (const ev of pending) applyLive(ev);
@@ -847,7 +963,12 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
         const seed = pendingSeedRef.current;
         setTimeout(() => {
           if (!disposed && pendingSeedRef.current === seed) {
-            injectSeed(seed);
+            // 정리 세션의 규약 시드는 대화를 **시작**시켜야 하므로 제출까지 한다
+            // (한 줄 + CR — 실측 근거는 submitSingleLine). 나머지 시드는 기존
+            // 경로 그대로(바이트 무변경).
+            // 쏘고 잊는 자리 — writeToSession은 더 이상 에러를 삼키지 않으므로
+            // 여기서 명시적으로 흘린다(실패해도 "시드 재주입" 버튼이 남는다).
+            void (isRefine ? submitSingleLine(seed) : injectSeed(seed)).catch(() => {});
             pendingSeedRef.current = null;
           }
         }, 1800);
@@ -952,6 +1073,195 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
   // 타임라인 peek 대상 = 이 패널의 세션 (열리기 전에는 resume/신규 uuid가 곧 그
   // 세션의 uuid — claude_open_or_attach가 그 값을 못박는다).
   const peekUuid = detailUuid;
+
+  // ---- 프롬프트 정리: 최종본 추출 · 적용 · codex 검증 --------------------
+  // 세션 전체에서 가장 최근의 **닫힌** ```prompt 블록(턴 역방향). `answers`는
+  // 백엔드가 절단하지 않는다(cap_content는 items 전용)라 최종본이 잘릴 일이 없다.
+  const refinedPrompt = useMemo(
+    () => (isRefine ? extractLatestPromptBlock(answers) : null),
+    [isRefine, answers],
+  );
+  // [적용] 게이트 입력 — 대상 세션이 권한/선택 프롬프트에 걸려 있으면 페이스트가
+  // 키 입력으로 소비된다(리뷰 #1). 구독이라 상태가 바뀌면 버튼도 즉시 따라간다.
+  const refineTargetUuid = isRefine ? (props.params.targetUuid ?? null) : null;
+  const refineTargetBlocked = useClaudeStatus((s) =>
+    refineTargetUuid ? s.entries[refineTargetUuid]?.status === "blocked" : false,
+  );
+  // [적용] 진행 상태 — 배달 ACK를 기다리는 동안 true (리뷰 #4).
+  const [applyPending, setApplyPending] = useState(false);
+  const [applyNote, setApplyNote] = useState<string | null>(null);
+  const applyReqIdRef = useRef<string | null>(null);
+  const claudeInjectAcks = useAppStore((s) => s.claudeInjectAcks);
+  const applyReason = isRefine
+    ? applyBlockReason({
+        block: refinedPrompt,
+        targetUuid: refineTargetUuid,
+        targetBlocked: refineTargetBlocked,
+        slotBusy: claudeInjectRequest !== null,
+        pending: applyPending,
+      })
+    : null;
+
+  /** 이 Claude 탭 오른쪽에 프롬프트 정리 세션을 연다(탭당 1개). */
+  const openRefinePanel = async (model: RefineModel) => {
+    if (!peekUuid) return;
+    try {
+      // 격리 디렉토리는 백엔드가 정본이다 — 프론트가 /tmp를 짓지 않는다.
+      const workdir = await invoke<string>("prompt_refine_workdir");
+      openPromptRefine(props.containerApi, {
+        sourcePanelId: props.api.id,
+        targetUuid: peekUuid,
+        workdir,
+        sessionUuid: crypto.randomUUID(),
+        model,
+        title: (props.params.title as string) ?? "세션",
+      });
+    } catch (e) {
+      alert(`프롬프트 정리 세션을 열지 못했습니다: ${errText(e)}`);
+    }
+  };
+
+  /** 모델 세그 선택. 스폰 전이면 params만 갈아끼우고, 이미 떠 있으면 재스폰 확인
+   * (돌고 있는 PTY의 모델은 바꿀 수 없다 — `--model`은 스폰 인자다). */
+  const chooseRefineModel = (model: RefineModel) => {
+    if (model === refineModel) return;
+    // 다음 정리 세션이 처음부터 이 모델로 뜨게 기억한다 — 재스폰이 파괴적이라
+    // 매번 "열고 바꾸고 날리고 다시 열기"를 반복하지 않도록(리뷰 #12).
+    saveLastRefineModel(model);
+    if (sessionIdRef.current == null) {
+      props.api.updateParameters({ ...props.params, model });
+      return;
+    }
+    if (
+      !confirm(
+        "모델은 세션을 시작할 때 정해집니다.\n지금 바꾸려면 이 정리 세션을 닫고 새로 시작해야 합니다 — 지금까지의 대화는 사라집니다. 진행할까요?",
+      )
+    )
+      return;
+    const sourcePanelId = props.params.sourcePanelId;
+    const targetUuid = props.params.targetUuid;
+    const workdir = props.params.project;
+    const containerApi = props.containerApi;
+    const title = ((props.params.title as string) ?? "").replace(/^프롬프트 정리 — /, "") || "세션";
+    props.api.close();
+    // 재생성은 제거가 반영된 뒤에 — 패널 id가 결정적이라 같은 틱에 다시 추가하면
+    // 중복 id가 된다.
+    queueMicrotask(() => {
+      if (!sourcePanelId || !targetUuid || !workdir) return;
+      openPromptRefine(containerApi, {
+        sourcePanelId,
+        targetUuid,
+        workdir,
+        sessionUuid: crypto.randomUUID(),
+        model,
+        title,
+      });
+    });
+  };
+
+  /**
+   * [적용]: 최종본을 **원본 세션 입력창에 채우고**(제출 없음) 정리 세션을 끝낸다.
+   *
+   * 배달 보장은 **at-least-once + 수동 재시도**다. exactly-once(요청 id 원장으로
+   * 중복 배달을 막는 설계)를 두 번 시도했고 두 번 다 수명 관리에서 깨졌다 —
+   * 선기록 race, 축출된 id의 오삭제, 재시도 이펙트 미재실행. 세 번째로 같은
+   * 토대를 다듬는 대신 요구를 다시 봤다: **이 주입은 자동 제출이 없는 "입력창
+   * 채우기"라 중복 배달이 파괴적이지 않다.** 두 번 붙으면 사용자가 그걸 보고
+   * 지우면 그만이고, 그 대가로 자동 재시도·타임아웃·배달 원장이 전부 사라진다.
+   *
+   * 그래서 여기엔 타이머가 없다. 요청을 올리고 **자기 id의 ack만** 기다린다:
+   * - `ok` → 배달 확인, 정리 세션 종료(패널 제거 → claude_detach).
+   * - 실패(쓰기 오류 / driver 아님) → 정리 세션을 **보존**하고 사유 + [다시 적용].
+   * - 무소식 → "전달 대기 중"을 그대로 둔다. 자동 조치는 하지 않는다. 원본 탭이
+   *   언마운트라 보류 중인 상태가 대부분이고, 그건 그 탭을 활성화하면 풀린다.
+   *
+   * 남는 중복 가능성은 "실패로 보고됐지만 실제로는 늦게 성공한" 희귀 케이스에서
+   * 사용자가 스스로 [다시 적용]을 누를 때뿐이고, 채우기 전용이라 무해하다.
+   */
+  const applyRefined = () => {
+    if (applyReason) {
+      setApplyNote(applyReason);
+      return;
+    }
+    const text = refinedPrompt;
+    const target = refineTargetUuid;
+    if (!text || !target) return;
+    // 매 시도는 새 요청이다 — 재시도 id를 재사용하며 dedupe를 노리던 설계는 폐기.
+    const req = { id: crypto.randomUUID(), uuid: target, text, mode: "fill" as const };
+    setApplyNote(null);
+    useAppStore.getState().requestClaudeInject(req);
+    // 슬롯을 실제로 잡았을 때만 대기 상태로 — 잡지 못했으면 남의 요청의 결과를
+    // 기다리게 된다.
+    if (useAppStore.getState().claudeInjectRequest?.id !== req.id) {
+      setApplyNote("다른 프롬프트 주입이 먼저 슬롯을 차지했습니다 — 잠시 뒤 다시 시도하세요.");
+      return;
+    }
+    applyReqIdRef.current = req.id;
+    setApplyPending(true);
+  };
+
+  /**
+   * 적용 배달 확인 — **우리 요청 id의 ack만** 신뢰한다(감사 G1).
+   *
+   * "슬롯이 비면 성공"이라는 추론은 두 곳에서 틀렸었다: `claude_write`는 이 창이
+   * driver가 아니면 아무것도 쓰지 않고도 성공을 반환했고(이제 백엔드가 bool로
+   * 사실을 준다), 슬롯을 비운 주체가 우리 소비자였다는 보장도 없었다. 이제
+   * 소비 패널이 실제 쓰기 결과를 ack로 남기고 여기서 id로 짝짓는다.
+   *
+   * 타이머는 없다(위 at-least-once 근거). ack가 올 때까지 대기 표시가 유지된다.
+   */
+  useEffect(() => {
+    if (!applyPending) return;
+    const myId = applyReqIdRef.current;
+    const outcome = resolveApplyAck(myId, claudeInjectAcks);
+    if (outcome.kind === "wait") return;
+    setApplyPending(false);
+    applyReqIdRef.current = null;
+    if (myId) useAppStore.getState().clearClaudeInjectAck(myId); // 결과 확인 완료
+    if (outcome.kind === "delivered") {
+      props.api.close();
+      return;
+    }
+    setApplyNote(
+      `원래 세션에 전달하지 못했습니다: ${outcome.reason}\n정리 세션은 그대로 둡니다 — [다시 적용]을 눌러 보세요.`,
+    );
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [applyPending, claudeInjectAcks]);
+
+  /** [codex 검증]: 현재 최종본을 codex에 비판시켜 하단에 표시(적용과 무관). */
+  const runCodexCheck = async () => {
+    const text = refinedPrompt;
+    if (!text || codexBusy) return;
+    setCodexBusy(true);
+    setCodexOpen(true);
+    setCodexResult(null);
+    try {
+      setCodexResult(await invoke<string>("run_codex_check", { prompt: text }));
+    } catch (e) {
+      // 실패는 무해 — 검증을 건너뛴다는 안내만 남기고 정리 세션은 계속된다.
+      setCodexResult(`codex 검증을 건너뜁니다: ${errText(e)}`);
+    } finally {
+      setCodexBusy(false);
+    }
+  };
+
+  // 정리 세션은 원본 Claude 탭의 **동반 패널**이다 — 그 탭이 dock에서 사라지면
+  // (닫기, 또는 다른 창으로 전송) 같이 닫는다. 남겨 두면 적용 대상이 없는 세션이
+  // 혼자 돌게 되고, 단발성이라는 의미와도 어긋난다. (peek와 같은 규약 —
+  // TimelinePeekPanel 참조. 닫기는 마이크로태스크로 미뤄 dock 콜백 재진입을 피한다.)
+  const refineSourceId = isRefine ? (props.params.sourcePanelId ?? null) : null;
+  const panelApi = props.api;
+  const containerApi = props.containerApi;
+  useEffect(() => {
+    if (!refineSourceId) return;
+    const closeLater = () => queueMicrotask(() => panelApi.close());
+    if (!containerApi.getPanel(refineSourceId)) closeLater();
+    const d = containerApi.onDidRemovePanel((p) => {
+      if (p.id === refineSourceId) closeLater();
+    });
+    return () => d.dispose();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [refineSourceId]);
   const detailProject = props.params.project ?? useAppStore.getState().activeProject ?? null;
   const detailKey =
     selectedItem?.content_truncated && detailUuid
@@ -1082,7 +1392,47 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
                 })()}
               </button>
             )}
-            {peekUuid && (
+            {isRefine && (
+              <>
+                <span className="seg" role="group" aria-label="정리 세션 모델">
+                  {REFINE_MODELS.map((m) => (
+                    <button
+                      key={m.id}
+                      className={`seg-item${refineModel === m.id ? " seg-on" : ""}`}
+                      aria-pressed={refineModel === m.id}
+                      title="정리 세션을 띄울 모델 — 스폰 이후에는 세션을 다시 시작해야 바뀝니다"
+                      onClick={() => chooseRefineModel(m.id)}
+                    >
+                      {m.label}
+                    </button>
+                  ))}
+                </span>
+                <button
+                  className="claudeterm-head-btn"
+                  disabled={applyReason !== null}
+                  title={
+                    applyReason ??
+                    "최종본을 원래 세션 입력창에 채웁니다 (제출하지 않습니다) — 전달이 확인되면 이 정리 세션은 종료됩니다"
+                  }
+                  onClick={applyRefined}
+                >
+                  {applyPending ? "전달 대기 중…" : applyNote ? "다시 적용" : "적용"}
+                </button>
+                <button
+                  className="claudeterm-head-btn"
+                  disabled={!refinedPrompt || codexBusy}
+                  title={
+                    refinedPrompt
+                      ? "현재 최종본을 codex에 비판시켜 아래에 보여줍니다 (적용과 무관 · 실패해도 무해)"
+                      : `아직 최종본이 없습니다 — 정리 도우미가 ${PROMPT_FENCE}prompt 블록을 닫아서 출력하면 활성화됩니다`
+                  }
+                  onClick={() => void runCodexCheck()}
+                >
+                  {codexBusy ? "codex 검증 중…" : "codex 검증"}
+                </button>
+              </>
+            )}
+            {!isRefine && peekUuid && (
               <button
                 className="claudeterm-head-btn"
                 title="이 세션의 타임라인을 오른쪽에 임시 패널로 엽니다 (같은 세션은 1개 · 앱을 다시 켜면 복원되지 않습니다)"
@@ -1098,26 +1448,89 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
                 ⧉ 타임라인
               </button>
             )}
+            {!isRefine && peekUuid && (
+              <button
+                className="claudeterm-head-btn"
+                title="프롬프트 정리 세션을 오른쪽에 엽니다 — 대화로 다듬은 뒤 [적용]하면 이 세션 입력창에 채워집니다 (자동 제출 없음 · 앱을 다시 켜면 복원되지 않습니다)"
+                onClick={() => void openRefinePanel(loadLastRefineModel())}
+              >
+                ✏ 프롬프트 정리
+              </button>
+            )}
             {lastSeed && (
               <button
                 className="claudeterm-head-btn"
                 title="시드 프롬프트를 현재 세션에 다시 보냅니다 (자동 주입이 빗나갔을 때)"
-                onClick={() => injectSeed(lastSeed)}
+                onClick={() =>
+                  void (isRefine ? submitSingleLine(lastSeed) : injectSeed(lastSeed)).catch(
+                    () => {},
+                  )
+                }
               >
                 시드 재주입
               </button>
             )}
-            <button
-              className="claudeterm-head-btn"
-              title="세션 아카이브: JSONL 원본 + 책(book.html) + 요약 + 지식(issue/method/domain) 추출 — 세션은 종료되지 않고 계속 사용 가능"
-              disabled={archiveBusy || !props.params.sessionUuid}
-              onClick={archiveSession}
-            >
-              {archiveBusy ? "아카이브 중…" : "아카이브"}
-            </button>
+            {/* 아카이브는 정리 세션에 없다 — 스크래치 세션을 아카이브하면 격리해
+                둔 전사가 그대로 지식베이스로 들어간다(spec ④ 금지영역). */}
+            {!isRefine && (
+              <button
+                className="claudeterm-head-btn"
+                title="세션 아카이브: JSONL 원본 + 책(book.html) + 요약 + 지식(issue/method/domain) 추출 — 세션은 종료되지 않고 계속 사용 가능"
+                disabled={archiveBusy || !props.params.sessionUuid}
+                onClick={archiveSession}
+              >
+                {archiveBusy ? "아카이브 중…" : "아카이브"}
+              </button>
+            )}
           </span>
         </div>
+        {isRefine && (applyPending || applyNote) && (
+          <div className="claudeterm-refine-note" role="status">
+            {applyPending
+              ? "전달 대기 중 — 원래 Claude 탭이 열려 있어야 전달됩니다. 그 탭을 활성화해 주세요.\n(전달이 확인되면 이 정리 세션은 자동으로 닫힙니다.)"
+              : applyNote}
+            <span
+              className="claudeterm-refine-note-x"
+              title={applyPending ? "전달 대기를 그만둡니다 (이미 보낸 요청은 취소되지 않습니다)" : "닫기"}
+              onClick={() => {
+                if (applyPending) {
+                  // 대기를 접는다. 이미 보낸 요청을 취소하지는 못하므로(그건
+                  // exactly-once 설계가 필요했던 지점) 슬롯만 우리 것이면 치운다.
+                  const myId = applyReqIdRef.current;
+                  const st = useAppStore.getState();
+                  if (myId && st.claudeInjectRequest?.id === myId) st.requestClaudeInject(null);
+                  applyReqIdRef.current = null;
+                  setApplyPending(false);
+                }
+                setApplyNote(null);
+              }}
+            >
+              ×
+            </span>
+          </div>
+        )}
         <div className="claudeterm-term" ref={hostRef} />
+        {isRefine && (codexBusy || codexResult) && (
+          <div className="claudeterm-codex">
+            <button
+              className="claudeterm-codex-head"
+              aria-expanded={codexOpen}
+              title="codex 2차 의견 접기/펼치기"
+              onClick={() => setCodexOpen((v) => !v)}
+            >
+              <span>{codexOpen ? "▾" : "▸"} codex 검증{codexBusy ? " — 실행 중…" : ""}</span>
+            </button>
+            {codexOpen && (
+              <div className="claudeterm-codex-body">
+                {codexResult ? (
+                  <MarkdownText text={codexResult} />
+                ) : (
+                  <span className="claudeterm-codex-wait">codex에게 물어보는 중입니다…</span>
+                )}
+              </div>
+            )}
+          </div>
+        )}
       </div>
 
       {(selectedItem || textView) && (

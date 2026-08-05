@@ -10,6 +10,7 @@
 
 pub mod archive;
 pub mod claude_cli;
+pub mod codex_cli;
 pub mod embed;
 pub mod external;
 pub mod fs;

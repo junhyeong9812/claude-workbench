@@ -711,6 +711,7 @@ dependencies = [
  "grep-regex",
  "grep-searcher",
  "ignore",
+ "libc",
  "portable-pty",
  "russh",
  "serde",

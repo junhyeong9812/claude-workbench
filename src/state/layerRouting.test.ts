@@ -284,7 +284,7 @@ describe("nextDevReviewAction (B2 — inject pacing over the single claudeInject
         s.claudeInjectRequest !== null,
       );
       if (action.kind === "inject") {
-        useAppStore.getState().requestClaudeInject({ uuid: "u", text: action.prompt });
+        useAppStore.getState().requestClaudeInject({ id: "r1", uuid: "u", text: action.prompt });
         useAppStore.getState().consumeDevReview(action.id);
       }
       return action;
