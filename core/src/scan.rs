@@ -203,10 +203,13 @@ struct HeadScan {
     probe: Probe,
     exhausted: bool,
     /// Bytes actually pulled off the disk, including those drained and thrown
-    /// away. Exposed so the budget can be asserted rather than assumed.
+    /// away. Exposed so the budget can be asserted rather than assumed — the
+    /// scan itself never consults it, so it is dead outside the tests.
+    #[cfg_attr(not(test), allow(dead_code))]
     bytes_read: u64,
     /// Largest single record held in memory at once — the memory bound this
     /// function promises, made observable for the same reason.
+    #[cfg_attr(not(test), allow(dead_code))]
     peak_buffer: u64,
 }
 
