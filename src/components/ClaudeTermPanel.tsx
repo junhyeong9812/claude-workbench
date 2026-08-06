@@ -28,6 +28,7 @@ import {
   DEFAULT_REFINE_VIEW,
   PROMPT_FENCE,
   REFINE_MODELS,
+  REFINE_SUBMIT_CONFIRM_MS,
   REFINE_SUBMIT_CR_DELAY,
   REFINE_VIEWS,
   applyBlockReason,
@@ -44,6 +45,7 @@ import {
   resolveApplyAck,
   saveLastRefineModel,
   sendBlockReason,
+  shouldNavPanes,
   submitPasteBytes,
   type RefineExitReason,
   type RefineModel,
@@ -268,6 +270,11 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
   // 종료가 이미 돌고 있는가 — **동기** 가드. setState는 다음 렌더에나 반영되므로
   // 같은 프레임에 두 경로(× + 동반 닫힘)가 겹치면 아카이브가 두 번 나간다.
   const closingRef = useRef(false);
+  // [보내기]의 동기 중복 가드 (리뷰 #6).
+  const sendingRef = useRef(false);
+  // 제출 확인 타이머 · 최신 턴 수 (리뷰 #8).
+  const sendCheckRef = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
+  const turnsCountRef = useRef(0);
   // 메모 저장기의 손잡이 (MemoEditor가 마운트되면 채워진다) — 닫기 전에 저장을
   // 확인하는 유일한 경로.
   const memoHandleRef = useRef<MemoHandle | null>(null);
@@ -432,6 +439,12 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
   };
   const onContainerKey = (e: React.KeyboardEvent) => {
     if (e.ctrlKey && (e.key === "ArrowLeft" || e.key === "ArrowRight")) {
+      // 메모를 쓰는 중에는 Ctrl+←/→가 **단어 이동**이어야 한다(리뷰 #7). 패널
+      // 이동으로 가로채면 롱폼 편집의 기본 조작을 뺏는 셈이고, 정리 패널의 메모
+      // 뷰에서는 옮겨 갈 다른 pane도 없다. preventDefault도 하지 않는다 —
+      // CodeMirror가 그 키를 그대로 받아야 한다.
+      const inEditor = (e.target as HTMLElement | null)?.closest?.(".cm-editor") != null;
+      if (!shouldNavPanes({ inEditor, isRefine, view: refineView })) return;
       e.preventDefault();
       navPane(e.key === "ArrowRight" ? 1 : -1);
     }
@@ -1317,6 +1330,9 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
    * 차이를 문구로 구분해 준다.
    */
   const sendMemo = async () => {
+    // **동기** 가드가 먼저다 — `sending` state는 다음 렌더에나 반영되므로 같은
+    // 프레임의 더블클릭은 setSending을 통과해 메모를 두 번 제출한다(리뷰 #6).
+    if (sendingRef.current) return;
     if (sendReason) {
       setSendNote(sendReason);
       return;
@@ -1324,6 +1340,7 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
     const text = memoTextRef.current;
     if (text.trim() === "") return;
     const [paste, cr] = submitPasteBytes(text);
+    sendingRef.current = true;
     setSending(true);
     setSendNote(null);
     try {
@@ -1336,11 +1353,26 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
         setSendNote("메모는 입력창에 들어갔지만 제출 키를 보내지 못했습니다 — 터미널 뷰에서 Enter를 눌러 주세요.");
         return;
       }
+      // 제출은 **타이밍에 기대는 동작**이다(붙여넣기 다음 프레임의 CR). 성공
+      // 여부를 눈으로 확인할 길이 없으면 사용자는 보낸 줄 알고 기다린다 — 그래서
+      // 전사가 실제로 자랐는지 한 번 확인한다(리뷰 #8). **자동 재전송은 하지
+      // 않는다**: 늦게 도착한 제출과 겹치면 같은 프롬프트가 두 번 실행된다.
+      const before = turnsCountRef.current;
+      if (sendCheckRef.current !== undefined) clearTimeout(sendCheckRef.current);
+      sendCheckRef.current = setTimeout(() => {
+        sendCheckRef.current = undefined;
+        if (turnsCountRef.current > before) return;
+        setSendNote(
+          "제출을 확인하지 못했습니다 — 메모는 입력창에 들어가 있을 수 있습니다.\n" +
+            "터미널 뷰에서 Enter를 눌러 주세요. (같은 내용을 자동으로 다시 보내지는 않습니다.)",
+        );
+      }, REFINE_SUBMIT_CONFIRM_MS);
       // 보냈으면 대화를 보는 것이 다음 동작이다.
       setRefineView("term");
     } catch (e) {
       setSendNote(`보내지 못했습니다: ${errText(e)}`);
     } finally {
+      sendingRef.current = false;
       setSending(false);
     }
   };
@@ -1823,6 +1855,15 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
           </div>
         )}
     </>
+  );
+
+  turnsCountRef.current = turns.size;
+  // 패널이 사라진 뒤에 확인 배너를 띄우려 들지 않게.
+  useEffect(
+    () => () => {
+      if (sendCheckRef.current !== undefined) clearTimeout(sendCheckRef.current);
+    },
+    [],
   );
 
   const codexPane = !isRefine || !(codexBusy || codexResult) ? null : (

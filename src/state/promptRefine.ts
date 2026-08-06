@@ -83,10 +83,48 @@ export function refineViewStyle(
  */
 export const REFINE_SUBMIT_CR_DELAY = 300;
 
+/**
+ * CR을 보낸 뒤 "정말 제출됐나"를 확인하기까지 기다리는 시간(ms).
+ *
+ * 제출은 타이밍에 기대는 동작이라(붙여넣기 **다음 프레임**의 CR) 성공을 코드가
+ * 단정할 수 없다. 전사에 새 턴이 실제로 생겼는지로 사후 확인하고, 안 생겼으면
+ * 사용자에게 Enter를 안내한다 — **자동 재전송은 하지 않는다**: 늦게 도착한 제출과
+ * 겹치면 같은 프롬프트가 두 번 실행되고, 그건 채우기만 하는 [적용]과 달리
+ * 되돌릴 수 없다.
+ *
+ * 2초인 이유: 실측에서 제출 직후 user 레코드는 즉시(수백 ms 내) 생겼고 — 판정에
+ * 필요한 것은 어시스턴트 응답이 아니라 그 레코드다 — 여유를 얹은 값이다.
+ */
+export const REFINE_SUBMIT_CONFIRM_MS = 2000;
+
 /** [보내기]가 보낼 두 조각 — `[붙여넣기, CR]`. 반드시 **따로** 써야 한다
  * ({@link REFINE_SUBMIT_CR_DELAY}). */
 export function submitPasteBytes(text: string): [string, string] {
   return [bracketedPaste(text), "\r"];
+}
+
+/**
+ * Ctrl+←/→를 **패널 이동**으로 쓸 것인가.
+ *
+ * 아니라면 호출부는 `preventDefault`도 하지 않고 그냥 빠져야 한다 — 그 키는
+ * CodeMirror의 단어 이동이고, 롱폼 메모를 쓰는 중에 그걸 뺏으면 편집의 기본
+ * 조작이 사라진다(리뷰 #7). 정리 패널의 메모 뷰에서는 옮겨 갈 다른 pane조차 없다.
+ *
+ * 에디터 바깥 판정을 뷰와 **따로** 두는 이유: 프로젝트 메모 패널처럼 정리 세션이
+ * 아닌 곳에도 에디터가 있고, 반대로 메모 뷰 안에서도 포커스가 에디터 밖(헤더
+ * 버튼)일 수 있다.
+ */
+export function shouldNavPanes(i: {
+  /** 이벤트가 CodeMirror 안에서 났는가. */
+  inEditor: boolean;
+  /** 정리 패널인가. */
+  isRefine: boolean;
+  /** 지금 보이는 뷰. */
+  view: RefineView;
+}): boolean {
+  if (i.inEditor) return false;
+  if (i.isRefine && i.view === "memo") return false;
+  return true;
 }
 
 /** [보내기] 판정에 필요한 사실들 (호출부가 관측해 넘긴다). */

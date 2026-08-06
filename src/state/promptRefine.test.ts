@@ -9,6 +9,7 @@ import {
   extractPromptBlock,
   injectDeliveryDecision,
   isRefineParams,
+  REFINE_SUBMIT_CONFIRM_MS,
   REFINE_SUBMIT_CR_DELAY,
   openPromptRefine,
   refineCloseDecision,
@@ -19,6 +20,7 @@ import {
   refineViewStyle,
   resolveApplyAck,
   sendBlockReason,
+  shouldNavPanes,
   submitPasteBytes,
   type RefineDock,
 } from "./promptRefine";
@@ -559,5 +561,26 @@ describe("refineExitAction — 종료 경로 정책표 (리뷰 #1)", () => {
     expect(refineExitAction("source-missing-at-mount")).toBe("detach");
     expect(refineExitAction("layout-restore")).toBe("detach");
     expect(refineExitAction("model-restart")).toBe("detach");
+  });
+});
+
+describe("제출 확인 · 키 라우팅 (리뷰 #7·#8)", () => {
+  it("확인 시점은 CR을 보낸 뒤여야 한다", () => {
+    // 확인이 CR보다 먼저 돌면 언제나 "제출 못 함"으로 오보한다.
+    expect(REFINE_SUBMIT_CONFIRM_MS).toBeGreaterThan(REFINE_SUBMIT_CR_DELAY);
+  });
+
+  it("에디터 안의 Ctrl+←/→는 패널 이동이 아니다 — 단어 이동을 뺏지 않는다", () => {
+    expect(shouldNavPanes({ inEditor: true, isRefine: true, view: "memo" })).toBe(false);
+    // 정리 세션이 아닌 곳(프로젝트 메모 패널)의 에디터도 마찬가지.
+    expect(shouldNavPanes({ inEditor: true, isRefine: false, view: "term" })).toBe(false);
+    // 메모 뷰면 포커스가 에디터 밖(헤더)이어도 옮겨 갈 pane이 없다.
+    expect(shouldNavPanes({ inEditor: false, isRefine: true, view: "memo" })).toBe(false);
+  });
+
+  it("터미널·타임라인 뷰와 일반 세션에서는 그대로 패널 이동이다", () => {
+    expect(shouldNavPanes({ inEditor: false, isRefine: true, view: "term" })).toBe(true);
+    expect(shouldNavPanes({ inEditor: false, isRefine: true, view: "timeline" })).toBe(true);
+    expect(shouldNavPanes({ inEditor: false, isRefine: false, view: "memo" })).toBe(true);
   });
 });
