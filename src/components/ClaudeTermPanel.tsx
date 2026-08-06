@@ -39,6 +39,7 @@ import {
   isRefineParams,
   loadLastRefineModel,
   makeSubmitProbe,
+  makeTurnClaims,
   openPromptRefine,
   refineCloseDecision,
   refineCloseFailure,
@@ -287,6 +288,9 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
   // 제출의 결과가 조용히 사라진다(codex J3): 그 요청도 미확인이면 미확인이라고
   // 말해야 한다. 언마운트에서 한꺼번에 거둔다.
   const confirmTimersRef = useRef<Set<ReturnType<typeof setTimeout>>>(new Set());
+  // 이 패널(=이 세션)에서 어떤 probe가 성공 판정에 쓴 턴들. 같은 문안을 연달아
+  // 보내면 도착한 턴 하나가 두 probe를 모두 만족시키므로, 쓴 턴은 적어 둔다(K1).
+  const turnClaimsRef = useRef(makeTurnClaims());
   const turnsMapRef = useRef<ReadonlyMap<number, string>>(new Map());
   // 시드(리뷰·개발 모드) 제출의 안내와 그 확인 타이머. 정리 메모의 sendNote와
   // 나눠 두는 이유: 정리 패널이 아닌 일반 세션에도 떠야 하고, 둘이 동시에 살아
@@ -380,7 +384,10 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
    * 고치는 지시일 수 있어 되돌리기 어렵다.
    */
   const submitSeed = async (text: string): Promise<boolean> => {
-    const probe = makeSubmitProbe(() => turnsMapRef.current, text);
+    const probe = makeSubmitProbe(() => turnsMapRef.current, text, {
+      source: "app",
+      claims: turnClaimsRef.current,
+    });
     probe.capture(); // 기준선은 반드시 쓰기 **전**에 (감사 I2)
     let out: SubmitOutcome;
     try {
@@ -1462,7 +1469,10 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
     // 관측 기준선은 **바이트를 쓰기 전에** 잡는다(리뷰 I2). CR 뒤에 잡으면 아주
     // 빠르게 도착한 턴이 이미 기준선에 포함돼, 제출이 성공했는데도 "확인 못 함"
     // 경고가 뜬다.
-    const probe = makeSubmitProbe(() => turnsMapRef.current, text);
+    const probe = makeSubmitProbe(() => turnsMapRef.current, text, {
+      source: "user",
+      claims: turnClaimsRef.current,
+    });
     probe.capture();
     sendingRef.current = true;
     setSending(true);

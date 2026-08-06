@@ -14,6 +14,8 @@ import {
   REFINE_SUBMIT_CR_DELAY,
   openPromptRefine,
   makeSubmitProbe,
+  makeTurnClaims,
+  submitBody,
   refineCloseDecision,
   refineCloseFailure,
   refineClosePhase,
@@ -720,6 +722,84 @@ describe("makeSubmitProbe — 내가 보낸 그 본문이 새 턴으로 나타�
 
   it("기준선을 잡지 않았으면 판정하지 않는다 — 모르는 것을 실패로 보고하지 않는다", () => {
     expect(makeSubmitProbe(() => new Map(), TEXT).observed()).toBe(true);
+  });
+
+  // ---- 턴 클레임 (codex K1) ----
+
+  it("같은 문안 2연속 제출: 턴이 2개면 각각 자기 턴으로 확인된다", () => {
+    const turns = new Map<number, string>();
+    const claims = makeTurnClaims();
+    const a = makeSubmitProbe(() => turns, TEXT, { claims });
+    a.capture();
+    const b = makeSubmitProbe(() => turns, TEXT, { claims });
+    b.capture();
+    turns.set(1, TEXT);
+    turns.set(2, TEXT);
+    expect(a.observed()).toBe(true);
+    expect(b.observed()).toBe(true);
+  });
+
+  it("**턴이 1개뿐이면 두 번째는 미확인이다** — 하나가 둘을 만족시키면 안 된다", () => {
+    const turns = new Map<number, string>();
+    const claims = makeTurnClaims();
+    const a = makeSubmitProbe(() => turns, TEXT, { claims });
+    a.capture();
+    const b = makeSubmitProbe(() => turns, TEXT, { claims });
+    b.capture();
+    turns.set(1, TEXT); // 하나만 도착했다 = 하나는 안 들어갔다
+    expect(a.observed()).toBe(true);
+    expect(b.observed()).toBe(false); // 안내가 떠야 한다
+    // 뒤늦게 두 번째가 도착하면 그때 확인된다.
+    turns.set(2, TEXT);
+    expect(b.observed()).toBe(true);
+  });
+
+  it("앞 40자만 같은 다른 문안끼리도 턴을 나눠 갖는다", () => {
+    // 앞 40자(정규화 후)가 **정확히 같아야** 이 테스트가 클레임을 시험한다 —
+    // 짧으면 needle이 서로 달라져서 클레임과 무관하게 통과한다(자체 점검에서 발견).
+    const head = "아주 긴 공통 머리말이 사십 자를 확실히 넘도록 길게 이어지는 문장입니다 그리고 여기서 갈린다";
+    const turns = new Map<number, string>();
+    const claims = makeTurnClaims();
+    const a = makeSubmitProbe(() => turns, `${head} 첫째`, { claims });
+    a.capture();
+    const b = makeSubmitProbe(() => turns, `${head} 둘째`, { claims });
+    b.capture();
+    turns.set(1, `${head} 첫째`);
+    expect(a.observed()).toBe(true);
+    expect(b.observed()).toBe(false);
+  });
+
+  it("확인은 멱등이다 — 다시 물어도 남의 턴을 더 집지 않는다", () => {
+    const turns = new Map<number, string>();
+    const claims = makeTurnClaims();
+    const a = makeSubmitProbe(() => turns, TEXT, { claims });
+    a.capture();
+    turns.set(1, TEXT);
+    expect(a.observed()).toBe(true);
+    expect(a.observed()).toBe(true);
+    expect(claims.size).toBe(1); // 두 번 물었다고 두 턴을 먹지 않는다
+  });
+
+  // ---- 비교 정규화 (codex K2) ----
+
+  it("붙여넣기가 지우는 제어열이 앞부분에 있어도 오경고가 없다", () => {
+    // 전송되는 것은 정리된 본문이다. probe가 원문과 대조하면 어긋나서, 제출에
+    // 성공하고도 "확인 못 함"이 뜬다.
+    const raw = "\x1b[201~붙여넣기 탈출을 흉내 낸 머리말과 그 뒤의 본문 내용";
+    const turns = new Map<number, string>();
+    const probe = makeSubmitProbe(() => turns, raw, { source: "user" });
+    probe.capture();
+    // 전사에는 정리된 본문이 남는다 = submitBody가 만드는 그것.
+    turns.set(1, submitBody(raw, "user"));
+    expect(probe.observed()).toBe(true);
+  });
+
+  it("submitBody는 실제로 보내는 알맹이와 같다", () => {
+    const raw = "첫 줄\r\n둘째 줄\x1b[200~";
+    // user 경로: 붙여넣기 껍데기 안에 들어가는 본문과 일치해야 한다.
+    expect(submitBytes(raw, "user")[0]).toBe(bracketedPaste(submitBody(raw, "user")));
+    // app 단일행: CR 앞의 본문과 일치.
+    expect(submitBytes("한 줄", "app")[0]).toBe(`${submitBody("한 줄", "app")}\r`);
   });
 });
 

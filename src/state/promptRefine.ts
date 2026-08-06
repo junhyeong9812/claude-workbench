@@ -167,6 +167,20 @@ export function submitBytes(text: string, source: SubmitSource = "app"): string[
 }
 
 /**
+ * 이 본문이 세션에 **실제로 들어가는 형태** — {@link submitBytes}가 보낼 것에서
+ * 제출 키(CR)와 붙여넣기 껍데기를 뺀 알맹이.
+ *
+ * 제출 확인이 전사와 대조할 기준이다. 확인이 원문을 들고 비교하면, 붙여넣기가
+ * 정리해 버리는 것(종료 시퀀스·CRLF)이 본문 앞부분에 있는 순간 둘이 어긋나
+ * **제출에 성공하고도 경고가 뜬다**(codex K2). 보내는 쪽과 확인하는 쪽이 같은
+ * 함수를 통과해야 그 어긋남이 생기지 않는다.
+ */
+export function submitBody(text: string, source: SubmitSource = "app"): string {
+  const body = text.replace(/\s+$/, "");
+  return source === "user" || body.includes("\n") ? pasteBody(body) : body;
+}
+
+/**
  * Ctrl+←/→를 **패널 이동**으로 쓸 것인가.
  *
  * 아니라면 호출부는 `preventDefault`도 하지 않고 그냥 빠져야 한다 — 그 키는
@@ -361,22 +375,46 @@ const normalizeForProbe = (s: string): string => s.replace(/\s+/g, " ").trim();
  * 뜰 뿐이고(자동 재전송 없음), 잘못 "확인됨"으로 넘기면 사용자는 아무것도 모른 채
  * 기다린다. 그래서 애매하면 미확인으로 떨어뜨린다.
  */
+/**
+ * 여러 probe가 **같은 턴을 두 번 세지 못하게** 하는 공유 장부 (codex K1).
+ *
+ * 같은 문안을 연달아 두 번 보내면(재시도가 흔하다) 도착한 턴 하나가 두 probe의
+ * 조건을 모두 만족한다 — 둘 다 "확인됨"이 되어, 실제로는 하나만 들어갔는데도
+ * 아무 안내가 뜨지 않는다. 성공 판정에 쓴 턴을 여기 적어 두면 두 번째 probe는
+ * 자기 몫의 턴을 따로 기다린다.
+ *
+ * 범위는 **한 패널(=한 세션)**이다. 턴 번호가 세션 안에서만 유일하기 때문이다.
+ */
+export type TurnClaims = Set<number>;
+export const makeTurnClaims = (): TurnClaims => new Set<number>();
+
 export function makeSubmitProbe(
   readTurns: () => ReadonlyMap<number, string>,
   text: string,
+  opts: { source?: SubmitSource; claims?: TurnClaims } = {},
 ): { capture(): void; observed(): boolean } {
+  const claims = opts.claims ?? makeTurnClaims();
   let before: Set<number> | null = null;
-  const needle = normalizeForProbe(text).slice(0, PROBE_HEAD);
+  /** 보내는 쪽과 **같은 전처리**를 거친 본문에서 뽑은 앞부분 (K2). */
+  const needle = normalizeForProbe(submitBody(text, opts.source ?? "app")).slice(0, PROBE_HEAD);
+  /** 이 probe가 이미 자기 것으로 삼은 턴 — 재호출이 남의 턴을 더 집지 않게. */
+  let mine: number | null = null;
   return {
     capture() {
       before = new Set(readTurns().keys());
     },
     observed() {
       if (before === null) return true; // 기준선 없음 — 판정하지 않는다
+      if (mine !== null) return true; // 이미 확인했다 (멱등)
       if (needle === "") return false;
       for (const [turn, prompt] of readTurns()) {
         if (before.has(turn)) continue; // 기준선에 있던 턴은 내 것이 아니다
-        if (normalizeForProbe(prompt).startsWith(needle)) return true;
+        if (claims.has(turn)) continue; // 다른 probe가 이미 자기 것으로 셌다
+        if (normalizeForProbe(prompt).startsWith(needle)) {
+          claims.add(turn);
+          mine = turn;
+          return true;
+        }
       }
       return false;
     },
@@ -638,8 +676,18 @@ export function extractLatestPromptBlock(
  */
 export function bracketedPaste(text: string): string {
   const ESC = "\x1b";
-  const body = text.replace(/\x1b\[20[01]~/g, "").replace(/\r\n?/g, "\n");
-  return `${ESC}[200~${body}${ESC}[201~`;
+  return `${ESC}[200~${pasteBody(text)}${ESC}[201~`;
+}
+
+/**
+ * 붙여넣기로 감쌀 때 본문에 실제로 가해지는 정리 — 종료 시퀀스 제거 + 개행 정규화.
+ *
+ * {@link bracketedPaste}에서 떼어낸 이유는 **제출 확인이 같은 전처리를 봐야**
+ * 하기 때문이다: 전송되는 것은 정리된 본문인데 확인은 원문과 대조하면, 본문 앞에
+ * 제어열이 들어 있는 순간 둘이 어긋나 제출에 성공하고도 경고가 뜬다(codex K2).
+ */
+function pasteBody(text: string): string {
+  return text.replace(/\x1b\[20[01]~/g, "").replace(/\r\n?/g, "\n");
 }
 
 /** [적용] 가능 여부 판정에 필요한 사실들 (전부 호출부가 관측해 넘긴다). */
