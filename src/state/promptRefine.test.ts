@@ -10,6 +10,7 @@ import {
   injectDeliveryDecision,
   isRefineParams,
   REFINE_SUBMIT_CONFIRM_MS,
+  SEED_READY_DELAY,
   REFINE_SUBMIT_CR_DELAY,
   openPromptRefine,
   makeSubmitProbe,
@@ -25,6 +26,7 @@ import {
   resolveApplyAck,
   sendBlockReason,
   shouldNavPanes,
+  submitBytes,
   submitPasteBytes,
   type RefineDock,
 } from "./promptRefine";
@@ -676,5 +678,110 @@ describe("makeSubmitProbe — 기준선은 보내기 전에 잡는다", () => {
   it("기준선을 잡지 않았으면 판정하지 않는다 — 모르는 것을 실패로 보고하지 않는다", () => {
     const probe = makeSubmitProbe(() => 0);
     expect(probe.observed()).toBe(true);
+  });
+});
+
+// ---- 시드 제출 바이트 (후속 A: injectSeed LF 실결함) -----------------------
+
+describe("submitBytes — 본문 모양이 바이트를 정한다", () => {
+  it("단일행은 CR 한 조각 — LF가 아니다", () => {
+    // 예전 구현은 `text + "\n"`이었다. LF는 제출이 아니라 소프트 개행이라
+    // 시드가 입력창에 앉아만 있고 대화가 시작되지 않았다.
+    expect(submitBytes("이 파일 검토해줘")).toEqual(["이 파일 검토해줘\r"]);
+    expect(submitBytes("한 줄")[0]).not.toContain("\n");
+  });
+
+  it("멀티라인은 붙여넣기 + CR 두 조각 — 순서대로 따로 써야 한다", () => {
+    const body = "이 커밋 리뷰하자\n- a.rs\n- b.rs";
+    expect(submitBytes(body)).toEqual(submitPasteBytes(body));
+    const parts = submitBytes(body);
+    expect(parts).toHaveLength(2);
+    expect(parts[0]).not.toContain("\r"); // 붙여넣기 조각엔 CR이 없다
+    expect(parts[1]).toBe("\r");
+  });
+
+  it("꼬리 개행은 떼고 판정한다 — 안 그러면 단일행이 멀티라인 버퍼가 된다", () => {
+    // "한 줄\n"을 그대로 보내면 LF가 줄을 하나 더 만들고, 멀티라인 버퍼에서는
+    // CR이 제출로 동작하지 않는다 = 조용한 미제출.
+    expect(submitBytes("한 줄\n")).toEqual(["한 줄\r"]);
+    expect(submitBytes("한 줄   \n\n")).toEqual(["한 줄\r"]);
+    // 본문 **중간**의 개행은 그대로 멀티라인이다.
+    expect(submitBytes("첫 줄\n둘째 줄\n")).toHaveLength(2);
+  });
+
+  it("시드 주입 지연은 실측 준비 임계(1.8s<t≤2.0s)보다 위다", () => {
+    // 1800ms는 임계 바로 아래라 시드가 통째로 사라졌다(실측 재현).
+    expect(SEED_READY_DELAY).toBeGreaterThan(2000);
+  });
+});
+
+// ---- 회귀 방지: "채우기만" 계약은 건드리지 않았다 --------------------------
+
+describe("[적용] 채우기 경로 무접촉 (회귀 고정)", () => {
+  it("bracketedPaste는 여전히 CR을 만들지 않는다", () => {
+    // 제출 경로를 고치면서 채우기 경로에 CR이 새면, 사용자가 누른 적 없는
+    // 프롬프트가 원본 세션에서 실행된다.
+    const filled = bracketedPaste("첫 줄\n둘째 줄\n");
+    expect(filled).not.toContain("\r");
+    expect(filled.endsWith("\x1b[201~")).toBe(true);
+  });
+
+  it("submitBytes와 bracketedPaste는 다른 것을 만든다", () => {
+    const body = "a\nb";
+    expect(bracketedPaste(body)).not.toContain("\r");
+    expect(submitBytes(body).join("")).toContain("\r");
+  });
+});
+
+// ---- 소비처 전수: 실제 시드 문안이 제출 형태로 나가는가 --------------------
+
+describe("시드 소비처 4종 — 전부 제출된다 (실결함 회귀 고정)", () => {
+  /** 각 소비처가 실제로 만드는 문안의 **모양**(줄 구성)을 그대로 옮긴 것.
+   * 본문 문구가 아니라 단일행/멀티라인 여부가 바이트를 가르므로, 그 성질만
+   * 재현하면 계약이 고정된다. */
+  const seeds = {
+    // CommitFilesSidebar.startReview (리뷰 모드 🤖) — 유일한 멀티라인.
+    "리뷰 모드":
+      "이 커밋을 함께 코드리뷰하자. 커밋: abc1234\n" +
+      "변경 파일 2개:\n- a.rs (수정)\n- b.rs (추가)\n\n" +
+      "먼저 `git show abc1234` 로 변경을 확인하고, 버그·경계조건·설계 관점에서 리뷰해줘.",
+    // DevView.review (개발 모드 ✓확인) — 한 줄.
+    "개발 모드 확인":
+      "방금 `src/a.ts` 를 편집·저장했어. 그 파일을 읽고 검토해줘 — " +
+      "오타·빠진 import·들여쓰기/포맷·맥락 적합성 위주로. 직접 수정하지 말고 지적·설명만 해줘.",
+    // EditorPanel.confirmReview (확인) — 한 줄.
+    "EditorPanel 확인":
+      "방금 `src/b.ts` 를 편집·저장했어. 그 파일을 읽고 검토해줘 — 오타·빠진 import 위주로.",
+    // EditorPanel 테스트 생성 (🧪) — 한 줄.
+    "EditorPanel 테스트 생성":
+      "`src/c.ts` 의 단위 테스트를 src/c.test.ts 에 생성해줘. " +
+      "프로젝트의 기존 테스트 컨벤션·프레임워크를 따르고, 파일을 실제로 만들어줘.",
+  };
+
+  it("네 소비처 모두 마지막 조각이 CR이다 — LF로 끝나는 것은 하나도 없다", () => {
+    for (const [who, text] of Object.entries(seeds)) {
+      const parts = submitBytes(text);
+      expect(parts[parts.length - 1], `${who}: 제출 키가 CR이어야 한다`).toBe(
+        parts.length === 1 ? `${text}\r` : "\r",
+      );
+      expect(parts.join(""), `${who}: LF로 제출을 시도하면 안 된다`).not.toMatch(/\n$/);
+    }
+  });
+
+  it("멀티라인 시드만 두 조각(붙여넣기+CR), 나머지는 한 조각", () => {
+    expect(submitBytes(seeds["리뷰 모드"])).toHaveLength(2);
+    expect(submitBytes(seeds["개발 모드 확인"])).toHaveLength(1);
+    expect(submitBytes(seeds["EditorPanel 확인"])).toHaveLength(1);
+    expect(submitBytes(seeds["EditorPanel 테스트 생성"])).toHaveLength(1);
+  });
+
+  it("단일행 시드의 본문은 손대지 않는다 (문안 불변 — 백틱·경로 포함)", () => {
+    const text = seeds["개발 모드 확인"];
+    expect(submitBytes(text)[0]).toBe(`${text}\r`);
+  });
+
+  it("멀티라인 시드의 줄 구조는 보존된다", () => {
+    const [paste] = submitBytes(seeds["리뷰 모드"]);
+    expect(paste).toContain("변경 파일 2개:\n- a.rs (수정)\n- b.rs (추가)");
   });
 });
