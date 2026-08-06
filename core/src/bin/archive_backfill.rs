@@ -315,6 +315,11 @@ fn archive_one(
             mcp_bin,
             // 무인 대량 실행 — 일시적 추출 실패는 1회 재시도로 흡수한다.
             attempts: 2,
+            // 백필은 일반 세션만 다룬다(정리 세션 전사는 스캔 단계에서 이미
+            // 제외된다) — 라벨 없음 + 추출 그대로.
+            kind: None,
+            skip_extraction: false,
+            summary: None,
         },
         &extract,
     )

@@ -101,11 +101,29 @@ pub(super) fn archive_root(app: &AppHandle) -> Result<PathBuf, AppError> {
 /// and write `session.jsonl` + `normalized.json` + `book.html` under the archive
 /// root. Blocking work (file IO + full-transcript parse) runs on the blocking
 /// pool so the webview stays responsive.
+///
+/// The four trailing arguments are all `Option` and all absent in the ordinary
+/// 아카이브 button path — the shape that call site sends (`{cwd, uuid}`) is
+/// unchanged. They exist for the 프롬프트 정리 close path, which archives a
+/// session whose transcript lives in the `/tmp` scratch dir but which belongs,
+/// as a record, to the project it was opened from:
+///
+/// - `kind` — `"prompt"`, so the browser can label and filter it.
+/// - `skip_extraction` — no knowledge extraction for a prompt draft (and no
+///   1~3분 claude run in a tab-close handler).
+/// - `summary` — the user's memo, landed as this archive's `summary.md`.
+/// - `title` — the fallback title. The sidecar lookup below is keyed by
+///   `project_key(cwd)`, and a refine session's sidecars sit under the *scratch*
+///   key, so without this every prompt archive would be titled "Claude".
 #[tauri::command]
 pub async fn archive_session(
     app: AppHandle,
     cwd: String,
     uuid: String,
+    kind: Option<String>,
+    skip_extraction: Option<bool>,
+    summary: Option<String>,
+    title: Option<String>,
 ) -> Result<ArchiveResult, AppError> {
     // Canonical project identity, so `.`/trailing-slash/symlink aliases of the
     // same project can't slip past the guard (post-fix P4).
@@ -125,9 +143,25 @@ pub async fn archive_session(
     };
     let _ = app.emit("mt-archive-started", serde_json::json!({ "project": cwd }));
     let app2 = app.clone();
-    tauri::async_runtime::spawn_blocking(move || archive_session_blocking(app2, cwd, uuid))
+    let extra = ArchiveExtras {
+        kind,
+        skip_extraction: skip_extraction.unwrap_or(false),
+        summary,
+        title,
+    };
+    tauri::async_runtime::spawn_blocking(move || archive_session_blocking(app2, cwd, uuid, extra))
         .await
         .map_err(|_| AppError::new("Archive task failed to run"))?
+}
+
+/// The optional, caller-supplied parts of one archive run (see
+/// [`archive_session`]). Grouped so the blocking worker keeps a short signature.
+#[derive(Default)]
+struct ArchiveExtras {
+    kind: Option<String>,
+    skip_extraction: bool,
+    summary: Option<String>,
+    title: Option<String>,
 }
 
 /// Whether an archive of `project` is currently running — the picker's
@@ -143,6 +177,7 @@ fn archive_session_blocking(
     app: AppHandle,
     cwd: String,
     uuid: String,
+    extra: ArchiveExtras,
 ) -> Result<ArchiveResult, AppError> {
     let base = app
         .path()
@@ -156,9 +191,14 @@ fn archive_session_blocking(
         .ok_or_else(|| AppError::new("Session transcript not found"))?;
     let jsonl_bytes = std::fs::read(&jsonl_path)
         .map_err(|e| AppError::new(io_message("Cannot read transcript", &e)))?;
-    // Fallback title until extraction supplies one: the `.title` sidecar, else
-    // the display name — the archive folder slug derives from it.
-    let fallback_title = core_lib::snapshot::read_title(&base, &cwd, &uuid)
+    // Fallback title until extraction supplies one: the caller's, else the
+    // `.title` sidecar, else the display name — the archive folder slug derives
+    // from it.
+    let fallback_title = extra
+        .title
+        .map(|t| t.trim().to_string())
+        .filter(|t| !t.is_empty())
+        .or_else(|| core_lib::snapshot::read_title(&base, &cwd, &uuid))
         .or_else(|| core_lib::snapshot::read_name(&base, &cwd, &uuid))
         .unwrap_or_else(|| "Claude".to_string());
     let date = chrono::Local::now().format("%Y-%m-%d").to_string();
@@ -184,6 +224,9 @@ fn archive_session_blocking(
             jsonl_bytes: &jsonl_bytes,
             mcp_bin: mcp_bin.as_deref(),
             attempts: 1,
+            kind: extra.kind.as_deref(),
+            skip_extraction: extra.skip_extraction,
+            summary: extra.summary.as_deref(),
         },
         &extract,
     )
@@ -228,6 +271,9 @@ pub struct ArchiveListEntry {
     pub date: String,
     pub turns: usize,
     pub archived_at: Option<u64>,
+    /// 세션 종류 — `None`/부재 = 일반 작업 세션, `"prompt"` = 프롬프트 정리
+    /// 세션. 브라우저의 배지·필터가 읽는 값(`ArchiveMeta::kind` 그대로).
+    pub kind: Option<String>,
     /// Preserved past versions, newest first.
     pub history: Vec<ArchiveHistoryItem>,
 }
@@ -273,6 +319,7 @@ pub fn archive_list(app: AppHandle) -> Result<Vec<ArchiveProjectGroup>, AppError
                     date: s.meta.date,
                     turns: s.meta.turns,
                     archived_at: s.meta.archived_at,
+                    kind: s.meta.kind,
                     history: s
                         .history
                         .into_iter()
