@@ -30,6 +30,7 @@ import {
   submitPasteBytes,
   type RefineDock,
 } from "./promptRefine";
+import { commitReviewSeed, fileReviewSeed, testGenSeed } from "./seedPrompts";
 
 /** 최소 dock 스텁 — addPanel은 호출 인자를 기록하고 패널 목록에 반영한다. */
 function fakeDock(initial: { id: string; params?: unknown }[] = []) {
@@ -733,32 +734,24 @@ describe("[적용] 채우기 경로 무접촉 (회귀 고정)", () => {
   });
 });
 
-// ---- 소비처 전수: 실제 시드 문안이 제출 형태로 나가는가 --------------------
+// ---- 소비처 전수: **실제** 시드 문안이 제출 형태로 나가는가 --------------
 
 describe("시드 소비처 4종 — 전부 제출된다 (실결함 회귀 고정)", () => {
-  /** 각 소비처가 실제로 만드는 문안의 **모양**(줄 구성)을 그대로 옮긴 것.
-   * 본문 문구가 아니라 단일행/멀티라인 여부가 바이트를 가르므로, 그 성질만
-   * 재현하면 계약이 고정된다. */
-  const seeds = {
-    // CommitFilesSidebar.startReview (리뷰 모드 🤖) — 유일한 멀티라인.
-    "리뷰 모드":
-      "이 커밋을 함께 코드리뷰하자. 커밋: abc1234\n" +
-      "변경 파일 2개:\n- a.rs (수정)\n- b.rs (추가)\n\n" +
-      "먼저 `git show abc1234` 로 변경을 확인하고, 버그·경계조건·설계 관점에서 리뷰해줘.",
-    // DevView.review (개발 모드 ✓확인) — 한 줄.
-    "개발 모드 확인":
-      "방금 `src/a.ts` 를 편집·저장했어. 그 파일을 읽고 검토해줘 — " +
-      "오타·빠진 import·들여쓰기/포맷·맥락 적합성 위주로. 직접 수정하지 말고 지적·설명만 해줘.",
-    // EditorPanel.confirmReview (확인) — 한 줄.
-    "EditorPanel 확인":
-      "방금 `src/b.ts` 를 편집·저장했어. 그 파일을 읽고 검토해줘 — 오타·빠진 import 위주로.",
-    // EditorPanel 테스트 생성 (🧪) — 한 줄.
-    "EditorPanel 테스트 생성":
-      "`src/c.ts` 의 단위 테스트를 src/c.test.ts 에 생성해줘. " +
-      "프로젝트의 기존 테스트 컨벤션·프레임워크를 따르고, 파일을 실제로 만들어줘.",
+  /** 소비처가 **실제로 부르는 생성기**를 그대로 부른다(사본 문자열이 아니라).
+   * 문안이 바뀌면 — 특히 줄바꿈이 생기거나 사라지면 — 이 테스트가 깨져야 한다.
+   * 사본을 검증하면 실제 문안이 멀티라인이 돼도 태연히 통과한다(codex J5). */
+  const seeds: Record<string, string> = {
+    "리뷰 모드 🤖 (CommitFilesSidebar)": commitReviewSeed("abc1234", [
+      "- a.rs (수정)",
+      "- b.rs (추가)",
+    ]),
+    "개발 모드 ✓확인 (DevView)": fileReviewSeed("src/a.ts"),
+    "EditorPanel ✓확인": fileReviewSeed("src/b.ts"),
+    "EditorPanel 🧪 테스트 생성": testGenSeed("src/c.ts", "src/c.test.ts"),
+    "EditorPanel 🧪 (미러 경로 미상)": testGenSeed("src/c.ts", null),
   };
 
-  it("네 소비처 모두 마지막 조각이 CR이다 — LF로 끝나는 것은 하나도 없다", () => {
+  it("모든 소비처의 마지막 조각이 CR이다 — LF로 끝나는 것은 하나도 없다", () => {
     for (const [who, text] of Object.entries(seeds)) {
       const parts = submitBytes(text);
       expect(parts[parts.length - 1], `${who}: 제출 키가 CR이어야 한다`).toBe(
@@ -768,20 +761,32 @@ describe("시드 소비처 4종 — 전부 제출된다 (실결함 회귀 고정
     }
   });
 
-  it("멀티라인 시드만 두 조각(붙여넣기+CR), 나머지는 한 조각", () => {
-    expect(submitBytes(seeds["리뷰 모드"])).toHaveLength(2);
-    expect(submitBytes(seeds["개발 모드 확인"])).toHaveLength(1);
-    expect(submitBytes(seeds["EditorPanel 확인"])).toHaveLength(1);
-    expect(submitBytes(seeds["EditorPanel 테스트 생성"])).toHaveLength(1);
+  it("커밋 리뷰만 멀티라인(두 조각), 나머지는 단일행(한 조각)", () => {
+    // 이 분류가 바뀌면 전송 방식이 바뀐다 — 문안 수정 시 여기서 걸린다.
+    expect(submitBytes(seeds["리뷰 모드 🤖 (CommitFilesSidebar)"])).toHaveLength(2);
+    for (const who of [
+      "개발 모드 ✓확인 (DevView)",
+      "EditorPanel ✓확인",
+      "EditorPanel 🧪 테스트 생성",
+      "EditorPanel 🧪 (미러 경로 미상)",
+    ]) {
+      expect(submitBytes(seeds[who]), `${who}는 단일행이어야 한다`).toHaveLength(1);
+    }
+  });
+
+  it("DevView와 EditorPanel의 ✓확인은 같은 문안이다 (한 함수에서 나온다)", () => {
+    expect(fileReviewSeed("같은/경로.ts")).toBe(fileReviewSeed("같은/경로.ts"));
+    // 경로만 문안에 들어간다.
+    expect(fileReviewSeed("src/x.ts")).toContain("`src/x.ts`");
   });
 
   it("단일행 시드의 본문은 손대지 않는다 (문안 불변 — 백틱·경로 포함)", () => {
-    const text = seeds["개발 모드 확인"];
+    const text = fileReviewSeed("src/a.ts");
     expect(submitBytes(text)[0]).toBe(`${text}\r`);
   });
 
   it("멀티라인 시드의 줄 구조는 보존된다", () => {
-    const [paste] = submitBytes(seeds["리뷰 모드"]);
+    const [paste] = submitBytes(seeds["리뷰 모드 🤖 (CommitFilesSidebar)"]);
     expect(paste).toContain("변경 파일 2개:\n- a.rs (수정)\n- b.rs (추가)");
   });
 });
