@@ -69,15 +69,24 @@ pub fn save(base: &Path, project: &str, text: &str) -> io::Result<()> {
     }
     let d = dir(base, project);
     std::fs::create_dir_all(&d)?;
+    atomic_write(&d, text)
+}
+
+/// temp + rename. **어느 단계에서 실패하든** 임시 파일을 지운다 — 쓰기 실패로
+/// 남은 반쪽짜리 `.tmp`도 누적되면 프로젝트 디렉토리를 채운다(rename 실패만
+/// 정리하던 것을 전 구간으로 넓힘, 리뷰 P3).
+fn atomic_write(d: &Path, text: &str) -> io::Result<()> {
     let tmp = d.join(format!(
         "memo.md.{}-{}.tmp",
         std::process::id(),
         TMP_SEQ.fetch_add(1, Ordering::Relaxed)
     ));
-    std::fs::write(&tmp, text.as_bytes())?;
-    std::fs::rename(&tmp, d.join("memo.md")).inspect_err(|_| {
+    let r = std::fs::write(&tmp, text.as_bytes())
+        .and_then(|()| std::fs::rename(&tmp, d.join("memo.md")));
+    if r.is_err() {
         let _ = std::fs::remove_file(&tmp);
-    })
+    }
+    r
 }
 
 #[cfg(test)]
@@ -152,6 +161,29 @@ mod tests {
         let p = path(&b, "../../etc/passwd");
         assert!(p.starts_with(&b), "{p:?} escaped {b:?}");
         assert_eq!(load(&b, "../../etc/passwd").as_deref(), Some("x"));
+    }
+
+    /// 남아 있는 `.tmp` 파일 이름들.
+    fn temps(d: &Path) -> Vec<String> {
+        std::fs::read_dir(d)
+            .map(|it| {
+                it.filter_map(|e| e.ok())
+                    .map(|e| e.file_name().to_string_lossy().into_owned())
+                    .filter(|n| n.ends_with(".tmp"))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn failed_write_leaves_no_temp_file() {
+        // rename 실패를 강제한다: 목적지 `memo.md`를 디렉토리로 만들어 두면
+        // 파일→디렉토리 rename이 실패한다. 임시 파일은 이미 만들어진 뒤다.
+        let b = temp_base("failtmp");
+        let d = dir(&b, "/p");
+        std::fs::create_dir_all(d.join("memo.md")).unwrap();
+        assert!(save(&b, "/p", "내용").is_err());
+        assert!(temps(&d).is_empty(), "실패한 쓰기가 .tmp를 남겼다: {:?}", temps(&d));
     }
 
     #[test]
