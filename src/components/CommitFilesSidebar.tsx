@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { errText } from "../utils/error";
 import { useAppStore } from "../state/store";
+import { commitReviewSeed } from "../state/seedPrompts";
 
 interface CommitFile {
   path: string;
@@ -100,12 +101,10 @@ export function CommitFilesSidebar() {
   // commit + the changed-file list, so the seed stays small.
   const startReview = () => {
     if (!gitHistory || files.length === 0) return;
-    const fileList = files.map((f) => `- ${f.path} (${STATUS_LABEL[f.status] ?? f.status})`).join("\n");
-    const seed =
-      `이 커밋을 함께 코드리뷰하자. 커밋: ${commit}\n` +
-      `변경 파일 ${files.length}개:\n${fileList}\n\n` +
-      `먼저 \`git show ${commit}\` 로 변경을 확인하고, 버그·경계조건·설계 관점에서 리뷰해줘. ` +
-      `내가 특정 파일/라인을 물으면 그 부분을 깊이 보자. (파일은 수정하지 말고 리뷰·설명만)`;
+    const seed = commitReviewSeed(
+      commit,
+      files.map((f) => `- ${f.path} (${STATUS_LABEL[f.status] ?? f.status})`),
+    );
     // Open the commit diff as a dockview panel (left) and the review-dedicated
     // Claude session to its right — genuine side-by-side. The diff panel id
     // mirrors MainArea's dedupe key (`diff:<cwd>:<hash>`). Close the history

@@ -31,6 +31,7 @@ import {
   REFINE_SUBMIT_CONFIRM_MS,
   REFINE_SUBMIT_CR_DELAY,
   REFINE_VIEWS,
+  SEED_READY_DELAY,
   applyBlockReason,
   bracketedPaste,
   extractLatestPromptBlock,
@@ -38,6 +39,7 @@ import {
   isRefineParams,
   loadLastRefineModel,
   makeSubmitProbe,
+  makeTurnClaims,
   openPromptRefine,
   refineCloseDecision,
   refineCloseFailure,
@@ -50,7 +52,8 @@ import {
   saveLastRefineModel,
   sendBlockReason,
   shouldNavPanes,
-  submitPasteBytes,
+  submitBytes,
+  type SubmitSource,
   type RefineExitReason,
   type RefineModel,
   type RefineView,
@@ -281,9 +284,26 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
   const closingRef = useRef(false);
   // [보내기]의 동기 중복 가드 (리뷰 #6).
   const sendingRef = useRef(false);
-  // 제출 확인 타이머 · 최신 턴 수 (리뷰 #8).
-  const sendCheckRef = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
-  const turnsCountRef = useRef(0);
+  // 제출 확인 타이머 — **요청마다 하나**. 새 요청이 이전 타이머를 취소하면 앞선
+  // 제출의 결과가 조용히 사라진다(codex J3): 그 요청도 미확인이면 미확인이라고
+  // 말해야 한다. 언마운트에서 한꺼번에 거둔다.
+  const confirmTimersRef = useRef<Set<ReturnType<typeof setTimeout>>>(new Set());
+  // 이 패널(=이 세션)에서 어떤 probe가 성공 판정에 쓴 턴들. 같은 문안을 연달아
+  // 보내면 도착한 턴 하나가 두 probe를 모두 만족시키므로, 쓴 턴은 적어 둔다(K1).
+  const turnClaimsRef = useRef(makeTurnClaims());
+  const turnsMapRef = useRef<ReadonlyMap<number, string>>(new Map());
+  // 시드(리뷰·개발 모드) 제출의 안내와 그 확인 타이머. 정리 메모의 sendNote와
+  // 나눠 두는 이유: 정리 패널이 아닌 일반 세션에도 떠야 하고, 둘이 동시에 살아
+  // 있을 수 있다(정리 세션의 규약 시드 + 메모 보내기).
+  const [seedNote, setSeedNote] = useState<string | null>(null);
+  // 규약 시드가 아직 안 나갔는가 (정리 세션 전용, codex J4).
+  //
+  // **시드를 실제로 예약했을 때만** 켠다. params.seed 유무로 미리 켜 두면, 이
+  // 창이 미러라 시드를 보내지 않는 경우(driver가 아니면 예약 자체를 안 한다)
+  // 영영 켜진 채로 남아 "규약을 보내는 중"이라는 틀린 이유가 미러 안내를 덮는다.
+  // 예약 시점은 세션이 열리는 순간이고 그 전에는 sessionOpen 게이트가 막으므로,
+  // 늦게 켜서 생기는 틈은 없다.
+  const [seedPending, setSeedPending] = useState(false);
   // 메모 저장기의 손잡이 (MemoEditor가 마운트되면 채워진다) — 닫기 전에 저장을
   // 확인하는 유일한 경로.
   const memoHandleRef = useRef<MemoHandle | null>(null);
@@ -308,9 +328,93 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
     });
   };
 
-  /** Write the seed (+Enter) to the current session — the review/dev one-shot
-   * prompt path, byte-for-byte unchanged. */
-  const injectSeed = (text: string) => writeToSession(text + "\n");
+  /** 한 번의 제출 시도가 어디까지 갔는가. */
+  type SubmitOutcome =
+    /** 조각을 전부 PTY에 넣었다 (실제 제출 여부는 probe가 사후 확인한다). */
+    | { ok: true }
+    /** 첫 조각부터 못 썼다 — 입력창에 아무것도 안 들어갔다. */
+    | { ok: false; stage: "start" }
+    /** 본문은 들어갔는데 제출 키를 못 보냈다 — Enter 한 번이면 된다. */
+    | { ok: false; stage: "submit" };
+
+  /**
+   * 본문을 현재 세션에 **제출**한다 — 시드([확인]·리뷰 모드)와 정리 메모
+   * [보내기]가 함께 쓰는 유일한 제출 경로.
+   *
+   * 바이트를 무엇으로 할지는 순수 규칙이 정한다({@link submitBytes}) — `source`가
+   * 인코딩 정책을 가른다: 사용자가 쓴 글은 길이와 무관하게 붙여넣기로 감싸고,
+   * 앱이 만든 시드는 단일행이면 `\r` 한 조각으로 끝낸다. 여기가 책임지는 것은 그
+   * 계약의 실행부다 — **조각 사이에 지연을 두고 각각 따로 쓴다**. 두 조각을 한
+   * write에 합치면 CR이 붙여넣기 본문으로 먹혀 제출되지 않는다(실측).
+   *
+   * 두 호출부가 같은 함수를 쓰는 이유: 제출 바이트는 CLI 동작에 대한 실측 위에
+   * 서 있고, 그 지식이 두 벌로 갈라지면 한쪽만 낡는다. 시드가 `text + "\n"`으로
+   * 남아 조용히 제출되지 않던 것이 정확히 그 형태의 실결함이었다.
+   */
+  const submitToSession = async (text: string, source: SubmitSource): Promise<SubmitOutcome> => {
+    const parts = submitBytes(text, source);
+    for (let i = 0; i < parts.length; i++) {
+      if (i > 0) await new Promise((r) => setTimeout(r, REFINE_SUBMIT_CR_DELAY));
+      if ((await writeToSession(parts[i])) !== true) {
+        return { ok: false, stage: i === 0 ? "start" : "submit" };
+      }
+    }
+    return { ok: true };
+  };
+
+  /** 제출 확인을 예약한다 — 확인되지 않으면 `onUnconfirmed`. 요청마다 독립이다. */
+  const scheduleConfirm = (probe: { observed(): boolean }, onUnconfirmed: () => void) => {
+    const t = setTimeout(() => {
+      confirmTimersRef.current.delete(t);
+      if (!probe.observed()) onUnconfirmed();
+    }, REFINE_SUBMIT_CONFIRM_MS);
+    confirmTimersRef.current.add(t);
+  };
+
+  /**
+   * 시드(리뷰 모드 🤖 · 개발 모드 ✓확인 · 테스트 생성)를 제출한다.
+   *
+   * 예전 구현은 `text + "\n"`이었다. LF는 claude TUI에서 **제출이 아니라 소프트
+   * 개행**이라, 시드는 입력창에 얌전히 앉아 있기만 하고 아무 대화도 시작되지
+   * 않았다 — 그런데 앱은 성공으로 보고했으므로 사용자는 Claude가 무시한 줄 알았다.
+   *
+   * 제출 여부는 코드가 단정할 수 없으므로(타이밍 의존) 전사가 실제로 자랐는지
+   * 사후 확인하고, 아니면 안내만 남긴다. **자동 재전송은 하지 않는다** — 늦게
+   * 도착한 제출과 겹치면 같은 요청이 두 번 실행되고, 시드는 파일을 만들거나
+   * 고치는 지시일 수 있어 되돌리기 어렵다.
+   */
+  const submitSeed = async (text: string): Promise<boolean> => {
+    const probe = makeSubmitProbe(() => turnsMapRef.current, text, {
+      source: "app",
+      claims: turnClaimsRef.current,
+    });
+    probe.capture(); // 기준선은 반드시 쓰기 **전**에 (감사 I2)
+    let out: SubmitOutcome;
+    try {
+      out = await submitToSession(text, "app");
+    } catch (e) {
+      // **예외를 삼키지 않는다**(codex J2). 세션이 안 열렸다거나 IPC가 실패한
+      // 경우가 여기로 오는데, 조용히 넘기면 "요청을 보냈는데 아무 일도 없다"가
+      // 된다 — 이 작업이 없애려던 실패 모양 그 자체다.
+      setSeedNote(`요청을 보내지 못했습니다: ${errText(e)}`);
+      return false;
+    }
+    if (!out.ok) {
+      setSeedNote(
+        out.stage === "start"
+          ? "요청을 세션에 보내지 못했습니다 — 이 창이 입력 권한을 갖고 있지 않습니다."
+          : "요청은 입력창에 들어갔지만 제출 키를 보내지 못했습니다 — 터미널에서 Enter를 눌러 주세요.",
+      );
+      return false;
+    }
+    scheduleConfirm(probe, () =>
+      setSeedNote(
+        "제출을 확인하지 못했습니다 — 요청이 입력창에 들어가 있을 수 있습니다.\n" +
+          "터미널에서 Enter를 눌러 주세요. (같은 내용을 자동으로 다시 보내지는 않습니다.)",
+      ),
+    );
+    return true;
+  };
 
   /** 입력창에 **채우기만** 한다 — 제출 없음.
    *
@@ -362,7 +466,8 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
       let reason: string | undefined;
       try {
         // "fill" = 프롬프트 정리 [적용] — 채우기만 하고 제출하지 않는다.
-        ok = (await (req.mode === "fill" ? fillInput(req.text) : injectSeed(req.text))) === true;
+        // 그 밖(시드·개발 모드 ✓확인)은 **제출**이다.
+        ok = (await (req.mode === "fill" ? fillInput(req.text) : submitSeed(req.text))) === true;
         if (!ok) reason = "이 창이 세션의 입력 권한을 갖고 있지 않습니다.";
       } catch (e) {
         reason = errText(e);
@@ -974,6 +1079,9 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
         if (driving && props.params.seed && pendingSeedRef.current == null) {
           pendingSeedRef.current = props.params.seed;
           setLastSeed(props.params.seed);
+          // 규약 시드가 나가기 전까지 [보내기]를 잠근다(정리 세션만 — 일반
+          // 세션의 시드는 순서를 다툴 상대가 없다).
+          if (isRefine) setSeedPending(true);
         }
         // 1회성 필드(seed 주입·adopt 재검증)는 지우고 나머지는 보존 —
         // `spawnCwd`는 **남는다**(재시작 후에도 원 디렉토리에서 띄워야 한다).
@@ -1043,10 +1151,19 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
             // 경로 그대로(바이트 무변경).
             // 쏘고 잊는 자리 — writeToSession은 더 이상 에러를 삼키지 않으므로
             // 여기서 명시적으로 흘린다(실패해도 "시드 재주입" 버튼이 남는다).
-            void (isRefine ? submitSingleLine(seed) : injectSeed(seed)).catch(() => {});
+            // submitSeed는 스스로 실패를 배너로 보고한다(codex J2) — 여기서
+            // 삼키는 catch는 정리 세션의 한 줄 시드 경로에만 남는다.
+            if (isRefine) {
+              // 성공하든 실패하든 **시도가 끝나면** 게이트를 연다 — 순서만
+              // 지키면 되고, 영영 잠가 두면 사용자가 갇힌다(실패는 "시드 재주입"
+              // 버튼과 배너가 받는다).
+              void submitSingleLine(seed)
+                .catch(() => {})
+                .finally(() => setSeedPending(false));
+            } else void submitSeed(seed);
             pendingSeedRef.current = null;
           }
-        }, 1800);
+        }, SEED_READY_DELAY);
       }
 
       // Seed the timeline from the saved snapshot (reopen or tab-switch
@@ -1324,6 +1441,7 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
         isDriver,
         blocked: myBlocked,
         sending,
+        seedPending,
       })
     : null;
 
@@ -1348,38 +1466,40 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
     }
     const text = memoTextRef.current;
     if (text.trim() === "") return;
-    const [paste, cr] = submitPasteBytes(text);
     // 관측 기준선은 **바이트를 쓰기 전에** 잡는다(리뷰 I2). CR 뒤에 잡으면 아주
     // 빠르게 도착한 턴이 이미 기준선에 포함돼, 제출이 성공했는데도 "확인 못 함"
     // 경고가 뜬다.
-    const probe = makeSubmitProbe(() => turnsCountRef.current);
+    const probe = makeSubmitProbe(() => turnsMapRef.current, text, {
+      source: "user",
+      claims: turnClaimsRef.current,
+    });
     probe.capture();
     sendingRef.current = true;
     setSending(true);
     setSendNote(null);
     try {
-      if ((await writeToSession(paste)) !== true) {
-        setSendNote("정리 세션에 쓰지 못했습니다 — 이 창이 입력 권한을 갖고 있지 않습니다.");
-        return;
-      }
-      await new Promise((r) => setTimeout(r, REFINE_SUBMIT_CR_DELAY));
-      if ((await writeToSession(cr)) !== true) {
-        setSendNote("메모는 입력창에 들어갔지만 제출 키를 보내지 못했습니다 — 터미널 뷰에서 Enter를 눌러 주세요.");
+      // 바이트 계약은 시드와 공유한다(submitToSession). 메모는 사용자가 쓴
+      // 글이므로 **길이와 무관하게** 붙여넣기로 감싼다("user") — 한 줄짜리
+      // 메모라고 raw로 흘리면 그 안의 제어문자가 키 입력이 된다(codex J1).
+      const out = await submitToSession(text, "user");
+      if (!out.ok) {
+        setSendNote(
+          out.stage === "start"
+            ? "정리 세션에 쓰지 못했습니다 — 이 창이 입력 권한을 갖고 있지 않습니다."
+            : "메모는 입력창에 들어갔지만 제출 키를 보내지 못했습니다 — 터미널 뷰에서 Enter를 눌러 주세요.",
+        );
         return;
       }
       // 제출은 **타이밍에 기대는 동작**이다(붙여넣기 다음 프레임의 CR). 성공
       // 여부를 눈으로 확인할 길이 없으면 사용자는 보낸 줄 알고 기다린다 — 그래서
       // 전사가 실제로 자랐는지 한 번 확인한다(리뷰 #8). **자동 재전송은 하지
       // 않는다**: 늦게 도착한 제출과 겹치면 같은 프롬프트가 두 번 실행된다.
-      if (sendCheckRef.current !== undefined) clearTimeout(sendCheckRef.current);
-      sendCheckRef.current = setTimeout(() => {
-        sendCheckRef.current = undefined;
-        if (probe.observed()) return;
+      scheduleConfirm(probe, () =>
         setSendNote(
           "제출을 확인하지 못했습니다 — 메모는 입력창에 들어가 있을 수 있습니다.\n" +
             "터미널 뷰에서 Enter를 눌러 주세요. (같은 내용을 자동으로 다시 보내지는 않습니다.)",
-        );
-      }, REFINE_SUBMIT_CONFIRM_MS);
+        ),
+      );
       // 보냈으면 대화를 보는 것이 다음 동작이다.
       setRefineView("term");
     } catch (e) {
@@ -1474,6 +1594,17 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
   // 낡은 상태(메모·uuid·프로젝트)로 아카이브하게 된다.
   const closeWithArchiveRef = useRef(closeWithArchive);
   closeWithArchiveRef.current = closeWithArchive;
+
+  /** 시드 제출 안내 — "보냈는데 아무 일도 없다"를 알 수 있는 유일한 자리다.
+   * 정리 패널의 배너와 같은 어휘·같은 요소를 쓴다(새 UI 어휘를 만들지 않는다). */
+  const seedNoteBanner = seedNote && (
+    <div className="claudeterm-refine-note" role="alert">
+      {seedNote}
+      <span className="claudeterm-refine-note-x" title="닫기" onClick={() => setSeedNote(null)}>
+        ×
+      </span>
+    </div>
+  );
 
   /** 정리 패널의 **유일한 종료 문**. 어떤 사건이 아카이브를 부르는지는 정책 표가
    * 정한다(`promptRefine.refineExitAction`) — 경로마다 판단을 흩뿌리면 그중 하나가
@@ -1790,9 +1921,9 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
                 className="claudeterm-head-btn"
                 title="시드 프롬프트를 현재 세션에 다시 보냅니다 (자동 주입이 빗나갔을 때)"
                 onClick={() =>
-                  void (isRefine ? submitSingleLine(lastSeed) : injectSeed(lastSeed)).catch(
-                    () => {},
-                  )
+                  void (isRefine
+                    ? submitSingleLine(lastSeed).catch(() => {})
+                    : submitSeed(lastSeed))
                 }
               >
                 시드 재주입
@@ -1818,6 +1949,7 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
   // 실패. 셋 다 "조용히 넘어가면 사용자가 알 길이 없는" 사건이라 화면에 남는다.
   const refineNotes = !isRefine ? null : (
     <>
+      {seedNoteBanner}
       {closeNote && (
         <div className="claudeterm-refine-note" role="alert">
           {closeNote.reason}
@@ -1884,11 +2016,12 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
     </>
   );
 
-  turnsCountRef.current = turns.size;
+  turnsMapRef.current = turns;
   // 패널이 사라진 뒤에 확인 배너를 띄우려 들지 않게.
   useEffect(
     () => () => {
-      if (sendCheckRef.current !== undefined) clearTimeout(sendCheckRef.current);
+      for (const t of confirmTimersRef.current) clearTimeout(t);
+      confirmTimersRef.current.clear();
     },
     [],
   );
@@ -1927,6 +2060,7 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
       style={isRefine ? refineViewStyle(refineView, "term") : undefined}
     >
       {!isRefine && paneHead}
+      {!isRefine && seedNoteBanner}
       <div className="claudeterm-term" ref={hostRef} />
     </div>
   );

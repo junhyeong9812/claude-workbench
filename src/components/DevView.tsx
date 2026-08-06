@@ -6,6 +6,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { ClaudeTermPanel } from "./ClaudeTermPanel";
 import { StudyFileView } from "./StudyFileView";
 import { useAppStore } from "../state/store";
+import { fileReviewSeed } from "../state/seedPrompts";
 import {
   resolveLayerMode,
   devIsFront,
@@ -85,10 +86,7 @@ export function DevView({ project }: { project: string }) {
   const review = () => {
     if (!active) return;
     const uuid = useAppStore.getState().ensureDevUuid(project);
-    const prompt =
-      `방금 \`${active}\` 를 편집·저장했어. 그 파일을 읽고 검토해줘 — ` +
-      `오타·빠진 import·들여쓰기/포맷·맥락 적합성 위주로. ` +
-      `직접 수정하지 말고 무엇을 어떻게 고치면 되는지 지적·설명만 해줘.`;
+    const prompt = fileReviewSeed(active);
     useAppStore.getState().requestClaudeInject({ id: crypto.randomUUID(), uuid, text: prompt });
   };
 
