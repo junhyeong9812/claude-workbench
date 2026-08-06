@@ -126,6 +126,47 @@ export function sendBlockReason(g: SendGate): string | null {
 
 // ---- 닫기 = 아카이브 -------------------------------------------------------
 
+/** 정리 패널이 사라지는 사건들 — **전부** 여기 이름이 있어야 한다. */
+export type RefineExitReason =
+  /** 탭의 × (사용자가 이 작업을 끝냈다). */
+  | "tab-close"
+  /** [적용]이 배달 확인됨 — 이 기능의 정상 종료. */
+  | "apply-delivered"
+  /** 살아 있던 원본 탭이 사라졌다 (닫기/삭제·다른 창으로 전송). */
+  | "source-removed"
+  /** 마운트해 보니 원본이 이미 없다 — 레이아웃 복원 직후의 유령. */
+  | "source-missing-at-mount"
+  /** 모델을 바꾸느라 세션을 다시 시작한다 (대화 파기에 사용자가 동의했다). */
+  | "model-restart"
+  /** 레이아웃 복원 뒷정리 (`closeEphemeralPanels`). */
+  | "layout-restore";
+
+/**
+ * 그 사건에서 아카이브할 것인가, 그냥 놓아줄 것인가.
+ *
+ * 이 표가 존재하는 이유는 정확히 한 번 틀렸기 때문이다(리뷰 #1): 닫기=아카이브를
+ * 탭의 ×에만 붙였더니, **기능이 성공했을 때**([적용] 배달 확인)와 원본 탭이
+ * 사라졌을 때는 기록 없이 사라졌다. 종료 경로가 여섯인데 정책은 한 곳에만 쓰여
+ * 있었던 것이다. 새 종료 경로가 생기면 여기 이름을 올리는 것이 강제된다.
+ *
+ * `detach` 쪽 셋의 공통점은 **사용자가 이 작업을 끝낸 것이 아니라는 것**이다:
+ * 레이아웃 복원 뒷정리는 프로젝트 탭을 왕복할 때마다 일어나므로 아카이브하면
+ * 기록이 소음으로 차고(그때 초안은 파일로 남는다), 모델 재시작은 대화를 버리기로
+ * 이미 합의한 경로다.
+ */
+export function refineExitAction(reason: RefineExitReason): "archive" | "detach" {
+  switch (reason) {
+    case "tab-close":
+    case "apply-delivered":
+    case "source-removed":
+      return "archive";
+    case "source-missing-at-mount":
+    case "model-restart":
+    case "layout-restore":
+      return "detach";
+  }
+}
+
 /** 닫기 요청 하나에 대한 방침. */
 export type RefineCloseAction =
   /** 남길 기록이 없다 — 아카이브하지 않고 그냥 닫는다. */
@@ -136,40 +177,57 @@ export type RefineCloseAction =
 /**
  * 닫기를 아카이브로 볼지 그냥 닫을지.
  *
- * "빈 세션은 스킵"이 계약인 이유: 정리 패널을 열어 두고 아무 대화도 없이 닫는
- * 것은 흔한 경로다(마음이 바뀌었다·잘못 열었다). 그걸 실패로 보고하면 안내가
- * 소음이 되고, 0턴짜리 아카이브를 남기면 목록이 쓰레기로 찬다. 세션이 아직
- * 스폰도 안 됐거나 기록할 프로젝트를 모르는 경우도 같은 결론이다.
+ * **턴 수를 보지 않는다**(리뷰 #2). 프론트의 턴 집계는 이 패널이 지금 마운트돼
+ * 있고 스냅샷이 이미 도착했을 때만 맞다 — 배경 탭의 ×는 그 둘 다 아닐 수 있고,
+ * 그때 `turns === 0`을 "빈 세션"으로 읽으면 **대화가 있는 세션을 아카이브 없이
+ * 닫아 버린다**(무음 기록 소실). 빈 세션 판정은 전사를 실제로 파싱하는 백엔드의
+ * `NoTurns`에 맡기고, 여기서는 "아카이브를 시도할 수 있는가"만 본다.
  */
 export function refineCloseDecision(i: {
   /** 정리 세션 uuid (스폰 전이면 null). */
   uuid: string | null | undefined;
   /** 기록될 원본 프로젝트. */
   project: string | null | undefined;
-  /** 지금까지 관측된 대화 턴 수. */
-  turns: number;
 }): RefineCloseAction {
   if (!i.uuid) return { kind: "close", why: "세션이 아직 시작되지 않았습니다" };
   if (!i.project) return { kind: "close", why: "기록할 프로젝트를 알 수 없습니다" };
-  if (i.turns <= 0) return { kind: "close", why: "대화가 없습니다" };
   return { kind: "archive", uuid: i.uuid, project: i.project };
 }
 
-/**
- * 아카이브가 실패했을 때 패널을 닫을지(`"close"`) 남길지(`"keep"`).
- *
- * **기본은 남기는 것이다** — 세션은 한 번 닫히면 되돌릴 수 없으므로, 원인을
- * 모르는 실패에서 닫는 것은 곧 조용한 기록 소실이다. 예외는 백엔드가 "아카이브할
- * 대화가 없다"고 답한 경우 하나뿐인데, 그건 실패가 아니라 우리 턴 집계와 어긋난
- * 것이고 결론(남길 것이 없다)은 같다.
- *
- * 남기는 쪽으로 떨어지는 실경로들: 같은 프로젝트에서 다른 아카이브가 진행 중
- * (`in_flight`), 전사 파일을 찾지 못함, 쓰기 실패. 전부 다시 시도하면 풀릴 수
- * 있는 것들이라 [다시 닫기]가 의미를 갖는다.
- */
+/** 아카이브가 실패했을 때의 처리 방침. */
+export type RefineCloseVerdict =
+  /** 남길 것이 없었다 — 그냥 닫는다. */
+  | { kind: "close" }
+  /** 사용자에게 사유를 보여 주고 맡긴다. `retryable`이면 [다시 닫기]가 의미 있다. */
+  | { kind: "ask"; reason: string; retryable: boolean };
+
 export const NO_TURNS_MESSAGE = "아카이브할 대화가 없습니다";
-export function refineCloseFailure(message: string): "close" | "keep" {
-  return message.includes(NO_TURNS_MESSAGE) ? "close" : "keep";
+
+/**
+ * 아카이브 실패를 어떻게 다룰지.
+ *
+ * **기본은 닫지 않는 것이다** — 세션은 한 번 닫히면 되돌릴 수 없으므로, 원인을
+ * 모르는 실패에서 닫는 것은 곧 조용한 기록 소실이다. 실경로(같은 프로젝트에서
+ * 다른 아카이브 진행 중·전사 미존재·쓰기 실패)는 전부 다시 시도하면 풀릴 수
+ * 있어 [다시 닫기]가 의미를 갖는다.
+ *
+ * `NoTurns`만 다르다. 그건 실패가 아니라 "남길 대화가 없다"는 사실이고 재시도가
+ * 무의미하다. 그래도 **메모가 비어 있지 않으면 조용히 닫지 않는다**(리뷰 #2):
+ * 사용자가 초안을 써 뒀는데 아카이브가 안 됐다는 사실은 알려야 하고, 그 초안을
+ * 우리가 대신 폐기하기로 결정할 일도 아니다. 안내하고 [그래도 닫기]를 준다.
+ */
+export function refineCloseFailure(message: string, memoEmpty: boolean): RefineCloseVerdict {
+  if (message.includes(NO_TURNS_MESSAGE)) {
+    if (memoEmpty) return { kind: "close" };
+    return {
+      kind: "ask",
+      retryable: false,
+      reason:
+        "정리 대화가 없어 아카이브하지 않았습니다 — 메모만으로는 남길 기록이 없습니다.\n" +
+        "메모는 정리 스크래치 파일에 그대로 남습니다.",
+    };
+  }
+  return { kind: "ask", retryable: true, reason: message };
 }
 
 /** 정리 세션에 쓸 수 있는 모델 (CLI 별칭 그대로 `--model`에 실린다). */

@@ -13,6 +13,7 @@ import {
   openPromptRefine,
   refineCloseDecision,
   refineCloseFailure,
+  refineExitAction,
   refinePanelId,
   refineSeedPrompt,
   refineViewStyle,
@@ -492,31 +493,71 @@ describe("sendBlockReason — 무엇을 막는가", () => {
 
 // ---- 닫기 = 아카이브 --------------------------------------------------------
 
-describe("refineCloseDecision — 남길 것이 있을 때만 아카이브한다", () => {
-  it("턴이 있으면 원본 프로젝트 키로 아카이브한다", () => {
-    expect(refineCloseDecision({ uuid: "u", project: "/proj", turns: 3 })).toEqual({
+describe("refineCloseDecision — 턴 수를 보지 않는다 (리뷰 #2)", () => {
+  it("uuid와 프로젝트가 있으면 아카이브를 시도한다", () => {
+    expect(refineCloseDecision({ uuid: "u", project: "/proj" })).toEqual({
       kind: "archive",
       uuid: "u",
       project: "/proj",
     });
   });
 
-  it("빈 세션(0턴)·스폰 전·프로젝트 미상은 아카이브 없이 닫는다", () => {
-    expect(refineCloseDecision({ uuid: "u", project: "/proj", turns: 0 }).kind).toBe("close");
-    expect(refineCloseDecision({ uuid: null, project: "/proj", turns: 5 }).kind).toBe("close");
-    expect(refineCloseDecision({ uuid: "u", project: null, turns: 5 }).kind).toBe("close");
+  it("**턴이 0으로 보여도 아카이브를 시도한다** — 빈 세션 판정은 백엔드 몫", () => {
+    // 배경 탭의 ×는 스냅샷이 아직 안 왔을 수 있다. 그 순간의 turns===0을 "빈
+    // 세션"으로 읽으면 대화가 있는 세션이 기록 없이 닫힌다(무음 소실).
+    expect(refineCloseDecision({ uuid: "u", project: "/proj" }).kind).toBe("archive");
+  });
+
+  it("스폰 전·프로젝트 미상만 아카이브 없이 닫는다", () => {
+    expect(refineCloseDecision({ uuid: null, project: "/proj" }).kind).toBe("close");
+    expect(refineCloseDecision({ uuid: "u", project: null }).kind).toBe("close");
   });
 });
 
 describe("refineCloseFailure — 실패했으면 닫지 않는다", () => {
-  it("in_flight·전사 미존재·쓰기 실패는 패널을 남긴다(다시 시도 가능)", () => {
-    expect(refineCloseFailure("이 프로젝트는 이미 아카이브 진행 중입니다")).toBe("keep");
-    expect(refineCloseFailure("Session transcript not found")).toBe("keep");
-    expect(refineCloseFailure("Cannot write archive: 권한 없음")).toBe("keep");
-    expect(refineCloseFailure("")).toBe("keep");
+  it("in_flight·전사 미존재·쓰기 실패는 패널을 남기고 재시도를 준다", () => {
+    for (const msg of [
+      "이 프로젝트는 이미 아카이브 진행 중입니다",
+      "Session transcript not found",
+      "Cannot write archive: 권한 없음",
+      "아카이브 부분 실패: 메모 동봉 실패",
+      "",
+    ]) {
+      expect(refineCloseFailure(msg, false)).toEqual({
+        kind: "ask",
+        retryable: true,
+        reason: msg,
+      });
+    }
   });
 
-  it("'대화 없음'만 예외 — 실패가 아니라 남길 것이 없다는 뜻이라 닫는다", () => {
-    expect(refineCloseFailure("아카이브할 대화가 없습니다")).toBe("close");
+  it("대화 없음 + 빈 메모 = 남길 것이 없다 — 그냥 닫는다", () => {
+    expect(refineCloseFailure("아카이브할 대화가 없습니다", true)).toEqual({ kind: "close" });
+  });
+
+  it("대화 없음 + 메모 있음 = 조용히 닫지 않는다 (초안 무단 폐기 금지)", () => {
+    const v = refineCloseFailure("아카이브할 대화가 없습니다", false);
+    expect(v.kind).toBe("ask");
+    // 재시도해도 결과가 같으므로 [다시 닫기]는 주지 않는다 — [그래도 닫기]만.
+    expect(v).toMatchObject({ retryable: false });
+    if (v.kind === "ask") expect(v.reason).toMatch(/메모는 정리 스크래치/);
+  });
+});
+
+describe("refineExitAction — 종료 경로 정책표 (리뷰 #1)", () => {
+  it("사용자가 이 작업을 끝낸 세 경로는 아카이브한다", () => {
+    // [적용] 성공이 여기 있는 것이 이 표의 요점이다 — 기능이 **성공**했을 때
+    // 기록이 남지 않던 것이 실결함이었다.
+    expect(refineExitAction("tab-close")).toBe("archive");
+    expect(refineExitAction("apply-delivered")).toBe("archive");
+    expect(refineExitAction("source-removed")).toBe("archive");
+  });
+
+  it("사용자가 끝낸 것이 아닌 세 경로는 그냥 놓아준다", () => {
+    // 복원 뒷정리를 아카이브하면 프로젝트 탭 왕복마다 기록이 쌓인다(초안은
+    // 파일로 남으므로 잃는 것이 없다). 모델 재시작은 대화 파기에 이미 합의했다.
+    expect(refineExitAction("source-missing-at-mount")).toBe("detach");
+    expect(refineExitAction("layout-restore")).toBe("detach");
+    expect(refineExitAction("model-restart")).toBe("detach");
   });
 });

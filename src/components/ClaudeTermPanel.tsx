@@ -39,11 +39,13 @@ import {
   openPromptRefine,
   refineCloseDecision,
   refineCloseFailure,
+  refineExitAction,
   refineViewStyle,
   resolveApplyAck,
   saveLastRefineModel,
   sendBlockReason,
   submitPasteBytes,
+  type RefineExitReason,
   type RefineModel,
   type RefineView,
 } from "../state/promptRefine";
@@ -264,9 +266,12 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
   const [memoEmpty, setMemoEmpty] = useState(true);
   const [sending, setSending] = useState(false);
   const [sendNote, setSendNote] = useState<string | null>(null);
+  // 종료가 이미 돌고 있는가 — **동기** 가드. setState는 다음 렌더에나 반영되므로
+  // 같은 프레임에 두 경로(× + 동반 닫힘)가 겹치면 아카이브가 두 번 나간다.
+  const closingRef = useRef(false);
   // 닫기=아카이브의 진행/실패 상태. 실패하면 패널을 **닫지 않고** 사유를 남긴다.
   const [closing, setClosing] = useState(false);
-  const [closeNote, setCloseNote] = useState<string | null>(null);
+  const [closeNote, setCloseNote] = useState<{ reason: string; retryable: boolean } | null>(null);
 
   /** Raw bytes to this session's PTY (driver-gated in the backend).
    *
@@ -458,8 +463,18 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
   // switch, so the "last area" is read from the module-level panelFocus map
   // (component state would have been wiped by the remount).
   const restoreFocus = () => {
+    // 정리 패널은 보이는 뷰가 하나뿐이다 — 기억해 둔 영역("term" 기본)으로 보내면
+    // 숨은(display:none) 터미널을 향하게 되고, 그런 요소는 포커스를 받지 못해
+    // 커서가 아무 데도 없는 상태가 된다(리뷰 #10). 보이는 뷰로 보낸다.
+    if (isRefine) {
+      focusRefineViewRef.current();
+      return;
+    }
     focusArea(recallArea(props.api.id) ?? "term");
   };
+  // 뷰 전환 이펙트와 restoreFocus가 같은 동작을 쓰도록 하는 손잡이 — 마운트
+  // 이펙트(deps [])에서 불리므로 최신 뷰를 ref로 읽는다.
+  const focusRefineViewRef = useRef<() => void>(() => {});
 
   // Track which sub-area holds focus so a later tab switch can restore it.
   useEffect(() => {
@@ -1189,7 +1204,7 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
     const sourceProject = refineSourceProject;
     const containerApi = props.containerApi;
     const title = ((props.params.title as string) ?? "").replace(/^프롬프트 정리 — /, "") || "세션";
-    props.api.close();
+    exitRefine("model-restart");
     // 재생성은 제거가 반영된 뒤에 — 패널 id가 결정적이라 같은 틱에 다시 추가하면
     // 중복 id가 된다.
     queueMicrotask(() => {
@@ -1266,7 +1281,9 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
     applyReqIdRef.current = null;
     if (myId) useAppStore.getState().clearClaudeInjectAck(myId); // 결과 확인 완료
     if (outcome.kind === "delivered") {
-      props.api.close();
+      // 배달 확인 = 이 정리 세션의 **정상 종료**다. 그냥 닫으면 기능이 성공했을
+      // 때만 기록이 남지 않는다(리뷰 #1) — 다른 종료 경로와 같은 문을 쓴다.
+      exitRefineRef.current("apply-delivered");
       return;
     }
     setApplyNote(
@@ -1338,6 +1355,8 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
    *    한 번 닫히면 되돌릴 수 없으므로 조용한 실패가 곧 기록 소실이다.
    */
   const closeWithArchive = async () => {
+    if (closingRef.current) return; // 재진입 금지 (동반 닫힘 + × 가 겹칠 수 있다)
+    closingRef.current = true;
     setClosing(true);
     setCloseNote(null);
     try {
@@ -1346,38 +1365,50 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
       const decision = refineCloseDecision({
         uuid: refineUuid,
         project: refineSourceProject,
-        turns: turns.size,
       });
       if (decision.kind === "close") {
         props.api.close();
         return;
       }
       const { uuid, project } = decision;
-      const memo = await invoke<MemoDoc>("refine_memo_read", { uuid }).catch(() => null);
+      const memo = await invoke<MemoDoc>("refine_memo_read", { uuid });
       await invoke("archive_session", {
         cwd: project,
         uuid,
         kind: "prompt",
         skipExtraction: true,
-        summary: memo?.text ?? null,
+        summary: memo.text,
         title: (props.params.title as string) ?? "프롬프트 정리",
       });
       window.dispatchEvent(new CustomEvent("mt-archive-updated"));
       props.api.close();
     } catch (e) {
-      const msg = errText(e);
-      if (refineCloseFailure(msg) === "close") {
+      const verdict = refineCloseFailure(errText(e), memoTextRef.current.trim() === "");
+      if (verdict.kind === "close") {
         props.api.close();
         return;
       }
-      setCloseNote(
-        `아카이브하지 못해 닫지 않았습니다: ${msg}\n` +
-          "(다른 아카이브가 이 프로젝트에서 진행 중이면 끝난 뒤 다시 시도하세요. 메모는 저장돼 있습니다.)",
-      );
+      setCloseNote({ reason: verdict.reason, retryable: verdict.retryable });
     } finally {
+      closingRef.current = false;
       setClosing(false);
     }
   };
+  // 최신 클로저를 다른 이펙트가 붙잡을 수 있는 손잡이. 종료 경로들(동반 닫힘·
+  // [적용] 성공)은 마운트 시점의 deps로 등록되므로 함수를 직접 캡처하면 그때의
+  // 낡은 상태(메모·uuid·프로젝트)로 아카이브하게 된다.
+  const closeWithArchiveRef = useRef(closeWithArchive);
+  closeWithArchiveRef.current = closeWithArchive;
+
+  /** 정리 패널의 **유일한 종료 문**. 어떤 사건이 아카이브를 부르는지는 정책 표가
+   * 정한다(`promptRefine.refineExitAction`) — 경로마다 판단을 흩뿌리면 그중 하나가
+   * 조용히 기록을 건너뛴다(리뷰 #1이 잡은 실결함이 정확히 그것이었다). */
+  const exitRefine = (reason: RefineExitReason) => {
+    if (refineExitAction(reason) === "archive") void closeWithArchiveRef.current();
+    else props.api.close();
+  };
+  const exitRefineRef = useRef(exitRefine);
+  exitRefineRef.current = exitRefine;
 
   // 탭 ×가 올린 닫기 요청을 여기서 처리한다 — 아카이브 실패를 보여 줄 자리가
   // 패널 안뿐이기 때문이다(탭 헤더는 overflow:hidden이고, 모달은 쓰지 않기로 했다).
@@ -1386,15 +1417,14 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
     if (!isRefine || !refineCloseRequest) return;
     if (refineCloseRequest.panelId !== props.api.id) return;
     useClaudeUi.getState().clearRefineClose();
-    void closeWithArchive();
+    exitRefine("tab-close");
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [refineCloseRequest]);
 
-  // 뷰가 바뀌면 그 뷰로 커서를 옮기고, 터미널은 다시 맞춘다. `display:none` 동안
+  // 보이는 뷰로 커서를 옮긴다(+터미널이면 다시 맞춘다). `display:none` 동안
   // fit()은 조기 return했으므로 (NaN 가드) 표시되는 순간 한 번은 필요하다 —
   // ResizeObserver도 곧 때리지만 첫 프레임의 깜빡임을 없앤다.
-  useEffect(() => {
-    if (!isRefine) return;
+  focusRefineViewRef.current = () => {
     if (refineView === "term") {
       try {
         fitRef.current?.fit();
@@ -1403,10 +1433,15 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
       }
       termRef.current?.focus();
     } else if (refineView === "memo") {
+      // 마운트 직후에는 에디터가 아직 없다(본문을 비동기로 읽는다) — 그때는
+      // MemoEditor가 스스로 포커스를 잡으므로 여기서 아무것도 하지 않는 것이 맞다.
       (containerRef.current?.querySelector(".memo-body .cm-content") as HTMLElement | null)?.focus();
     } else {
       (containerRef.current?.querySelector(".timeline-list") as HTMLElement | null)?.focus();
     }
+  };
+  useEffect(() => {
+    if (isRefine) focusRefineViewRef.current();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [refineView]);
 
@@ -1432,14 +1467,22 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
   // 혼자 돌게 되고, 단발성이라는 의미와도 어긋난다. (peek와 같은 규약 —
   // TimelinePeekPanel 참조. 닫기는 마이크로태스크로 미뤄 dock 콜백 재진입을 피한다.)
   const refineSourceId = isRefine ? (props.params.sourcePanelId ?? null) : null;
-  const panelApi = props.api;
   const containerApi = props.containerApi;
   useEffect(() => {
     if (!refineSourceId) return;
-    const closeLater = () => queueMicrotask(() => panelApi.close());
-    if (!containerApi.getPanel(refineSourceId)) closeLater();
+    // **마운트 시점에 이미 원본이 없다** = 레이아웃 복원 직후의 유령 패널이다.
+    // 여기만 기존 detach-닫기를 유지한다 — 프로젝트 탭을 왕복할 때마다 아카이브가
+    // 터지면 기록이 소음으로 찬다(closeEphemeralPanels 무적용과 같은 이유).
+    if (!containerApi.getPanel(refineSourceId)) {
+      queueMicrotask(() => exitRefineRef.current("source-missing-at-mount"));
+      return;
+    }
+    // 반면 **살아 있던 원본이 사라지는 것**(닫기/삭제·다른 창으로 전송)은 사용자가
+    // 이 작업을 끝낸 사건이다 — ×와 같은 문으로 보낸다(리뷰 #1). 최신 클로저를
+    // ref로 집는 이유는 이 이펙트가 refineSourceId에만 묶여 있기 때문(그때의 낡은
+    // 메모·uuid로 아카이브하면 안 된다).
     const d = containerApi.onDidRemovePanel((p) => {
-      if (p.id === refineSourceId) closeLater();
+      if (p.id === refineSourceId) queueMicrotask(() => exitRefineRef.current("source-removed"));
     });
     return () => d.dispose();
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -1702,14 +1745,23 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
     <>
       {closeNote && (
         <div className="claudeterm-refine-note" role="alert">
-          {closeNote}
+          {closeNote.reason}
+          {closeNote.retryable && (
+            <button
+              className="claudeterm-head-btn"
+              disabled={closing}
+              title="아카이브를 다시 시도하고, 성공하면 이 패널을 닫습니다"
+              onClick={() => void closeWithArchive()}
+            >
+              {closing ? "아카이브 중…" : "다시 닫기"}
+            </button>
+          )}
           <button
             className="claudeterm-head-btn"
-            disabled={closing}
-            title="아카이브를 다시 시도하고, 성공하면 이 패널을 닫습니다"
-            onClick={() => void closeWithArchive()}
+            title="아카이브 없이 이 정리 세션을 닫습니다 (메모 파일은 남습니다)"
+            onClick={() => props.api.close()}
           >
-            {closing ? "아카이브 중…" : "다시 닫기"}
+            그래도 닫기
           </button>
           <span className="claudeterm-refine-note-x" title="이 안내 닫기" onClick={() => setCloseNote(null)}>
             ×
