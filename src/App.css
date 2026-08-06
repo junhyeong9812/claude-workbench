@@ -1379,6 +1379,15 @@ body {
   flex: 0 0 auto;
   opacity: 0.75;
 }
+/* 편집 잠금 사유 (닫는 중) — 왜 안 써지는지 모르는 것이 최악이라 눈에 띄게. */
+.memo-locked {
+  flex: 0 0 auto;
+  padding: 0 6px;
+  color: var(--fg, #cdd6f4);
+  background: color-mix(in srgb, var(--st-warn) 22%, transparent);
+  border: 1px solid color-mix(in srgb, var(--st-warn) 45%, transparent);
+  border-radius: 999px;
+}
 .memo-body {
   flex: 1 1 0;
   min-height: 0;

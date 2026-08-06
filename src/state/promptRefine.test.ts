@@ -12,8 +12,11 @@ import {
   REFINE_SUBMIT_CONFIRM_MS,
   REFINE_SUBMIT_CR_DELAY,
   openPromptRefine,
+  makeSubmitProbe,
   refineCloseDecision,
   refineCloseFailure,
+  refineClosePhase,
+  refineMemoLocked,
   refineExitAction,
   refineMemoStoreKey,
   refinePanelId,
@@ -610,5 +613,68 @@ describe("refineMemoStoreKey — 초안은 세션이 아니라 정리 작업에 
   it("아무것도 없으면 null — 저장할 곳이 없다", () => {
     expect(refineMemoStoreKey({})).toBeNull();
     expect(refineMemoStoreKey(null)).toBeNull();
+  });
+});
+
+// ---- 종료 중 초안 잠금 (감사 I1) -------------------------------------------
+
+describe("refineClosePhase / refineMemoLocked — 되돌릴 수 없는 구간만 잠근다", () => {
+  it("아카이브가 도는 동안 초안이 잠긴다", () => {
+    const phase = refineClosePhase({ closing: true, blocked: false });
+    expect(phase).toBe("archiving");
+    // 그 창에서 친 글자는 갈 곳이 없다 — 동봉 본문은 이미 결정됐고, 성공하면
+    // 스크래치 초안 파일이 지워진다(무음 소실).
+    expect(refineMemoLocked(phase)).toBe(true);
+  });
+
+  it("실패해서 패널이 남으면(keep) 곧바로 풀린다 — 초안은 여전히 사용자 것", () => {
+    const phase = refineClosePhase({ closing: false, blocked: true });
+    expect(phase).toBe("blocked");
+    expect(refineMemoLocked(phase)).toBe(false);
+  });
+
+  it("평상시엔 잠기지 않는다", () => {
+    expect(refineMemoLocked(refineClosePhase({ closing: false, blocked: false }))).toBe(false);
+  });
+
+  it("사유 배너를 띄운 채 [다시 닫기]를 누르면 다시 잠긴다", () => {
+    // 재시도는 blocked 상태에서 시작되므로 closing이 이겨야 한다.
+    expect(refineClosePhase({ closing: true, blocked: true })).toBe("archiving");
+    expect(refineMemoLocked(refineClosePhase({ closing: true, blocked: true }))).toBe(true);
+  });
+});
+
+// ---- 제출 확인 기준선 (감사 I2) --------------------------------------------
+
+describe("makeSubmitProbe — 기준선은 보내기 전에 잡는다", () => {
+  it("보내기 전에 잡으면 그 뒤에 늘어난 턴을 제출로 읽는다", () => {
+    let turns = 3;
+    const probe = makeSubmitProbe(() => turns);
+    probe.capture(); // ← 바이트를 쓰기 전
+    turns = 4;
+    expect(probe.observed()).toBe(true);
+  });
+
+  it("**보낸 뒤에 잡으면** 아주 빠른 턴을 놓쳐 성공을 실패로 오보한다", () => {
+    // 이것이 고친 실결함이다: CR 직후 도착한 턴이 이미 기준선에 포함된다.
+    let turns = 3;
+    turns = 4; // 제출이 즉시 반영됐다
+    const late = makeSubmitProbe(() => turns);
+    late.capture(); // ← 늦게 잡은 기준선
+    expect(late.observed()).toBe(false);
+  });
+
+  it("증가가 없으면 미관측이다", () => {
+    let turns = 3;
+    const probe = makeSubmitProbe(() => turns);
+    probe.capture();
+    expect(probe.observed()).toBe(false);
+    turns = 3;
+    expect(probe.observed()).toBe(false);
+  });
+
+  it("기준선을 잡지 않았으면 판정하지 않는다 — 모르는 것을 실패로 보고하지 않는다", () => {
+    const probe = makeSubmitProbe(() => 0);
+    expect(probe.observed()).toBe(true);
   });
 });

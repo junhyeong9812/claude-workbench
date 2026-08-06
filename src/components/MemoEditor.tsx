@@ -15,6 +15,10 @@ import {
   type AutoSaver,
 } from "../state/projectMemo";
 
+/** 편집 잠금 확장 — 키 입력과 프로그램 편집을 둘 다 막는다. */
+const readOnlyExts = (ro: boolean) =>
+  ro ? [EditorState.readOnly.of(true), EditorView.editable.of(false)] : [];
+
 /** 메모 읽기의 반환 — 본문 + 낙관적 잠금 base(파일 없으면 null). */
 export interface MemoDoc {
   text: string;
@@ -41,6 +45,11 @@ export interface MemoEditorProps {
   onText?: (text: string) => void;
   /** 저장 손잡이를 부모에게 넘긴다(언마운트 시 null). */
   onHandle?: (h: MemoHandle | null) => void;
+  /** 편집을 잠근다 (본문은 그대로 보인다). 저장기는 그대로 살아 있다 — 잠금은
+   * **새 입력을 막는 것**이지 대기 중인 저장을 버리는 것이 아니다. */
+  readOnly?: boolean;
+  /** 잠긴 이유 — 헤더에 그대로 보여 준다(왜 안 써지는지 모르는 것이 최악). */
+  readOnlyNote?: string;
 }
 
 /** 부모가 잡을 수 있는 저장 손잡이. */
@@ -84,6 +93,8 @@ export function MemoEditor({
   write,
   onText,
   onHandle,
+  readOnly,
+  readOnlyNote,
 }: MemoEditorProps) {
   const hostRef = useRef<HTMLDivElement | null>(null);
   const viewRef = useRef<EditorView | null>(null);
@@ -97,6 +108,13 @@ export function MemoEditor({
   // 에디터가 디스크 기준으로 다시 만들어진다.
   const [reloads, setReloads] = useState(0);
   const themeComp = useRef(new Compartment());
+  // 편집 잠금은 Compartment로 갈아 끼운다 — 에디터를 다시 만들면 커서·스크롤·
+  // 대기 중인 저장이 함께 날아간다.
+  const roComp = useRef(new Compartment());
+  // 에디터는 본문을 비동기로 읽은 **뒤에** 만들어지므로, 그 시점의 최신 잠금
+  // 상태를 ref로 읽는다(생성 인자로 준 prop은 그 사이 낡을 수 있다).
+  const readOnlyRef = useRef(!!readOnly);
+  readOnlyRef.current = !!readOnly;
   // 낙관적 잠금의 base — 이 편집이 출발한 디스크 해시(파일 없으면 null).
   const baseHashRef = useRef<string | null>(null);
   // 마지막으로 편집된 본문 — 늦게 도착한 저장 성공이 그 뒤의 편집을 clean으로
@@ -114,6 +132,12 @@ export function MemoEditor({
   useEffect(() => {
     viewRef.current?.dispatch({ effects: themeComp.current.reconfigure(cmThemeExt(theme)) });
   }, [theme]);
+
+  useEffect(() => {
+    viewRef.current?.dispatch({
+      effects: roComp.current.reconfigure(readOnlyExts(!!readOnly)),
+    });
+  }, [readOnly]);
 
   useEffect(() => {
     if (!storeKey) {
@@ -185,6 +209,7 @@ export function MemoEditor({
               basicSetup,
               themeComp.current.of(cmThemeExt(useAppStore.getState().theme)),
               ...langFor("memo.md"),
+              roComp.current.of(readOnlyExts(readOnlyRef.current)),
               // 롱폼 산문 — 긴 줄은 가로 스크롤 대신 접는다.
               EditorView.lineWrapping,
               // 포커스를 잃는 순간 즉시 저장 (디바운스 창을 기다리지 않는다).
@@ -247,6 +272,7 @@ export function MemoEditor({
       <div className="memo-head">
         <span className="memo-title">메모{dirty ? " ●" : ""}</span>
         {subtitle && <span className="memo-path">{subtitle}</span>}
+        {readOnly && readOnlyNote && <span className="memo-locked">{readOnlyNote}</span>}
         <span className="memo-status">{status}</span>
         {actions}
       </div>

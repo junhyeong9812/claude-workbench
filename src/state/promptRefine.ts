@@ -232,6 +232,61 @@ export function refineCloseDecision(i: {
   return { kind: "archive", uuid: i.uuid, project: i.project };
 }
 
+/** 종료 흐름이 지금 어디에 있는가 — 초안 잠금과 배너가 같은 값을 읽는다. */
+export type RefineClosePhase =
+  /** 종료 중이 아니다. */
+  | "idle"
+  /** 아카이브가 도는 중 — 되돌릴 수 없는 구간. */
+  | "archiving"
+  /** 아카이브가 실패해 패널이 남았다 — 사용자의 다음 선택을 기다린다. */
+  | "blocked";
+
+export function refineClosePhase(i: { closing: boolean; blocked: boolean }): RefineClosePhase {
+  // 재시도([다시 닫기])는 사유 배너가 떠 있는 채로 시작되므로 closing이 이긴다.
+  if (i.closing) return "archiving";
+  return i.blocked ? "blocked" : "idle";
+}
+
+/**
+ * 그 구간에서 초안을 잠글 것인가.
+ *
+ * 아카이브가 도는 동안(`archiving`)만 잠근다. 그 창에서 친 글자는 **갈 곳이
+ * 없기 때문**이다: 동봉할 본문은 이미 flush·읽기가 끝나 결정됐고, 아카이브가
+ * 성공하면 스크래치의 초안 파일은 지워진다 — 그 사이의 입력은 아카이브에도
+ * 디스크에도 남지 않는다(무음 소실).
+ *
+ * 잠금을 고른 이유(재-flush 대신): 완료 직전에 한 번 더 저장·재확인하는 설계는
+ * "언제까지 받아 줄 것인가"라는 경합을 계속 만들고, 그 경합의 각 변종이 다시
+ * 소실 창이 된다. 편집을 못 하게 하면 그 창 자체가 없어진다. 실패해서 패널이
+ * 남으면(`blocked`) 바로 풀린다 — 그때는 초안이 여전히 사용자 것이다.
+ */
+export function refineMemoLocked(phase: RefineClosePhase): boolean {
+  return phase === "archiving";
+}
+
+/**
+ * 제출 확인기 — 전사가 실제로 자랐는지로 [보내기]의 성공을 사후 판정한다.
+ *
+ * **기준선은 반드시 바이트를 쓰기 *전*에 잡아야 한다**. CR을 보낸 뒤에 잡으면,
+ * 아주 빠르게 도착한 턴이 이미 기준선에 포함돼 "증가 없음"으로 읽히고 제출이
+ * 성공했는데도 경고가 뜬다. `capture()`를 안 불렀으면 아예 판정하지 않는다 —
+ * 모르는 것을 실패로 보고하지 않기 위해서다.
+ */
+export function makeSubmitProbe(read: () => number): {
+  capture(): void;
+  observed(): boolean;
+} {
+  let base: number | null = null;
+  return {
+    capture() {
+      base = read();
+    },
+    observed() {
+      return base === null || read() > base;
+    },
+  };
+}
+
 /** 아카이브가 실패했을 때의 처리 방침. */
 export type RefineCloseVerdict =
   /** 남길 것이 없었다 — 그냥 닫는다. */

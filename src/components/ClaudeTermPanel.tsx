@@ -37,9 +37,12 @@ import {
   injectDeliveryDecision,
   isRefineParams,
   loadLastRefineModel,
+  makeSubmitProbe,
   openPromptRefine,
   refineCloseDecision,
   refineCloseFailure,
+  refineClosePhase,
+  refineMemoLocked,
   refineExitAction,
   refineMemoStoreKey,
   refineViewStyle,
@@ -1346,6 +1349,11 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
     const text = memoTextRef.current;
     if (text.trim() === "") return;
     const [paste, cr] = submitPasteBytes(text);
+    // 관측 기준선은 **바이트를 쓰기 전에** 잡는다(리뷰 I2). CR 뒤에 잡으면 아주
+    // 빠르게 도착한 턴이 이미 기준선에 포함돼, 제출이 성공했는데도 "확인 못 함"
+    // 경고가 뜬다.
+    const probe = makeSubmitProbe(() => turnsCountRef.current);
+    probe.capture();
     sendingRef.current = true;
     setSending(true);
     setSendNote(null);
@@ -1363,11 +1371,10 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
       // 여부를 눈으로 확인할 길이 없으면 사용자는 보낸 줄 알고 기다린다 — 그래서
       // 전사가 실제로 자랐는지 한 번 확인한다(리뷰 #8). **자동 재전송은 하지
       // 않는다**: 늦게 도착한 제출과 겹치면 같은 프롬프트가 두 번 실행된다.
-      const before = turnsCountRef.current;
       if (sendCheckRef.current !== undefined) clearTimeout(sendCheckRef.current);
       sendCheckRef.current = setTimeout(() => {
         sendCheckRef.current = undefined;
-        if (turnsCountRef.current > before) return;
+        if (probe.observed()) return;
         setSendNote(
           "제출을 확인하지 못했습니다 — 메모는 입력창에 들어가 있을 수 있습니다.\n" +
             "터미널 뷰에서 Enter를 눌러 주세요. (같은 내용을 자동으로 다시 보내지는 않습니다.)",
@@ -1886,6 +1893,10 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
     [],
   );
 
+  // 종료 흐름의 단계 — 초안 잠금과 배너가 같은 값을 읽는다(리뷰 I1).
+  const closePhase = refineClosePhase({ closing, blocked: closeNote !== null });
+  const memoLocked = isRefine && refineMemoLocked(closePhase);
+
   const codexPane = !isRefine || !(codexBusy || codexResult) ? null : (
     <div className="claudeterm-codex">
       <button
@@ -2190,6 +2201,8 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
               onHandle={(h) => {
                 memoHandleRef.current = h;
               }}
+              readOnly={memoLocked}
+              readOnlyNote="닫는 중 — 아카이브에 저장하고 있습니다"
             />
           ) : (
             <div className="memo-err">정리 세션을 식별할 수 없어 메모를 열지 못했습니다</div>
