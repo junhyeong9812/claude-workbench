@@ -11,6 +11,7 @@ import {
   MEMO_SAVE_DELAY,
   clearStash,
   makeAutoSaver,
+  registerMemoSaver,
   stashMemo,
   takeStash,
   type AutoSaver,
@@ -128,6 +129,9 @@ export function MemoPanel(props: IDockviewPanelProps<MemoParams>) {
       }
     }, MEMO_SAVE_DELAY);
     saverRef.current = saver;
+    // 창 종료는 React cleanup을 거치지 않는다 — 닫기 핸들러가 직접 이 저장기를
+    // 붙잡을 수 있게 창 레지스트리에 올린다 (리뷰 P1).
+    const unregister = registerMemoSaver(saver);
 
     invoke<MemoDoc>("memo_read", { project })
       .then(({ text: diskText, hash }) => {
@@ -188,6 +192,7 @@ export function MemoPanel(props: IDockviewPanelProps<MemoParams>) {
       //
       // 저장이 실패할 수도 있는데 그때는 알려 줄 화면이 이미 없다. 그래서 값을
       // 먼저 stash에 넣어 두고, 저장이 실제로 성공하면 지운다 (P2-2).
+      unregister();
       const leftover = saver.peek();
       if (leftover !== undefined) stashMemo(project, leftover);
       void saver.flush().then(() => {

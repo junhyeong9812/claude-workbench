@@ -18,6 +18,7 @@ import { installTransferTarget } from "../state/panelTransferTarget";
 import { DropTargetOverlay } from "./DropTargetOverlay";
 import { components, AppTab } from "./panelRegistry";
 import { closeEphemeralPanels } from "../state/ephemeralPanels";
+import { flushAllMemos } from "../state/projectMemo";
 import { initClaudeStatusGlobal } from "../state/claudeStatusGlobal";
 import { initNotify } from "../state/notify";
 
@@ -153,6 +154,9 @@ export function PopoutWorkbench() {
         void win.destroy().catch(() => {});
       }, 4000);
       try {
+        // 메모부터 (리뷰 P1) — destroy()는 React cleanup을 보장하지 않으므로
+        // 이 창의 메모 패널이 들고 있는 편집이 언마운트 flush 없이 사라진다.
+        await flushAllMemos();
         await closeOwnedSessions();
         if (!shuttingDownRef.current) {
           useAppStore.getState().removePopoutLayout(label);
@@ -195,6 +199,8 @@ export function PopoutWorkbench() {
       } catch {
         /* geometry best-effort — reopen falls back to default placement */
       }
+      // 앱 종료 경로도 같다 — ack를 보내면 메인이 이 창을 destroy한다.
+      await flushAllMemos();
       await closeOwnedSessions();
       void emit("app-shutdown-ack", { label });
     })

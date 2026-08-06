@@ -1,14 +1,21 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
+  MEMO_CLOSE_FLUSH_MS,
   MEMO_KIND,
   MEMO_SAVE_DELAY,
+  clearStash,
+  flushAllMemos,
   isMemoParams,
   makeAutoSaver,
   memoPanelId,
   openProjectMemo,
+  registerMemoSaver,
+  resetMemoSavers,
+  resetStash,
+  stashMemo,
+  takeStash,
   type MemoDock,
 } from "./projectMemo";
-import { clearStash, resetStash, stashMemo, takeStash } from "./projectMemo";
 import { isEphemeralParams } from "./ephemeralPanels";
 
 /** 최소 dock 스텁 — addPanel은 호출 인자를 기록하고 패널 목록에 반영한다. */
@@ -100,6 +107,64 @@ describe("stash — 저장 못 한 편집의 임시 보관", () => {
     stashMemo("/p", "x");
     clearStash("/p");
     expect(takeStash("/p")).toBeUndefined();
+  });
+});
+
+describe("flushAllMemos — 창 종료 경로 (React cleanup이 안 도는 곳)", () => {
+  beforeEach(() => resetMemoSavers());
+  afterEach(() => {
+    resetMemoSavers();
+    vi.useRealTimers();
+  });
+
+  it("등록된 저장기를 모두 flush하고 완료를 기다린다", async () => {
+    const a = { flush: vi.fn().mockResolvedValue(undefined) };
+    const b = { flush: vi.fn().mockResolvedValue(undefined) };
+    registerMemoSaver(a);
+    registerMemoSaver(b);
+    await flushAllMemos();
+    expect(a.flush).toHaveBeenCalledTimes(1);
+    expect(b.flush).toHaveBeenCalledTimes(1);
+  });
+
+  it("해제된 저장기는 부르지 않는다 (언마운트된 패널)", async () => {
+    const a = { flush: vi.fn().mockResolvedValue(undefined) };
+    const off = registerMemoSaver(a);
+    off();
+    await flushAllMemos();
+    expect(a.flush).not.toHaveBeenCalled();
+  });
+
+  it("등록된 게 없으면 즉시 끝난다 (닫기를 지연시키지 않는다)", async () => {
+    await expect(flushAllMemos()).resolves.toBeUndefined();
+  });
+
+  it("하나가 실패해도 나머지는 저장되고 전체는 성공으로 끝난다", async () => {
+    const bad = { flush: vi.fn().mockRejectedValue(new Error("디스크 오류")) };
+    const good = { flush: vi.fn().mockResolvedValue(undefined) };
+    registerMemoSaver(bad);
+    registerMemoSaver(good);
+    await expect(flushAllMemos()).resolves.toBeUndefined();
+    expect(good.flush).toHaveBeenCalledTimes(1);
+  });
+
+  it("**상한을 넘기면 기다리지 않는다** — 메모 하나가 앱을 못 닫게 하면 안 된다", async () => {
+    vi.useFakeTimers();
+    const stuck = { flush: vi.fn().mockReturnValue(new Promise<void>(() => {})) };
+    registerMemoSaver(stuck);
+    let done = false;
+    const p = flushAllMemos(1200).then(() => {
+      done = true;
+    });
+    await vi.advanceTimersByTimeAsync(1199);
+    expect(done).toBe(false);
+    await vi.advanceTimersByTimeAsync(1);
+    await p;
+    expect(done).toBe(true);
+  });
+
+  it("상한은 메인 창 닫기 예산 안에 들어간다 (ack 2.5s + flush < watchdog 4s)", () => {
+    expect(MEMO_CLOSE_FLUSH_MS + 2500).toBeLessThan(4000);
   });
 });
 

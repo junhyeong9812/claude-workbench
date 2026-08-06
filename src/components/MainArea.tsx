@@ -24,7 +24,7 @@ import { DropTargetOverlay } from "./DropTargetOverlay";
 import { installTransferTarget } from "../state/panelTransferTarget";
 import { components, AppTab, type PanelKind } from "./panelRegistry";
 import { closeEphemeralPanels } from "../state/ephemeralPanels";
-import { openProjectMemo } from "../state/projectMemo";
+import { flushAllMemos, openProjectMemo } from "../state/projectMemo";
 import { type SessionDragPayload } from "./sessionDropZone";
 import { useSessionDropZone } from "../hooks/useSessionDropZone";
 import { resolveLayerMode, integratedIsFront } from "../state/layerRouting";
@@ -245,6 +245,11 @@ export function MainArea({
         void win.destroy().catch(() => {});
       }, 4000);
       try {
+        // 메모부터 흘려보낸다 (리뷰 P1) — destroy()는 React cleanup을 보장하지
+        // 않으므로 패널의 언마운트 flush가 돌지 않는다. 상한이 있는 호출이고
+        // (MEMO_CLOSE_FLUSH_MS), 뒤따르는 ack 대기(2.5s)와 합쳐도 watchdog
+        // 4s를 넘지 않는다.
+        await flushAllMemos();
         const others = (await getAllWindows()).filter((w) => w.label !== "main");
         if (others.length > 0) {
           const expected = others.map((w) => w.label);

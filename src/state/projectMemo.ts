@@ -211,3 +211,52 @@ export function clearStash(project: string): void {
 export function resetStash(): void {
   stash.clear();
 }
+
+// ---- 창 종료 시 일괄 flush (리뷰 P1) ---------------------------------------
+
+/**
+ * 창을 닫을 때 쓸 수 있는 시간의 상한(ms).
+ *
+ * 메인 창 닫기 경로의 예산에서 역산한 값이다: watchdog이 4000ms 뒤 강제
+ * `destroy()`를 걸고, 그 앞에 팝아웃 ack 대기가 최대 2500ms 있다. 1200 + 2500 =
+ * 3700 < 4000 이라 메모 flush를 앞에 끼워도 기존 종료 보증을 잠식하지 않는다.
+ * 여기를 늘리려면 watchdog부터 같이 봐야 한다.
+ */
+export const MEMO_CLOSE_FLUSH_MS = 1200;
+
+/** 이 창에 살아 있는 메모 저장기들. 창 종료는 React cleanup을 거치지 않으므로
+ * (`win.destroy()`가 언마운트를 보장하지 않는다) 닫기 경로가 직접 붙잡을 수
+ * 있는 손잡이가 필요하다. */
+const activeSavers = new Set<{ flush(): Promise<void> }>();
+
+/** 저장기를 등록하고 해제 함수를 돌려준다 (패널 언마운트에서 호출). */
+export function registerMemoSaver(saver: { flush(): Promise<void> }): () => void {
+  activeSavers.add(saver);
+  return () => {
+    activeSavers.delete(saver);
+  };
+}
+
+/**
+ * 이 창의 모든 메모를 flush하고 완료를 기다린다 — 단, `timeoutMs`까지만.
+ *
+ * 상한이 있는 이유는 닫기가 **반드시** 진행돼야 하기 때문이다. 저장이 걸리면
+ * 메모 한 줄 때문에 앱이 안 닫히는 쪽이 더 나쁜 실패다. 시간 안에 못 끝낸 값은
+ * stash에 남아 다음 실행이 아니라 이번 창의 다음 마운트에서 복구된다(그마저
+ * 못 하면 그때는 프로세스가 사라진 뒤라 어차피 붙들 것이 없다).
+ *
+ * 개별 flush의 실패는 삼킨다 — 하나가 거부돼도 나머지는 저장돼야 한다.
+ */
+export function flushAllMemos(timeoutMs: number = MEMO_CLOSE_FLUSH_MS): Promise<void> {
+  const all = [...activeSavers].map((s) => s.flush().catch(() => {}));
+  if (all.length === 0) return Promise.resolve();
+  return Promise.race([
+    Promise.all(all).then(() => {}),
+    new Promise<void>((resolve) => setTimeout(resolve, timeoutMs)),
+  ]);
+}
+
+/** 테스트 격리용 — 등록된 저장기를 모두 잊는다. */
+export function resetMemoSavers(): void {
+  activeSavers.clear();
+}
