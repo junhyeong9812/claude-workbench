@@ -72,6 +72,13 @@ const detachSession = (params: unknown): void => {
  *
  * peek는 세션을 소유하지 않아(`params.sessionId` 없음) detach가 그대로 no-op이다.
  * `detach`를 인자로 받는 것은 테스트가 그 부작용을 관측하기 위해서다.
+ *
+ * **여기서는 아카이브하지 않는다** — 탭의 ×는 정리 세션을 아카이브하지만
+ * (`ClaudeTab.onClose` → `useClaudeUi.requestRefineClose`), 이 경로는 사용자가
+ * 닫은 것이 아니라 레이아웃 복원의 뒷정리다. 프로젝트 탭을 왕복할 때마다
+ * 아카이브가 터지면 기록이 소음으로 가득 찬다. 그때 화면의 초안이 사라지지
+ * 않는 근거는 메모가 이미 파일(정리 스크래치의 `memo/<uuid>.md`)이라는 것이고,
+ * 같은 정리 세션을 다시 열면 그 본문이 그대로 돌아온다.
  */
 export function closeEphemeralPanels(
   dock: { readonly panels: readonly { params?: unknown; api: { close(): void } }[] },

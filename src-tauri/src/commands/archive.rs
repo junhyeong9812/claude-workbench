@@ -101,11 +101,29 @@ pub(super) fn archive_root(app: &AppHandle) -> Result<PathBuf, AppError> {
 /// and write `session.jsonl` + `normalized.json` + `book.html` under the archive
 /// root. Blocking work (file IO + full-transcript parse) runs on the blocking
 /// pool so the webview stays responsive.
+///
+/// The four trailing arguments are all `Option` and all absent in the ordinary
+/// 아카이브 button path — the shape that call site sends (`{cwd, uuid}`) is
+/// unchanged. They exist for the 프롬프트 정리 close path, which archives a
+/// session whose transcript lives in the `/tmp` scratch dir but which belongs,
+/// as a record, to the project it was opened from:
+///
+/// - `kind` — `"prompt"`, so the browser can label and filter it.
+/// - `skip_extraction` — no knowledge extraction for a prompt draft (and no
+///   1~3분 claude run in a tab-close handler).
+/// - `summary` — the user's memo, landed as this archive's `summary.md`.
+/// - `title` — the fallback title. The sidecar lookup below is keyed by
+///   `project_key(cwd)`, and a refine session's sidecars sit under the *scratch*
+///   key, so without this every prompt archive would be titled "Claude".
 #[tauri::command]
 pub async fn archive_session(
     app: AppHandle,
     cwd: String,
     uuid: String,
+    kind: Option<String>,
+    skip_extraction: Option<bool>,
+    summary: Option<String>,
+    title: Option<String>,
 ) -> Result<ArchiveResult, AppError> {
     // Canonical project identity, so `.`/trailing-slash/symlink aliases of the
     // same project can't slip past the guard (post-fix P4).
@@ -125,9 +143,25 @@ pub async fn archive_session(
     };
     let _ = app.emit("mt-archive-started", serde_json::json!({ "project": cwd }));
     let app2 = app.clone();
-    tauri::async_runtime::spawn_blocking(move || archive_session_blocking(app2, cwd, uuid))
+    let extra = ArchiveExtras {
+        kind,
+        skip_extraction: skip_extraction.unwrap_or(false),
+        summary,
+        title,
+    };
+    tauri::async_runtime::spawn_blocking(move || archive_session_blocking(app2, cwd, uuid, extra))
         .await
         .map_err(|_| AppError::new("Archive task failed to run"))?
+}
+
+/// The optional, caller-supplied parts of one archive run (see
+/// [`archive_session`]). Grouped so the blocking worker keeps a short signature.
+#[derive(Default)]
+struct ArchiveExtras {
+    kind: Option<String>,
+    skip_extraction: bool,
+    summary: Option<String>,
+    title: Option<String>,
 }
 
 /// Whether an archive of `project` is currently running — the picker's
@@ -143,6 +177,7 @@ fn archive_session_blocking(
     app: AppHandle,
     cwd: String,
     uuid: String,
+    extra: ArchiveExtras,
 ) -> Result<ArchiveResult, AppError> {
     let base = app
         .path()
@@ -156,9 +191,14 @@ fn archive_session_blocking(
         .ok_or_else(|| AppError::new("Session transcript not found"))?;
     let jsonl_bytes = std::fs::read(&jsonl_path)
         .map_err(|e| AppError::new(io_message("Cannot read transcript", &e)))?;
-    // Fallback title until extraction supplies one: the `.title` sidecar, else
-    // the display name — the archive folder slug derives from it.
-    let fallback_title = core_lib::snapshot::read_title(&base, &cwd, &uuid)
+    // Fallback title until extraction supplies one: the caller's, else the
+    // `.title` sidecar, else the display name — the archive folder slug derives
+    // from it.
+    let fallback_title = extra
+        .title
+        .map(|t| t.trim().to_string())
+        .filter(|t| !t.is_empty())
+        .or_else(|| core_lib::snapshot::read_title(&base, &cwd, &uuid))
         .or_else(|| core_lib::snapshot::read_name(&base, &cwd, &uuid))
         .unwrap_or_else(|| "Claude".to_string());
     let date = chrono::Local::now().format("%Y-%m-%d").to_string();
@@ -184,6 +224,9 @@ fn archive_session_blocking(
             jsonl_bytes: &jsonl_bytes,
             mcp_bin: mcp_bin.as_deref(),
             attempts: 1,
+            kind: extra.kind.as_deref(),
+            skip_extraction: extra.skip_extraction,
+            summary: extra.summary.as_deref(),
         },
         &extract,
     )
@@ -193,6 +236,14 @@ fn archive_session_blocking(
             AppError::new(io_message("Cannot write archive", &e))
         }
     })?;
+
+    // 프롬프트 정리 세션의 닫기는 "성공했을 때만 닫는다"가 계약이라, 부분 실패를
+    // Ok로 돌려주면 그 계약이 조용히 깨진다(리뷰 #3): 메모 동봉이나 스킵 마커
+    // 기록이 실패해도 패널이 닫히고, 사용자는 초안이 아카이브에 들어간 줄 안다.
+    // 일반 아카이브는 추출 실패가 흔하고 부분 성공이 의미 있으므로 기존대로 Ok.
+    if let Some(msg) = skip_partial_failure(extra.skip_extraction, &run.errors) {
+        return Err(AppError::new(msg));
+    }
 
     // GUI 보고 표면은 **errors만** — notes(mcp 등록 실패 등 부가 작업)는 CLI
     // 로그 전용이다(리뷰: 성공/부가 note가 '추출 경고'로 오노출되던 것 차단).
@@ -206,6 +257,20 @@ fn archive_session_blocking(
         extraction_error: (!warnings.is_empty()).then(|| warnings.join(" / ")),
         unchanged: run.unchanged,
     })
+}
+
+/// 추출을 건너뛴 아카이브(=프롬프트 정리 세션)에서 **부분 실패를 성공으로
+/// 보고하지 않는다** — 실패 문구(없으면 `None`).
+///
+/// 추출을 건너뛴 실행의 `errors`에 남을 수 있는 것은 전부 진짜 I/O 실패다(메모를
+/// summary.md로 못 씀 · 스킵 마커를 못 씀). 그 상태로 Ok를 돌려주면 호출부의
+/// "성공했을 때만 닫는다"가 무의미해진다. 산출물은 이미 안착해 있으므로 재시도는
+/// 안전하다(재아카이브가 폴더를 통째로 교체한다).
+fn skip_partial_failure(skip_extraction: bool, errors: &[String]) -> Option<String> {
+    if !skip_extraction || errors.is_empty() {
+        return None;
+    }
+    Some(format!("아카이브 부분 실패: {}", errors.join(" / ")))
 }
 
 /// One preserved past version of an archived session (browser pane).
@@ -228,6 +293,9 @@ pub struct ArchiveListEntry {
     pub date: String,
     pub turns: usize,
     pub archived_at: Option<u64>,
+    /// 세션 종류 — `None`/부재 = 일반 작업 세션, `"prompt"` = 프롬프트 정리
+    /// 세션. 브라우저의 배지·필터가 읽는 값(`ArchiveMeta::kind` 그대로).
+    pub kind: Option<String>,
     /// Preserved past versions, newest first.
     pub history: Vec<ArchiveHistoryItem>,
 }
@@ -273,6 +341,7 @@ pub fn archive_list(app: AppHandle) -> Result<Vec<ArchiveProjectGroup>, AppError
                     date: s.meta.date,
                     turns: s.meta.turns,
                     archived_at: s.meta.archived_at,
+                    kind: s.meta.kind,
                     history: s
                         .history
                         .into_iter()
@@ -413,3 +482,28 @@ pub fn archive_open_path(app: AppHandle, path: String) -> Result<(), AppError> {
         .map_err(|_| AppError::new("시스템 뷰어를 열 수 없습니다"))
 }
 
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 프롬프트 아카이브의 부분 실패는 **실패로 올라간다** — "성공 시에만 닫기"가
+    /// 조용히 깨지던 자리(리뷰 #3).
+    #[test]
+    fn skip_path_reports_partial_failure_as_an_error() {
+        let errs = vec!["메모 동봉 실패: 권한 없음".to_string()];
+        let msg = skip_partial_failure(true, &errs).expect("실패로 보고해야 한다");
+        assert!(msg.contains("메모 동봉 실패"), "{msg}");
+
+        // 성공(경고 0)은 그대로 통과.
+        assert_eq!(skip_partial_failure(true, &[]), None);
+    }
+
+    /// 일반 아카이브는 건드리지 않는다 — 추출 실패는 흔하고, 전사 복사와 책이
+    /// 안착한 부분 성공에는 의미가 있다(기존 계약).
+    #[test]
+    fn ordinary_path_keeps_partial_success() {
+        let errs = vec!["추출 실패: timeout".to_string()];
+        assert_eq!(skip_partial_failure(false, &errs), None);
+    }
+}

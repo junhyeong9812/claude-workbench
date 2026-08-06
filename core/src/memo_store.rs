@@ -42,6 +42,52 @@ pub fn path(base: &Path, project: &str) -> PathBuf {
     dir(base, project).join("memo.md")
 }
 
+/// The **same store keyed by an explicit file path** — [`load`]/[`save`] are
+/// this with the project layout baked in.
+///
+/// It exists because a second kind of memo shares every guarantee here (atomic
+/// replace, cap, optimistic lock, absent≠empty) but not the location: the
+/// 프롬프트 정리 세션's draft lives in that session's `/tmp` scratch directory,
+/// keyed by session uuid, not under `<base>/projects/`. Duplicating the store to
+/// change one path is how the two contracts would drift.
+///
+/// The caller owns the path's safety — these take it verbatim.
+pub fn load_at(file: &Path) -> io::Result<Option<String>> {
+    use std::io::Read;
+    let f = match std::fs::File::open(file) {
+        Ok(f) => f,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    let mut buf = Vec::new();
+    f.take(MEMO_CAP as u64).read_to_end(&mut buf)?;
+    Ok(Some(String::from_utf8_lossy(&buf).into_owned()))
+}
+
+/// See [`load_at`] / [`save`]. Creates the parent directory as needed.
+pub fn save_at(file: &Path, text: &str, base_hash: Option<&str>) -> io::Result<SaveOutcome> {
+    if text.len() > MEMO_CAP {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "memo exceeds the size cap",
+        ));
+    }
+    // 읽기 실패는 오류로 올린다 — "못 읽었으니 그냥 덮자"는 P2-4가 막은 바로 그
+    // 경로다.
+    let disk_hash = load_at(file)?.as_deref().map(content_hash);
+    if disk_hash.as_deref() != base_hash {
+        return Ok(SaveOutcome::Conflict { disk_hash });
+    }
+    let Some(d) = file.parent() else {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "memo path has no parent"));
+    };
+    std::fs::create_dir_all(d)?;
+    atomic_write_to(file, text)?;
+    Ok(SaveOutcome::Saved {
+        hash: content_hash(text),
+    })
+}
+
 /// 메모 본문의 콘텐츠 해시 — 낙관적 잠금의 토큰이자 "디스크가 내가 읽은 그대로
 /// 인가"의 판정 값.
 ///
@@ -74,15 +120,7 @@ pub fn content_hash(text: &str) -> String {
 /// also bounds IO if the file grew out of band. Invalid UTF-8 is replaced rather
 /// than failing: showing a slightly mangled memo beats showing none.
 pub fn load(base: &Path, project: &str) -> io::Result<Option<String>> {
-    use std::io::Read;
-    let f = match std::fs::File::open(path(base, project)) {
-        Ok(f) => f,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(e),
-    };
-    let mut buf = Vec::new();
-    f.take(MEMO_CAP as u64).read_to_end(&mut buf)?;
-    Ok(Some(String::from_utf8_lossy(&buf).into_owned()))
+    load_at(&path(base, project))
 }
 
 /// [`save`]의 결과 — 썼거나, 디스크가 그 사이 바뀌어 **거부했거나**.
@@ -119,37 +157,24 @@ pub fn save(
     text: &str,
     base_hash: Option<&str>,
 ) -> io::Result<SaveOutcome> {
-    if text.len() > MEMO_CAP {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "memo exceeds the size cap",
-        ));
-    }
-    // 읽기 실패는 오류로 올린다 — "못 읽었으니 그냥 덮자"는 P2-4가 막은 바로 그
-    // 경로다.
-    let disk_hash = load(base, project)?.as_deref().map(content_hash);
-    if disk_hash.as_deref() != base_hash {
-        return Ok(SaveOutcome::Conflict { disk_hash });
-    }
-    let d = dir(base, project);
-    std::fs::create_dir_all(&d)?;
-    atomic_write(&d, text)?;
-    Ok(SaveOutcome::Saved {
-        hash: content_hash(text),
-    })
+    save_at(&path(base, project), text, base_hash)
 }
 
 /// temp + rename. **어느 단계에서 실패하든** 임시 파일을 지운다 — 쓰기 실패로
 /// 남은 반쪽짜리 `.tmp`도 누적되면 프로젝트 디렉토리를 채운다(rename 실패만
 /// 정리하던 것을 전 구간으로 넓힘, 리뷰 P3).
-fn atomic_write(d: &Path, text: &str) -> io::Result<()> {
+fn atomic_write_to(file: &Path, text: &str) -> io::Result<()> {
+    let name = file
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "memo path has no file name"))?;
+    let d = file.parent().unwrap_or_else(|| Path::new("."));
     let tmp = d.join(format!(
-        "memo.md.{}-{}.tmp",
+        "{name}.{}-{}.tmp",
         std::process::id(),
         TMP_SEQ.fetch_add(1, Ordering::Relaxed)
     ));
-    let r = std::fs::write(&tmp, text.as_bytes())
-        .and_then(|()| std::fs::rename(&tmp, d.join("memo.md")));
+    let r = std::fs::write(&tmp, text.as_bytes()).and_then(|()| std::fs::rename(&tmp, file));
     if r.is_err() {
         let _ = std::fs::remove_file(&tmp);
     }
@@ -277,7 +302,7 @@ mod tests {
         let b = temp_base("failtmp");
         let d = dir(&b, "/p");
         std::fs::create_dir_all(d.join("memo.md")).unwrap();
-        assert!(atomic_write(&d, "내용").is_err());
+        assert!(atomic_write_to(&d.join("memo.md"), "내용").is_err());
         assert!(temps(&d).is_empty(), "실패한 쓰기가 .tmp를 남겼다: {:?}", temps(&d));
     }
 
@@ -333,6 +358,33 @@ mod tests {
         };
         assert_eq!(h2, cur(&b, "/p").unwrap());
         assert_eq!(load(&b, "/p").unwrap().as_deref(), Some("2"));
+    }
+
+    /// 경로 지정형도 같은 계약이다 — 부재=None, 부모 디렉토리 자동 생성, 원자
+    /// 교체, 낙관적 잠금. (정리 세션 메모가 타는 길.)
+    #[test]
+    fn explicit_path_store_shares_the_contract() {
+        let b = temp_base("at");
+        let file = b.join("memo").join("f47ac10b-58cc-4372-a567-0e02b2c3d479.md");
+        assert_eq!(load_at(&file).unwrap(), None, "부재는 None");
+
+        let SaveOutcome::Saved { hash } = save_at(&file, "정리 초안", None).unwrap() else {
+            panic!("첫 저장은 Saved");
+        };
+        assert!(file.is_file(), "부모 디렉토리를 만들어야 한다");
+        assert_eq!(load_at(&file).unwrap().as_deref(), Some("정리 초안"));
+
+        // stale base는 거부되고 본문은 그대로 (프로젝트 메모와 동일 규칙).
+        assert!(matches!(
+            save_at(&file, "덮어쓸 뻔한 것", None).unwrap(),
+            SaveOutcome::Conflict { .. }
+        ));
+        assert_eq!(load_at(&file).unwrap().as_deref(), Some("정리 초안"));
+        assert!(matches!(
+            save_at(&file, "이어쓰기", Some(&hash)).unwrap(),
+            SaveOutcome::Saved { .. }
+        ));
+        assert!(temps(file.parent().unwrap()).is_empty());
     }
 
     #[test]

@@ -744,6 +744,25 @@ body {
   white-space: nowrap;
   text-overflow: ellipsis;
 }
+/* 종류 배지 — 일반 세션에는 붙지 않는다(예외만 라벨링). */
+.archive-kind {
+  margin-right: 6px;
+  padding: 0 5px;
+  font-size: 0.75em;
+  vertical-align: middle;
+  color: var(--fg, #cdd6f4);
+  background: color-mix(in srgb, var(--accent-bright) 22%, transparent);
+  border: 1px solid color-mix(in srgb, var(--accent-bright) 45%, transparent);
+  border-radius: 999px;
+}
+.archive-kind-filter {
+  padding: 1px 4px;
+  font-size: 0.9em;
+  color: var(--fg, #cdd6f4);
+  background: var(--bg, #1e1e1e);
+  border: 1px solid var(--border, #333);
+  border-radius: 4px;
+}
 .archive-session-meta {
   display: flex;
   align-items: center;
@@ -1323,7 +1342,10 @@ body {
 }
 
 /* ---- Memo panel (프로젝트 메모장 — 자동 저장 롱폼 에디터) ---- */
-.memo-panel {
+/* `.memo-editor`는 프로젝트 메모장과 프롬프트 정리 초안이 함께 쓰는 에디터
+   껍데기다 — 세로 스택 + 높이 100%만 책임지고, 바깥 배경·패딩은 각 패널 몫. */
+.memo-panel,
+.memo-editor {
   display: flex;
   flex-direction: column;
   height: 100%;
@@ -1356,6 +1378,15 @@ body {
 .memo-status {
   flex: 0 0 auto;
   opacity: 0.75;
+}
+/* 편집 잠금 사유 (닫는 중) — 왜 안 써지는지 모르는 것이 최악이라 눈에 띄게. */
+.memo-locked {
+  flex: 0 0 auto;
+  padding: 0 6px;
+  color: var(--fg, #cdd6f4);
+  background: color-mix(in srgb, var(--st-warn) 22%, transparent);
+  border: 1px solid color-mix(in srgb, var(--st-warn) 45%, transparent);
+  border-radius: 999px;
 }
 .memo-body {
   flex: 1 1 0;
@@ -2376,6 +2407,27 @@ body {
   /* flex (width) set inline via the splitter drag state */
   border-left: 1px solid var(--border, #333);
   background: var(--bg, #1e1e1e);
+}
+/* 프롬프트 정리 패널 — 세로 스택(툴바 · 배너 · 뷰 하나 · codex). 뷰 셋은
+   `.claudeterm-refine-body` 안에서 한 번에 하나만 보이고, 숨기는 방법은
+   `display:none`뿐이다(state/promptRefine.refineViewStyle이 유일한 출처 —
+   크기로 숨기면 xterm이 PTY를 2×1로 실제 축소한다). */
+.claudeterm-refine {
+  flex-direction: column;
+}
+.claudeterm-refine-body {
+  flex: 1 1 0;
+  display: flex;
+  min-width: 0;
+  min-height: 0;
+}
+/* 3뷰일 때는 각 뷰가 폭을 다 쓴다 — 우측 고정폭/테두리는 일반 세션의 규칙이다. */
+.claudeterm-refine .claudeterm-timeline-pane {
+  border-left: none;
+}
+.claudeterm-memo-pane {
+  min-width: 0;
+  min-height: 0;
 }
 /* Each pane labels which pane it is. */
 .claudeterm-pane-head {

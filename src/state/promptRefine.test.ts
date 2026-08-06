@@ -9,10 +9,23 @@ import {
   extractPromptBlock,
   injectDeliveryDecision,
   isRefineParams,
+  REFINE_SUBMIT_CONFIRM_MS,
+  REFINE_SUBMIT_CR_DELAY,
   openPromptRefine,
+  makeSubmitProbe,
+  refineCloseDecision,
+  refineCloseFailure,
+  refineClosePhase,
+  refineMemoLocked,
+  refineExitAction,
+  refineMemoStoreKey,
   refinePanelId,
   refineSeedPrompt,
+  refineViewStyle,
   resolveApplyAck,
+  sendBlockReason,
+  shouldNavPanes,
+  submitPasteBytes,
   type RefineDock,
 } from "./promptRefine";
 
@@ -41,6 +54,7 @@ const args = {
   sessionUuid: "u-refine",
   model: DEFAULT_REFINE_MODEL,
   title: "작업 A",
+  sourceProject: "/home/u/proj",
 };
 
 describe("openPromptRefine — 우측 배치 · 탭당 1개", () => {
@@ -421,5 +435,246 @@ describe("resolveApplyAck — 내 요청 id의 결과만 신뢰", () => {
     ];
     expect(resolveApplyAck("mine", acks)).toEqual({ kind: "failed", reason: "권한 없음" });
     expect(resolveApplyAck("dev-seed", acks)).toEqual({ kind: "delivered" });
+  });
+});
+
+// ---- 3뷰 스와톱: 숨기는 방법이 계약이다 ------------------------------------
+
+describe("refineViewStyle — 숨김은 display:none만", () => {
+  it("보이는 뷰는 폭을 다 쓰고, 나머지는 display:none이다", () => {
+    expect(refineViewStyle("memo", "memo")).toEqual({ flex: "1 1 0" });
+    expect(refineViewStyle("memo", "term")).toEqual({ display: "none" });
+    expect(refineViewStyle("timeline", "timeline")).toEqual({ flex: "1 1 0" });
+  });
+
+  it("**크기로 숨기지 않는다** — 0px 높이는 PTY를 2×1로 실제 축소시킨다", () => {
+    // 숨김 스타일에 height/flex 같은 크기 속성이 섞이는 순간 xterm FitAddon이
+    // computed height "0px"를 읽어 cols=2,rows=1을 계산하고 claude_resize가
+    // 그대로 나간다(claude TUI 파괴). 숨김은 오직 display:none이어야 한다.
+    for (const self of ["memo", "timeline", "term"] as const) {
+      const hidden = refineViewStyle(self === "memo" ? "term" : "memo", self);
+      expect(Object.keys(hidden)).toEqual(["display"]);
+      expect(hidden).toEqual({ display: "none" });
+    }
+  });
+});
+
+// ---- [보내기]: 제출 바이트와 게이트 ----------------------------------------
+
+describe("submitPasteBytes — 붙여넣기와 CR은 따로 나간다", () => {
+  it("두 조각으로 나눠 주고, 붙여넣기 조각에는 CR이 없다", () => {
+    const [paste, cr] = submitPasteBytes("첫 줄\n둘째 줄");
+    expect(paste).toBe("\x1b[200~첫 줄\n둘째 줄\x1b[201~");
+    expect(paste).not.toContain("\r");
+    expect(cr).toBe("\r");
+    // 실측 근거: 두 조각이 같은 write에 실리면 CR이 페이스트 본문으로 먹혀
+    // 제출되지 않는다. 지연을 두는 이유가 그것이라 값도 0보다 커야 한다.
+    expect(REFINE_SUBMIT_CR_DELAY).toBeGreaterThan(120);
+  });
+
+  it("줄 구조를 보존한다 — 한 줄로 접지 않는다", () => {
+    const [paste] = submitPasteBytes("a\nb\nc");
+    expect(paste).toContain("a\nb\nc");
+  });
+});
+
+describe("sendBlockReason — 무엇을 막는가", () => {
+  const ok = { text: "초안", sessionOpen: true, isDriver: true, blocked: false, sending: false };
+
+  it("정상이면 막지 않는다", () => {
+    expect(sendBlockReason(ok)).toBeNull();
+  });
+
+  it("빈 메모·미개통·미러·보내는 중은 각각의 사유로 막는다", () => {
+    expect(sendBlockReason({ ...ok, text: "   \n " })).toMatch(/비어/);
+    expect(sendBlockReason({ ...ok, sessionOpen: false })).toMatch(/시작되지/);
+    expect(sendBlockReason({ ...ok, isDriver: false })).toMatch(/미러/);
+    expect(sendBlockReason({ ...ok, sending: true })).toMatch(/보내는 중/);
+  });
+
+  it("blocked면 막는다 — 페이스트+CR이 키 입력이 되어 승인까지 눌린다", () => {
+    expect(sendBlockReason({ ...ok, blocked: true })).toMatch(/키 입력/);
+  });
+});
+
+// ---- 닫기 = 아카이브 --------------------------------------------------------
+
+describe("refineCloseDecision — 턴 수를 보지 않는다 (리뷰 #2)", () => {
+  it("uuid와 프로젝트가 있으면 아카이브를 시도한다", () => {
+    expect(refineCloseDecision({ uuid: "u", project: "/proj" })).toEqual({
+      kind: "archive",
+      uuid: "u",
+      project: "/proj",
+    });
+  });
+
+  it("**턴이 0으로 보여도 아카이브를 시도한다** — 빈 세션 판정은 백엔드 몫", () => {
+    // 배경 탭의 ×는 스냅샷이 아직 안 왔을 수 있다. 그 순간의 turns===0을 "빈
+    // 세션"으로 읽으면 대화가 있는 세션이 기록 없이 닫힌다(무음 소실).
+    expect(refineCloseDecision({ uuid: "u", project: "/proj" }).kind).toBe("archive");
+  });
+
+  it("스폰 전·프로젝트 미상만 아카이브 없이 닫는다", () => {
+    expect(refineCloseDecision({ uuid: null, project: "/proj" }).kind).toBe("close");
+    expect(refineCloseDecision({ uuid: "u", project: null }).kind).toBe("close");
+  });
+});
+
+describe("refineCloseFailure — 실패했으면 닫지 않는다", () => {
+  it("in_flight·전사 미존재·쓰기 실패는 패널을 남기고 재시도를 준다", () => {
+    for (const msg of [
+      "이 프로젝트는 이미 아카이브 진행 중입니다",
+      "Session transcript not found",
+      "Cannot write archive: 권한 없음",
+      "아카이브 부분 실패: 메모 동봉 실패",
+      "",
+    ]) {
+      expect(refineCloseFailure(msg, false)).toEqual({
+        kind: "ask",
+        retryable: true,
+        reason: msg,
+      });
+    }
+  });
+
+  it("대화 없음 + 빈 메모 = 남길 것이 없다 — 그냥 닫는다", () => {
+    expect(refineCloseFailure("아카이브할 대화가 없습니다", true)).toEqual({ kind: "close" });
+  });
+
+  it("대화 없음 + 메모 있음 = 조용히 닫지 않는다 (초안 무단 폐기 금지)", () => {
+    const v = refineCloseFailure("아카이브할 대화가 없습니다", false);
+    expect(v.kind).toBe("ask");
+    // 재시도해도 결과가 같으므로 [다시 닫기]는 주지 않는다 — [그래도 닫기]만.
+    expect(v).toMatchObject({ retryable: false });
+    if (v.kind === "ask") expect(v.reason).toMatch(/메모는 정리 스크래치/);
+  });
+});
+
+describe("refineExitAction — 종료 경로 정책표 (리뷰 #1)", () => {
+  it("사용자가 이 작업을 끝낸 세 경로는 아카이브한다", () => {
+    // [적용] 성공이 여기 있는 것이 이 표의 요점이다 — 기능이 **성공**했을 때
+    // 기록이 남지 않던 것이 실결함이었다.
+    expect(refineExitAction("tab-close")).toBe("archive");
+    expect(refineExitAction("apply-delivered")).toBe("archive");
+    expect(refineExitAction("source-removed")).toBe("archive");
+  });
+
+  it("사용자가 끝낸 것이 아닌 세 경로는 그냥 놓아준다", () => {
+    // 복원 뒷정리를 아카이브하면 프로젝트 탭 왕복마다 기록이 쌓인다(초안은
+    // 파일로 남으므로 잃는 것이 없다). 모델 재시작은 대화 파기에 이미 합의했다.
+    expect(refineExitAction("source-missing-at-mount")).toBe("detach");
+    expect(refineExitAction("layout-restore")).toBe("detach");
+    expect(refineExitAction("model-restart")).toBe("detach");
+  });
+});
+
+describe("제출 확인 · 키 라우팅 (리뷰 #7·#8)", () => {
+  it("확인 시점은 CR을 보낸 뒤여야 한다", () => {
+    // 확인이 CR보다 먼저 돌면 언제나 "제출 못 함"으로 오보한다.
+    expect(REFINE_SUBMIT_CONFIRM_MS).toBeGreaterThan(REFINE_SUBMIT_CR_DELAY);
+  });
+
+  it("에디터 안의 Ctrl+←/→는 패널 이동이 아니다 — 단어 이동을 뺏지 않는다", () => {
+    expect(shouldNavPanes({ inEditor: true, isRefine: true, view: "memo" })).toBe(false);
+    // 정리 세션이 아닌 곳(프로젝트 메모 패널)의 에디터도 마찬가지.
+    expect(shouldNavPanes({ inEditor: true, isRefine: false, view: "term" })).toBe(false);
+    // 메모 뷰면 포커스가 에디터 밖(헤더)이어도 옮겨 갈 pane이 없다.
+    expect(shouldNavPanes({ inEditor: false, isRefine: true, view: "memo" })).toBe(false);
+  });
+
+  it("터미널·타임라인 뷰와 일반 세션에서는 그대로 패널 이동이다", () => {
+    expect(shouldNavPanes({ inEditor: false, isRefine: true, view: "term" })).toBe(true);
+    expect(shouldNavPanes({ inEditor: false, isRefine: true, view: "timeline" })).toBe(true);
+    expect(shouldNavPanes({ inEditor: false, isRefine: false, view: "memo" })).toBe(true);
+  });
+});
+
+describe("refineMemoStoreKey — 초안은 세션이 아니라 정리 작업에 딸린다 (리뷰 #9)", () => {
+  it("소스 패널 id로 키를 만든다 — 모델 재시작을 가로질러 같다", () => {
+    const before = refineMemoStoreKey({ sourcePanelId: "claudeterm-1", sessionUuid: "u-old" });
+    // 모델을 바꾸면 세션이 재스폰되어 uuid가 바뀌지만 소스 패널은 그대로다.
+    const after = refineMemoStoreKey({ sourcePanelId: "claudeterm-1", sessionUuid: "u-new" });
+    expect(before).toBe(after);
+    expect(before).toBe(refinePanelId("claudeterm-1"));
+  });
+
+  it("소스 탭이 다르면 초안도 다르다", () => {
+    expect(refineMemoStoreKey({ sourcePanelId: "a" })).not.toBe(
+      refineMemoStoreKey({ sourcePanelId: "b" }),
+    );
+  });
+
+  it("소스 패널 id가 없으면 세션 uuid로 떨어진다 (초안을 못 쓰게 하느니)", () => {
+    expect(refineMemoStoreKey({ sessionUuid: "u-1" })).toBe("u-1");
+    expect(refineMemoStoreKey({ loadSessionId: "u-2" })).toBe("u-2");
+    expect(refineMemoStoreKey({ sourcePanelId: "   ", loadSessionId: "u-2" })).toBe("u-2");
+  });
+
+  it("아무것도 없으면 null — 저장할 곳이 없다", () => {
+    expect(refineMemoStoreKey({})).toBeNull();
+    expect(refineMemoStoreKey(null)).toBeNull();
+  });
+});
+
+// ---- 종료 중 초안 잠금 (감사 I1) -------------------------------------------
+
+describe("refineClosePhase / refineMemoLocked — 되돌릴 수 없는 구간만 잠근다", () => {
+  it("아카이브가 도는 동안 초안이 잠긴다", () => {
+    const phase = refineClosePhase({ closing: true, blocked: false });
+    expect(phase).toBe("archiving");
+    // 그 창에서 친 글자는 갈 곳이 없다 — 동봉 본문은 이미 결정됐고, 성공하면
+    // 스크래치 초안 파일이 지워진다(무음 소실).
+    expect(refineMemoLocked(phase)).toBe(true);
+  });
+
+  it("실패해서 패널이 남으면(keep) 곧바로 풀린다 — 초안은 여전히 사용자 것", () => {
+    const phase = refineClosePhase({ closing: false, blocked: true });
+    expect(phase).toBe("blocked");
+    expect(refineMemoLocked(phase)).toBe(false);
+  });
+
+  it("평상시엔 잠기지 않는다", () => {
+    expect(refineMemoLocked(refineClosePhase({ closing: false, blocked: false }))).toBe(false);
+  });
+
+  it("사유 배너를 띄운 채 [다시 닫기]를 누르면 다시 잠긴다", () => {
+    // 재시도는 blocked 상태에서 시작되므로 closing이 이겨야 한다.
+    expect(refineClosePhase({ closing: true, blocked: true })).toBe("archiving");
+    expect(refineMemoLocked(refineClosePhase({ closing: true, blocked: true }))).toBe(true);
+  });
+});
+
+// ---- 제출 확인 기준선 (감사 I2) --------------------------------------------
+
+describe("makeSubmitProbe — 기준선은 보내기 전에 잡는다", () => {
+  it("보내기 전에 잡으면 그 뒤에 늘어난 턴을 제출로 읽는다", () => {
+    let turns = 3;
+    const probe = makeSubmitProbe(() => turns);
+    probe.capture(); // ← 바이트를 쓰기 전
+    turns = 4;
+    expect(probe.observed()).toBe(true);
+  });
+
+  it("**보낸 뒤에 잡으면** 아주 빠른 턴을 놓쳐 성공을 실패로 오보한다", () => {
+    // 이것이 고친 실결함이다: CR 직후 도착한 턴이 이미 기준선에 포함된다.
+    let turns = 3;
+    turns = 4; // 제출이 즉시 반영됐다
+    const late = makeSubmitProbe(() => turns);
+    late.capture(); // ← 늦게 잡은 기준선
+    expect(late.observed()).toBe(false);
+  });
+
+  it("증가가 없으면 미관측이다", () => {
+    let turns = 3;
+    const probe = makeSubmitProbe(() => turns);
+    probe.capture();
+    expect(probe.observed()).toBe(false);
+    turns = 3;
+    expect(probe.observed()).toBe(false);
+  });
+
+  it("기준선을 잡지 않았으면 판정하지 않는다 — 모르는 것을 실패로 보고하지 않는다", () => {
+    const probe = makeSubmitProbe(() => 0);
+    expect(probe.observed()).toBe(true);
   });
 });

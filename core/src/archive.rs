@@ -42,6 +42,17 @@ pub const SCHEMA_VERSION: u32 = 1;
 /// finished **whole**. See [`is_extraction_complete`] for the full contract.
 pub const EXTRACTION_OK: &str = ".extraction-ok";
 
+/// Marker file dropped when a run archived the session with extraction
+/// **deliberately skipped** ([`ArchiveRequest::skip_extraction`]).
+///
+/// It exists because "no `.extraction-ok`" already means something else — *this
+/// archive's extraction failed or predates the marker, retry it*. A prompt-refine
+/// archive never wants extraction, so without an explicit marker it would sit in
+/// the backfill's "재추출 대상" bucket forever, permanently misreported as a
+/// partial failure. The skipped marker says which of the two it is, and
+/// [`is_extraction_complete`] reads it as complete.
+pub const EXTRACTION_SKIPPED: &str = ".extraction-skipped";
+
 /// Process-unique suffix counter for temp dirs (same rationale as snapshot.rs:
 /// concurrent writers must never race on a shared temp path).
 static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
@@ -124,6 +135,20 @@ pub struct ArchiveMeta {
     /// uuid of the last transcript record that carried one.
     #[serde(default)]
     pub last_message_uuid: Option<String>,
+    /// What kind of session this archive holds. `None` = an ordinary work
+    /// session (every archive written before this field existed, and every one
+    /// written since by the normal path) — the browser labels only the
+    /// exceptions. Currently the one exception is `"prompt"`: a 프롬프트 정리
+    /// session, archived on close.
+    ///
+    /// `#[serde(default)]` and **no [`SCHEMA_VERSION`] bump** — exactly the
+    /// pattern `archived_at`/`jsonl_bytes` set. The version tracks the shape of
+    /// [`NormalizedSession`] (what viewers parse); an optional meta field that
+    /// old readers ignore and old files omit breaks nothing. `backfill_meta`
+    /// round-trips the whole struct, so it preserves a kind it doesn't know to
+    /// write.
+    #[serde(default)]
+    pub kind: Option<String>,
 }
 
 /// Content identity of a transcript snapshot: byte length + non-empty line
@@ -422,6 +447,7 @@ pub fn write_archive(
     project: &str,
     session: &NormalizedSession,
     jsonl_bytes: &[u8],
+    kind: Option<&str>,
 ) -> io::Result<ArchiveOutcome> {
     if !is_safe_uuid(&session.uuid) {
         return Err(io::Error::new(io::ErrorKind::InvalidInput, "unsafe session id"));
@@ -461,6 +487,7 @@ pub fn write_archive(
             jsonl_bytes: Some(stat.bytes),
             jsonl_lines: Some(stat.lines),
             last_message_uuid: stat.last_uuid.clone(),
+            kind: kind.map(str::to_string),
         };
         let meta_json = serde_json::to_string_pretty(&meta)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
@@ -787,7 +814,14 @@ pub fn find_archived_session(
 ///   (리뷰 F5/G2: 부분 실패가 영영 재시도되지 않는 상태 차단).
 /// - *수명*: [`write_archive`]는 새 폴더를 만들어 갈아끼우므로 마커는 이월되지
 ///   않는다 — 항상 "마지막 실행의 결과"만 나타낸다.
+/// - *생략*: [`EXTRACTION_SKIPPED`] 마커가 있으면 **완료로 본다** — 그 아카이브는
+///   추출을 하지 않기로 하고 만들어진 것이지 실패한 것이 아니다. 요약 유무는
+///   묻지 않는다(정리 세션은 메모를 안 쓴 채 닫힐 수 있고, 그래도 재추출 대상이
+///   아니다).
 pub fn is_extraction_complete(entry: &ArchiveSessionEntry) -> bool {
+    if entry.dir.join(EXTRACTION_SKIPPED).is_file() {
+        return true;
+    }
     entry.summary_path.is_some() && entry.dir.join(EXTRACTION_OK).is_file()
 }
 
@@ -854,6 +888,25 @@ pub struct ArchiveRequest<'a> {
     /// 대화형 GUI는 1회(사용자가 다시 누르면 그만), 무인 대량 실행인 CLI 백필은
     /// 2회로 일시적 실패를 흡수한다.
     pub attempts: usize,
+    /// 이 아카이브의 종류 — [`ArchiveMeta::kind`]에 그대로 기록된다. 일반 세션은
+    /// `None`, 프롬프트 정리 세션은 `Some("prompt")`.
+    pub kind: Option<&'a str>,
+    /// 지식 추출을 **통째로 건너뛴다**.
+    ///
+    /// 정공법을 고른 이유(조사 근거): no-op 추출기(`|_| Ok(String::new())`)를
+    /// 주입하면 `write_knowledge`가 돌아 대상 프로젝트의 `INDEX.md`를 재작성하고
+    /// (총 0건이면 아예 삭제한다), `Err`를 반환하는 추출기는 이 아카이브를 영영
+    /// "부분 실패"로 남긴다. 둘 다 의도하지 않은 부작용을 아카이브 밖으로 흘린다.
+    /// 플래그는 의도를 코드에 드러내고 [`EXTRACTION_SKIPPED`] 마커로 사후 판별
+    /// 가능하게 만든다.
+    pub skip_extraction: bool,
+    /// 이 아카이브에 동봉할 `summary.md` 본문 (프롬프트 정리 세션의 메모).
+    ///
+    /// 새 파일이 아니라 `summary.md`인 이유: 목록의 `summary_path`와 브라우저의
+    /// [요약] 버튼이 이미 그 이름을 읽는다 — 스키마 변경 0으로 붙는다. 추출이
+    /// 도는 경로(`skip_extraction == false`)에서는 추출이 만든 요약이 이기므로
+    /// 이 값은 무시된다.
+    pub summary: Option<&'a str>,
 }
 
 /// Why an archive run never got off the ground. Everything after `write_archive`
@@ -881,6 +934,10 @@ pub struct ArchiveRun {
     /// Nothing was rewritten — the existing archive already matched
     /// ([`is_unchanged_complete`]).
     pub unchanged: bool,
+    /// 추출을 의도적으로 건너뛴 실행 ([`ArchiveRequest::skip_extraction`]).
+    /// "요약이 없다"를 실패로 세지 않기 위해 [`ArchiveRun::extraction_complete`]가
+    /// 이 값을 본다 — 디스크의 [`EXTRACTION_SKIPPED`] 마커와 같은 사실이다.
+    pub extraction_skipped: bool,
     /// 추출 단계 경고. **하나라도 있으면 `.extraction-ok` 마커를 남기지
     /// 않는다** — 다음 재아카이브가 추출 재시도로 동작한다.
     pub errors: Vec<String>,
@@ -892,7 +949,9 @@ pub struct ArchiveRun {
 impl ArchiveRun {
     /// This run left (or found) a complete extraction — the CLI's ok/부분 집계.
     pub fn extraction_complete(&self) -> bool {
-        self.unchanged || (self.summary_ok && self.errors.is_empty())
+        self.unchanged
+            || (self.extraction_skipped && self.errors.is_empty())
+            || (self.summary_ok && self.errors.is_empty())
     }
 
     /// Every warning, extraction-gating first — for one-line UI/CLI reporting.
@@ -902,6 +961,28 @@ impl ArchiveRun {
             .chain(self.notes.iter())
             .map(String::as_str)
             .collect()
+    }
+}
+
+/// 동봉할 요약이 이미 디스크에 있는 것과 같은가 — "변경 없음" 스킵의 추가 조건.
+///
+/// 추출이 도는 경로에서는 요약을 추출기가 만들므로 호출자의 `summary`는 애초에
+/// 쓰이지 않는다 → 항상 같다고 본다(기존 판정 무변경). 스킵 경로에서만 비교한다.
+fn summary_unchanged(entry: &ArchiveSessionEntry, req: &ArchiveRequest<'_>) -> bool {
+    if !req.skip_extraction {
+        return true;
+    }
+    // 쓰기 경로와 같은 규칙: 공백뿐인 메모는 "요약 없음"이다.
+    let want = req.summary.filter(|s| !s.trim().is_empty());
+    let have = entry
+        .summary_path
+        .as_ref()
+        .and_then(|p| fs::read_to_string(p).ok());
+    match (want, have.as_deref()) {
+        (None, None) => true,
+        (Some(w), Some(h)) => w == h,
+        // 읽지 못한 요약은 "다르다"로 본다 — 스킵해서 잃는 쪽이 더 나쁘다.
+        _ => false,
     }
 }
 
@@ -955,7 +1036,14 @@ pub fn run_archive(
     let live = jsonl_stat(req.jsonl_bytes);
     let prev = find_archived_session(req.archive_root, req.project, req.uuid);
     if let Some(p) = &prev {
-        if is_unchanged_complete(p, &live) {
+        // "변경 없음"은 **전사만** 보던 판정이었다(리뷰 #5). 전사가 그대로여도
+        // 라벨이나 동봉한 메모가 달라졌으면 그건 다시 써야 하는 변경이다 —
+        // 정리 세션에서 메모만 고치고 다시 닫는 것이 정확히 그 경로고, 그때
+        // 조용히 스킵되면 사용자의 마지막 편집이 아카이브에 영영 안 들어간다.
+        if is_unchanged_complete(p, &live)
+            && p.meta.kind.as_deref() == req.kind
+            && summary_unchanged(p, req)
+        {
             return Ok(ArchiveRun {
                 dir: p.dir.clone(),
                 book_path: p.book_path.clone(),
@@ -964,6 +1052,7 @@ pub fn run_archive(
                 summary_ok: true,
                 knowledge_files: 0,
                 unchanged: true,
+                extraction_skipped: req.skip_extraction,
                 errors,
                 notes,
             });
@@ -981,7 +1070,7 @@ pub fn run_archive(
 
     // 1) Core artifacts land FIRST — a quit or crash during the (up to
     // 3-minute) extraction must never cost the transcript copy + book.
-    let mut out = write_archive(req.archive_root, req.project, &session, req.jsonl_bytes)
+    let mut out = write_archive(req.archive_root, req.project, &session, req.jsonl_bytes, req.kind)
         .map_err(ArchiveError::Write)?;
     let replaced = out.replaced;
     // The last-good summary goes to disk NOW — held only in memory, a crash
@@ -992,33 +1081,50 @@ pub fn run_archive(
         }
     }
 
-    // 2) Extraction — best-effort, `attempts` tries.
-    let prompt = crate::knowledge::extraction_prompt(&crate::knowledge::render_session_for_extraction(&session));
-    let attempts = req.attempts.max(1);
+    // 2) Extraction — best-effort, `attempts` tries. `skip_extraction`이면 이
+    // 블록 전체(추출 호출·리타이틀·지식 기록)를 건너뛰고, 요약 자리에는 호출자가
+    // 동봉한 본문(정리 세션의 메모)이 들어간다.
     let mut raw = None;
-    for attempt in 1..=attempts {
-        match extract(&prompt) {
-            Ok(text) => {
-                raw = Some(text);
-                break;
+    if !req.skip_extraction {
+        let prompt = crate::knowledge::extraction_prompt(
+            &crate::knowledge::render_session_for_extraction(&session),
+        );
+        let attempts = req.attempts.max(1);
+        for attempt in 1..=attempts {
+            match extract(&prompt) {
+                Ok(text) => {
+                    raw = Some(text);
+                    break;
+                }
+                // 재시도로 성공한 실행은 온전한 추출이다 — 1차 실패는 마커를 막지
+                // 않는 note로만 남는다.
+                Err(e) if attempt < attempts => {
+                    notes.push(format!("추출 {attempt}차 실패({e}) — 재시도"))
+                }
+                Err(e) => errors.push(format!("추출 실패: {e}")),
             }
-            // 재시도로 성공한 실행은 온전한 추출이다 — 1차 실패는 마커를 막지
-            // 않는 note로만 남는다.
-            Err(e) if attempt < attempts => notes.push(format!("추출 {attempt}차 실패({e}) — 재시도")),
-            Err(e) => errors.push(format!("추출 실패: {e}")),
         }
     }
 
     let mut summary_ok = false;
     let mut knowledge_files = 0usize;
-    if let Some(raw) = raw {
+    if req.skip_extraction {
+        // 동봉 요약 = 이 아카이브의 `summary.md`. 빈 메모는 파일을 만들지 않는다
+        // (없는 요약을 빈 파일로 위장하지 않는다 — [요약] 버튼이 비활성으로 남는다).
+        if let Some(text) = req.summary.filter(|s| !s.trim().is_empty()) {
+            match fs::write(out.dir.join("summary.md"), text) {
+                Ok(()) => summary_ok = true,
+                Err(e) => errors.push(format!("메모 동봉 실패: {}", io_brief(&e))),
+            }
+        }
+    } else if let Some(raw) = raw {
         let ex = crate::knowledge::parse_extraction(&raw);
         // Extracted title → re-land the archive under it. write_archive is
         // idempotent per uuid, so this just replaces our own fallback folder.
         let new_title = ex.title.trim();
         if !new_title.is_empty() && new_title != session.title {
             session.title = new_title.to_string();
-            match write_archive(req.archive_root, req.project, &session, req.jsonl_bytes) {
+            match write_archive(req.archive_root, req.project, &session, req.jsonl_bytes, req.kind) {
                 Ok(o) => out = o,
                 Err(e) => errors.push(format!("제목 반영 실패: {}", io_brief(&e))),
             }
@@ -1051,8 +1157,10 @@ pub fn run_archive(
     // 3) 지식 MCP 서버를 대상 프로젝트 `.mcp.json`에 등록(병합·멱등) — 이후 그
     // 프로젝트의 Claude 세션이 과거 지식을 바로 조회한다. 추출 품질과 무관한
     // 부가 작업이므로 결과는 note (마커를 막지 않는다).
+    // 추출을 건너뛴 실행은 지식을 한 건도 만들지 않았으므로 등록할 이유가 없다 —
+    // 정리 패널을 닫을 때마다 대상 프로젝트의 `.mcp.json`을 건드리지 않는다.
     let proj_path = Path::new(req.project);
-    if proj_path.is_dir() {
+    if proj_path.is_dir() && !req.skip_extraction {
         match req.mcp_bin {
             Some(bin) if bin.is_file() => {
                 let kdir = crate::knowledge::knowledge_dir(req.archive_root, req.project);
@@ -1073,7 +1181,10 @@ pub fn run_archive(
     // how knowledge entries persist when extraction fails. (Re-written here
     // because a retitle re-land above replaced the folder the early copy was
     // in.) 이 경로는 "이번 실행의 추출이 온전하지 않았다"는 뜻이므로 경고다.
-    if !summary_ok {
+    // (스킵 경로는 해당 없음 — 이번 실행의 요약은 동봉된 메모이고, 그게 없으면
+    // 요약이 없는 것이 정상이다. 여기서 이전 요약을 되살리면 "추출이 온전하지
+    // 않았다"는 뜻의 경고까지 함께 남아 스킵을 실패로 오인시킨다.)
+    if !summary_ok && !req.skip_extraction {
         if let Some(prev) = prev_summary {
             match fs::write(out.dir.join("summary.md"), prev) {
                 Ok(()) => {
@@ -1084,10 +1195,17 @@ pub fn run_archive(
             }
         }
     }
-    // 5) 추출이 온전히 성공했을 때만 완료 마커 — unchanged 스킵의 근거
-    // ([`is_extraction_complete`]의 계약).
-    if summary_ok && errors.is_empty() {
-        if let Err(e) = fs::write(out.dir.join(EXTRACTION_OK), b"") {
+    // 5) 마커. 추출이 온전히 성공했을 때만 완료 마커 — unchanged 스킵의 근거
+    // ([`is_extraction_complete`]의 계약). 추출을 **건너뛴** 실행은 그 사실을
+    // 별도 마커로 남긴다: 마커가 아예 없으면 "실패했으니 재추출하라"로 읽혀
+    // 백필의 재추출 대상 집계에 영원히 잡힌다(거짓 부분 실패).
+    let marker = if req.skip_extraction {
+        errors.is_empty().then_some(EXTRACTION_SKIPPED)
+    } else {
+        (summary_ok && errors.is_empty()).then_some(EXTRACTION_OK)
+    };
+    if let Some(name) = marker {
+        if let Err(e) = fs::write(out.dir.join(name), b"") {
             errors.push(format!("추출 완료 마커 기록 실패: {}", io_brief(&e)));
         }
     }
@@ -1103,6 +1221,7 @@ pub fn run_archive(
         summary_ok,
         knowledge_files,
         unchanged: false,
+        extraction_skipped: req.skip_extraction,
         errors,
         notes,
     })
@@ -1210,7 +1329,7 @@ mod tests {
         let root = temp_root("layout");
         let jsonl = sample_jsonl("do the thing");
         let s = sample_session("아카이브 테스트");
-        let out = write_archive(&root, "/p", &s, jsonl.as_bytes()).unwrap();
+        let out = write_archive(&root, "/p", &s, jsonl.as_bytes(), None).unwrap();
         assert!(!out.replaced);
         assert!(out.dir.file_name().unwrap().to_string_lossy().starts_with("2026-07-19-아카이브-테스트-"));
         assert_eq!(fs::read(out.dir.join("session.jsonl")).unwrap(), jsonl.as_bytes());
@@ -1227,11 +1346,11 @@ mod tests {
         let root = temp_root("idem");
         let jsonl = sample_jsonl("p");
         let s1 = sample_session("첫 제목");
-        let out1 = write_archive(&root, "/p", &s1, jsonl.as_bytes()).unwrap();
+        let out1 = write_archive(&root, "/p", &s1, jsonl.as_bytes(), None).unwrap();
         assert!(!out1.replaced);
         // Same session again, different title → old folder replaced, not duplicated.
         let s2 = sample_session("다른 제목");
-        let out2 = write_archive(&root, "/p", &s2, jsonl.as_bytes()).unwrap();
+        let out2 = write_archive(&root, "/p", &s2, jsonl.as_bytes(), None).unwrap();
         assert!(out2.replaced);
         assert!(!out1.dir.exists(), "old folder removed");
         let sessions = out2.dir.parent().unwrap();
@@ -1247,8 +1366,8 @@ mod tests {
         let a = sample_session("작업 A");
         let mut b = sample_session("작업 B");
         b.uuid = "ffff9999-1111-2222-3333-444455556666".to_string();
-        write_archive(&root, "/p", &a, jsonl.as_bytes()).unwrap();
-        let out_b = write_archive(&root, "/p", &b, jsonl.as_bytes()).unwrap();
+        write_archive(&root, "/p", &a, jsonl.as_bytes(), None).unwrap();
+        let out_b = write_archive(&root, "/p", &b, jsonl.as_bytes(), None).unwrap();
         assert!(!out_b.replaced, "a different uuid never replaces another session");
         let sessions = out_b.dir.parent().unwrap();
         assert_eq!(fs::read_dir(sessions).unwrap().flatten().count(), 2);
@@ -1264,8 +1383,8 @@ mod tests {
         let a = sample_session("작업 A"); // abcd1234-...
         let mut b = sample_session("작업 B");
         b.uuid = format!("{}-9999-8888-7777-666655554444", &UUID[..8]); // 같은 앞 8자
-        let out_a = write_archive(&root, "/p", &a, jsonl.as_bytes()).unwrap();
-        let out_b = write_archive(&root, "/p", &b, jsonl.as_bytes()).unwrap();
+        let out_a = write_archive(&root, "/p", &a, jsonl.as_bytes(), None).unwrap();
+        let out_b = write_archive(&root, "/p", &b, jsonl.as_bytes(), None).unwrap();
         assert!(!out_b.replaced, "같은 8자 접두여도 전체 uuid가 다르면 교체 아님");
         assert!(out_a.dir.exists(), "기존 세션 아카이브 보존");
         assert_eq!(
@@ -1273,7 +1392,7 @@ mod tests {
             2
         );
         // 같은 세션 재아카이브는 여전히 자신만 교체.
-        let out_b2 = write_archive(&root, "/p", &b, jsonl.as_bytes()).unwrap();
+        let out_b2 = write_archive(&root, "/p", &b, jsonl.as_bytes(), None).unwrap();
         assert!(out_b2.replaced);
         assert!(out_a.dir.exists());
         let _ = fs::remove_dir_all(&root);
@@ -1286,14 +1405,14 @@ mod tests {
         let root = temp_root("oldreclaim");
         let jsonl = sample_jsonl("p");
         let s = sample_session("복구 테스트");
-        let out = write_archive(&root, "/p", &s, jsonl.as_bytes()).unwrap();
+        let out = write_archive(&root, "/p", &s, jsonl.as_bytes(), None).unwrap();
         let sessions = out.dir.parent().unwrap().to_path_buf();
         // 크래시 시나리오 재현: 최종 폴더가 `.old-*`로만 남아 있는 상태.
         let leftover = sessions.join(".old-crashed-1");
         fs::rename(&out.dir, &leftover).unwrap();
         assert!(list_archives(&root).is_empty(), "dot-dir는 목록에 안 보임");
         // 재아카이브가 leftover를 회수하고 정상 폴더 하나만 남긴다.
-        let out2 = write_archive(&root, "/p", &s, jsonl.as_bytes()).unwrap();
+        let out2 = write_archive(&root, "/p", &s, jsonl.as_bytes(), None).unwrap();
         assert!(out2.replaced, "leftover 회수도 교체로 집계");
         assert!(!leftover.exists());
         assert_eq!(fs::read_dir(&sessions).unwrap().flatten().count(), 1);
@@ -1314,7 +1433,7 @@ mod tests {
     fn list_archives_reads_meta_and_flags_summary() {
         let root = temp_root("list");
         let jsonl = sample_jsonl("p");
-        let out = write_archive(&root, "/p", &sample_session("목록 테스트"), jsonl.as_bytes()).unwrap();
+        let out = write_archive(&root, "/p", &sample_session("목록 테스트"), jsonl.as_bytes(), None).unwrap();
         let listed = list_archives(&root);
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].project, "/p");
@@ -1340,7 +1459,7 @@ mod tests {
     fn meta_snapshot_stat_matches_source_transcript() {
         let root = temp_root("stat");
         let jsonl = sample_jsonl("p");
-        let out = write_archive(&root, "/p", &sample_session("스탯"), jsonl.as_bytes()).unwrap();
+        let out = write_archive(&root, "/p", &sample_session("스탯"), jsonl.as_bytes(), None).unwrap();
         let meta: ArchiveMeta =
             serde_json::from_str(&fs::read_to_string(out.dir.join("meta.json")).unwrap()).unwrap();
         let src = jsonl_stat(jsonl.as_bytes());
@@ -1372,11 +1491,11 @@ mod tests {
     fn changed_rearchive_preserves_previous_as_history() {
         let root = temp_root("hist");
         let v1 = sample_jsonl("첫 작업");
-        let out1 = write_archive(&root, "/p", &sample_session("t"), v1.as_bytes()).unwrap();
+        let out1 = write_archive(&root, "/p", &sample_session("t"), v1.as_bytes(), None).unwrap();
         assert!(list_archives(&root)[0].sessions[0].history.is_empty());
 
         let v2 = format!("{v1}\n{}", json!({"type":"user","uuid":"u-new","message":{"role":"user","content":"more"}}));
-        let out2 = write_archive(&root, "/p", &sample_session("t"), v2.as_bytes()).unwrap();
+        let out2 = write_archive(&root, "/p", &sample_session("t"), v2.as_bytes(), None).unwrap();
         assert!(out2.replaced);
         assert_eq!(out1.dir, out2.dir, "같은 제목·날짜 → 같은 최신 경로에 안착");
         assert_eq!(
@@ -1392,7 +1511,7 @@ mod tests {
 
         // 한 번 더 변경 재아카이브 → 버전 2개, 전부 이월.
         let v3 = format!("{v2}\n{}", json!({"type":"user","uuid":"u-3","message":{"role":"user","content":"x"}}));
-        write_archive(&root, "/p", &sample_session("t"), v3.as_bytes()).unwrap();
+        write_archive(&root, "/p", &sample_session("t"), v3.as_bytes(), None).unwrap();
         let listed = &list_archives(&root)[0].sessions[0];
         assert_eq!(listed.history.len(), 2, "기존 버전 이월 + 새 버전");
         let _ = fs::remove_dir_all(&root);
@@ -1403,12 +1522,12 @@ mod tests {
     fn same_content_rearchive_does_not_stack_versions() {
         let root = temp_root("same");
         let v1 = sample_jsonl("작업");
-        write_archive(&root, "/p", &sample_session("가제"), v1.as_bytes()).unwrap();
+        write_archive(&root, "/p", &sample_session("가제"), v1.as_bytes(), None).unwrap();
         // 내용 변경 1회로 버전 하나 만들어 둠.
         let v2 = format!("{v1}\n{}", json!({"type":"user","uuid":"u-n","message":{"role":"user","content":"m"}}));
-        write_archive(&root, "/p", &sample_session("가제"), v2.as_bytes()).unwrap();
+        write_archive(&root, "/p", &sample_session("가제"), v2.as_bytes(), None).unwrap();
         // 같은 내용으로 제목만 바꿔 재land — 버전이 늘면 안 되고 기존 버전은 유지.
-        write_archive(&root, "/p", &sample_session("추출된 제목"), v2.as_bytes()).unwrap();
+        write_archive(&root, "/p", &sample_session("추출된 제목"), v2.as_bytes(), None).unwrap();
         let listed = &list_archives(&root)[0].sessions[0];
         assert_eq!(listed.meta.title, "추출된 제목");
         assert_eq!(listed.history.len(), 1, "동일 내용 re-land는 버전을 쌓지 않음");
@@ -1420,7 +1539,7 @@ mod tests {
     fn backfill_fills_missing_stat_fields_idempotently() {
         let root = temp_root("backfill");
         let jsonl = sample_jsonl("p");
-        let out = write_archive(&root, "/p", &sample_session("백필"), jsonl.as_bytes()).unwrap();
+        let out = write_archive(&root, "/p", &sample_session("백필"), jsonl.as_bytes(), None).unwrap();
         // 구버전 메타 재현: 새 필드를 벗겨낸 meta.json으로 되돌린다.
         let mut v: serde_json::Value =
             serde_json::from_str(&fs::read_to_string(out.dir.join("meta.json")).unwrap()).unwrap();
@@ -1511,7 +1630,7 @@ mod tests {
     fn carry_forward_name_collision_preserves_both_versions() {
         let root = temp_root("carry");
         let v1 = sample_jsonl("일");
-        let out1 = write_archive(&root, "/p", &sample_session("t"), v1.as_bytes()).unwrap();
+        let out1 = write_archive(&root, "/p", &sample_session("t"), v1.as_bytes(), None).unwrap();
         let sessions = out1.dir.parent().unwrap().to_path_buf();
         // 크래시 leftover 재현: 같은 uuid의 .old- 폴더가 최신 폴더와 같은 이름의
         // history 항목을 갖고 있다.
@@ -1530,7 +1649,7 @@ mod tests {
 
         // 내용이 달라진 재아카이브 — 최신 폴더·leftover 둘 다 치환된다.
         let v2 = format!("{v1}\n{}", json!({"type":"user","uuid":"u-n","message":{"role":"user","content":"m"}}));
-        let out2 = write_archive(&root, "/p", &sample_session("t"), v2.as_bytes()).unwrap();
+        let out2 = write_archive(&root, "/p", &sample_session("t"), v2.as_bytes(), None).unwrap();
         let hist = out2.dir.join("history");
         let names: Vec<String> = fs::read_dir(&hist)
             .unwrap()
@@ -1565,7 +1684,7 @@ mod tests {
     fn unchanged_skip_requires_same_content_summary_and_marker() {
         let root = temp_root("verdict");
         let jsonl = sample_jsonl("p");
-        let out = write_archive(&root, "/p", &sample_session("t"), jsonl.as_bytes()).unwrap();
+        let out = write_archive(&root, "/p", &sample_session("t"), jsonl.as_bytes(), None).unwrap();
         let live = jsonl_stat(jsonl.as_bytes());
         let entry = || find_archived_session(&root, "/p", UUID).unwrap();
 
@@ -1593,7 +1712,7 @@ mod tests {
         let root = temp_root("legacy");
         let jsonl = sample_jsonl("p");
         // 구 CLI 백필이 남기던 형상 그대로: core 산출물 + summary.md, 마커 없음.
-        let out = write_archive(&root, "/p", &sample_session("t"), jsonl.as_bytes()).unwrap();
+        let out = write_archive(&root, "/p", &sample_session("t"), jsonl.as_bytes(), None).unwrap();
         fs::write(out.dir.join("summary.md"), "요약").unwrap();
         assert!(!out.dir.join(EXTRACTION_OK).exists());
 
@@ -1644,6 +1763,9 @@ mod tests {
             jsonl_bytes: jsonl,
             mcp_bin: None,
             attempts: 2, // 백필 소유 파라미터
+            kind: None,
+            skip_extraction: false,
+            summary: None,
         }
     }
 
@@ -1693,7 +1815,7 @@ mod tests {
         let jsonl = sample_jsonl("작업");
         // 구 CLI 백필 형상 재현: core 산출물 + summary.md, 마커 없음.
         let out =
-            write_archive(&root, "/p", &session_from(&jsonl, "옛 제목"), jsonl.as_bytes()).unwrap();
+            write_archive(&root, "/p", &session_from(&jsonl, "옛 제목"), jsonl.as_bytes(), None).unwrap();
         fs::write(out.dir.join("summary.md"), "옛 요약").unwrap();
 
         let ex = FakeExtractor::new("옛 제목");
@@ -1759,7 +1881,7 @@ mod tests {
         // 참조본: 최종 제목으로 write_archive만 호출한 결과.
         let ref_root = temp_root("shape-ref");
         let reference =
-            write_archive(&ref_root, "/p", &session_from(&jsonl, title), jsonl.as_bytes()).unwrap();
+            write_archive(&ref_root, "/p", &session_from(&jsonl, title), jsonl.as_bytes(), None).unwrap();
 
         assert_eq!(
             run.dir.file_name(),
@@ -1866,14 +1988,205 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
     }
 
+    // ---- 프롬프트 정리 아카이브 (kind · skip_extraction · 메모 동봉) ----
+
+    /// 정리 세션 요청 — 원본 프로젝트 키 아래에, 라벨 붙여서, 추출 없이.
+    fn prompt_request<'a>(
+        root: &'a Path,
+        jsonl: &'a [u8],
+        summary: Option<&'a str>,
+    ) -> ArchiveRequest<'a> {
+        ArchiveRequest {
+            archive_root: root,
+            project: "/p",
+            uuid: UUID,
+            fallback_title: "프롬프트 정리 — 세션",
+            date: "2026-08-06",
+            jsonl_bytes: jsonl,
+            mcp_bin: None,
+            attempts: 1,
+            kind: Some("prompt"),
+            skip_extraction: true,
+            summary,
+        }
+    }
+
+    /// 스킵 경로의 계약 전부를 한 자리에서 고정한다: 추출기는 **호출되지 않고**,
+    /// 메모가 `summary.md`가 되며, meta에 라벨이 남고, 마커는 `.extraction-ok`가
+    /// 아니라 `.extraction-skipped`다.
+    #[test]
+    fn prompt_archive_skips_extraction_lands_memo_and_marks_skipped() {
+        let root = temp_root("prompt_skip");
+        let jsonl = sample_jsonl("초안 다듬기");
+        let never = FakeExtractor::new("불려선 안 됨");
+        let run = run_archive(
+            &prompt_request(&root, jsonl.as_bytes(), Some("내가 쓴 메모\n둘째 줄\n")),
+            &never.f(),
+        )
+        .unwrap();
+
+        assert_eq!(never.calls.get(), 0, "추출기는 한 번도 불리지 않는다");
+        assert!(run.errors.is_empty(), "{:?}", run.errors);
+        assert!(run.extraction_skipped && run.summary_ok);
+        assert_eq!(run.knowledge_files, 0);
+        assert!(run.extraction_complete(), "스킵은 실패가 아니다");
+
+        assert_eq!(
+            fs::read_to_string(run.dir.join("summary.md")).unwrap(),
+            "내가 쓴 메모\n둘째 줄\n"
+        );
+        assert!(run.dir.join(EXTRACTION_SKIPPED).is_file());
+        assert!(!run.dir.join(EXTRACTION_OK).exists(), "완료 마커는 남기지 않는다");
+
+        // 라벨은 meta.json에 실려 목록까지 그대로 흐른다.
+        let entry = find_archived_session(&root, "/p", UUID).unwrap();
+        assert_eq!(entry.meta.kind.as_deref(), Some("prompt"));
+        assert!(entry.summary_path.is_some(), "브라우저의 [요약] 버튼이 산다");
+        // 스킵 마커가 "재추출 대상"이라는 거짓 판정을 막는다.
+        assert!(is_extraction_complete(&entry));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// 메모를 한 글자도 안 쓰고 닫아도 정상이다 — 요약이 없을 뿐, 재추출 대상이
+    /// 되어서는 안 된다(빈 파일로 요약을 위장하지도 않는다).
+    #[test]
+    fn prompt_archive_without_memo_is_still_complete() {
+        let jsonl = sample_jsonl("초안");
+        let never = FakeExtractor::new("x");
+        // 케이스마다 새 root — 같은 root면 두 번째 실행이 "변경 없음" 스킵으로
+        // 빠져(스킵 마커가 완료로 읽히므로) 요약 판정을 검사하지 못한다.
+        for (tag, summary) in [("prompt_nomemo_none", None), ("prompt_nomemo_blank", Some("   \n "))]
+        {
+            let root = temp_root(tag);
+            let run =
+                run_archive(&prompt_request(&root, jsonl.as_bytes(), summary), &never.f()).unwrap();
+            assert!(run.errors.is_empty(), "{:?}", run.errors);
+            assert!(!run.summary_ok);
+            assert!(!run.dir.join("summary.md").exists(), "빈 메모는 파일을 만들지 않는다");
+            assert!(run.dir.join(EXTRACTION_SKIPPED).is_file());
+            assert!(run.extraction_complete());
+            let entry = find_archived_session(&root, "/p", UUID).unwrap();
+            assert!(entry.summary_path.is_none());
+            assert!(is_extraction_complete(&entry));
+            let _ = fs::remove_dir_all(&root);
+        }
+        assert_eq!(never.calls.get(), 0);
+    }
+
+    /// 일반 경로는 손대지 않았다 — kind 없음(None) + 완료 마커 그대로.
+    #[test]
+    fn ordinary_archive_has_no_kind_and_keeps_the_ok_marker() {
+        let root = temp_root("prompt_regress");
+        let jsonl = sample_jsonl("작업");
+        let ex = FakeExtractor::new("제목");
+        let run = run_archive(&cli_request(&root, jsonl.as_bytes()), &ex.f()).unwrap();
+        assert!(!run.extraction_skipped);
+        assert!(run.dir.join(EXTRACTION_OK).is_file());
+        assert!(!run.dir.join(EXTRACTION_SKIPPED).exists());
+        assert_eq!(
+            find_archived_session(&root, "/p", UUID).unwrap().meta.kind,
+            None
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// 전사가 그대로여도 **메모가 달라졌으면 다시 쓴다**(리뷰 #5) — 메모만 고치고
+    /// 다시 닫는 경로가 조용히 스킵되면 마지막 편집이 영영 안 들어간다.
+    #[test]
+    fn changed_memo_is_not_unchanged() {
+        let root = temp_root("prompt_memo_changed");
+        let jsonl = sample_jsonl("초안");
+        let never = FakeExtractor::new("x");
+        let first =
+            run_archive(&prompt_request(&root, jsonl.as_bytes(), Some("v1 메모")), &never.f())
+                .unwrap();
+        assert!(!first.unchanged);
+
+        // 같은 전사 + 다른 메모 → 스킵하지 않고 요약을 갱신한다.
+        let again =
+            run_archive(&prompt_request(&root, jsonl.as_bytes(), Some("v2 메모")), &never.f())
+                .unwrap();
+        assert!(!again.unchanged, "메모가 달라졌는데 변경 없음으로 스킵됐다");
+        assert_eq!(fs::read_to_string(again.dir.join("summary.md")).unwrap(), "v2 메모");
+
+        // 같은 전사 + 같은 메모 → 그때는 스킵이 맞다.
+        let third =
+            run_archive(&prompt_request(&root, jsonl.as_bytes(), Some("v2 메모")), &never.f())
+                .unwrap();
+        assert!(third.unchanged, "완전히 같은 입력은 스킵해야 한다");
+        assert_eq!(never.calls.get(), 0);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// 라벨이 달라지면 meta를 다시 써야 한다 — 일반 세션으로 아카이브된 uuid를
+    /// 프롬프트로 다시 남기는(또는 그 반대) 경로가 조용히 무시되지 않게.
+    #[test]
+    fn changed_kind_is_not_unchanged() {
+        let root = temp_root("prompt_kind_changed");
+        let jsonl = sample_jsonl("초안");
+        let ex = FakeExtractor::new("제목");
+        // ① 일반 아카이브(kind None, 추출 완료 마커까지).
+        run_archive(&cli_request(&root, jsonl.as_bytes()), &ex.f()).unwrap();
+        // ② 같은 전사를 프롬프트로 — 스킵되면 라벨이 영영 안 붙는다.
+        let never = FakeExtractor::new("x");
+        let run =
+            run_archive(&prompt_request(&root, jsonl.as_bytes(), Some("메모")), &never.f()).unwrap();
+        assert!(!run.unchanged);
+        assert_eq!(
+            find_archived_session(&root, "/p", UUID).unwrap().meta.kind.as_deref(),
+            Some("prompt")
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// `kind` 도입 전에 쓰인 meta.json은 그대로 읽힌다(`serde(default)`) —
+    /// SCHEMA_VERSION을 올리지 않은 근거.
+    #[test]
+    fn meta_without_kind_field_deserializes_as_none() {
+        let meta: ArchiveMeta = serde_json::from_str(
+            r#"{"schema_version":1,"uuid":"u","project":"/p","title":"t","date":"d",
+                "model":null,"turns":3}"#,
+        )
+        .unwrap();
+        assert_eq!(meta.kind, None);
+        assert_eq!(meta.archived_at, None);
+    }
+
+    /// 백필은 stat 필드만 채우고 **kind는 보존**한다 — 구 meta를 재생성하는
+    /// 경로가 라벨을 지워 버리면 프롬프트 아카이브가 조용히 일반 세션이 된다.
+    #[test]
+    fn backfill_meta_preserves_kind() {
+        let root = temp_root("prompt_backfill");
+        let jsonl = sample_jsonl("초안");
+        let out =
+            write_archive(&root, "/p", &sample_session("정리"), jsonl.as_bytes(), Some("prompt"))
+                .unwrap();
+        // 구버전 메타 재현(stat 필드만 제거 — kind는 남긴다).
+        let mut v: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(out.dir.join("meta.json")).unwrap()).unwrap();
+        let obj = v.as_object_mut().unwrap();
+        for k in ["archived_at", "jsonl_bytes", "jsonl_lines", "last_message_uuid"] {
+            obj.remove(k);
+        }
+        assert_eq!(obj.get("kind").and_then(|k| k.as_str()), Some("prompt"));
+        fs::write(out.dir.join("meta.json"), v.to_string()).unwrap();
+
+        assert_eq!(backfill_meta(&root), (1, 1));
+        let meta: ArchiveMeta =
+            serde_json::from_str(&fs::read_to_string(out.dir.join("meta.json")).unwrap()).unwrap();
+        assert_eq!(meta.kind.as_deref(), Some("prompt"), "백필이 라벨을 지웠다");
+        assert!(meta.jsonl_bytes.is_some() && meta.archived_at.is_some());
+        let _ = fs::remove_dir_all(&root);
+    }
+
     #[test]
     fn unsafe_or_short_uuid_is_rejected() {
         let root = temp_root("unsafe");
         let mut s = sample_session("t");
         s.uuid = "../../evil".to_string();
-        assert!(write_archive(&root, "/p", &s, b"{}").is_err());
+        assert!(write_archive(&root, "/p", &s, b"{}", None).is_err());
         s.uuid = "short".to_string();
-        assert!(write_archive(&root, "/p", &s, b"{}").is_err());
+        assert!(write_archive(&root, "/p", &s, b"{}", None).is_err());
         let _ = fs::remove_dir_all(&root);
     }
 }

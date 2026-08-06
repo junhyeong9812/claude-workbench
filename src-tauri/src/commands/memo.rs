@@ -22,6 +22,23 @@ pub struct MemoDoc {
     hash: Option<String>,
 }
 
+impl MemoDoc {
+    /// 읽어 온 본문 + 그 해시(다음 저장의 base).
+    pub fn of(text: String) -> Self {
+        MemoDoc {
+            hash: Some(core_lib::memo_store::content_hash(&text)),
+            text,
+        }
+    }
+    /// 파일 부재 — 빈 본문 + `hash: None`("내가 처음 쓴다").
+    pub fn empty() -> Self {
+        MemoDoc {
+            text: String::new(),
+            hash: None,
+        }
+    }
+}
+
 fn app_data(app: &AppHandle) -> Result<std::path::PathBuf, AppError> {
     app.path()
         .app_data_dir()
@@ -40,14 +57,8 @@ pub fn memo_read(app: AppHandle, project: String) -> Result<MemoDoc, AppError> {
     }
     let base = app_data(&app)?;
     match core_lib::memo_store::load(&base, &project) {
-        Ok(Some(text)) => Ok(MemoDoc {
-            hash: Some(core_lib::memo_store::content_hash(&text)),
-            text,
-        }),
-        Ok(None) => Ok(MemoDoc {
-            text: String::new(),
-            hash: None,
-        }),
+        Ok(Some(text)) => Ok(MemoDoc::of(text)),
+        Ok(None) => Ok(MemoDoc::empty()),
         Err(e) => Err(AppError::new(io_message("Cannot read memo", &e))),
     }
 }
