@@ -327,3 +327,35 @@ describe("makeAutoSaver — 디바운스 · flush · 유실 0", () => {
     expect(save.mock.calls).toEqual([["1"], ["2"]]);
   });
 });
+
+// ---- 엄격 flush: "저장됐는가"를 실제로 답한다 (리뷰 #4) --------------------
+
+describe("flush 후 pending() — 닫기 경로의 판정 기준", () => {
+  it("저장에 성공하면 pending이 풀린다 = 닫아도 된다", async () => {
+    const s = makeAutoSaver(async () => {}, 1000);
+    s.schedule("초안");
+    await s.flush();
+    expect(s.pending()).toBe(false);
+  });
+
+  it("**저장이 실패하면 flush가 resolve해도 pending이 남는다** = 닫으면 안 된다", async () => {
+    // flush 자체는 reject하지 않는다(호출부가 await로 죽지 않게). 그래서 "flush가
+    // 끝났다"를 "저장됐다"로 읽으면 편집 이전 본문이 아카이브에 동봉된다 —
+    // 판정은 반드시 pending()으로 해야 한다.
+    const s = makeAutoSaver(async () => {
+      throw new Error("디스크 가득 참");
+    }, 1000);
+    s.schedule("잃으면 안 되는 초안");
+    await s.flush();
+    expect(s.pending()).toBe(true);
+    expect(s.peek()).toBe("잃으면 안 되는 초안");
+  });
+
+  it("대기 값이 없으면 flush는 성공으로 끝난다 (빈 쓰기 없음)", async () => {
+    const save = vi.fn(async () => {});
+    const s = makeAutoSaver(save, 1000);
+    await s.flush();
+    expect(save).not.toHaveBeenCalled();
+    expect(s.pending()).toBe(false);
+  });
+});

@@ -237,6 +237,14 @@ fn archive_session_blocking(
         }
     })?;
 
+    // 프롬프트 정리 세션의 닫기는 "성공했을 때만 닫는다"가 계약이라, 부분 실패를
+    // Ok로 돌려주면 그 계약이 조용히 깨진다(리뷰 #3): 메모 동봉이나 스킵 마커
+    // 기록이 실패해도 패널이 닫히고, 사용자는 초안이 아카이브에 들어간 줄 안다.
+    // 일반 아카이브는 추출 실패가 흔하고 부분 성공이 의미 있으므로 기존대로 Ok.
+    if let Some(msg) = skip_partial_failure(extra.skip_extraction, &run.errors) {
+        return Err(AppError::new(msg));
+    }
+
     // GUI 보고 표면은 **errors만** — notes(mcp 등록 실패 등 부가 작업)는 CLI
     // 로그 전용이다(리뷰: 성공/부가 note가 '추출 경고'로 오노출되던 것 차단).
     let warnings: Vec<&str> = run.errors.iter().map(String::as_str).collect();
@@ -249,6 +257,20 @@ fn archive_session_blocking(
         extraction_error: (!warnings.is_empty()).then(|| warnings.join(" / ")),
         unchanged: run.unchanged,
     })
+}
+
+/// 추출을 건너뛴 아카이브(=프롬프트 정리 세션)에서 **부분 실패를 성공으로
+/// 보고하지 않는다** — 실패 문구(없으면 `None`).
+///
+/// 추출을 건너뛴 실행의 `errors`에 남을 수 있는 것은 전부 진짜 I/O 실패다(메모를
+/// summary.md로 못 씀 · 스킵 마커를 못 씀). 그 상태로 Ok를 돌려주면 호출부의
+/// "성공했을 때만 닫는다"가 무의미해진다. 산출물은 이미 안착해 있으므로 재시도는
+/// 안전하다(재아카이브가 폴더를 통째로 교체한다).
+fn skip_partial_failure(skip_extraction: bool, errors: &[String]) -> Option<String> {
+    if !skip_extraction || errors.is_empty() {
+        return None;
+    }
+    Some(format!("아카이브 부분 실패: {}", errors.join(" / ")))
 }
 
 /// One preserved past version of an archived session (browser pane).
@@ -460,3 +482,28 @@ pub fn archive_open_path(app: AppHandle, path: String) -> Result<(), AppError> {
         .map_err(|_| AppError::new("시스템 뷰어를 열 수 없습니다"))
 }
 
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 프롬프트 아카이브의 부분 실패는 **실패로 올라간다** — "성공 시에만 닫기"가
+    /// 조용히 깨지던 자리(리뷰 #3).
+    #[test]
+    fn skip_path_reports_partial_failure_as_an_error() {
+        let errs = vec!["메모 동봉 실패: 권한 없음".to_string()];
+        let msg = skip_partial_failure(true, &errs).expect("실패로 보고해야 한다");
+        assert!(msg.contains("메모 동봉 실패"), "{msg}");
+
+        // 성공(경고 0)은 그대로 통과.
+        assert_eq!(skip_partial_failure(true, &[]), None);
+    }
+
+    /// 일반 아카이브는 건드리지 않는다 — 추출 실패는 흔하고, 전사 복사와 책이
+    /// 안착한 부분 성공에는 의미가 있다(기존 계약).
+    #[test]
+    fn ordinary_path_keeps_partial_success() {
+        let errs = vec!["추출 실패: timeout".to_string()];
+        assert_eq!(skip_partial_failure(false, &errs), None);
+    }
+}

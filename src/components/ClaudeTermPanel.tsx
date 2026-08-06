@@ -49,9 +49,8 @@ import {
   type RefineModel,
   type RefineView,
 } from "../state/promptRefine";
-import { MemoEditor, type MemoDoc, type MemoSaveResult } from "./MemoEditor";
+import { MemoEditor, type MemoDoc, type MemoHandle, type MemoSaveResult } from "./MemoEditor";
 import { useClaudeUi } from "../state/claudeUi";
-import { flushAllMemos } from "../state/projectMemo";
 import { SubagentsPane } from "./SubagentsPane";
 import { handleScrollKey } from "./scrollKeys";
 import {
@@ -269,6 +268,9 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
   // 종료가 이미 돌고 있는가 — **동기** 가드. setState는 다음 렌더에나 반영되므로
   // 같은 프레임에 두 경로(× + 동반 닫힘)가 겹치면 아카이브가 두 번 나간다.
   const closingRef = useRef(false);
+  // 메모 저장기의 손잡이 (MemoEditor가 마운트되면 채워진다) — 닫기 전에 저장을
+  // 확인하는 유일한 경로.
+  const memoHandleRef = useRef<MemoHandle | null>(null);
   // 닫기=아카이브의 진행/실패 상태. 실패하면 패널을 **닫지 않고** 사유를 남긴다.
   const [closing, setClosing] = useState(false);
   const [closeNote, setCloseNote] = useState<{ reason: string; retryable: boolean } | null>(null);
@@ -1360,8 +1362,19 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
     setClosing(true);
     setCloseNote(null);
     try {
-      // 이 창의 메모 저장기를 전부 flush (대기 값이 없으면 아무것도 쓰지 않는다).
-      await flushAllMemos();
+      // 메모를 **확실히** 디스크에 올린 뒤에 읽는다. 동봉할 본문의 단일 출처는
+      // 파일이므로, 저장이 실패했는데 성공으로 알고 진행하면 편집 **이전** 본문이
+      // 아카이브에 들어간다(리뷰 #4 — flushAllMemos는 실패를 삼키고 타임아웃도
+      // 정상 resolve라 이 자리에 맞지 않는다).
+      if ((await memoHandleRef.current?.flush()) === false) {
+        setCloseNote({
+          reason:
+            "메모를 저장하지 못해 닫지 않았습니다 — 지금 닫으면 마지막 편집이 아카이브에 빠집니다.\n" +
+            "메모 뷰의 상태 줄에서 사유를 확인한 뒤 다시 시도하세요.",
+          retryable: true,
+        });
+        return;
+      }
       const decision = refineCloseDecision({
         uuid: refineUuid,
         project: refineSourceProject,
@@ -1372,7 +1385,7 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
       }
       const { uuid, project } = decision;
       const memo = await invoke<MemoDoc>("refine_memo_read", { uuid });
-      await invoke("archive_session", {
+      const res = await invoke<{ extraction_error?: string | null }>("archive_session", {
         cwd: project,
         uuid,
         kind: "prompt",
@@ -1380,6 +1393,9 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
         summary: memo.text,
         title: (props.params.title as string) ?? "프롬프트 정리",
       });
+      // 백엔드가 스킵 경로의 부분 실패를 Err로 올리지만(리뷰 #3), 계약을 프론트에도
+      // 남겨 둔다 — "성공했다는 응답"과 "경고가 실린 응답"을 같이 취급하지 않는다.
+      if (res.extraction_error) throw new Error(`아카이브 부분 실패: ${res.extraction_error}`);
       window.dispatchEvent(new CustomEvent("mt-archive-updated"));
       props.api.close();
     } catch (e) {
@@ -2109,6 +2125,9 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
               onText={(t) => {
                 memoTextRef.current = t;
                 setMemoEmpty(t.trim() === "");
+              }}
+              onHandle={(h) => {
+                memoHandleRef.current = h;
               }}
             />
           ) : (

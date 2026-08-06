@@ -39,6 +39,21 @@ export interface MemoEditorProps {
   /** 본문이 바뀔 때마다(최초 로드 포함) 호출 — 부모가 현재 본문을 알아야 하는
    * 경우([보내기])의 창구. */
   onText?: (text: string) => void;
+  /** 저장 손잡이를 부모에게 넘긴다(언마운트 시 null). */
+  onHandle?: (h: MemoHandle | null) => void;
+}
+
+/** 부모가 잡을 수 있는 저장 손잡이. */
+export interface MemoHandle {
+  /**
+   * 대기 중인 편집을 지금 저장하고 **성공 여부를 돌려준다**.
+   *
+   * `flushAllMemos`(창 종료용)와 다른 점이 계약의 전부다: 저기는 개별 실패를
+   * 삼키고 타임아웃도 정상 resolve로 끝난다 — 닫기 전에 그걸 기다리면 "저장이
+   * 안 됐는데 저장된 줄 알고" 편집 **이전** 본문을 아카이브에 동봉하게 된다
+   * (리뷰 #4). 여기서는 flush 뒤에도 값이 dirty로 남아 있으면 `false`다.
+   */
+  flush(): Promise<boolean>;
 }
 
 /**
@@ -68,6 +83,7 @@ export function MemoEditor({
   read,
   write,
   onText,
+  onHandle,
 }: MemoEditorProps) {
   const hostRef = useRef<HTMLDivElement | null>(null);
   const viewRef = useRef<EditorView | null>(null);
@@ -90,8 +106,8 @@ export function MemoEditor({
   const saverRef = useRef<AutoSaver<string> | null>(null);
   // 최신 콜백을 effect 재실행 없이 부르기 위한 상자 (부모가 인라인 함수를 넘겨도
   // 에디터가 매 렌더 재생성되지 않게 한다).
-  const cbRef = useRef({ read, write, onText });
-  cbRef.current = { read, write, onText };
+  const cbRef = useRef({ read, write, onText, onHandle });
+  cbRef.current = { read, write, onText, onHandle };
 
   // Switch the CodeMirror theme live when the app theme changes (EditorPanel 선례).
   const theme = useAppStore((s) => s.theme);
@@ -138,6 +154,13 @@ export function MemoEditor({
       }
     }, MEMO_SAVE_DELAY);
     saverRef.current = saver;
+    // 닫기 경로가 "저장됐는가"를 실제로 확인할 수 있는 손잡이 (리뷰 #4).
+    cbRef.current.onHandle?.({
+      flush: async () => {
+        await saver.flush();
+        return !saver.pending();
+      },
+    });
     // 창 종료는 React cleanup을 거치지 않는다 — 닫기 핸들러가 직접 이 저장기를
     // 붙잡을 수 있게 창 레지스트리에 올린다 (리뷰 P1).
     const unregister = registerMemoSaver(saver);
@@ -205,6 +228,7 @@ export function MemoEditor({
       // 저장이 실패할 수도 있는데 그때는 알려 줄 화면이 이미 없다. 그래서 값을
       // 먼저 stash에 넣어 두고, 저장이 실제로 성공하면 지운다 (P2-2).
       unregister();
+      cbRef.current.onHandle?.(null);
       const leftover = saver.peek();
       if (leftover !== undefined) stashMemo(storeKey, leftover);
       void saver.flush().then(() => {
