@@ -20,7 +20,7 @@ const lines = css.split("\n");
 const PREFIXES = new Set([
   "activity", "app", "appearance", "archive", "badge", "cfs", "claude", "claudeterm",
   "cm", "commit", "ctx", "dev", "diff", "dock", "drop", "dropzone", "dual", "editor", "font",
-  "git", "graph", "main", "modal", "pane", "panes", "peek", "placeholder", "resize",
+  "git", "graph", "main", "memo", "modal", "pane", "panes", "peek", "placeholder", "resize",
   "run", "search", "seg", "sidebar", "ssh", "study", "tab", "tabbar", "terminal",
   "timeline", "tl", "toolbar", "tree", "ts", "workspace", "worktree",
 ]);

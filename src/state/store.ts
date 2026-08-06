@@ -349,6 +349,10 @@ interface AppState {
   /** App-toolbar "⤢ 분리" click → MainArea pops the active panel out to a new
    * window. Counter. Consumed only while the integrated layer is front. */
   detachPanelRequest: number;
+  /** App-toolbar "메모" click (and the session picker's memo row) → MainArea
+   * opens this project's memo panel. Counter. Consumed only while the integrated
+   * layer is front. */
+  memoRequest: number;
   /** 아카이브 "이어서" — resume a saved session in the main dock, pinned to its
    * own `project` (no activeProject switch; MainArea consumes without a project
    * gate and clears with null). Already-open session → activate that panel. */
@@ -521,6 +525,8 @@ interface AppState {
   requestClaudePicker: () => void;
   /** Ask MainArea to detach the active panel to a new window (app-toolbar button). */
   requestDetachPanel: () => void;
+  /** Ask MainArea to open the active project's memo panel (툴바·피커). */
+  requestMemo: () => void;
   /** Ask MainArea to resume a saved session (아카이브 "이어서"); null clears. */
   requestSessionResume: (req: { uuid: string; project: string; title: string } | null) => void;
   /** Switch the color theme. */
@@ -655,6 +661,7 @@ export const useAppStore = create<AppState>((set, get) => ({
   termMenuRequest: 0,
   claudePickerRequest: 0,
   detachPanelRequest: 0,
+  memoRequest: 0,
   sessionResumeRequest: null,
   dualProject: localStorage.getItem("dualProject") || null,
   theme: (localStorage.getItem("theme") as "dark" | "light") || "dark",
@@ -867,6 +874,7 @@ export const useAppStore = create<AppState>((set, get) => ({
   requestTermMenu: () => set((s) => ({ termMenuRequest: s.termMenuRequest + 1 })),
   requestClaudePicker: () => set((s) => ({ claudePickerRequest: s.claudePickerRequest + 1 })),
   requestDetachPanel: () => set((s) => ({ detachPanelRequest: s.detachPanelRequest + 1 })),
+  requestMemo: () => set((s) => ({ memoRequest: s.memoRequest + 1 })),
   setDualProject: (path) => {
     if (path) localStorage.setItem("dualProject", path);
     else localStorage.removeItem("dualProject");

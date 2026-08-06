@@ -22,6 +22,7 @@ pub mod knowledge;
 pub mod label;
 pub mod live;
 pub mod mcp;
+pub mod memo_store;
 pub mod pathguard;
 pub mod persist;
 pub mod project_type;

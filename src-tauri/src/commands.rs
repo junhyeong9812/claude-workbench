@@ -21,6 +21,7 @@ pub mod files;
 pub mod git;
 pub mod graph;
 mod hookserver;
+pub mod memo;
 pub mod refine;
 pub mod ssh;
 pub mod terminal;
