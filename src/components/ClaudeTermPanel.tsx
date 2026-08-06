@@ -41,6 +41,7 @@ import {
   refineCloseDecision,
   refineCloseFailure,
   refineExitAction,
+  refineMemoStoreKey,
   refineViewStyle,
   resolveApplyAck,
   saveLastRefineModel,
@@ -242,10 +243,15 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
   // 그대로 읽어도 안전하다.
   const isRefine = isRefineParams(props.params);
   const refineModel = (props.params.model as RefineModel | undefined) ?? DEFAULT_REFINE_MODEL;
-  /** 이 정리 세션의 uuid — 메모 파일 키이자 아카이브 대상. */
+  /** 이 정리 세션의 uuid — 아카이브 대상(세션마다 새로 생긴다). */
   const refineUuid = isRefine
     ? (props.params.sessionUuid ?? props.params.loadSessionId ?? null)
     : null;
+  /** 초안의 저장 키 — **세션이 아니라 이 정리 작업**에 딸린다(리뷰 #9).
+   * 모델을 바꾸면 세션이 재스폰되어 uuid가 새로 생기는데, 대화를 버리는 것은
+   * 사용자가 동의한 바지만 초안까지 고아가 되는 것은 합의한 적이 없다. 소스
+   * 패널 id는 그 재시작을 가로질러 같다. */
+  const refineMemoKey = isRefine ? refineMemoStoreKey(props.params) : null;
   /** 이 정리 세션이 기록될 **원본 프로젝트** — `params.project`는 격리 스크래치라
    * 그걸 쓰면 모든 프로젝트의 프롬프트가 정체불명 그룹 하나로 뭉친다. */
   const refineSourceProject = isRefine
@@ -1416,7 +1422,9 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
         return;
       }
       const { uuid, project } = decision;
-      const memo = await invoke<MemoDoc>("refine_memo_read", { uuid });
+      const memo = refineMemoKey
+        ? await invoke<MemoDoc>("refine_memo_read", { key: refineMemoKey })
+        : { text: "", hash: null };
       const res = await invoke<{ extraction_error?: string | null }>("archive_session", {
         cwd: project,
         uuid,
@@ -1428,6 +1436,11 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
       // 백엔드가 스킵 경로의 부분 실패를 Err로 올리지만(리뷰 #3), 계약을 프론트에도
       // 남겨 둔다 — "성공했다는 응답"과 "경고가 실린 응답"을 같이 취급하지 않는다.
       if (res.extraction_error) throw new Error(`아카이브 부분 실패: ${res.extraction_error}`);
+      // 초안은 이제 아카이브 안의 summary.md가 정본이다 — 스크래치 사본을 남기면
+      // 다음 정리 세션에 되살아난다(리뷰 #10). best-effort: 이미 기록은 끝났다.
+      if (refineMemoKey) {
+        await invoke("refine_memo_delete", { key: refineMemoKey }).catch(() => {});
+      }
       window.dispatchEvent(new CustomEvent("mt-archive-updated"));
       props.api.close();
     } catch (e) {
@@ -2155,13 +2168,13 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
           className="claudeterm-pane claudeterm-memo-pane"
           style={refineViewStyle(refineView, "memo")}
         >
-          {refineUuid ? (
+          {refineMemoKey ? (
             <MemoEditor
-              storeKey={refineUuid}
+              storeKey={refineMemoKey}
               subtitle="이 정리 세션의 초안 — 닫을 때 아카이브에 함께 남습니다"
-              read={(uuid) => invoke<MemoDoc>("refine_memo_read", { uuid })}
-              write={(uuid, text, baseHash) =>
-                invoke<MemoSaveResult>("refine_memo_write", { uuid, text, baseHash })
+              read={(key) => invoke<MemoDoc>("refine_memo_read", { key })}
+              write={(key, text, baseHash) =>
+                invoke<MemoSaveResult>("refine_memo_write", { key, text, baseHash })
               }
               onText={(t) => {
                 memoTextRef.current = t;
@@ -2172,7 +2185,7 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
               }}
             />
           ) : (
-            <div className="memo-err">정리 세션 id를 찾을 수 없어 메모를 열지 못했습니다</div>
+            <div className="memo-err">정리 세션을 식별할 수 없어 메모를 열지 못했습니다</div>
           )}
         </div>
         {termPane}

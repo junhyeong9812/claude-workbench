@@ -130,6 +130,7 @@ pub fn run() {
             commands::memo::memo_read,
             commands::memo::memo_write,
             commands::refine::prompt_refine_workdir,
+            commands::refine::refine_memo_delete,
             commands::refine::refine_memo_read,
             commands::refine::refine_memo_write,
             commands::refine::run_codex_check,

@@ -318,6 +318,30 @@ export const PROMPT_FENCE = "````";
 /** 결정적 패널 id — 한 Claude 탭에 정리 세션은 하나. */
 export const refinePanelId = (sourcePanelId: string): string => `prompt-refine:${sourcePanelId}`;
 
+/**
+ * 이 정리 작업의 **초안 저장 키** (식별 불가면 null).
+ *
+ * 세션 uuid가 아니라 정리 패널의 정체성(= 소스 탭 하나당 하나)에 묶는다(리뷰 #9).
+ * 모델을 바꾸면 세션이 재스폰되어 uuid가 새로 생기는데, 대화를 버리는 것은
+ * 사용자가 확인창에서 동의한 바지만 **초안까지 고아가 되는 것은 합의한 적이
+ * 없다**. 소스 패널 id는 그 재시작을 가로질러 같으므로 메모가 그대로 승계된다.
+ *
+ * 폴백이 uuid인 이유: 소스 패널 id는 정리 패널을 여는 경로가 항상 채우지만,
+ * 없더라도 초안을 못 쓰게 만드는 것보다 세션에 묶어서라도 저장하는 편이 낫다.
+ */
+export function refineMemoStoreKey(params: unknown): string | null {
+  const p = params as
+    | { sourcePanelId?: unknown; sessionUuid?: unknown; loadSessionId?: unknown }
+    | null
+    | undefined;
+  const src = typeof p?.sourcePanelId === "string" ? p.sourcePanelId.trim() : "";
+  if (src !== "") return refinePanelId(src);
+  const uuid =
+    (typeof p?.sessionUuid === "string" ? p.sessionUuid : null) ??
+    (typeof p?.loadSessionId === "string" ? p.loadSessionId : null);
+  return uuid && uuid.trim() !== "" ? uuid : null;
+}
+
 /** 이 패널 params가 정리 세션인가. */
 export function isRefineParams(params: unknown): boolean {
   return (params as { refineKind?: unknown } | null | undefined)?.refineKind === REFINE_KIND;

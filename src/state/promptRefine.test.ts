@@ -15,6 +15,7 @@ import {
   refineCloseDecision,
   refineCloseFailure,
   refineExitAction,
+  refineMemoStoreKey,
   refinePanelId,
   refineSeedPrompt,
   refineViewStyle,
@@ -582,5 +583,32 @@ describe("제출 확인 · 키 라우팅 (리뷰 #7·#8)", () => {
     expect(shouldNavPanes({ inEditor: false, isRefine: true, view: "term" })).toBe(true);
     expect(shouldNavPanes({ inEditor: false, isRefine: true, view: "timeline" })).toBe(true);
     expect(shouldNavPanes({ inEditor: false, isRefine: false, view: "memo" })).toBe(true);
+  });
+});
+
+describe("refineMemoStoreKey — 초안은 세션이 아니라 정리 작업에 딸린다 (리뷰 #9)", () => {
+  it("소스 패널 id로 키를 만든다 — 모델 재시작을 가로질러 같다", () => {
+    const before = refineMemoStoreKey({ sourcePanelId: "claudeterm-1", sessionUuid: "u-old" });
+    // 모델을 바꾸면 세션이 재스폰되어 uuid가 바뀌지만 소스 패널은 그대로다.
+    const after = refineMemoStoreKey({ sourcePanelId: "claudeterm-1", sessionUuid: "u-new" });
+    expect(before).toBe(after);
+    expect(before).toBe(refinePanelId("claudeterm-1"));
+  });
+
+  it("소스 탭이 다르면 초안도 다르다", () => {
+    expect(refineMemoStoreKey({ sourcePanelId: "a" })).not.toBe(
+      refineMemoStoreKey({ sourcePanelId: "b" }),
+    );
+  });
+
+  it("소스 패널 id가 없으면 세션 uuid로 떨어진다 (초안을 못 쓰게 하느니)", () => {
+    expect(refineMemoStoreKey({ sessionUuid: "u-1" })).toBe("u-1");
+    expect(refineMemoStoreKey({ loadSessionId: "u-2" })).toBe("u-2");
+    expect(refineMemoStoreKey({ sourcePanelId: "   ", loadSessionId: "u-2" })).toBe("u-2");
+  });
+
+  it("아무것도 없으면 null — 저장할 곳이 없다", () => {
+    expect(refineMemoStoreKey({})).toBeNull();
+    expect(refineMemoStoreKey(null)).toBeNull();
   });
 });

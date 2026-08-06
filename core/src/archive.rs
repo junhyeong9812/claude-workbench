@@ -964,6 +964,28 @@ impl ArchiveRun {
     }
 }
 
+/// 동봉할 요약이 이미 디스크에 있는 것과 같은가 — "변경 없음" 스킵의 추가 조건.
+///
+/// 추출이 도는 경로에서는 요약을 추출기가 만들므로 호출자의 `summary`는 애초에
+/// 쓰이지 않는다 → 항상 같다고 본다(기존 판정 무변경). 스킵 경로에서만 비교한다.
+fn summary_unchanged(entry: &ArchiveSessionEntry, req: &ArchiveRequest<'_>) -> bool {
+    if !req.skip_extraction {
+        return true;
+    }
+    // 쓰기 경로와 같은 규칙: 공백뿐인 메모는 "요약 없음"이다.
+    let want = req.summary.filter(|s| !s.trim().is_empty());
+    let have = entry
+        .summary_path
+        .as_ref()
+        .and_then(|p| fs::read_to_string(p).ok());
+    match (want, have.as_deref()) {
+        (None, None) => true,
+        (Some(w), Some(h)) => w == h,
+        // 읽지 못한 요약은 "다르다"로 본다 — 스킵해서 잃는 쪽이 더 나쁘다.
+        _ => false,
+    }
+}
+
 /// The real extractor: a one-shot `claude -p` in the `/tmp` scratch cwd
 /// (프로젝트 안에서 돌리면 추출 자체가 그 프로젝트의 새 세션 전사가 되어 백필
 /// 되먹임 루프를 만든다 — `claude_cli::extraction_workdir` 참조).
@@ -1014,7 +1036,14 @@ pub fn run_archive(
     let live = jsonl_stat(req.jsonl_bytes);
     let prev = find_archived_session(req.archive_root, req.project, req.uuid);
     if let Some(p) = &prev {
-        if is_unchanged_complete(p, &live) {
+        // "변경 없음"은 **전사만** 보던 판정이었다(리뷰 #5). 전사가 그대로여도
+        // 라벨이나 동봉한 메모가 달라졌으면 그건 다시 써야 하는 변경이다 —
+        // 정리 세션에서 메모만 고치고 다시 닫는 것이 정확히 그 경로고, 그때
+        // 조용히 스킵되면 사용자의 마지막 편집이 아카이브에 영영 안 들어간다.
+        if is_unchanged_complete(p, &live)
+            && p.meta.kind.as_deref() == req.kind
+            && summary_unchanged(p, req)
+        {
             return Ok(ArchiveRun {
                 dir: p.dir.clone(),
                 book_path: p.book_path.clone(),
@@ -2057,6 +2086,55 @@ mod tests {
         assert_eq!(
             find_archived_session(&root, "/p", UUID).unwrap().meta.kind,
             None
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// 전사가 그대로여도 **메모가 달라졌으면 다시 쓴다**(리뷰 #5) — 메모만 고치고
+    /// 다시 닫는 경로가 조용히 스킵되면 마지막 편집이 영영 안 들어간다.
+    #[test]
+    fn changed_memo_is_not_unchanged() {
+        let root = temp_root("prompt_memo_changed");
+        let jsonl = sample_jsonl("초안");
+        let never = FakeExtractor::new("x");
+        let first =
+            run_archive(&prompt_request(&root, jsonl.as_bytes(), Some("v1 메모")), &never.f())
+                .unwrap();
+        assert!(!first.unchanged);
+
+        // 같은 전사 + 다른 메모 → 스킵하지 않고 요약을 갱신한다.
+        let again =
+            run_archive(&prompt_request(&root, jsonl.as_bytes(), Some("v2 메모")), &never.f())
+                .unwrap();
+        assert!(!again.unchanged, "메모가 달라졌는데 변경 없음으로 스킵됐다");
+        assert_eq!(fs::read_to_string(again.dir.join("summary.md")).unwrap(), "v2 메모");
+
+        // 같은 전사 + 같은 메모 → 그때는 스킵이 맞다.
+        let third =
+            run_archive(&prompt_request(&root, jsonl.as_bytes(), Some("v2 메모")), &never.f())
+                .unwrap();
+        assert!(third.unchanged, "완전히 같은 입력은 스킵해야 한다");
+        assert_eq!(never.calls.get(), 0);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// 라벨이 달라지면 meta를 다시 써야 한다 — 일반 세션으로 아카이브된 uuid를
+    /// 프롬프트로 다시 남기는(또는 그 반대) 경로가 조용히 무시되지 않게.
+    #[test]
+    fn changed_kind_is_not_unchanged() {
+        let root = temp_root("prompt_kind_changed");
+        let jsonl = sample_jsonl("초안");
+        let ex = FakeExtractor::new("제목");
+        // ① 일반 아카이브(kind None, 추출 완료 마커까지).
+        run_archive(&cli_request(&root, jsonl.as_bytes()), &ex.f()).unwrap();
+        // ② 같은 전사를 프롬프트로 — 스킵되면 라벨이 영영 안 붙는다.
+        let never = FakeExtractor::new("x");
+        let run =
+            run_archive(&prompt_request(&root, jsonl.as_bytes(), Some("메모")), &never.f()).unwrap();
+        assert!(!run.unchanged);
+        assert_eq!(
+            find_archived_session(&root, "/p", UUID).unwrap().meta.kind.as_deref(),
+            Some("prompt")
         );
         let _ = fs::remove_dir_all(&root);
     }
