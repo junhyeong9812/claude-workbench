@@ -9,6 +9,12 @@ import { errText } from "../utils/error";
 import { useAppStore } from "../state/store";
 import { MEMO_SAVE_DELAY, makeAutoSaver } from "../state/projectMemo";
 
+/** `memo_read`의 반환 — 본문 + 낙관적 잠금 base(파일 없으면 null). */
+interface MemoDoc {
+  text: string;
+  hash: string | null;
+}
+
 export interface MemoParams {
   kind?: "memo";
   title?: string;
@@ -37,6 +43,9 @@ export function MemoPanel(props: IDockviewPanelProps<MemoParams>) {
   const viewRef = useRef<EditorView | null>(null);
   const [err, setErr] = useState<string | null>(null);
   const [status, setStatus] = useState("");
+  // 읽기를 다시 태우는 트리거 (재시도 버튼) — effect의 deps라 bump하면 에디터가
+  // 처음부터 다시 만들어진다.
+  const [reloads, setReloads] = useState(0);
   const themeComp = useRef(new Compartment());
 
   // Switch the CodeMirror theme live when the app theme changes (EditorPanel 선례).
@@ -73,8 +82,8 @@ export function MemoPanel(props: IDockviewPanelProps<MemoParams>) {
         });
     }, MEMO_SAVE_DELAY);
 
-    invoke<string>("memo_read", { project })
-      .then((text) => {
+    invoke<MemoDoc>("memo_read", { project })
+      .then(({ text }) => {
         if (cancelled || !hostRef.current) return;
         viewRef.current = new EditorView({
           parent: hostRef.current,
@@ -105,6 +114,8 @@ export function MemoPanel(props: IDockviewPanelProps<MemoParams>) {
         viewRef.current.focus();
       })
       .catch((e) => {
+        // 읽기 실패 = **에디터를 만들지 않는다**. 빈 에디터를 띄우면 한 글자만
+        // 쳐도 그 빈 기반이 멀쩡한 파일을 덮어쓴다 (리뷰 P2-4). 재시도만 준다.
         if (!cancelled) setErr(`메모를 읽지 못했습니다 — ${errText(e)}`);
       });
 
@@ -116,7 +127,7 @@ export function MemoPanel(props: IDockviewPanelProps<MemoParams>) {
       viewRef.current?.destroy();
       viewRef.current = null;
     };
-  }, [project]);
+  }, [project, reloads]);
 
   return (
     <div className="memo-panel">
@@ -125,7 +136,16 @@ export function MemoPanel(props: IDockviewPanelProps<MemoParams>) {
         <span className="memo-path">{project}</span>
         <span className="memo-status">{status}</span>
       </div>
-      {err ? <div className="memo-err">{err}</div> : <div className="memo-body" ref={hostRef} />}
+      {err ? (
+        <div className="memo-err">
+          {err}
+          <button className="memo-retry" onClick={() => setReloads((n) => n + 1)}>
+            재시도
+          </button>
+        </div>
+      ) : (
+        <div className="memo-body" ref={hostRef} />
+      )}
     </div>
   );
 }

@@ -42,18 +42,47 @@ pub fn path(base: &Path, project: &str) -> PathBuf {
     dir(base, project).join("memo.md")
 }
 
-/// Load a project's memo — `None` when it was never written (or is unreadable).
+/// 메모 본문의 콘텐츠 해시 — 낙관적 잠금의 토큰이자 "디스크가 내가 읽은 그대로
+/// 인가"의 판정 값.
+///
+/// FNV-1a 64bit + 바이트 길이. 적대적 위조를 막는 용도가 아니라 **다른 창이
+/// 끼어들어 썼는지**를 알아채는 용도라 암호학적 해시가 필요 없다(길이를 함께
+/// 넣어 우연한 충돌 여지를 한 번 더 줄인다). 판정은 항상 [`load`]가 돌려준
+/// *문자열*을 기준으로 한다 — 잘못된 UTF-8이 lossy로 치환되므로 원시 바이트로
+/// 해시하면 읽기와 쓰기의 기준이 어긋난다.
+pub fn content_hash(text: &str) -> String {
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for &b in text.as_bytes() {
+        hash ^= b as u64;
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    format!("{}-{:016x}", text.len(), hash)
+}
+
+/// Load a project's memo.
+///
+/// - `Ok(None)` — 아직 메모가 없다(첫 열기). 정상 상태다.
+/// - `Ok(Some(text))` — 본문.
+/// - `Err(e)` — **진짜 I/O 실패**(권한·손상·디렉토리 충돌 등).
+///
+/// 이 셋을 구분하는 것이 중요하다(리뷰 P2-4): 읽기 실패를 "빈 메모"로 뭉개면
+/// 호출부가 빈 문서를 기반으로 저장해 **멀쩡한 파일을 빈 값으로 덮는다**. 부재만
+/// 빈 메모다.
 ///
 /// Reads at most [`MEMO_CAP`] bytes from the **head** (a memo is a document, so
 /// the head is the meaningful part — unlike scrollback, whose tail is), which
 /// also bounds IO if the file grew out of band. Invalid UTF-8 is replaced rather
 /// than failing: showing a slightly mangled memo beats showing none.
-pub fn load(base: &Path, project: &str) -> Option<String> {
+pub fn load(base: &Path, project: &str) -> io::Result<Option<String>> {
     use std::io::Read;
-    let f = std::fs::File::open(path(base, project)).ok()?;
+    let f = match std::fs::File::open(path(base, project)) {
+        Ok(f) => f,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e),
+    };
     let mut buf = Vec::new();
-    f.take(MEMO_CAP as u64).read_to_end(&mut buf).ok()?;
-    Some(String::from_utf8_lossy(&buf).into_owned())
+    f.take(MEMO_CAP as u64).read_to_end(&mut buf)?;
+    Ok(Some(String::from_utf8_lossy(&buf).into_owned()))
 }
 
 /// Persist a project's memo atomically (temp + rename).
@@ -105,13 +134,24 @@ mod tests {
     fn round_trip() {
         let b = temp_base("rt");
         save(&b, "/home/u/proj", "첫 줄\n둘째 줄\n").unwrap();
-        assert_eq!(load(&b, "/home/u/proj").as_deref(), Some("첫 줄\n둘째 줄\n"));
+        assert_eq!(load(&b, "/home/u/proj").unwrap().as_deref(), Some("첫 줄\n둘째 줄\n"));
     }
 
     #[test]
     fn missing_is_none() {
         let b = temp_base("missing");
-        assert!(load(&b, "/home/u/never-written").is_none());
+        assert_eq!(load(&b, "/home/u/never-written").unwrap(), None);
+    }
+
+    #[test]
+    fn read_failure_is_an_error_not_missing() {
+        // 읽기 실패를 "메모 없음"으로 뭉개면 호출부가 빈 문서를 기반으로 저장해
+        // 멀쩡한 파일을 빈 값으로 덮는다 (리뷰 P2-4). memo.md를 디렉토리로 만들어
+        // 읽기 실패를 강제한다 — 열기는 되고 read가 EISDIR로 실패하는 경로.
+        let b = temp_base("readerr");
+        let d = dir(&b, "/p");
+        std::fs::create_dir_all(d.join("memo.md")).unwrap();
+        assert!(load(&b, "/p").is_err(), "부재가 아니라 오류여야 한다");
     }
 
     #[test]
@@ -120,7 +160,7 @@ mod tests {
         save(&b, "/p", "긴 원본 내용").unwrap();
         save(&b, "/p", "짧게").unwrap();
         // rename semantics: no leftover tail from the longer previous write.
-        assert_eq!(load(&b, "/p").as_deref(), Some("짧게"));
+        assert_eq!(load(&b, "/p").unwrap().as_deref(), Some("짧게"));
     }
 
     #[test]
@@ -130,7 +170,7 @@ mod tests {
         let b = temp_base("empty");
         save(&b, "/p", "내용").unwrap();
         save(&b, "/p", "").unwrap();
-        assert_eq!(load(&b, "/p").as_deref(), Some(""));
+        assert_eq!(load(&b, "/p").unwrap().as_deref(), Some(""));
     }
 
     #[test]
@@ -138,8 +178,8 @@ mod tests {
         let b = temp_base("iso");
         save(&b, "/a/proj", "A").unwrap();
         save(&b, "/b/proj", "B").unwrap();
-        assert_eq!(load(&b, "/a/proj").as_deref(), Some("A"));
-        assert_eq!(load(&b, "/b/proj").as_deref(), Some("B"));
+        assert_eq!(load(&b, "/a/proj").unwrap().as_deref(), Some("A"));
+        assert_eq!(load(&b, "/b/proj").unwrap().as_deref(), Some("B"));
     }
 
     #[test]
@@ -150,7 +190,7 @@ mod tests {
         let err = save(&b, "/p", &huge).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
         // The refused write left the previous memo intact.
-        assert_eq!(load(&b, "/p").as_deref(), Some("지켜야 할 내용"));
+        assert_eq!(load(&b, "/p").unwrap().as_deref(), Some("지켜야 할 내용"));
     }
 
     #[test]
@@ -160,7 +200,7 @@ mod tests {
         // The file landed under `base/projects/<key>/`, never outside `base`.
         let p = path(&b, "../../etc/passwd");
         assert!(p.starts_with(&b), "{p:?} escaped {b:?}");
-        assert_eq!(load(&b, "../../etc/passwd").as_deref(), Some("x"));
+        assert_eq!(load(&b, "../../etc/passwd").unwrap().as_deref(), Some("x"));
     }
 
     /// 남아 있는 `.tmp` 파일 이름들.

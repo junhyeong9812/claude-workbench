@@ -60,7 +60,9 @@ describe("MemoPanel — 언마운트 유실 0", () => {
     vi.stubGlobal("ResizeObserver", NoopResizeObserver);
     // 자동 저장은 실제 IPC를 타므로 전부 목. 읽기는 저장된 본문을 돌려준다.
     invoke.mockImplementation((cmd: string) =>
-      cmd === "memo_read" ? Promise.resolve("저장돼 있던 본문") : Promise.resolve(),
+      cmd === "memo_read"
+        ? Promise.resolve({ text: "저장돼 있던 본문", hash: "h0" })
+        : Promise.resolve({ status: "saved", hash: "h1" }),
     );
     host = document.createElement("div");
     document.body.appendChild(host);
@@ -134,6 +136,30 @@ describe("MemoPanel — 언마운트 유실 0", () => {
     act(() => root.unmount());
     expect(writes()).toEqual([]);
     root = createRoot(host);
+  });
+
+  it("읽기 실패면 에디터를 만들지 않는다 — 빈 기반이 파일을 덮는 경로 차단", async () => {
+    invoke.mockImplementation((cmd: string) =>
+      cmd === "memo_read" ? Promise.reject(new Error("permission denied")) : Promise.resolve(),
+    );
+    await act(async () => {
+      root.render(<MemoPanel {...panelProps({ kind: "memo", project: "/home/u/repo" })} />);
+    });
+    expect(host.querySelector(".cm-content"), "에디터가 없어야 한다").toBeNull();
+    expect(host.querySelector(".memo-err")?.textContent).toContain("읽지 못했습니다");
+    expect(writes()).toEqual([]);
+
+    // 재시도 — 이번엔 성공하면 에디터가 뜬다.
+    invoke.mockImplementation((cmd: string) =>
+      cmd === "memo_read" ? Promise.resolve({ text: "돌아온 본문", hash: "h0" }) : Promise.resolve(),
+    );
+    const retry = host.querySelector(".memo-retry") as HTMLButtonElement;
+    expect(retry).toBeTruthy();
+    await act(async () => {
+      retry.click();
+    });
+    expect(host.querySelector(".cm-content")?.textContent).toContain("돌아온 본문");
+    expect(host.querySelector(".memo-err")).toBeNull();
   });
 
   it("프로젝트가 없으면 에디터를 만들지 않고 사유를 보여준다", async () => {
