@@ -1399,6 +1399,11 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
     closingRef.current = true;
     setClosing(true);
     setCloseNote(null);
+    // 초안 본문의 정본은 **디스크**다. `memoTextRef`는 에디터가 본문을 읽은 뒤에야
+    // 채워지는데, 배경 탭의 ×는 패널을 방금 마운트시킨 참이라 아직 빈 문자열일 수
+    // 있다 — 그걸로 "메모 없음"을 판정하면 초안이 있는데도 NoTurns에서 조용히
+    // 닫힌다(리뷰 #2가 막으려던 바로 그 소실). 읽기 전이면 ref로 폴백한다.
+    let memoText: string | null = null;
     try {
       // 메모를 **확실히** 디스크에 올린 뒤에 읽는다. 동봉할 본문의 단일 출처는
       // 파일이므로, 저장이 실패했는데 성공으로 알고 진행하면 편집 **이전** 본문이
@@ -1425,6 +1430,7 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
       const memo = refineMemoKey
         ? await invoke<MemoDoc>("refine_memo_read", { key: refineMemoKey })
         : { text: "", hash: null };
+      memoText = memo.text;
       const res = await invoke<{ extraction_error?: string | null }>("archive_session", {
         cwd: project,
         uuid,
@@ -1444,7 +1450,8 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
       window.dispatchEvent(new CustomEvent("mt-archive-updated"));
       props.api.close();
     } catch (e) {
-      const verdict = refineCloseFailure(errText(e), memoTextRef.current.trim() === "");
+      const memo = memoText ?? memoTextRef.current;
+      const verdict = refineCloseFailure(errText(e), memo.trim() === "");
       if (verdict.kind === "close") {
         props.api.close();
         return;
