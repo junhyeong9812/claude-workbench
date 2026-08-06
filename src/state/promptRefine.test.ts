@@ -9,10 +9,16 @@ import {
   extractPromptBlock,
   injectDeliveryDecision,
   isRefineParams,
+  REFINE_SUBMIT_CR_DELAY,
   openPromptRefine,
+  refineCloseDecision,
+  refineCloseFailure,
   refinePanelId,
   refineSeedPrompt,
+  refineViewStyle,
   resolveApplyAck,
+  sendBlockReason,
+  submitPasteBytes,
   type RefineDock,
 } from "./promptRefine";
 
@@ -41,6 +47,7 @@ const args = {
   sessionUuid: "u-refine",
   model: DEFAULT_REFINE_MODEL,
   title: "작업 A",
+  sourceProject: "/home/u/proj",
 };
 
 describe("openPromptRefine — 우측 배치 · 탭당 1개", () => {
@@ -421,5 +428,95 @@ describe("resolveApplyAck — 내 요청 id의 결과만 신뢰", () => {
     ];
     expect(resolveApplyAck("mine", acks)).toEqual({ kind: "failed", reason: "권한 없음" });
     expect(resolveApplyAck("dev-seed", acks)).toEqual({ kind: "delivered" });
+  });
+});
+
+// ---- 3뷰 스와톱: 숨기는 방법이 계약이다 ------------------------------------
+
+describe("refineViewStyle — 숨김은 display:none만", () => {
+  it("보이는 뷰는 폭을 다 쓰고, 나머지는 display:none이다", () => {
+    expect(refineViewStyle("memo", "memo")).toEqual({ flex: "1 1 0" });
+    expect(refineViewStyle("memo", "term")).toEqual({ display: "none" });
+    expect(refineViewStyle("timeline", "timeline")).toEqual({ flex: "1 1 0" });
+  });
+
+  it("**크기로 숨기지 않는다** — 0px 높이는 PTY를 2×1로 실제 축소시킨다", () => {
+    // 숨김 스타일에 height/flex 같은 크기 속성이 섞이는 순간 xterm FitAddon이
+    // computed height "0px"를 읽어 cols=2,rows=1을 계산하고 claude_resize가
+    // 그대로 나간다(claude TUI 파괴). 숨김은 오직 display:none이어야 한다.
+    for (const self of ["memo", "timeline", "term"] as const) {
+      const hidden = refineViewStyle(self === "memo" ? "term" : "memo", self);
+      expect(Object.keys(hidden)).toEqual(["display"]);
+      expect(hidden).toEqual({ display: "none" });
+    }
+  });
+});
+
+// ---- [보내기]: 제출 바이트와 게이트 ----------------------------------------
+
+describe("submitPasteBytes — 붙여넣기와 CR은 따로 나간다", () => {
+  it("두 조각으로 나눠 주고, 붙여넣기 조각에는 CR이 없다", () => {
+    const [paste, cr] = submitPasteBytes("첫 줄\n둘째 줄");
+    expect(paste).toBe("\x1b[200~첫 줄\n둘째 줄\x1b[201~");
+    expect(paste).not.toContain("\r");
+    expect(cr).toBe("\r");
+    // 실측 근거: 두 조각이 같은 write에 실리면 CR이 페이스트 본문으로 먹혀
+    // 제출되지 않는다. 지연을 두는 이유가 그것이라 값도 0보다 커야 한다.
+    expect(REFINE_SUBMIT_CR_DELAY).toBeGreaterThan(120);
+  });
+
+  it("줄 구조를 보존한다 — 한 줄로 접지 않는다", () => {
+    const [paste] = submitPasteBytes("a\nb\nc");
+    expect(paste).toContain("a\nb\nc");
+  });
+});
+
+describe("sendBlockReason — 무엇을 막는가", () => {
+  const ok = { text: "초안", sessionOpen: true, isDriver: true, blocked: false, sending: false };
+
+  it("정상이면 막지 않는다", () => {
+    expect(sendBlockReason(ok)).toBeNull();
+  });
+
+  it("빈 메모·미개통·미러·보내는 중은 각각의 사유로 막는다", () => {
+    expect(sendBlockReason({ ...ok, text: "   \n " })).toMatch(/비어/);
+    expect(sendBlockReason({ ...ok, sessionOpen: false })).toMatch(/시작되지/);
+    expect(sendBlockReason({ ...ok, isDriver: false })).toMatch(/미러/);
+    expect(sendBlockReason({ ...ok, sending: true })).toMatch(/보내는 중/);
+  });
+
+  it("blocked면 막는다 — 페이스트+CR이 키 입력이 되어 승인까지 눌린다", () => {
+    expect(sendBlockReason({ ...ok, blocked: true })).toMatch(/키 입력/);
+  });
+});
+
+// ---- 닫기 = 아카이브 --------------------------------------------------------
+
+describe("refineCloseDecision — 남길 것이 있을 때만 아카이브한다", () => {
+  it("턴이 있으면 원본 프로젝트 키로 아카이브한다", () => {
+    expect(refineCloseDecision({ uuid: "u", project: "/proj", turns: 3 })).toEqual({
+      kind: "archive",
+      uuid: "u",
+      project: "/proj",
+    });
+  });
+
+  it("빈 세션(0턴)·스폰 전·프로젝트 미상은 아카이브 없이 닫는다", () => {
+    expect(refineCloseDecision({ uuid: "u", project: "/proj", turns: 0 }).kind).toBe("close");
+    expect(refineCloseDecision({ uuid: null, project: "/proj", turns: 5 }).kind).toBe("close");
+    expect(refineCloseDecision({ uuid: "u", project: null, turns: 5 }).kind).toBe("close");
+  });
+});
+
+describe("refineCloseFailure — 실패했으면 닫지 않는다", () => {
+  it("in_flight·전사 미존재·쓰기 실패는 패널을 남긴다(다시 시도 가능)", () => {
+    expect(refineCloseFailure("이 프로젝트는 이미 아카이브 진행 중입니다")).toBe("keep");
+    expect(refineCloseFailure("Session transcript not found")).toBe("keep");
+    expect(refineCloseFailure("Cannot write archive: 권한 없음")).toBe("keep");
+    expect(refineCloseFailure("")).toBe("keep");
+  });
+
+  it("'대화 없음'만 예외 — 실패가 아니라 남길 것이 없다는 뜻이라 닫는다", () => {
+    expect(refineCloseFailure("아카이브할 대화가 없습니다")).toBe("close");
   });
 });

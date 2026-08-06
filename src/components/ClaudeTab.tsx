@@ -3,6 +3,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { useAppStore } from "../state/store";
 import { useClaudeUi } from "../state/claudeUi";
 import { useClaudeStatus, attentionOf } from "../state/claudeStatus";
+import { isRefineParams } from "../state/promptRefine";
 import { RenameTab } from "./RenameTab";
 
 /** Attention dot for a Claude tab (agent-status-badges P3). A color dot (never
@@ -52,6 +53,16 @@ export function ClaudeTab(props: IDockviewPanelHeaderProps) {
         }
       }}
       onClose={() => {
+        // 프롬프트 정리 세션은 닫기 = 아카이브다 — 닫기/삭제 모달의 선택지가
+        // 여기엔 의미가 없고(스크래치 스냅샷은 어떤 피커에도 뜨지 않는다),
+        // 대신 아카이브가 성공해야만 닫혀야 한다. 그 판단·실패 표시·메모 동봉은
+        // 전부 패널이 들고 있으므로 여기서는 요청만 올린다(state/claudeUi).
+        // 배경 탭이면 패널이 언마운트돼 있으니 먼저 활성화해 마운트시킨다.
+        if (isRefineParams(props.params)) {
+          props.api.setActive();
+          useClaudeUi.getState().requestRefineClose(props.api.id);
+          return;
+        }
         const ptyId =
           typeof props.params.sessionId === "number"
             ? (props.params.sessionId as number)

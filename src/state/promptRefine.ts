@@ -33,6 +33,145 @@ import { findPanelById } from "./surfaceRegistry";
  * 어긋나 PTY가 샌다. 표식만 얹고 나머지 계약은 건드리지 않는다. */
 export const REFINE_KIND = "promptrefine";
 
+/** 정리 패널의 세 뷰 — 한 번에 하나만 보인다. 기본은 메모다(초안을 쓰는 것이
+ * 이 패널에서 가장 먼저 하는 일이고, 터미널은 대화가 필요할 때 꺼내 본다). */
+export const REFINE_VIEWS = [
+  { id: "memo", label: "메모" },
+  { id: "timeline", label: "타임라인" },
+  { id: "term", label: "터미널" },
+] as const;
+export type RefineView = (typeof REFINE_VIEWS)[number]["id"];
+export const DEFAULT_REFINE_VIEW: RefineView = "memo";
+
+/**
+ * 보이지 않는 뷰를 숨기는 스타일 — **`display:none`만 쓴다**.
+ *
+ * 터미널을 살려 둔 채 숨겨야 하는데(대화가 이어져야 한다), 크기로 숨기면
+ * PTY가 실제로 줄어든다: `flex:0`/`height:0`이면 xterm FitAddon이 부모의
+ * computed height `"0px"`을 읽어 `cols=2, rows=1`을 계산하고 그대로
+ * `claude_resize`가 나가 claude TUI 화면이 파괴된다. `display:none`이면 같은
+ * computed height가 `"auto"`라 `parseInt`가 `NaN`이 되고 fit이 조기 return한다 —
+ * 즉 리사이즈가 **발생하지 않는다**(FitAddon의 `isNaN` 가드). 재표시 때는 이미
+ * 걸려 있는 ResizeObserver가 다시 맞춘다.
+ *
+ * 이 함수가 존재하는 이유는 그 규칙을 한 곳에 못박기 위해서다 — 호출부에서
+ * 즉흥적으로 `height:0`을 쓰면 조용히 저 실패로 돌아간다.
+ */
+export function refineViewStyle(
+  view: RefineView,
+  self: RefineView,
+): { flex: string } | { display: "none" } {
+  return view === self ? { flex: "1 1 0" } : { display: "none" };
+}
+
+/**
+ * [보내기]의 두 번째 write(CR)까지 두는 간격(ms).
+ *
+ * **실측(2026-08-06, claude CLI 2.1.223, 실 PTY + 전사 user 레코드 판정)**:
+ *
+ * | 보낸 바이트 | 결과 |
+ * |---|---|
+ * | `ESC[200~ … ESC[201~\r` (한 write) | 채워지기만 하고 **미제출** |
+ * | paste → 별도 write `\r` (간격 0ms) | **미제출** |
+ * | paste → 별도 write `\r` (간격 120ms) | **제출** |
+ * | paste → 별도 write `\r` (간격 300·1500ms) | **제출** |
+ *
+ * 즉 CR이 붙여넣기와 같은 read 청크에 들어가면 페이스트 본문으로 소비되고,
+ * **다음 프레임에 따로 도착한 CR만** Enter로 해석된다. 300ms는 관측된 하한
+ * (0 < t ≤ 120ms) 위의 여유값이다. 제출된 본문은 줄 구조가 그대로 보존된다 —
+ * 한 줄로 접을 필요가 없다.
+ */
+export const REFINE_SUBMIT_CR_DELAY = 300;
+
+/** [보내기]가 보낼 두 조각 — `[붙여넣기, CR]`. 반드시 **따로** 써야 한다
+ * ({@link REFINE_SUBMIT_CR_DELAY}). */
+export function submitPasteBytes(text: string): [string, string] {
+  return [bracketedPaste(text), "\r"];
+}
+
+/** [보내기] 판정에 필요한 사실들 (호출부가 관측해 넘긴다). */
+export interface SendGate {
+  /** 메모 본문. */
+  text: string;
+  /** 정리 세션의 PTY가 열려 있는가. */
+  sessionOpen: boolean;
+  /** 이 창이 정리 세션의 입력 driver인가. */
+  isDriver: boolean;
+  /** 정리 세션이 지금 권한·선택 프롬프트에 걸려 있는가. */
+  blocked: boolean;
+  /** 이미 보내는 중인가. */
+  sending: boolean;
+}
+
+/**
+ * [보내기]를 막아야 할 이유 — 없으면 null.
+ *
+ * `blocked`가 여기 있는 이유는 [적용]과 같다: claude TUI는 bracketed paste 모드를
+ * 켜지 않으므로(`?2004h` 없음), 권한 승인이나 선택 메뉴가 떠 있으면 우리가 보내는
+ * 페이스트가 **키 스트림**으로 흘러 들어간다. 게다가 [보내기]는 [적용]과 달리 CR을
+ * 붙이므로 그 상태에서는 사용자가 누른 적 없는 확정까지 일어난다.
+ */
+export function sendBlockReason(g: SendGate): string | null {
+  if (g.sending) return "메모를 보내는 중입니다.";
+  if (g.text.trim() === "") return "메모가 비어 있습니다 — 초안을 먼저 쓰세요.";
+  if (!g.sessionOpen) return "정리 세션이 아직 시작되지 않았습니다.";
+  if (!g.isDriver) return "이 창은 읽기 전용 미러입니다 — 입력 권한을 먼저 가져오세요.";
+  if (g.blocked)
+    return (
+      "정리 세션이 입력을 기다리는 상태입니다(권한 승인·선택 프롬프트 등).\n" +
+      "지금 보내면 메모가 프롬프트가 아니라 그 화면의 키 입력으로 들어갑니다 — 먼저 그 프롬프트를 처리하세요."
+    );
+  return null;
+}
+
+// ---- 닫기 = 아카이브 -------------------------------------------------------
+
+/** 닫기 요청 하나에 대한 방침. */
+export type RefineCloseAction =
+  /** 남길 기록이 없다 — 아카이브하지 않고 그냥 닫는다. */
+  | { kind: "close"; why: string }
+  /** 아카이브한 뒤, **성공하면** 닫는다. */
+  | { kind: "archive"; uuid: string; project: string };
+
+/**
+ * 닫기를 아카이브로 볼지 그냥 닫을지.
+ *
+ * "빈 세션은 스킵"이 계약인 이유: 정리 패널을 열어 두고 아무 대화도 없이 닫는
+ * 것은 흔한 경로다(마음이 바뀌었다·잘못 열었다). 그걸 실패로 보고하면 안내가
+ * 소음이 되고, 0턴짜리 아카이브를 남기면 목록이 쓰레기로 찬다. 세션이 아직
+ * 스폰도 안 됐거나 기록할 프로젝트를 모르는 경우도 같은 결론이다.
+ */
+export function refineCloseDecision(i: {
+  /** 정리 세션 uuid (스폰 전이면 null). */
+  uuid: string | null | undefined;
+  /** 기록될 원본 프로젝트. */
+  project: string | null | undefined;
+  /** 지금까지 관측된 대화 턴 수. */
+  turns: number;
+}): RefineCloseAction {
+  if (!i.uuid) return { kind: "close", why: "세션이 아직 시작되지 않았습니다" };
+  if (!i.project) return { kind: "close", why: "기록할 프로젝트를 알 수 없습니다" };
+  if (i.turns <= 0) return { kind: "close", why: "대화가 없습니다" };
+  return { kind: "archive", uuid: i.uuid, project: i.project };
+}
+
+/**
+ * 아카이브가 실패했을 때 패널을 닫을지(`"close"`) 남길지(`"keep"`).
+ *
+ * **기본은 남기는 것이다** — 세션은 한 번 닫히면 되돌릴 수 없으므로, 원인을
+ * 모르는 실패에서 닫는 것은 곧 조용한 기록 소실이다. 예외는 백엔드가 "아카이브할
+ * 대화가 없다"고 답한 경우 하나뿐인데, 그건 실패가 아니라 우리 턴 집계와 어긋난
+ * 것이고 결론(남길 것이 없다)은 같다.
+ *
+ * 남기는 쪽으로 떨어지는 실경로들: 같은 프로젝트에서 다른 아카이브가 진행 중
+ * (`in_flight`), 전사 파일을 찾지 못함, 쓰기 실패. 전부 다시 시도하면 풀릴 수
+ * 있는 것들이라 [다시 닫기]가 의미를 갖는다.
+ */
+export const NO_TURNS_MESSAGE = "아카이브할 대화가 없습니다";
+export function refineCloseFailure(message: string): "close" | "keep" {
+  return message.includes(NO_TURNS_MESSAGE) ? "close" : "keep";
+}
+
 /** 정리 세션에 쓸 수 있는 모델 (CLI 별칭 그대로 `--model`에 실린다). */
 export const REFINE_MODELS = [
   { id: "opus", label: "Opus" },
@@ -382,6 +521,12 @@ export interface RefineOpenArgs {
   model: RefineModel;
   /** 헤더·탭 제목에 쓸 원본 세션 이름. */
   title: string;
+  /** 정리 세션을 연 **원본 프로젝트** 경로.
+   *
+   * `params.project`는 격리 cwd(스크래치)라 이 값을 따로 들고 다녀야 한다. 닫기=
+   * 아카이브가 "이 프로젝트에서 다듬은 프롬프트"로 남기는 키가 이것이다 —
+   * 스크래치 키 아래 두면 모든 프로젝트의 프롬프트가 정체불명 그룹 하나로 뭉친다. */
+  sourceProject: string | null;
 }
 
 /** 정리 세션을 연다 — 이미 있으면(다른 surface 포함) 활성화만. */
@@ -409,6 +554,7 @@ export function openPromptRefine(dock: RefineDock, args: RefineOpenArgs): "focus
       seed: refineSeedPrompt(),
       sourcePanelId: args.sourcePanelId,
       targetUuid: args.targetUuid,
+      sourceProject: args.sourceProject,
     },
     position: { referencePanel: args.sourcePanelId, direction: "right" },
   });

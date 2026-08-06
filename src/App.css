@@ -2380,6 +2380,27 @@ body {
   border-left: 1px solid var(--border, #333);
   background: var(--bg, #1e1e1e);
 }
+/* 프롬프트 정리 패널 — 세로 스택(툴바 · 배너 · 뷰 하나 · codex). 뷰 셋은
+   `.claudeterm-refine-body` 안에서 한 번에 하나만 보이고, 숨기는 방법은
+   `display:none`뿐이다(state/promptRefine.refineViewStyle이 유일한 출처 —
+   크기로 숨기면 xterm이 PTY를 2×1로 실제 축소한다). */
+.claudeterm-refine {
+  flex-direction: column;
+}
+.claudeterm-refine-body {
+  flex: 1 1 0;
+  display: flex;
+  min-width: 0;
+  min-height: 0;
+}
+/* 3뷰일 때는 각 뷰가 폭을 다 쓴다 — 우측 고정폭/테두리는 일반 세션의 규칙이다. */
+.claudeterm-refine .claudeterm-timeline-pane {
+  border-left: none;
+}
+.claudeterm-memo-pane {
+  min-width: 0;
+  min-height: 0;
+}
 /* Each pane labels which pane it is. */
 .claudeterm-pane-head {
   flex: 0 0 auto;

@@ -25,8 +25,11 @@ import {
 import { openTimelinePeek } from "../state/timelinePeek";
 import {
   DEFAULT_REFINE_MODEL,
+  DEFAULT_REFINE_VIEW,
   PROMPT_FENCE,
   REFINE_MODELS,
+  REFINE_SUBMIT_CR_DELAY,
+  REFINE_VIEWS,
   applyBlockReason,
   bracketedPaste,
   extractLatestPromptBlock,
@@ -34,10 +37,19 @@ import {
   isRefineParams,
   loadLastRefineModel,
   openPromptRefine,
+  refineCloseDecision,
+  refineCloseFailure,
+  refineViewStyle,
   resolveApplyAck,
   saveLastRefineModel,
+  sendBlockReason,
+  submitPasteBytes,
   type RefineModel,
+  type RefineView,
 } from "../state/promptRefine";
+import { MemoEditor, type MemoDoc, type MemoSaveResult } from "./MemoEditor";
+import { useClaudeUi } from "../state/claudeUi";
+import { flushAllMemos } from "../state/projectMemo";
 import { SubagentsPane } from "./SubagentsPane";
 import { handleScrollKey } from "./scrollKeys";
 import {
@@ -227,10 +239,34 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
   // 그대로 읽어도 안전하다.
   const isRefine = isRefineParams(props.params);
   const refineModel = (props.params.model as RefineModel | undefined) ?? DEFAULT_REFINE_MODEL;
+  /** 이 정리 세션의 uuid — 메모 파일 키이자 아카이브 대상. */
+  const refineUuid = isRefine
+    ? (props.params.sessionUuid ?? props.params.loadSessionId ?? null)
+    : null;
+  /** 이 정리 세션이 기록될 **원본 프로젝트** — `params.project`는 격리 스크래치라
+   * 그걸 쓰면 모든 프로젝트의 프롬프트가 정체불명 그룹 하나로 뭉친다. */
+  const refineSourceProject = isRefine
+    ? ((props.params as { sourceProject?: string | null }).sourceProject ??
+      useAppStore.getState().activeProject ??
+      null)
+    : null;
   // codex 2차 의견 — 적용과 무관한 참고용(하단 접이식).
   const [codexBusy, setCodexBusy] = useState(false);
   const [codexResult, setCodexResult] = useState<string | null>(null);
   const [codexOpen, setCodexOpen] = useState(true);
+  // 3뷰 스와톱 — 한 번에 하나만 보이고 나머지는 `display:none`으로 **마운트를
+  // 유지한 채** 숨는다(터미널의 PTY가 살아 있어야 한다 — refineViewStyle 참조).
+  const [refineView, setRefineView] = useState<RefineView>(DEFAULT_REFINE_VIEW);
+  // 메모 본문의 최신값 — [보내기]가 읽는다. state가 아니라 ref인 이유: 타이핑
+  // 한 글자마다 이 큰 패널을 다시 그릴 이유가 없다. 버튼의 활성/비활성만
+  // 필요하므로 "비었는가"만 state로 따로 둔다.
+  const memoTextRef = useRef("");
+  const [memoEmpty, setMemoEmpty] = useState(true);
+  const [sending, setSending] = useState(false);
+  const [sendNote, setSendNote] = useState<string | null>(null);
+  // 닫기=아카이브의 진행/실패 상태. 실패하면 패널을 **닫지 않고** 사유를 남긴다.
+  const [closing, setClosing] = useState(false);
+  const [closeNote, setCloseNote] = useState<string | null>(null);
 
   /** Raw bytes to this session's PTY (driver-gated in the backend).
    *
@@ -1009,6 +1045,13 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
     });
     const onResize = term.onResize(() => {
       if (sessionId == null) return;
+      // 퇴화 크기는 PTY로 내보내지 않는다(백스톱). 어떤 실제 레이아웃도 두 자리
+      // 미만 컬럼을 만들지 않는다 — 이 값이 나온다는 건 호스트가 0px로 접혔다는
+      // 뜻이고(FitAddon의 `max(2, …)`/`max(1, …)` 하한), 그대로 보내면 claude
+      // TUI가 2×1로 실제 리사이즈되어 화면이 파괴된다. 3뷰 스와톱이 뷰를 숨길 때
+      // `display:none`만 쓰는 이유가 이것이고(promptRefine.refineViewStyle),
+      // 여기는 그 규칙이 어디선가 어긋나도 PTY까지는 못 가게 막는 두 번째 선이다.
+      if (term.cols < 10 || term.rows < 3) return;
       // Driver-only (backend ignores a mirror's resize — the PTY size is shared).
       invoke("claude_resize", { id: sessionId, cols: term.cols, rows: term.rows }).catch(() => {});
     });
@@ -1115,6 +1158,8 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
         sessionUuid: crypto.randomUUID(),
         model,
         title: (props.params.title as string) ?? "세션",
+        // 닫기=아카이브가 이 세션을 기록할 프로젝트(격리 cwd가 아니다).
+        sourceProject: props.params.project ?? useAppStore.getState().activeProject ?? null,
       });
     } catch (e) {
       alert(`프롬프트 정리 세션을 열지 못했습니다: ${errText(e)}`);
@@ -1141,6 +1186,7 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
     const sourcePanelId = props.params.sourcePanelId;
     const targetUuid = props.params.targetUuid;
     const workdir = props.params.project;
+    const sourceProject = refineSourceProject;
     const containerApi = props.containerApi;
     const title = ((props.params.title as string) ?? "").replace(/^프롬프트 정리 — /, "") || "세션";
     props.api.close();
@@ -1155,6 +1201,7 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
         sessionUuid: crypto.randomUUID(),
         model,
         title,
+        sourceProject,
       });
     });
   };
@@ -1227,6 +1274,141 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
     );
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [applyPending, claudeInjectAcks]);
+
+  // ---- 메모 [보내기] · 닫기=아카이브 -------------------------------------
+  const sendReason = isRefine
+    ? sendBlockReason({
+        text: memoEmpty ? "" : "x",
+        sessionOpen: sessionOpened,
+        isDriver,
+        blocked: myBlocked,
+        sending,
+      })
+    : null;
+
+  /**
+   * [보내기]: 메모 **전문**을 정리 세션에 제출한다.
+   *
+   * 바이트는 두 조각이고 **반드시 따로** 나가야 한다 — 실측 근거와 지연값은
+   * `promptRefine.REFINE_SUBMIT_CR_DELAY`가 소유한다(같은 write에 CR을 붙이면
+   * 페이스트 본문으로 먹혀 제출되지 않는다). 줄 구조는 그대로 보존된다.
+   *
+   * 실패는 남긴다: 첫 write가 실패했으면 아무것도 안 들어간 것이고, CR만 실패한
+   * 경우엔 본문이 입력창에 채워진 채 남아 사용자가 Enter를 누르면 된다 — 그
+   * 차이를 문구로 구분해 준다.
+   */
+  const sendMemo = async () => {
+    if (sendReason) {
+      setSendNote(sendReason);
+      return;
+    }
+    const text = memoTextRef.current;
+    if (text.trim() === "") return;
+    const [paste, cr] = submitPasteBytes(text);
+    setSending(true);
+    setSendNote(null);
+    try {
+      if ((await writeToSession(paste)) !== true) {
+        setSendNote("정리 세션에 쓰지 못했습니다 — 이 창이 입력 권한을 갖고 있지 않습니다.");
+        return;
+      }
+      await new Promise((r) => setTimeout(r, REFINE_SUBMIT_CR_DELAY));
+      if ((await writeToSession(cr)) !== true) {
+        setSendNote("메모는 입력창에 들어갔지만 제출 키를 보내지 못했습니다 — 터미널 뷰에서 Enter를 눌러 주세요.");
+        return;
+      }
+      // 보냈으면 대화를 보는 것이 다음 동작이다.
+      setRefineView("term");
+    } catch (e) {
+      setSendNote(`보내지 못했습니다: ${errText(e)}`);
+    } finally {
+      setSending(false);
+    }
+  };
+
+  /**
+   * 닫기 = **아카이브**. 정리 세션은 여기서만 아카이브된다(툴바에 버튼이 없다).
+   *
+   * 순서와 그 이유:
+   * 1. 메모를 먼저 디스크로 flush한다 — 동봉할 본문의 단일 출처는 파일이고,
+   *    디바운스 창 안이면 마지막 문장이 빠진 채 아카이브된다.
+   * 2. 대화가 하나도 없으면(빈 세션) **아카이브하지 않고 그냥 닫는다**. 시드만
+   *    보내고 닫는 것이 흔한 경로고, 그걸 실패로 보고하면 소음이다.
+   * 3. 성공했을 때만 닫는다. 실패하면 패널을 살려 두고 사유를 남긴다 — 세션은
+   *    한 번 닫히면 되돌릴 수 없으므로 조용한 실패가 곧 기록 소실이다.
+   */
+  const closeWithArchive = async () => {
+    setClosing(true);
+    setCloseNote(null);
+    try {
+      // 이 창의 메모 저장기를 전부 flush (대기 값이 없으면 아무것도 쓰지 않는다).
+      await flushAllMemos();
+      const decision = refineCloseDecision({
+        uuid: refineUuid,
+        project: refineSourceProject,
+        turns: turns.size,
+      });
+      if (decision.kind === "close") {
+        props.api.close();
+        return;
+      }
+      const { uuid, project } = decision;
+      const memo = await invoke<MemoDoc>("refine_memo_read", { uuid }).catch(() => null);
+      await invoke("archive_session", {
+        cwd: project,
+        uuid,
+        kind: "prompt",
+        skipExtraction: true,
+        summary: memo?.text ?? null,
+        title: (props.params.title as string) ?? "프롬프트 정리",
+      });
+      window.dispatchEvent(new CustomEvent("mt-archive-updated"));
+      props.api.close();
+    } catch (e) {
+      const msg = errText(e);
+      if (refineCloseFailure(msg) === "close") {
+        props.api.close();
+        return;
+      }
+      setCloseNote(
+        `아카이브하지 못해 닫지 않았습니다: ${msg}\n` +
+          "(다른 아카이브가 이 프로젝트에서 진행 중이면 끝난 뒤 다시 시도하세요. 메모는 저장돼 있습니다.)",
+      );
+    } finally {
+      setClosing(false);
+    }
+  };
+
+  // 탭 ×가 올린 닫기 요청을 여기서 처리한다 — 아카이브 실패를 보여 줄 자리가
+  // 패널 안뿐이기 때문이다(탭 헤더는 overflow:hidden이고, 모달은 쓰지 않기로 했다).
+  const refineCloseRequest = useClaudeUi((s) => s.refineCloseRequest);
+  useEffect(() => {
+    if (!isRefine || !refineCloseRequest) return;
+    if (refineCloseRequest.panelId !== props.api.id) return;
+    useClaudeUi.getState().clearRefineClose();
+    void closeWithArchive();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [refineCloseRequest]);
+
+  // 뷰가 바뀌면 그 뷰로 커서를 옮기고, 터미널은 다시 맞춘다. `display:none` 동안
+  // fit()은 조기 return했으므로 (NaN 가드) 표시되는 순간 한 번은 필요하다 —
+  // ResizeObserver도 곧 때리지만 첫 프레임의 깜빡임을 없앤다.
+  useEffect(() => {
+    if (!isRefine) return;
+    if (refineView === "term") {
+      try {
+        fitRef.current?.fit();
+      } catch {
+        /* 아직 레이아웃 전 */
+      }
+      termRef.current?.focus();
+    } else if (refineView === "memo") {
+      (containerRef.current?.querySelector(".memo-body .cm-content") as HTMLElement | null)?.focus();
+    } else {
+      (containerRef.current?.querySelector(".timeline-list") as HTMLElement | null)?.focus();
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [refineView]);
 
   /** [codex 검증]: 현재 최종본을 codex에 비판시켜 하단에 표시(적용과 무관). */
   const runCodexCheck = async () => {
@@ -1329,9 +1511,10 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
     setDetailRetry((r) => r + 1);
   };
 
-  return (
-    <div className="claudeterm" ref={containerRef} onKeyDown={onContainerKey}>
-      <div className="claudeterm-pane claudeterm-term-pane">
+  // 툴바(제목 + 컨트롤). 정리 세션에서는 이 줄이 **패널 맨 위**로 올라간다 —
+  // 3뷰 중 무엇을 보고 있든 [적용]·[codex 검증]·모델·뷰 전환은 늘 손에 닿아야
+  // 하는데, 원래 자리는 터미널 창(뷰 하나)의 안쪽이기 때문이다.
+  const paneHead = (
         <div className="claudeterm-pane-head">
           <span className="claudeterm-pane-head-title">
             Claude — {(props.params.title as string) ?? "터미널"}
@@ -1394,6 +1577,33 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
             )}
             {isRefine && (
               <>
+                <span className="seg" role="group" aria-label="정리 패널 뷰">
+                  {REFINE_VIEWS.map((v) => (
+                    <button
+                      key={v.id}
+                      className={`seg-item${refineView === v.id ? " seg-on" : ""}`}
+                      aria-pressed={refineView === v.id}
+                      title={
+                        v.id === "memo"
+                          ? "초안을 길게 쓰는 곳 — 자동 저장되고, 닫을 때 아카이브에 함께 남습니다"
+                          : v.id === "timeline"
+                            ? "정리 대화의 변경 타임라인"
+                            : "정리 세션의 claude 터미널 (숨어 있는 동안에도 계속 돌아갑니다)"
+                      }
+                      onClick={() => setRefineView(v.id)}
+                    >
+                      {v.label}
+                    </button>
+                  ))}
+                </span>
+                <button
+                  className="claudeterm-head-btn"
+                  disabled={sendReason !== null}
+                  title={sendReason ?? "메모 전문을 정리 세션에 보냅니다 (제출까지)"}
+                  onClick={() => void sendMemo()}
+                >
+                  {sending ? "보내는 중…" : "보내기"}
+                </button>
                 <span className="seg" role="group" aria-label="정리 세션 모델">
                   {REFINE_MODELS.map((m) => (
                     <button
@@ -1484,8 +1694,43 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
             )}
           </span>
         </div>
-        {isRefine && (applyPending || applyNote) && (
-          <div className="claudeterm-refine-note" role="status">
+  );
+
+  // 정리 세션의 상태 배너들 — 적용 배달 대기/실패, [보내기] 실패, 닫기(아카이브)
+  // 실패. 셋 다 "조용히 넘어가면 사용자가 알 길이 없는" 사건이라 화면에 남는다.
+  const refineNotes = !isRefine ? null : (
+    <>
+      {closeNote && (
+        <div className="claudeterm-refine-note" role="alert">
+          {closeNote}
+          <button
+            className="claudeterm-head-btn"
+            disabled={closing}
+            title="아카이브를 다시 시도하고, 성공하면 이 패널을 닫습니다"
+            onClick={() => void closeWithArchive()}
+          >
+            {closing ? "아카이브 중…" : "다시 닫기"}
+          </button>
+          <span className="claudeterm-refine-note-x" title="이 안내 닫기" onClick={() => setCloseNote(null)}>
+            ×
+          </span>
+        </div>
+      )}
+      {closing && !closeNote && (
+        <div className="claudeterm-refine-note" role="status">
+          아카이브하는 중입니다 — 끝나면 이 패널이 닫힙니다.
+        </div>
+      )}
+      {sendNote && (
+        <div className="claudeterm-refine-note" role="alert">
+          {sendNote}
+          <span className="claudeterm-refine-note-x" title="닫기" onClick={() => setSendNote(null)}>
+            ×
+          </span>
+        </div>
+      )}
+      {(applyPending || applyNote) && (
+        <div className="claudeterm-refine-note" role="status">
             {applyPending
               ? "전달 대기 중 — 원래 Claude 탭이 열려 있어야 전달됩니다. 그 탭을 활성화해 주세요.\n(전달이 확인되면 이 정리 세션은 자동으로 닫힙니다.)"
               : applyNote}
@@ -1509,31 +1754,44 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
             </span>
           </div>
         )}
-        <div className="claudeterm-term" ref={hostRef} />
-        {isRefine && (codexBusy || codexResult) && (
-          <div className="claudeterm-codex">
-            <button
-              className="claudeterm-codex-head"
-              aria-expanded={codexOpen}
-              title="codex 2차 의견 접기/펼치기"
-              onClick={() => setCodexOpen((v) => !v)}
-            >
-              <span>{codexOpen ? "▾" : "▸"} codex 검증{codexBusy ? " — 실행 중…" : ""}</span>
-            </button>
-            {codexOpen && (
-              <div className="claudeterm-codex-body">
-                {codexResult ? (
-                  <MarkdownText text={codexResult} />
-                ) : (
-                  <span className="claudeterm-codex-wait">codex에게 물어보는 중입니다…</span>
-                )}
-              </div>
-            )}
-          </div>
-        )}
-      </div>
+    </>
+  );
 
-      {(selectedItem || textView) && (
+  const codexPane = !isRefine || !(codexBusy || codexResult) ? null : (
+    <div className="claudeterm-codex">
+      <button
+        className="claudeterm-codex-head"
+        aria-expanded={codexOpen}
+        title="codex 2차 의견 접기/펼치기"
+        onClick={() => setCodexOpen((v) => !v)}
+      >
+        <span>{codexOpen ? "▾" : "▸"} codex 검증{codexBusy ? " — 실행 중…" : ""}</span>
+      </button>
+      {codexOpen && (
+        <div className="claudeterm-codex-body">
+          {codexResult ? (
+            <MarkdownText text={codexResult} />
+          ) : (
+            <span className="claudeterm-codex-wait">codex에게 물어보는 중입니다…</span>
+          )}
+        </div>
+      )}
+    </div>
+  );
+
+  /** 터미널 창. 정리 세션에서는 숨은 뷰가 될 수 있고, 그때도 **마운트는 유지**된다
+   * (PTY와 대화가 살아 있어야 한다 — 숨기는 방법은 refineViewStyle 단일 출처). */
+  const termPane = (
+    <div
+      className="claudeterm-pane claudeterm-term-pane"
+      style={isRefine ? refineViewStyle(refineView, "term") : undefined}
+    >
+      {!isRefine && paneHead}
+      <div className="claudeterm-term" ref={hostRef} />
+    </div>
+  );
+
+  const viewerPane = (selectedItem || textView) && (
         <>
           <div
             className="claudeterm-splitter"
@@ -1660,9 +1918,9 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
             </div>
           </div>
         </>
-      )}
+  );
 
-      {showAgents && subagents.length > 0 && (
+  const agentsPane = showAgents && subagents.length > 0 && (
         <>
           <div className="claudeterm-splitter" title="드래그로 크기 조절" onMouseDown={startDragAgents} />
           <div
@@ -1691,11 +1949,16 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
             />
           </div>
         </>
-      )}
-      {!timelineCollapsed && (
+  );
+
+  // 타임라인 컬럼. 일반 세션에선 우측 고정폭(접기 가능)이고, 정리 세션에선
+  // 3뷰 중 하나라 폭을 다 쓰거나 통째로 숨는다.
+  const timelineBlock = (
+    <>
+      {!isRefine && !timelineCollapsed && (
         <div className="claudeterm-splitter" title="드래그로 크기 조절" onMouseDown={startDragTimeline} />
       )}
-      {timelineCollapsed && (
+      {!isRefine && timelineCollapsed && (
         <button
           className="claudeterm-timeline-expand"
           title="타임라인 펼치기"
@@ -1707,18 +1970,26 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
       <div
         className="claudeterm-pane claudeterm-timeline-pane"
         ref={timelineRef}
-        style={timelineCollapsed ? { display: "none" } : { flex: `0 0 ${timelineWidth}px` }}
+        style={
+          isRefine
+            ? refineViewStyle(refineView, "timeline")
+            : timelineCollapsed
+              ? { display: "none" }
+              : { flex: `0 0 ${timelineWidth}px` }
+        }
       >
-        <div className="claudeterm-pane-head">
-          <span className="claudeterm-pane-head-title">타임라인</span>
-          <span
-            className="claudeterm-viewer-x"
-            title="타임라인 접기"
-            onClick={() => setTimelineCollapsed(true)}
-          >
-            ▶
-          </span>
-        </div>
+        {!isRefine && (
+          <div className="claudeterm-pane-head">
+            <span className="claudeterm-pane-head-title">타임라인</span>
+            <span
+              className="claudeterm-viewer-x"
+              title="타임라인 접기"
+              onClick={() => setTimelineCollapsed(true)}
+            >
+              ▶
+            </span>
+          </div>
+        )}
         <div className="claudeterm-timeline">
           <TimelineView
             items={items}
@@ -1748,6 +2019,55 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
           />
         </div>
       </div>
+    </>
+  );
+
+  // 일반 세션: 가로 한 줄(터미널 | 상세 | 서브에이전트 | 타임라인) — 기존 그대로.
+  if (!isRefine) {
+    return (
+      <div className="claudeterm" ref={containerRef} onKeyDown={onContainerKey}>
+        {termPane}
+        {viewerPane}
+        {agentsPane}
+        {timelineBlock}
+      </div>
+    );
+  }
+
+  // 정리 세션: 세로 스택(툴바 · 배너 · 뷰 하나 · codex 결과). 뷰 셋은 전부
+  // 마운트된 채로 `display:none`으로 갈아 끼운다 — 터미널을 숨기려고 크기를
+  // 0으로 만들면 PTY가 실제로 2×1로 줄어든다(refineViewStyle).
+  return (
+    <div className="claudeterm claudeterm-refine" ref={containerRef} onKeyDown={onContainerKey}>
+      {paneHead}
+      {refineNotes}
+      <div className="claudeterm-refine-body">
+        <div
+          className="claudeterm-pane claudeterm-memo-pane"
+          style={refineViewStyle(refineView, "memo")}
+        >
+          {refineUuid ? (
+            <MemoEditor
+              storeKey={refineUuid}
+              subtitle="이 정리 세션의 초안 — 닫을 때 아카이브에 함께 남습니다"
+              read={(uuid) => invoke<MemoDoc>("refine_memo_read", { uuid })}
+              write={(uuid, text, baseHash) =>
+                invoke<MemoSaveResult>("refine_memo_write", { uuid, text, baseHash })
+              }
+              onText={(t) => {
+                memoTextRef.current = t;
+                setMemoEmpty(t.trim() === "");
+              }}
+            />
+          ) : (
+            <div className="memo-err">정리 세션 id를 찾을 수 없어 메모를 열지 못했습니다</div>
+          )}
+        </div>
+        {termPane}
+        {refineView === "timeline" && viewerPane}
+        {timelineBlock}
+      </div>
+      {codexPane}
     </div>
   );
 }
