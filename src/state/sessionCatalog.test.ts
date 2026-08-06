@@ -116,35 +116,53 @@ describe("archBusyUpdate — in_flight 세대 가드", () => {
 });
 
 describe("외부 세션 — adoptable / liveBadge", () => {
-  const ext = (live: ExternalSessionRow["live"]): ExternalSessionRow => ({
+  const ext = (
+    live: ExternalSessionRow["live"],
+    reason: ExternalSessionRow["reason"] = null,
+  ): ExternalSessionRow => ({
     uuid: "u1",
     title: "터미널 세션",
     cwd: "/home/jun/proj",
     modified: 1_784_000_000,
     live,
+    reason,
   });
 
   it("free만 붙일 수 있다", () => {
     expect(adoptable(ext("free"))).toBe(true);
-    expect(adoptable(ext("live"))).toBe(false);
+    expect(adoptable(ext("live", "this_session"))).toBe(false);
   });
 
   it("unknown은 막는다 — 판정 실패는 보수적으로 차단(전사 이중 append 방지)", () => {
-    expect(adoptable(ext("unknown"))).toBe(false);
-    expect(liveBadge(ext("unknown"))?.label).toBe("확인 불가");
+    expect(adoptable(ext("unknown", "written_since_start"))).toBe(false);
+    expect(adoptable(ext("unknown", "undecidable"))).toBe(false);
+    expect(liveBadge(ext("unknown", "written_since_start"))?.label).toBe("확인 불가");
   });
 
   it("붙을 수 있는 행에는 배지가 없다", () => {
     expect(liveBadge(ext("free"))).toBeNull();
-    expect(liveBadge(ext("live"))?.label).toBe("사용 중");
+    expect(liveBadge(ext("live", "this_session"))?.label).toBe("사용 중");
+  });
+
+  it("확인 불가 두 종류의 안내가 갈린다 — 판정 불가에 '나머지는 열린다'고 하지 않는다", () => {
+    const threshold = liveBadge(ext("unknown", "written_since_start"))!.hint;
+    const undecidable = liveBadge(ext("unknown", "undecidable"))!.hint;
+    expect(threshold).not.toBe(undecidable);
+    // 시각 임계: 더 오래된 세션은 열린다고 말해도 참이다.
+    expect(threshold).toContain("이전에 마지막으로 쓰인 세션은 그대로 열 수 있습니다");
+    // 판정 불가: 그 말은 거짓이므로 없어야 하고, 전면 차단임을 말해야 한다.
+    expect(undecidable).not.toContain("그대로 열 수 있습니다");
+    expect(undecidable).toContain("어떤 외부 세션도 열 수 없습니다");
+    // 사유를 모르는(구버전) 응답도 안전한 쪽 문구로 떨어진다.
+    expect(liveBadge(ext("unknown", null))!.hint).toBe(undecidable);
   });
 });
 
 describe("externalRows — 최신순 + 열린 세션 제외", () => {
   const rows: ExternalSessionRow[] = [
-    { uuid: "a", title: "A", cwd: "/p", modified: 100, live: "free" },
-    { uuid: "b", title: "B", cwd: "/p", modified: 300, live: "live" },
-    { uuid: "c", title: "C", cwd: "/p", modified: 200, live: "free" },
+    { uuid: "a", title: "A", cwd: "/p", modified: 100, live: "free", reason: null },
+    { uuid: "b", title: "B", cwd: "/p", modified: 300, live: "live", reason: "this_session" },
+    { uuid: "c", title: "C", cwd: "/p", modified: 200, live: "free", reason: null },
   ];
 
   it("mtime 내림차순", () => {
@@ -163,8 +181,8 @@ describe("externalRows — 최신순 + 열린 세션 제외", () => {
 
   it("숨긴 행도 같은 규칙을 탄다 — 숨김은 표시 여부일 뿐 다른 목록이 아니다", () => {
     const hidden: ExternalSessionRow[] = [
-      { uuid: "h1", title: "삭제한 세션", cwd: "/p", modified: 100, live: "free" },
-      { uuid: "h2", title: "삭제한 세션2", cwd: "/p", modified: 400, live: "free" },
+      { uuid: "h1", title: "삭제한 세션", cwd: "/p", modified: 100, live: "free", reason: null },
+      { uuid: "h2", title: "삭제한 세션2", cwd: "/p", modified: 400, live: "free", reason: null },
     ];
     expect(externalRows(hidden, new Set()).map((r) => r.uuid)).toEqual(["h2", "h1"]);
     // 숨김이라도 이미 열려 있으면 (토글로 펼쳐도) 다시 제안하지 않는다.

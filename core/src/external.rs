@@ -28,7 +28,7 @@ use std::time::UNIX_EPOCH;
 
 use serde::Serialize;
 
-use crate::live::{CwdRank, LiveProbe, Liveness};
+use crate::live::{BlockReason, LiveProbe, Liveness};
 use crate::scan::{scan_transcripts, ScanOpts};
 
 /// Longest title we hand to the picker (characters).
@@ -50,6 +50,9 @@ pub struct ExternalSession {
     pub modified: u64,
     /// Whether something else still holds this session.
     pub live: Liveness,
+    /// Why it is blocked — `None` when `live == Free`. The UI needs it to say
+    /// anything true about the *other* rows (see [`BlockReason`]).
+    pub reason: Option<BlockReason>,
 }
 
 /// True when `a` and `b` name the same directory, resolving symlinks and `..`
@@ -123,18 +126,12 @@ fn candidates(
                 cwd,
                 modified,
                 live: Liveness::Unknown, // filled in below
+                reason: Some(BlockReason::Undecidable),
             },
             t.path,
         ));
     }
     found
-}
-
-/// The newest mtime among `rows` — the rank boundary. Ties share the crown, so
-/// same-second transcripts all count as [`CwdRank::Newest`] and all block; that
-/// is the direction of error this whole module errs in.
-fn newest_mtime(rows: &[(ExternalSession, PathBuf)]) -> Option<u64> {
-    rows.iter().map(|(s, _)| s.modified).max()
 }
 
 /// What the picker's external section shows, split by the user's own dismissals
@@ -163,10 +160,8 @@ pub struct ExternalListing {
 /// line never make a session look busy.
 ///
 /// Hiding happens **after** the liveness verdict, not before: a hidden
-/// transcript is still a file an un-pinned `claude` could be writing, so it must
-/// keep taking part in the mtime ranking (see [`crate::live`]). Dropping hidden
-/// rows earlier would hand their `Newest` slot to a visible row and report a
-/// blocked session as adoptable.
+/// transcript is still a file an un-pinned `claude` could be writing, and every
+/// row is judged against the same threshold whether or not it is shown.
 pub fn list_external(
     projects_root: &Path,
     snapshot_base: &Path,
@@ -175,7 +170,6 @@ pub fn list_external(
     self_pid: u32,
 ) -> ExternalListing {
     let found = candidates(projects_root, snapshot_base, project);
-    let newest = newest_mtime(&found);
 
     // One /proc pass for the whole list rather than one per session.
     let targets: HashSet<PathBuf> = found
@@ -188,8 +182,11 @@ pub fn list_external(
         .map(|(mut s, path)| {
             let jsonl = path.canonicalize().unwrap_or(path);
             let cwd = std::fs::canonicalize(&s.cwd).unwrap_or_else(|_| PathBuf::from(&s.cwd));
-            let rank = if Some(s.modified) == newest { CwdRank::Newest } else { CwdRank::Older };
-            s.live = probe.classify(&s.uuid, &jsonl, &cwd, rank);
+            // The mtime is already in hand here — the closure exists for the
+            // recheck path, which has to go and find it.
+            let verdict = probe.classify(&s.uuid, &jsonl, &cwd, || Some(s.modified));
+            s.live = verdict.live;
+            s.reason = verdict.reason;
             s
         })
         .collect();
@@ -201,24 +198,26 @@ pub fn list_external(
     ExternalListing { hidden_count: hidden.len(), sessions, hidden }
 }
 
-/// Where `uuid` ranks by mtime among `project`'s adoptable candidates — the
-/// argument [`LiveProbe::classify`] needs, recomputed for the single session the
-/// spawn-time recheck is about.
+/// When `uuid`'s transcript was last written, unix seconds — the input
+/// [`LiveProbe::classify`] compares against signal 3b's threshold, recomputed for
+/// the single session the spawn-time recheck is about.
 ///
-/// **Fail-closed**: anything we cannot establish — the scan failing, the uuid no
-/// longer being a candidate at all — is [`CwdRank::Newest`], the value that
-/// blocks. `Older` is returned only on positive evidence, i.e. some *other*
-/// candidate of the same project is strictly newer.
-pub fn rank_of(projects_root: &Path, snapshot_base: &Path, project: &str, uuid: &str) -> CwdRank {
-    let rows = candidates(projects_root, snapshot_base, project);
-    let Some((mine, _)) = rows.iter().find(|(s, _)| s.uuid == uuid) else {
-        return CwdRank::Newest;
-    };
-    if rows.iter().any(|(s, _)| s.uuid != uuid && s.modified > mine.modified) {
-        CwdRank::Older
-    } else {
-        CwdRank::Newest
-    }
+/// It is deliberately *not* a plain `stat` of the file: the answer must come from
+/// the same candidate set the picker was looking at, so that "this is still an
+/// adoptable external session of this project" is re-established at the same
+/// moment as its mtime. `None` — the uuid is no longer a candidate (a snapshot
+/// appeared, the transcript moved, the project no longer matches) — is a refusal,
+/// never a pass; `classify` turns it into a block and the caller into an error.
+pub fn candidate_mtime(
+    projects_root: &Path,
+    snapshot_base: &Path,
+    project: &str,
+    uuid: &str,
+) -> Option<u64> {
+    candidates(projects_root, snapshot_base, project)
+        .into_iter()
+        .find(|(s, _)| s.uuid == uuid)
+        .map(|(s, _)| s.modified)
 }
 
 #[cfg(test)]
@@ -365,8 +364,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
-    /// Force a transcript's mtime so the rank is a fact of the test, not of how
-    /// fast the filesystem clock ticked between two writes.
+    /// Force a transcript's mtime so its position relative to a process's start
+    /// time is a fact of the test, not of how fast the clock ticked between two
+    /// writes.
     fn set_mtime(root: &Path, slug: &str, uuid: &str, secs_ago: u64) {
         let f = std::fs::OpenOptions::new()
             .write(true)
@@ -377,62 +377,42 @@ mod tests {
     }
 
     #[test]
-    fn only_the_newest_candidate_of_a_directory_ranks_newest() {
-        let base = temp("rank");
+    fn candidate_mtime_answers_for_candidates_and_refuses_otherwise() {
+        // What the spawn-time recheck feeds the classifier. "Not a candidate" has
+        // to be `None` — a refusal — rather than any value that could pass.
+        let base = temp("mtime");
         let projects = base.join("projects-root");
         let snaps = base.join("app-data");
         let project = base.join("p");
         std::fs::create_dir_all(&project).unwrap();
         let p = project.to_string_lossy().to_string();
-        let (new, mid, old) = (
+        let (mine, other_project) = (
             "aaaaaaaa-1111-2222-3333-444444444444",
             "bbbbbbbb-1111-2222-3333-444444444444",
-            "cccccccc-1111-2222-3333-444444444444",
         );
-        for (u, ago) in [(new, 10u64), (mid, 100), (old, 1000)] {
-            transcript(&projects, "-p", u, &p, "hi");
-            set_mtime(&projects, "-p", u, ago);
-        }
-        assert_eq!(rank_of(&projects, &snaps, &p, new), CwdRank::Newest);
-        assert_eq!(rank_of(&projects, &snaps, &p, mid), CwdRank::Older);
-        assert_eq!(rank_of(&projects, &snaps, &p, old), CwdRank::Older);
+        transcript(&projects, "-p", mine, &p, "hi");
+        set_mtime(&projects, "-p", mine, 100);
+        transcript(&projects, "-other", other_project, "/somewhere/else", "hi");
 
-        // A session this app owns is not a candidate, so it neither ranks nor
-        // pushes the others down: adopting the newest *external* row is still
-        // the thing an un-pinned claude here would be blocking.
-        save(&snaps, &p, &snap(new)).unwrap();
-        assert_eq!(rank_of(&projects, &snaps, &p, mid), CwdRank::Newest);
+        let now = std::time::SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let got = candidate_mtime(&projects, &snaps, &p, mine).expect("a candidate has an mtime");
+        assert!(now - got >= 99 && now - got <= 102, "mtime {got} ≉ now−100 ({now})");
+
+        // Never a candidate of this project.
+        assert_eq!(candidate_mtime(&projects, &snaps, &p, other_project), None);
+        assert_eq!(candidate_mtime(&projects, &snaps, &p, "dddddddd-1111-2222-3333-444444444444"), None);
+        // …and a session this app already owns has left the candidate set, which
+        // is exactly the state that must refuse rather than resolve.
+        save(&snaps, &p, &snap(mine)).unwrap();
+        assert_eq!(candidate_mtime(&projects, &snaps, &p, mine), None);
         let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]
-    fn an_unrankable_uuid_fails_closed_to_newest() {
-        let base = temp("rank-fail");
-        let projects = base.join("projects-root");
-        let snaps = base.join("app-data");
-        let project = base.join("p");
-        std::fs::create_dir_all(&project).unwrap();
-        let p = project.to_string_lossy().to_string();
-        let known = "aaaaaaaa-1111-2222-3333-444444444444";
-        transcript(&projects, "-p", known, &p, "hi");
-        set_mtime(&projects, "-p", known, 10);
-        // A uuid that isn't a candidate at all (deleted transcript, other
-        // project, snapshot already written) must not read as "safely older".
-        assert_eq!(
-            rank_of(&projects, &snaps, &p, "dddddddd-1111-2222-3333-444444444444"),
-            CwdRank::Newest
-        );
-        // Same-second transcripts share the crown — both block.
-        let twin = "eeeeeeee-1111-2222-3333-444444444444";
-        transcript(&projects, "-p", twin, &p, "hi");
-        set_mtime(&projects, "-p", twin, 10);
-        assert_eq!(rank_of(&projects, &snaps, &p, known), CwdRank::Newest);
-        assert_eq!(rank_of(&projects, &snaps, &p, twin), CwdRank::Newest);
-        let _ = std::fs::remove_dir_all(&base);
-    }
-
-    #[test]
-    fn hidden_sessions_move_to_their_own_bucket_and_keep_ranking() {
+    fn hidden_sessions_move_to_their_own_bucket_and_stay_candidates() {
         let base = temp("hidden");
         let projects = base.join("projects-root");
         let snaps = base.join("app-data");
@@ -458,9 +438,9 @@ mod tests {
         assert_eq!(l.hidden_count, 1);
 
         // 숨겨도 후보에서 빠지지는 않는다 — 그 전사는 여전히 디스크에 있고
-        // 무특정 claude가 쓰고 있을 수 있으므로 mtime 순위를 계속 차지한다.
-        assert_eq!(rank_of(&projects, &snaps, &p, new), CwdRank::Newest);
-        assert_eq!(rank_of(&projects, &snaps, &p, old), CwdRank::Older);
+        // 무특정 claude가 쓰고 있을 수 있으므로 live 판정 입력으로 남는다.
+        assert!(candidate_mtime(&projects, &snaps, &p, new).is_some());
+        assert!(candidate_mtime(&projects, &snaps, &p, old).is_some());
 
         // adopt = 숨김 해제. 목록이 원래대로 돌아온다.
         crate::hidden::unhide(&snaps, &p, new).unwrap();
@@ -475,48 +455,145 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
-    /// End-to-end for the #69 review item 6 fix: a real un-pinned `claude`
-    /// running in the project directory used to make **every** row of that
-    /// project unadoptable. Now it costs exactly the newest row.
+    /// A project directory with `rows` transcripts, plus real stand-in processes.
+    /// Returns the listing taken while they run (the children are killed first).
     #[cfg(target_os = "linux")]
-    #[test]
-    fn a_real_unpinned_claude_costs_only_the_newest_row() {
-        let base = temp("live-narrow");
+    fn listing_with_processes(
+        tag: &str,
+        rows: &[(&str, u64)],
+        procs: &[Option<&str>],
+    ) -> (PathBuf, Vec<ExternalSession>) {
+        let base = temp(tag);
         let projects = base.join("projects-root");
         let snaps = base.join("app-data");
         let project = base.join("p");
         std::fs::create_dir_all(&project).unwrap();
         let project = project.canonicalize().unwrap();
         let p = project.to_string_lossy().to_string();
-        let (new, old) = (
-            "aaaaaaaa-1111-2222-3333-444444444444",
-            "bbbbbbbb-1111-2222-3333-444444444444",
-        );
-        for (u, ago) in [(new, 10u64), (old, 1000)] {
-            transcript(&projects, "-p", u, &p, "hi");
-            set_mtime(&projects, "-p", u, ago);
-        }
-        // Nothing running yet: both adoptable.
-        let before = list_external(&projects, &snaps, &p, Path::new("/proc"), 0).sessions;
-        assert!(before.iter().all(|s| s.live == Liveness::Free), "{before:?}");
 
-        // An un-pinned `claude` sitting in the project directory (live.rs's own
-        // stand-in, so both tests exercise the same process shape).
-        let mut child = crate::live::spawn_unpinned_claude(&project);
+        let mut children: Vec<std::process::Child> =
+            procs.iter().map(|pin| crate::live::spawn_stand_in_claude(&project, *pin)).collect();
+        // Transcripts are written *after* the processes start, then back-dated —
+        // so "ago" is measured against a start time that really precedes them.
+        for (uuid, ago) in rows {
+            transcript(&projects, "-p", uuid, &p, "hi");
+            set_mtime(&projects, "-p", uuid, *ago);
+        }
+        // Wait until the process table shows what we spawned (cwd link included).
         let mut list = Vec::new();
-        for _ in 0..100 {
-            list = list_external(&projects, &snaps, &p, Path::new("/proc"), std::process::id()).sessions;
-            if list.iter().any(|s| s.live == Liveness::Unknown) {
+        for _ in 0..150 {
+            list = list_external(&projects, &snaps, &p, Path::new("/proc"), std::process::id())
+                .sessions;
+            if list.iter().any(|s| s.live != Liveness::Free) {
                 break;
             }
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
-        let _ = child.kill();
-        let _ = child.wait();
+        for c in children.iter_mut() {
+            let _ = c.kill();
+            let _ = c.wait();
+        }
+        (base, list)
+    }
 
-        let by = |u: &str| list.iter().find(|s| s.uuid == u).unwrap().live;
-        assert_eq!(by(new), Liveness::Unknown, "the newest row absorbs the block");
-        assert_eq!(by(old), Liveness::Free, "older rows stay adoptable (#69 item 6)");
+    /// MISS2, reproduced with real processes: a **pinned** session and a newer
+    /// transcript whose writer has already exited used to steal the "newest" slot
+    /// from the transcript an un-pinned `claude` was actually holding, which then
+    /// read `Free`. The threshold has no slot to steal.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_pinned_or_dead_writer_no_longer_steals_the_block() {
+        // Uuids unique to this test: it puts a **real pinned process** on the
+        // machine for the length of the run, and a sibling test reusing the same
+        // uuid would read its own row as Live (tests run in parallel).
+        let (held, dead_newer, pinned, ancient) = (
+            "2aaaaaaa-1111-2222-3333-444444444444",
+            "2bbbbbbb-1111-2222-3333-444444444444",
+            "2ccccccc-1111-2222-3333-444444444444",
+            "2ddddddd-1111-2222-3333-444444444444",
+        );
+        let (base, list) = listing_with_processes(
+            "miss2",
+            // `dead_newer` is the newest row — under the old rule it took the
+            // block and `held` (2 s older) went Free.
+            &[(held, 2), (dead_newer, 0), (pinned, 3600), (ancient, 3600)],
+            &[None, Some(pinned)],
+        );
+        let by = |u: &str| list.iter().find(|s| s.uuid == u).unwrap();
+        // The fixture only reproduces MISS2 while `held` is *not* the newest row:
+        // that is the exact condition under which the old "block the newest one"
+        // rule reported it adoptable.
+        assert!(
+            by(dead_newer).modified >= by(held).modified,
+            "fixture no longer reproduces the miss"
+        );
+        assert_eq!(
+            (by(held).live, by(held).reason),
+            (Liveness::Unknown, Some(BlockReason::WrittenSinceStart)),
+            "the transcript written since the un-pinned claude started must block"
+        );
+        assert_eq!(by(dead_newer).live, Liveness::Unknown, "so must every other recent row");
+        assert_eq!(
+            (by(pinned).live, by(pinned).reason),
+            (Liveness::Live, Some(BlockReason::ThisSession)),
+            "the pinned session reads Live on its own row"
+        );
+        assert_eq!(
+            by(ancient).live,
+            Liveness::Free,
+            "an hour-old transcript is provably not what a process started minutes ago is writing"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// MISS1, reproduced with real processes: two un-pinned `claude`s in one
+    /// directory could only ever block one row between them, because the rule
+    /// blocked a row rather than a time window.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn two_real_unpinned_claudes_block_every_recent_row() {
+        // Uuids unique to this test — see the sibling MISS2 test on why.
+        let (a, b, ancient) = (
+            "1aaaaaaa-1111-2222-3333-444444444444",
+            "1bbbbbbb-1111-2222-3333-444444444444",
+            "1ccccccc-1111-2222-3333-444444444444",
+        );
+        let (base, list) = listing_with_processes(
+            "miss1",
+            &[(a, 0), (b, 2), (ancient, 3600)],
+            &[None, None],
+        );
+        let row = |u: &str| list.iter().find(|s| s.uuid == u).unwrap();
+        let by = |u: &str| row(u).live;
+        // Same trap as MISS2: `b` is not the newest row, so the old rule left it
+        // adoptable no matter how many un-pinned `claude`s were running.
+        assert!(row(a).modified >= row(b).modified, "fixture no longer reproduces the miss");
+        assert_eq!(by(a), Liveness::Unknown);
+        assert_eq!(by(b), Liveness::Unknown, "the second un-pinned claude's row must block too");
+        // The narrowing is still real — this is not a return to blocking the
+        // whole project (#69 item 6).
+        assert_eq!(by(ancient), Liveness::Free);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// The other half of #69 item 6: with nothing running, everything is
+    /// adoptable — the threshold only exists while a process does.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn nothing_running_leaves_every_row_adoptable() {
+        let base = temp("quiet");
+        let projects = base.join("projects-root");
+        let snaps = base.join("app-data");
+        let project = base.join("p");
+        std::fs::create_dir_all(&project).unwrap();
+        let p = project.to_string_lossy().to_string();
+        for (u, ago) in [("aaaaaaaa-1111-2222-3333-444444444444", 0u64),
+                         ("bbbbbbbb-1111-2222-3333-444444444444", 3600)] {
+            transcript(&projects, "-p", u, &p, "hi");
+            set_mtime(&projects, "-p", u, ago);
+        }
+        let list = list_external(&projects, &snaps, &p, Path::new("/proc"), 0).sessions;
+        assert!(list.iter().all(|s| s.live == Liveness::Free && s.reason.is_none()), "{list:?}");
         let _ = std::fs::remove_dir_all(&base);
     }
 

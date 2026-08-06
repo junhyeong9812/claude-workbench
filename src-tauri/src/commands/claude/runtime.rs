@@ -221,11 +221,17 @@ pub struct ClaudeDetached {
 /// the file — so letting a missing transcript through would quietly create a
 /// brand-new session wearing the id of the one the user clicked (audit B2).
 ///
-/// The mtime rank signal 3b needs is recomputed here from the same candidate set
-/// the picker ranked against (`core::external::rank_of`), so the check the user
-/// saw and the check that gates the spawn cannot disagree about which row an
-/// un-pinned `claude` is presumed to hold. A rank we cannot establish — no app
-/// data dir, uuid no longer a candidate — comes back `Newest`, which blocks.
+/// The transcript mtime signal 3b compares against its threshold is re-read here
+/// from the same candidate set the picker used (`core::external::candidate_mtime`)
+/// — the check the user saw and the check that gates the spawn must apply one
+/// rule, not two. It is fetched **lazily**: the classifier only asks when an
+/// un-pinned `claude` is actually running in this directory, so the common case
+/// does not stat the whole projects root while the runtime lock is held.
+///
+/// Anything that cannot be established is a refusal, not a fallback value: no app
+/// data dir, or a uuid that is no longer an adoptable candidate (a snapshot
+/// appeared, the transcript moved), yields `None`, which the classifier turns
+/// into `Unknown` and this function into an error.
 fn recheck_adoptable(
     app: &AppHandle,
     project: &str,
@@ -255,23 +261,30 @@ fn recheck_adoptable(
         &targets,
         std::process::id(),
     );
-    let rank = match app.path().app_data_dir() {
-        Ok(base) => core_lib::external::rank_of(&root, &base, project, uuid),
-        // Fail-closed: without the snapshot base we cannot tell which of this
-        // directory's transcripts are still candidates, so we assume this one is
-        // the newest — the blocking value.
-        Err(_) => core_lib::live::CwdRank::Newest,
+    let mtime = || {
+        let base = app.path().app_data_dir().ok()?;
+        core_lib::external::candidate_mtime(&root, &base, project, uuid)
     };
-    match probe.classify(uuid, &jsonl, &dir, rank) {
-        core_lib::live::Liveness::Free => Ok(()),
-        core_lib::live::Liveness::Live => Err(AppError::new(
+    let verdict = probe.classify(uuid, &jsonl, &dir, mtime);
+    use core_lib::live::{BlockReason, Liveness};
+    match (verdict.live, verdict.reason) {
+        (Liveness::Free, _) => Ok(()),
+        (Liveness::Live, _) => Err(AppError::new(
             "이 세션은 지금 다른 곳에서 열려 있습니다 — 그 창을 닫은 뒤 다시 시도하세요. \
              (같은 전사에 두 프로세스가 쓰면 세션이 깨집니다)",
         )),
-        core_lib::live::Liveness::Unknown => Err(AppError::new(
-            "이 세션이 열려 있는지 확인할 수 없어 열지 않았습니다 \
-             (같은 디렉토리에서 세션을 특정할 수 없는 claude가 돌고 있고, \
-             이 세션이 그 디렉토리에서 가장 최근에 쓰인 전사입니다).",
+        // The two Unknowns mean different things to the user: one says "this
+        // session, for now", the other says "nothing here, until that process
+        // goes away". Telling them apart is the whole reason the reason exists.
+        (Liveness::Unknown, Some(BlockReason::WrittenSinceStart)) => Err(AppError::new(
+            "이 세션이 열려 있는지 확인할 수 없어 열지 않았습니다 — 이 디렉토리에서 \
+             세션을 특정할 수 없는 claude가 돌고 있고, 이 전사는 그 claude가 시작된 뒤에 \
+             쓰였습니다. (그 전에 마지막으로 쓰인 세션은 그대로 열 수 있습니다)",
+        )),
+        (Liveness::Unknown, _) => Err(AppError::new(
+            "지금은 어떤 외부 세션도 열 수 없습니다 — 어디서 도는지 알 수 없는 프로세스가 \
+             있어(또는 이 세션의 최근 기록 시각을 확인할 수 없어) 어느 세션이 물려 있는지 \
+             특정할 수 없습니다. 잠시 뒤 다시 시도하세요.",
         )),
     }
 }
@@ -313,6 +326,11 @@ pub fn claude_open_or_attach(
     // Mirror: attach to the running PTY if this uuid is live (T1/T2 — 전이는
     // ClaudeRuntime 순수 메서드, 승격 emit은 락 해제 후. P6-impl #1/#3/#5).
     match rt.attach_live(&project, uuid.as_deref(), &label, |id| mgr.exists(id)) {
+        // NOTE: this early return skips both the adopt recheck and the un-hide
+        // below, and should: attaching as a mirror means the session is already
+        // running **in this app**, so it is not an external transcript being
+        // taken over and cannot be a dismissed external row either. `adopt` on
+        // this branch is a leftover flag from the click, not a takeover.
         AttachLive::Attached { id, driver, rev, handoff } => {
             let role = if driver == label { "driver" } else { "mirror" };
             let opened = ClaudeOpened {

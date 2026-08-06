@@ -93,6 +93,15 @@ export interface ExternalSessionRow {
   modified: number;
   /** free = 붙어도 안전 · live = 다른 곳에서 열려 있음 · unknown = 판정 불가. */
   live: "free" | "live" | "unknown";
+  /**
+   * 막힌 **이유** (free면 null). 같은 "확인 불가"라도 사용자에게 할 말이 다르다:
+   * - `this_session` — 이 세션이 다른 곳에서 열려 있다(그 창을 닫으면 열린다).
+   * - `undecidable` — 어디서 도는지 알 수 없는 프로세스가 있어 **어떤 세션도**
+   *   지금은 열 수 없다.
+   * - `written_since_start` — 이 디렉토리의 무특정 claude가 시작된 뒤에 이 전사가
+   *   쓰였다. 그 전에 마지막으로 쓰인 세션은 그대로 열 수 있다.
+   */
+  reason: "this_session" | "undecidable" | "written_since_start" | null;
 }
 
 /**
@@ -116,22 +125,32 @@ export const EMPTY_EXTERNAL: ExternalListing = { sessions: [], hidden: [], hidde
  * 같은 전사에 두 프로세스가 append해서 세션이 깨진다(복구 불가). */
 export const adoptable = (row: ExternalSessionRow): boolean => row.live === "free";
 
-/** 막힌 이유 배지. 붙을 수 있는 행은 배지가 없다. */
+/**
+ * 막힌 이유 배지. 붙을 수 있는 행은 배지가 없다.
+ *
+ * 힌트는 `live`가 아니라 **`reason`**으로 갈린다: "확인 불가" 두 종류가 사용자에게
+ * 정반대의 안내를 요구하기 때문이다. 시각 임계에 걸린 행은 "더 오래된 세션은
+ * 열린다"가 참이지만, 판정 자체가 불가능한 상태(어디서 도는지 모를 프로세스)에서
+ * 같은 말을 하면 거짓말이 된다(리뷰 P2).
+ */
 export function liveBadge(row: ExternalSessionRow): { label: string; hint: string } | null {
-  switch (row.live) {
-    case "live":
-      return {
-        label: "사용 중",
-        hint: "이 세션이 다른 터미널에서 열려 있습니다 — 그 창을 닫으면 붙일 수 있습니다",
-      };
-    case "unknown":
-      return {
-        label: "확인 불가",
-        hint: "이 세션이 열려 있는지 확인할 수 없습니다 — 같은 디렉토리에서 세션을 특정할 수 없는 claude가 돌고 있고, 그 claude가 쓰고 있을 가능성이 가장 큰 최신 전사(이 세션)만 막습니다. 같은 디렉토리의 나머지 세션은 그대로 열 수 있습니다",
-      };
-    default:
-      return null;
+  if (row.live === "free") return null;
+  if (row.live === "live") {
+    return {
+      label: "사용 중",
+      hint: "이 세션이 다른 터미널에서 열려 있습니다 — 그 창을 닫으면 붙일 수 있습니다",
+    };
   }
+  if (row.reason === "written_since_start") {
+    return {
+      label: "확인 불가",
+      hint: "이 디렉토리에서 세션을 특정할 수 없는 claude가 돌고 있고, 이 전사는 그 claude가 시작된 뒤에 쓰였습니다 — 그 claude가 쓰고 있는 세션일 수 있어 막습니다. 그 시각 이전에 마지막으로 쓰인 세션은 그대로 열 수 있습니다",
+    };
+  }
+  return {
+    label: "확인 불가",
+    hint: "지금은 어떤 외부 세션도 열 수 없습니다 — 어디서 도는지 알 수 없는 프로세스가 있어 어느 세션이 물려 있는지 특정할 수 없습니다. 그 프로세스가 사라지면 다시 열 수 있습니다",
+  };
 }
 
 /** 외부 세션 행: 이미 열려 있는 세션 제외 + 최신순. 백엔드도 최신순으로 주지만
