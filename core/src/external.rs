@@ -414,6 +414,52 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
+    /// Every way a session can stop being an adoptable candidate between the
+    /// picker's listing and the click that adopts it. The spawn-time recheck asks
+    /// this **eagerly** — before, and independently of, any liveness question —
+    /// because with nothing running the liveness path would otherwise never ask
+    /// and the adopt would go ahead (audit M2). All four must answer `None`.
+    #[test]
+    fn candidate_mtime_refuses_every_way_a_candidate_can_disappear() {
+        let base = temp("gone");
+        let projects = base.join("projects-root");
+        let snaps = base.join("app-data");
+        let project = base.join("p");
+        std::fs::create_dir_all(&project).unwrap();
+        let p = project.to_string_lossy().to_string();
+        let (adopted, extraction, elsewhere, ok) = (
+            "aaaaaaaa-1111-2222-3333-444444444444",
+            "bbbbbbbb-1111-2222-3333-444444444444",
+            "cccccccc-1111-2222-3333-444444444444",
+            "eeeeeeee-1111-2222-3333-444444444444",
+        );
+        transcript(&projects, "-p", adopted, &p, "hi");
+        transcript(&projects, "-p", extraction, &p, crate::knowledge::EXTRACTION_MARKER);
+        transcript(&projects, "-other", elsewhere, "/some/other/project", "hi");
+        transcript(&projects, "-p", ok, &p, "hi");
+
+        // Control: an untouched candidate does answer.
+        assert!(candidate_mtime(&projects, &snaps, &p, ok).is_some());
+
+        // ① The app adopted it in the meantime (a snapshot now exists).
+        save(&snaps, &p, &snap(adopted)).unwrap();
+        assert_eq!(candidate_mtime(&projects, &snaps, &p, adopted), None, "스냅샷 생성");
+        // ② The head probe excludes it (our own extraction by-product).
+        assert_eq!(candidate_mtime(&projects, &snaps, &p, extraction), None, "probe 제외");
+        // ③ Its transcript belongs to another project's cwd.
+        assert_eq!(candidate_mtime(&projects, &snaps, &p, elsewhere), None, "프로젝트 불일치");
+        // ④ The transcripts root cannot be scanned at all.
+        assert_eq!(
+            candidate_mtime(&base.join("no-such-root"), &snaps, &p, ok),
+            None,
+            "스캔 실패"
+        );
+        // …and a transcript that simply vanished.
+        std::fs::remove_file(projects.join("-p").join(format!("{ok}.jsonl"))).unwrap();
+        assert_eq!(candidate_mtime(&projects, &snaps, &p, ok), None, "전사 소실");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
     #[test]
     fn hidden_sessions_move_to_their_own_bucket_and_stay_candidates() {
         let base = temp("hidden");

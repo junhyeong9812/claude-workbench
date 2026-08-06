@@ -68,9 +68,15 @@
 //! `claude` that resumed a session and has **not written a single record yet**
 //! leaves that transcript's mtime where it was, so a transcript older than the
 //! threshold can still be the one it holds (see
-//! `a_freshly_resumed_session_that_has_not_written_yet_is_missed`). ε exists to
-//! keep clock rounding and any last write that raced the process start on the
-//! blocking side of the line.
+//! `a_freshly_resumed_session_that_has_not_written_yet_is_missed`).
+//!
+//! The threshold rests on one conversion — process start (ticks since boot) into
+//! a wall-clock instant comparable with an mtime — and that conversion is where
+//! the remaining ways to be wrong live. A suspend or stall between its reads is
+//! detected and refused ([`boot_instant`]); a forward step of the wall clock is
+//! not detectable from inside and moves the threshold later by the size of the
+//! step, so [`START_EPSILON_SECS`] is a minute rather than a few seconds. Both
+//! defences push in the same direction: when the clocks are unclear, block.
 //!
 //! Everything that is not "an un-pinned `claude` whose cwd we positively read as
 //! *this* directory" is unchanged and still blocks every row: an opaque process,
@@ -101,13 +107,29 @@ use serde::Serialize;
 /// Safety margin subtracted from the earliest un-pinned `claude`'s start time
 /// before comparing it against transcript mtimes.
 ///
-/// Two things it absorbs: the second-level truncation on both sides of the
-/// conversion (`/proc/uptime` → boot instant → start instant), and a write that
-/// landed in the same moment the process came up. Five seconds costs at most a
-/// handful of extra blocked rows — only those written in the five seconds before
-/// a `claude` started — and buys a threshold that never lands *after* the first
-/// append it is meant to catch.
-pub const START_EPSILON_SECS: u64 = 5;
+/// What it absorbs: second-level truncation on both sides of the conversion
+/// (`/proc/uptime` → boot instant → start instant), a write that landed in the
+/// same moment the process came up, and — the reason it is a minute rather than a
+/// few seconds — a **wall-clock step** between reading the uptime and reading the
+/// clock. The conversion window is validated ([`boot_instant`]), which catches a
+/// suspend; a pure forward step of the clock is invisible to that check and moves
+/// the computed start *later* by exactly the step, i.e. straight into the missing
+/// direction.
+///
+/// The trade is deliberately lopsided. Over-blocking costs only "transcripts last
+/// written in the 60 s before a `claude` started" — a window in which a session
+/// nobody has touched since is unlikely to be sitting, and the row comes back the
+/// moment that process exits. Under-blocking costs a destroyed transcript. So the
+/// residual miss is narrowed to clock steps larger than a minute.
+pub const START_EPSILON_SECS: u64 = 60;
+
+/// How long the boot-instant conversion may take before we distrust it.
+///
+/// The three reads (`uptime`, wall clock, `uptime` again) are microseconds apart
+/// in the normal case. A second or more between the two uptime reads means the
+/// machine was not running normally in between — a suspend, a stalled VM — and
+/// the arithmetic tying them to the wall clock no longer holds.
+const CONVERSION_WINDOW_SECS: f64 = 1.0;
 
 /// Whether an external session can be safely adopted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -282,16 +304,45 @@ impl ProcInfo {
 ///
 /// `/proc/<pid>/stat` reports a process's start as ticks **since boot**, so this
 /// is what turns it into a wall-clock instant comparable with a file mtime.
-/// `None` when `/proc/uptime` is absent or unparsable (a fake proc root in tests,
-/// a non-Linux host) — every start time then reads as unreadable, which blocks.
+///
+/// The conversion is only valid if the two clocks it bridges did not diverge
+/// while it ran, so the uptime is read **on both sides** of the wall-clock read
+/// and the window between them is checked ([`boot_from_window`]). A machine that
+/// suspended mid-conversion produces a boot instant that is wrong by the length
+/// of the suspend, and every start time with it. One retry, then `None`.
+///
+/// `None` — unreadable (`a fake proc root in tests, a non-Linux host`) or an
+/// untrustworthy window — makes every start time read as unreadable, which blocks
+/// the directories those processes are in. That is the point: a conversion we
+/// cannot trust must not produce a threshold.
 fn boot_instant(proc_root: &Path) -> Option<u64> {
+    (0..2).find_map(|_| boot_instant_once(proc_root))
+}
+
+fn boot_instant_once(proc_root: &Path) -> Option<u64> {
+    let up1 = read_uptime(proc_root)?;
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).ok()?.as_secs();
+    let up2 = read_uptime(proc_root)?;
+    boot_from_window(up1, now, up2)
+}
+
+fn read_uptime(proc_root: &Path) -> Option<f64> {
     let uptime = std::fs::read_to_string(proc_root.join("uptime")).ok()?;
     let secs: f64 = uptime.split_whitespace().next()?.parse().ok()?;
-    if !secs.is_finite() || secs < 0.0 {
-        return None;
+    (secs.is_finite() && secs >= 0.0).then_some(secs)
+}
+
+/// `now − uptime`, but only when the two uptime readings taken around `now` are
+/// close enough to call the whole thing one instant.
+///
+/// The **later** uptime is the one used: a larger uptime means an earlier boot,
+/// an earlier start, an earlier threshold — more blocking. Where the arithmetic
+/// has slack, the slack goes toward blocking.
+fn boot_from_window(up1: f64, now: u64, up2: f64) -> Option<u64> {
+    if !(up2 >= up1) || up2 - up1 > CONVERSION_WINDOW_SECS {
+        return None; // suspended, stalled, or the clock went backwards
     }
-    let now = SystemTime::now().duration_since(UNIX_EPOCH).ok()?.as_secs();
-    Some(now.saturating_sub(secs as u64))
+    Some(now.saturating_sub(up2 as u64))
 }
 
 /// Clock ticks per second — the unit of `/proc/<pid>/stat`'s `starttime` field.
@@ -737,11 +788,11 @@ mod tests {
             &[],
         );
         // Written between the two starts: still inside the earlier one's window.
-        assert_eq!(verdict(&p, P, old + 60).live, Liveness::Unknown);
+        assert_eq!(verdict(&p, P, old + 120).live, Liveness::Unknown);
         // Both rows of a two-row directory block, not just one.
         assert_eq!(verdict(&p, P, AFTER).live, Liveness::Unknown);
-        // Older than both — safe.
-        assert_eq!(verdict(&p, P, old - 60), Verdict::FREE);
+        // Older than both (and than ε) — safe.
+        assert_eq!(verdict(&p, P, old - START_EPSILON_SECS - 1), Verdict::FREE);
     }
 
     #[test]
@@ -772,14 +823,114 @@ mod tests {
 
     #[test]
     fn the_epsilon_keeps_a_write_that_raced_the_start_blocked() {
-        // Second-level truncation on both sides of the clock conversion, and a
-        // write landing in the same instant the process came up, must not fall on
-        // the "safe" side of the line.
+        // Second-level truncation on both sides of the clock conversion, a write
+        // landing in the same instant the process came up, and a wall-clock step
+        // up to ε must not fall on the "safe" side of the line.
         let p = probe(vec![proc(9, Some(P), &["claude"])], &[]);
         assert_eq!(verdict(&p, P, STARTED).live, Liveness::Unknown);
         assert_eq!(verdict(&p, P, STARTED - START_EPSILON_SECS).live, Liveness::Unknown);
-        // …but the margin is finite; a minute earlier is adoptable again.
-        assert_eq!(verdict(&p, P, STARTED - 60), Verdict::FREE);
+        // …but the margin is finite, and the row comes back just outside it.
+        assert_eq!(verdict(&p, P, STARTED - START_EPSILON_SECS - 1), Verdict::FREE);
+        // The margin is a minute, not a few seconds: a clock step is invisible to
+        // the conversion-window check and moves the threshold *later*, i.e. into
+        // the missing direction, so this constant is a safety property.
+        assert!(START_EPSILON_SECS >= 60, "ε was narrowed — see the module docs on clock steps");
+    }
+
+    #[test]
+    fn a_conversion_window_that_cannot_be_trusted_yields_no_boot_instant() {
+        // now − uptime is only one instant's arithmetic if the machine was
+        // running normally across the three reads. A suspend shows up as a gap
+        // between the two uptime readings.
+        let now = 1_800_000_000u64;
+        // Normal: microseconds apart, and the *later* uptime wins (earlier boot →
+        // earlier threshold → more blocking).
+        assert_eq!(boot_from_window(1000.0, now, 1000.002), Some(now - 1000));
+        assert_eq!(boot_from_window(1000.0, now, 1001.0), Some(now - 1001), "슬랙은 차단 쪽으로");
+        // Suspended (or a stalled VM) between the reads — refuse.
+        assert_eq!(boot_from_window(1000.0, now, 1001.001), None);
+        assert_eq!(boot_from_window(1000.0, now, 4000.0), None);
+        // Uptime went backwards: nothing about this is trustworthy either.
+        assert_eq!(boot_from_window(1000.0, now, 999.9), None);
+        // A boot instant after the epoch's start is still just arithmetic.
+        assert_eq!(boot_from_window(0.0, 0, 0.0), Some(0));
+    }
+
+    /// A synthetic `/proc` — the only way to exercise `scan_processes`'s start
+    /// time plumbing (and its **absence**) without a suspend to reproduce.
+    fn fake_proc(tag: &str, uptime: Option<&str>, stat_ticks: Option<u64>) -> PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "mt-live-fakeproc-{}-{tag}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        let pid_dir = root.join("4242");
+        std::fs::create_dir_all(&pid_dir).unwrap();
+        if let Some(u) = uptime {
+            std::fs::write(root.join("uptime"), u).unwrap();
+        }
+        std::fs::write(pid_dir.join("cmdline"), b"claude\0").unwrap();
+        let cwd = root.join("cwd-target");
+        std::fs::create_dir_all(&cwd).unwrap();
+        std::os::unix::fs::symlink(&cwd, pid_dir.join("cwd")).unwrap();
+        if let Some(ticks) = stat_ticks {
+            // Field 2 carries spaces and parens on purpose: the parser must find
+            // the *last* ')' rather than splitting from the left.
+            std::fs::write(
+                pid_dir.join("stat"),
+                format!(
+                    "4242 (claude (odd) name) S {} {ticks} 0 0\n",
+                    "0 ".repeat(18).trim()
+                ),
+            )
+            .unwrap();
+        }
+        root
+    }
+
+    #[test]
+    fn an_unusable_clock_conversion_blocks_the_directory_it_would_have_bounded() {
+        // End to end through `scan_processes`: an un-pinned claude whose start we
+        // cannot convert must leave the directory blocked, not open.
+        let ticks = clock_ticks();
+        // No /proc/uptime → no boot instant → no start time → Threshold::All.
+        let root = fake_proc("nouptime", None, Some(10 * ticks));
+        let scan = scan_processes(&root, 0);
+        let p = LiveProbe { scan, holders: HashSet::new() };
+        let cwd = root.join("cwd-target").canonicalize().unwrap();
+        assert!(p.scan.procs.iter().all(|x| x.started.is_none()));
+        assert_eq!(
+            p.classify(U, Path::new(J), &cwd, || Some(0)),
+            Verdict::blocked(Liveness::Unknown, BlockReason::Undecidable),
+            "시각 환산 불가 = 그 cwd 전체 차단"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+
+        // Uptime readable but the process's own stat is missing — same answer.
+        let root = fake_proc("nostat", Some("5000.00 4000.00\n"), None);
+        let scan = scan_processes(&root, 0);
+        let cwd = root.join("cwd-target").canonicalize().unwrap();
+        let p = LiveProbe { scan, holders: HashSet::new() };
+        assert_eq!(p.classify(U, Path::new(J), &cwd, || Some(0)).live, Liveness::Unknown);
+        let _ = std::fs::remove_dir_all(&root);
+
+        // Both readable → a real threshold, and the row written before it is free.
+        let root = fake_proc("ok", Some("5000.00 4000.00\n"), Some(4000 * ticks));
+        let scan = scan_processes(&root, 0);
+        let cwd = root.join("cwd-target").canonicalize().unwrap();
+        let started = scan
+            .procs
+            .iter()
+            .find(|x| x.pid == 4242)
+            .and_then(|x| x.started)
+            .expect("start time must come back from a well-formed /proc");
+        let p = LiveProbe { scan, holders: HashSet::new() };
+        assert_eq!(p.classify(U, Path::new(J), &cwd, || Some(started + 1)).live, Liveness::Unknown);
+        assert_eq!(
+            p.classify(U, Path::new(J), &cwd, || Some(started - START_EPSILON_SECS - 1)),
+            Verdict::FREE
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

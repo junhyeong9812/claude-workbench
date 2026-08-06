@@ -221,17 +221,22 @@ pub struct ClaudeDetached {
 /// the file — so letting a missing transcript through would quietly create a
 /// brand-new session wearing the id of the one the user clicked (audit B2).
 ///
-/// The transcript mtime signal 3b compares against its threshold is re-read here
-/// from the same candidate set the picker used (`core::external::candidate_mtime`)
-/// — the check the user saw and the check that gates the spawn must apply one
-/// rule, not two. It is fetched **lazily**: the classifier only asks when an
-/// un-pinned `claude` is actually running in this directory, so the common case
-/// does not stat the whole projects root while the runtime lock is held.
+/// Two questions are asked here, and both must be answered **before** the spawn:
 ///
-/// Anything that cannot be established is a refusal, not a fallback value: no app
-/// data dir, or a uuid that is no longer an adoptable candidate (a snapshot
-/// appeared, the transcript moved), yields `None`, which the classifier turns
-/// into `Unknown` and this function into an error.
+/// 1. *Is this still an adoptable external session of this project?*
+///    `core::external::candidate_mtime` re-derives it from the same candidate set
+///    the picker listed. This is checked **eagerly** — deliberately not folded
+///    into the liveness check. Threading it through the classifier's lazy mtime
+///    closure looked equivalent and was not: with no un-pinned `claude` running,
+///    the closure is never called, so a session that had meanwhile stopped being
+///    a candidate (the projects root became unreadable, a snapshot appeared, the
+///    transcript moved out of this project) sailed through as `Free` (audit M2).
+///    The picker's list path keeps the lazy form for a reason that does not apply
+///    here: there the mtime is already in the row, so asking costs nothing.
+/// 2. *Is anything else on it right now?* — the liveness signals, fed the mtime
+///    from (1).
+///
+/// Anything that cannot be established is a refusal, never a fallback value.
 fn recheck_adoptable(
     app: &AppHandle,
     project: &str,
@@ -253,6 +258,20 @@ fn recheck_adoptable(
             return Err(AppError::new(io_message("이 세션의 전사를 찾지 못했습니다", &e)))
         }
     };
+    // (1) Still a candidate? Eager — see the doc comment on why this must not
+    // ride along with the liveness check.
+    let base = app
+        .path()
+        .app_data_dir()
+        .map_err(|_| AppError::new("앱 데이터 경로를 찾을 수 없어 세션을 열지 않았습니다."))?;
+    let Some(modified) = core_lib::external::candidate_mtime(&root, &base, project, uuid) else {
+        return Err(AppError::new(
+            "이 세션은 지금 이 프로젝트의 '외부 세션'이 아닙니다 — 그 사이 앱이 이미 열었거나, \
+             전사가 옮겨졌거나, 전사 목록을 읽지 못했습니다. 목록을 다시 열어 확인하세요.",
+        ));
+    };
+
+    // (2) Anything on it right now?
     let jsonl = jsonl.canonicalize().unwrap_or(jsonl);
     let dir = std::fs::canonicalize(cwd).unwrap_or_else(|_| std::path::PathBuf::from(cwd));
     let targets = std::iter::once(jsonl.clone()).collect();
@@ -261,11 +280,7 @@ fn recheck_adoptable(
         &targets,
         std::process::id(),
     );
-    let mtime = || {
-        let base = app.path().app_data_dir().ok()?;
-        core_lib::external::candidate_mtime(&root, &base, project, uuid)
-    };
-    let verdict = probe.classify(uuid, &jsonl, &dir, mtime);
+    let verdict = probe.classify(uuid, &jsonl, &dir, || Some(modified));
     use core_lib::live::{BlockReason, Liveness};
     match (verdict.live, verdict.reason) {
         (Liveness::Free, _) => Ok(()),
@@ -283,8 +298,8 @@ fn recheck_adoptable(
         )),
         (Liveness::Unknown, _) => Err(AppError::new(
             "지금은 어떤 외부 세션도 열 수 없습니다 — 어디서 도는지 알 수 없는 프로세스가 \
-             있어(또는 이 세션의 최근 기록 시각을 확인할 수 없어) 어느 세션이 물려 있는지 \
-             특정할 수 없습니다. 잠시 뒤 다시 시도하세요.",
+             있어(또는 실행 중인 claude의 시작 시각을 확인할 수 없어) 어느 세션이 물려 \
+             있는지 특정할 수 없습니다. 잠시 뒤 다시 시도하세요.",
         )),
     }
 }
