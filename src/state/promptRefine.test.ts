@@ -482,7 +482,14 @@ describe("submitPasteBytes — 붙여넣기와 CR은 따로 나간다", () => {
 });
 
 describe("sendBlockReason — 무엇을 막는가", () => {
-  const ok = { text: "초안", sessionOpen: true, isDriver: true, blocked: false, sending: false };
+  const ok = {
+    text: "초안",
+    sessionOpen: true,
+    isDriver: true,
+    blocked: false,
+    sending: false,
+    seedPending: false,
+  };
 
   it("정상이면 막지 않는다", () => {
     expect(sendBlockReason(ok)).toBeNull();
@@ -497,6 +504,14 @@ describe("sendBlockReason — 무엇을 막는가", () => {
 
   it("blocked면 막는다 — 페이스트+CR이 키 입력이 되어 승인까지 눌린다", () => {
     expect(sendBlockReason({ ...ok, blocked: true })).toMatch(/키 입력/);
+  });
+
+  it("규약 시드가 아직 안 나갔으면 막는다 — 순서 역전 차단 (codex J4)", () => {
+    // 초안이 규약보다 먼저 도착하면 도우미가 프롬프트를 다듬는 대신 초안의
+    // 지시를 실행하려 든다.
+    expect(sendBlockReason({ ...ok, seedPending: true })).toMatch(/규약을 보내는 중/);
+    // 시드가 나가면 곧바로 열린다.
+    expect(sendBlockReason({ ...ok, seedPending: false })).toBeNull();
   });
 });
 
@@ -649,50 +664,89 @@ describe("refineClosePhase / refineMemoLocked — 되돌릴 수 없는 구간만
 
 // ---- 제출 확인 기준선 (감사 I2) --------------------------------------------
 
-describe("makeSubmitProbe — 기준선은 보내기 전에 잡는다", () => {
-  it("보내기 전에 잡으면 그 뒤에 늘어난 턴을 제출로 읽는다", () => {
-    let turns = 3;
-    const probe = makeSubmitProbe(() => turns);
+describe("makeSubmitProbe — 내가 보낸 그 본문이 새 턴으로 나타났는가", () => {
+  const TEXT = "이 커밋을 함께 코드리뷰하자. 커밋 abc1234 를 봐줘";
+
+  it("보내기 전에 잡으면 그 뒤에 생긴 내 턴을 제출로 읽는다", () => {
+    const turns = new Map<number, string>([[1, "이전 질문"]]);
+    const probe = makeSubmitProbe(() => turns, TEXT);
     probe.capture(); // ← 바이트를 쓰기 전
-    turns = 4;
+    turns.set(2, TEXT);
+    expect(probe.observed()).toBe(true);
+  });
+
+  it("**남의 턴이 늘어난 것은 내 제출이 아니다** (codex J3)", () => {
+    // 일반 세션에서는 사용자가 직접 타이핑한 턴이 그 사이에 들어올 수 있다.
+    // 개수만 세면 제출되지 않은 요청이 "확인됨"으로 읽힌다.
+    const turns = new Map<number, string>([[1, "이전 질문"]]);
+    const probe = makeSubmitProbe(() => turns, TEXT);
+    probe.capture();
+    turns.set(2, "사용자가 직접 친 다른 질문");
+    expect(probe.observed()).toBe(false);
+  });
+
+  it("기준선에 이미 있던 턴은 — 본문이 같아도 — 내 것이 아니다", () => {
+    // 같은 요청을 연달아 보내는 경우: 앞선 턴이 새 제출을 확인해 주면 안 된다.
+    const turns = new Map<number, string>([[1, TEXT]]);
+    const probe = makeSubmitProbe(() => turns, TEXT);
+    probe.capture();
+    expect(probe.observed()).toBe(false);
+    turns.set(2, TEXT); // 이번 제출이 도착
     expect(probe.observed()).toBe(true);
   });
 
   it("**보낸 뒤에 잡으면** 아주 빠른 턴을 놓쳐 성공을 실패로 오보한다", () => {
-    // 이것이 고친 실결함이다: CR 직후 도착한 턴이 이미 기준선에 포함된다.
-    let turns = 3;
-    turns = 4; // 제출이 즉시 반영됐다
-    const late = makeSubmitProbe(() => turns);
+    const turns = new Map<number, string>([[1, "이전 질문"]]);
+    turns.set(2, TEXT); // 제출이 즉시 반영됐다
+    const late = makeSubmitProbe(() => turns, TEXT);
     late.capture(); // ← 늦게 잡은 기준선
     expect(late.observed()).toBe(false);
   });
 
-  it("증가가 없으면 미관측이다", () => {
-    let turns = 3;
-    const probe = makeSubmitProbe(() => turns);
+  it("공백 차이는 무시한다 (전사와 우리 문자열의 줄바꿈 처리가 갈릴 수 있다)", () => {
+    const turns = new Map<number, string>();
+    const probe = makeSubmitProbe(() => turns, "첫 줄\n둘째 줄\n셋째 줄이 꽤 길게 이어진다 여기까지");
     probe.capture();
-    expect(probe.observed()).toBe(false);
-    turns = 3;
+    turns.set(1, "첫 줄 둘째 줄 셋째 줄이 꽤 길게 이어진다 여기까지");
+    expect(probe.observed()).toBe(true);
+  });
+
+  it("증가가 없으면 미관측이다", () => {
+    const turns = new Map<number, string>();
+    const probe = makeSubmitProbe(() => turns, TEXT);
+    probe.capture();
     expect(probe.observed()).toBe(false);
   });
 
   it("기준선을 잡지 않았으면 판정하지 않는다 — 모르는 것을 실패로 보고하지 않는다", () => {
-    const probe = makeSubmitProbe(() => 0);
-    expect(probe.observed()).toBe(true);
+    expect(makeSubmitProbe(() => new Map(), TEXT).observed()).toBe(true);
   });
 });
 
 // ---- 시드 제출 바이트 (후속 A: injectSeed LF 실결함) -----------------------
 
 describe("submitBytes — 본문 모양이 바이트를 정한다", () => {
-  it("단일행은 CR 한 조각 — LF가 아니다", () => {
+  it("사용자 본문은 **길이와 무관하게** 붙여넣기로 감싼다 (codex J1)", () => {
+    // 한 줄짜리 메모라고 raw로 흘리면 그 안의 제어문자가 키 입력이 된다 —
+    // 보호가 본문 길이에 따라 있다 없다 하면 안 된다.
+    const one = submitBytes("한 줄 메모", "user");
+    expect(one).toHaveLength(2);
+    expect(one[0]).toBe(bracketedPaste("한 줄 메모"));
+    expect(one[1]).toBe("\r");
+    // 멀티라인도 같은 모양(정책이 길이에 의존하지 않는다).
+    expect(submitBytes("a\nb", "user")).toEqual(submitPasteBytes("a\nb"));
+    // 붙여넣기 종료 시퀀스를 본문에 넣어도 빠져나올 수 없다.
+    expect(submitBytes("탈출\x1b[201~시도", "user")[0]).not.toContain("\x1b[201~탈출");
+  });
+
+  it("앱 시드는 단일행이면 CR 한 조각 — LF가 아니다", () => {
     // 예전 구현은 `text + "\n"`이었다. LF는 제출이 아니라 소프트 개행이라
     // 시드가 입력창에 앉아만 있고 대화가 시작되지 않았다.
     expect(submitBytes("이 파일 검토해줘")).toEqual(["이 파일 검토해줘\r"]);
     expect(submitBytes("한 줄")[0]).not.toContain("\n");
   });
 
-  it("멀티라인은 붙여넣기 + CR 두 조각 — 순서대로 따로 써야 한다", () => {
+  it("앱 시드 멀티라인은 붙여넣기 + CR 두 조각 — 순서대로 따로 써야 한다", () => {
     const body = "이 커밋 리뷰하자\n- a.rs\n- b.rs";
     expect(submitBytes(body)).toEqual(submitPasteBytes(body));
     const parts = submitBytes(body);

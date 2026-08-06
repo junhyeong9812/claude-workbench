@@ -121,14 +121,37 @@ export function submitPasteBytes(text: string): [string, string] {
 export const SEED_READY_DELAY = 3000;
 
 /**
- * 이 본문을 **제출**하는 바이트 조각들 — 한 조각(단일행) 또는 두 조각(멀티라인).
+ * 본문이 어디서 왔는가 — **인코딩** 정책을 가르는 축.
  *
- * 두 모양을 가르는 이유는 실측이다:
- * - 단일행: `\r` 하나면 제출된다. `\n`(LF)은 **제출 신호가 아니라 소프트 개행**이라
- *   입력창에 줄만 하나 늘리고 끝난다 — 기존 시드 주입이 조용히 실패하던 원인.
- * - 멀티라인: 여러 줄이 버퍼에 들어가면 CR도 제출로 동작하지 않는다. bracketed
- *   paste로 본문을 넣고 **다음 프레임에 별도 write로** CR을 보내야 제출된다
- *   (같은 write에 붙인 CR은 붙여넣기 본문으로 먹힌다 — {@link REFINE_SUBMIT_CR_DELAY}).
+ * 제출 정책(마지막 조각은 CR)은 둘이 같다. 다른 것은 본문을 그대로 키 스트림에
+ * 흘려도 되는지다.
+ */
+export type SubmitSource =
+  /** 사용자가 에디터에 직접 쓴 글 — 무엇이든 들어 있을 수 있다. */
+  | "user"
+  /** 앱이 템플릿으로 만든 시드 — 모양을 코드가 안다. */
+  | "app";
+
+/**
+ * 이 본문을 **제출**하는 바이트 조각들. 마지막 조각은 언제나 CR이다.
+ *
+ * 두 정책이 겹쳐 있으니 나눠서 읽어야 한다.
+ *
+ * **제출 정책(출처 무관)** — 실측: `\r`만 제출이고 `\n`(LF)은 소프트 개행이라
+ * 입력창에 줄만 하나 늘린다(기존 시드 주입이 조용히 실패하던 원인). 여러 줄이
+ * 버퍼에 들어간 뒤에는 CR도 제출로 동작하지 않으므로, 멀티라인은 붙여넣기로 본문을
+ * 넣고 **다음 프레임에 별도 write로** CR을 보낸다(같은 write의 CR은 붙여넣기
+ * 본문으로 먹힌다 — {@link REFINE_SUBMIT_CR_DELAY}).
+ *
+ * **인코딩 정책(출처가 가른다)**:
+ * - `"user"` — **길이·줄 수와 무관하게 항상 붙여넣기로 감싼다.** 사용자가 쓴
+ *   글에는 무엇이든 있을 수 있고(ESC·제어문자·붙여온 터미널 출력), 감싸지 않고
+ *   흘리면 그 바이트가 본문이 아니라 **키 입력**으로 해석된다. 한 줄짜리라고
+ *   raw로 보내면 그 보호가 길이에 따라 있다 없다 하는 셈이라, 짧은 메모 하나가
+ *   보호를 잃는다(codex J1). `bracketedPaste`가 종료 시퀀스를 제거하므로
+ *   본문이 붙여넣기를 중간에 끊고 나올 수도 없다.
+ * - `"app"` — 시드는 코드가 만든 템플릿이고 모양을 안다. 단일행이면 `\r` 한
+ *   조각으로 끝내 300ms 지연과 붙여넣기 왕복을 아낀다(가장 흔한 경로다).
  *
  * 끝의 공백·개행은 떼고 판정·전송한다. 단일행 본문에 개행이 하나라도 남아 있으면
  * 그 순간 "멀티라인 버퍼 + CR" = 미제출로 떨어지기 때문이다(문안은 그대로 —
@@ -137,10 +160,10 @@ export const SEED_READY_DELAY = 3000;
  * 반환이 배열인 것이 계약이다: 호출부는 조각을 **순서대로, 사이에 지연을 두고,
  * 각각 따로** 써야 한다.
  */
-export function submitBytes(text: string): string[] {
+export function submitBytes(text: string, source: SubmitSource = "app"): string[] {
   const body = text.replace(/\s+$/, "");
-  if (!body.includes("\n")) return [`${body}\r`];
-  return submitPasteBytes(body);
+  if (source === "user" || body.includes("\n")) return submitPasteBytes(body);
+  return [`${body}\r`];
 }
 
 /**
@@ -179,6 +202,8 @@ export interface SendGate {
   blocked: boolean;
   /** 이미 보내는 중인가. */
   sending: boolean;
+  /** 규약 시드가 아직 나가지 않았는가 (세션 시작 직후의 짧은 창). */
+  seedPending: boolean;
 }
 
 /**
@@ -193,6 +218,13 @@ export function sendBlockReason(g: SendGate): string | null {
   if (g.sending) return "메모를 보내는 중입니다.";
   if (g.text.trim() === "") return "메모가 비어 있습니다 — 초안을 먼저 쓰세요.";
   if (!g.sessionOpen) return "정리 세션이 아직 시작되지 않았습니다.";
+  // 순서 역전 차단(codex J4): 규약 시드는 세션이 열린 **뒤** 지연을 두고 나간다.
+  // 그 창에서 초안을 보내면 도우미가 규약을 받기 전에 초안을 먼저 읽어, 프롬프트를
+  // 다듬는 대신 초안의 지시를 실행하려 든다. 지연을 따로 관리해 경주하는 것보다
+  // "시드가 나갔는가"를 게이트로 두는 편이 단순하고, 실패 모드도 하나뿐이다
+  // (버튼이 잠깐 비활성).
+  if (g.seedPending)
+    return "정리 도우미에게 규약을 보내는 중입니다 — 잠시 뒤 다시 시도하세요.";
   if (!g.isDriver) return "이 창은 읽기 전용 미러입니다 — 입력 권한을 먼저 가져오세요.";
   if (g.blocked)
     return (
@@ -304,25 +336,49 @@ export function refineMemoLocked(phase: RefineClosePhase): boolean {
   return phase === "archiving";
 }
 
+/** 확인에 쓸 만큼의 앞부분 — 너무 짧으면 남의 턴과 우연히 겹친다. */
+const PROBE_HEAD = 40;
+
+/** 공백 차이를 무시한 비교용 정규화 (전사와 우리가 보낸 문자열이 줄바꿈·들여쓰기
+ * 처리에서 갈릴 수 있다 — 확인은 "같은 요청인가"만 알면 된다). */
+const normalizeForProbe = (s: string): string => s.replace(/\s+/g, " ").trim();
+
 /**
- * 제출 확인기 — 전사가 실제로 자랐는지로 [보내기]의 성공을 사후 판정한다.
+ * 제출 확인기 — **내가 보낸 그 본문이** 전사에 새 사용자 턴으로 나타났는지 본다.
  *
- * **기준선은 반드시 바이트를 쓰기 *전*에 잡아야 한다**. CR을 보낸 뒤에 잡으면,
- * 아주 빠르게 도착한 턴이 이미 기준선에 포함돼 "증가 없음"으로 읽히고 제출이
+ * 예전에는 턴 **개수**만 셌다. 정리 세션처럼 다른 입력원이 없는 곳에서는 그걸로
+ * 충분했지만, 일반 세션에서는 사용자가 직접 타이핑한 턴이나 앞선 주입이 그
+ * 증가를 만들 수 있다 — 제출되지 않은 요청을 "확인됨"으로 읽는다(codex J3).
+ * 그래서 기준선 이후 **새로 생긴** 턴들만 보고, 그중 본문 앞부분이 내가 보낸
+ * 것과 일치하는 턴이 있어야 확인으로 친다.
+ *
+ * **기준선은 반드시 바이트를 쓰기 *전*에 잡아야 한다**. CR을 보낸 뒤에 잡으면
+ * 아주 빠르게 도착한 턴이 이미 기준선에 들어가 "없음"으로 읽히고, 제출이
  * 성공했는데도 경고가 뜬다. `capture()`를 안 불렀으면 아예 판정하지 않는다 —
  * 모르는 것을 실패로 보고하지 않기 위해서다.
+ *
+ * 오판 방향은 한쪽으로 몰아 두었다: 확인에 실패하면 "Enter를 눌러 보라"는 안내가
+ * 뜰 뿐이고(자동 재전송 없음), 잘못 "확인됨"으로 넘기면 사용자는 아무것도 모른 채
+ * 기다린다. 그래서 애매하면 미확인으로 떨어뜨린다.
  */
-export function makeSubmitProbe(read: () => number): {
-  capture(): void;
-  observed(): boolean;
-} {
-  let base: number | null = null;
+export function makeSubmitProbe(
+  readTurns: () => ReadonlyMap<number, string>,
+  text: string,
+): { capture(): void; observed(): boolean } {
+  let before: Set<number> | null = null;
+  const needle = normalizeForProbe(text).slice(0, PROBE_HEAD);
   return {
     capture() {
-      base = read();
+      before = new Set(readTurns().keys());
     },
     observed() {
-      return base === null || read() > base;
+      if (before === null) return true; // 기준선 없음 — 판정하지 않는다
+      if (needle === "") return false;
+      for (const [turn, prompt] of readTurns()) {
+        if (before.has(turn)) continue; // 기준선에 있던 턴은 내 것이 아니다
+        if (normalizeForProbe(prompt).startsWith(needle)) return true;
+      }
+      return false;
     },
   };
 }
