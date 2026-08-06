@@ -24,6 +24,7 @@ import { DropTargetOverlay } from "./DropTargetOverlay";
 import { installTransferTarget } from "../state/panelTransferTarget";
 import { components, AppTab, type PanelKind } from "./panelRegistry";
 import { closeEphemeralPanels } from "../state/ephemeralPanels";
+import { openProjectMemo } from "../state/projectMemo";
 import { type SessionDragPayload } from "./sessionDropZone";
 import { useSessionDropZone } from "../hooks/useSessionDropZone";
 import { resolveLayerMode, integratedIsFront } from "../state/layerRouting";
@@ -609,6 +610,24 @@ export function MainArea({
     void openPicker();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [claudePickerRequest]);
+
+  // "메모" — 이 프로젝트의 메모 패널을 연다(이미 있으면 포커스). 다른 툴바
+  // 버튼과 같은 bump 카운터 계약이고, 규칙(결정적 id·중복 방지)은 순수 모듈
+  // state/projectMemo가 소유한다. 프로젝트가 없으면 저장 키가 없으므로 no-op.
+  const memoRequest = useAppStore((s) => s.memoRequest);
+  const memoHandledRef = useRef(memoRequest);
+  useEffect(() => {
+    if (!isPrimary) return;
+    if (memoRequest === memoHandledRef.current) return;
+    memoHandledRef.current = memoRequest;
+    if (!integratedIsFront(layerMode)) return;
+    const api = apiRef.current;
+    if (!api || !activeProject) return;
+    setTermMenu(false);
+    setPicker(null);
+    openProjectMemo(api, activeProject);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [memoRequest]);
 
   const detachPanelRequest = useAppStore((s) => s.detachPanelRequest);
   const detachHandledRef = useRef(detachPanelRequest);

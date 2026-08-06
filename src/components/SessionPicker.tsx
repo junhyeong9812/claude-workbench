@@ -29,6 +29,7 @@ import {
   type SessionSummary,
 } from "../state/sessionCatalog";
 import { fmtAgo, fmtUnix } from "../utils/time";
+import { useAppStore } from "../state/store";
 
 export interface SessionPickerController {
   /** null = 피커 닫힘. */
@@ -427,6 +428,24 @@ export function SessionPicker({
           </>
         );
       })()}
+      {activeProject && (
+        <>
+          <div className="claude-picker-sep">프로젝트</div>
+          <button
+            className="claude-picker-item"
+            title="이 프로젝트의 메모장 (자동 저장 · 프로젝트당 1개). 툴바 ▤ 메모와 같은 탭을 엽니다."
+            onClick={() => {
+              // 여는 실행부는 MainArea가 소유한다(dockview api가 거기 있다) —
+              // 피커는 툴바 버튼과 **같은** 요청 버스를 두드릴 뿐이라 두 진입점이
+              // 갈라질 수 없다. 닫기는 그 소비자가 한다.
+              useAppStore.getState().requestMemo();
+            }}
+          >
+            <span className="claude-picker-title">▤ 메모장</span>
+            <span className="claude-picker-meta">이 프로젝트의 메모 (세션 아님)</span>
+          </button>
+        </>
+      )}
       <button className="claude-picker-item claude-picker-cancel" onClick={() => setPicker(null)}>
         취소
       </button>

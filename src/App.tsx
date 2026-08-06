@@ -609,6 +609,7 @@ function AppMain() {
   const requestTermMenu = useAppStore((s) => s.requestTermMenu);
   const requestClaudePicker = useAppStore((s) => s.requestClaudePicker);
   const requestDetachPanel = useAppStore((s) => s.requestDetachPanel);
+  const requestMemo = useAppStore((s) => s.requestMemo);
 
   return (
     <div className="app">
@@ -685,6 +686,20 @@ function AppMain() {
               onClick={() => requestDetachPanel()}
             >
               <span className="toolbar-ico">⤢</span> 분리
+            </button>
+            <button
+              className="toolbar-btn"
+              title={
+                layerMode === "dev"
+                  ? "메모는 통합 모드에서 사용할 수 있습니다"
+                  : !activeProject
+                    ? "메모는 프로젝트를 연 뒤 사용할 수 있습니다"
+                    : "이 프로젝트의 메모장 열기 (자동 저장 · 프로젝트당 1개)"
+              }
+              disabled={layerMode === "dev" || !activeProject}
+              onClick={() => requestMemo()}
+            >
+              <span className="toolbar-ico">▤</span> 메모
             </button>
           </div>
         )}
