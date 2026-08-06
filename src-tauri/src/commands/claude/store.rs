@@ -199,7 +199,11 @@ pub fn claude_delete(app: AppHandle, project: String, uuid: String) -> Result<()
         .map_err(|_| AppError::new("Cannot resolve app data directory"))?;
     core_lib::snapshot::delete(&base, &project, &uuid)
         .map_err(|e| AppError::new(io_message("Cannot delete session", &e)))?;
-    if let Err(e) = core_lib::hidden::hide(&base, &project, &uuid) {
+    // The transcripts root is passed so that, if this project's dismissal list is
+    // ever at its cap, tombstones (dismissals whose transcript is gone) are what
+    // gets evicted rather than a dismissal that is still doing its job.
+    let root = core_lib::jsonl::claude_projects_root();
+    if let Err(e) = core_lib::hidden::hide(&base, &project, &uuid, root.as_deref()) {
         eprintln!(
             "claude_delete: 숨김 목록 기록 실패 — 이 세션이 '외부 세션'으로 다시 보일 수 있습니다 ({e})"
         );

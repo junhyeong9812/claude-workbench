@@ -72,9 +72,9 @@ pub fn same_dir(a: &str, b: &str) -> bool {
 /// candidates, before any liveness verdict. Paired with each transcript's path.
 ///
 /// Split out of [`list_external`] because the spawn-time recheck needs the very
-/// same set to rank against: "which of this directory's candidates is newest"
-/// has to mean the same thing in the picker and at the spawn, or the two would
-/// disagree about which row signal 3b blocks.
+/// same set: "this uuid is still an adoptable external session of this project,
+/// and this is when it was last written" has to mean the same thing in the picker
+/// and at the spawn, or the two checks would be answering different questions.
 fn candidates(
     projects_root: &Path,
     snapshot_base: &Path,
@@ -139,17 +139,20 @@ fn candidates(
 ///
 /// `hidden` is carried in the same response rather than fetched on demand: the
 /// toggle that reveals it must show a **count** before it is expanded, and a
-/// count the user can't act on is worse than the rows themselves. `hidden_count`
-/// is `hidden.len()` — the hidden sessions that still exist as transcripts here,
-/// not the size of the dismissal list (entries whose transcript is gone are
-/// nothing the UI can offer).
+/// count the user can't act on is worse than the rows themselves.
+///
+/// That count is `hidden.len()` and is deliberately *not* also sent as a field:
+/// the UI filters the rows once more (a session already open in a panel is never
+/// offered), so a number computed here would be the wrong one to print the
+/// moment the two disagree. Only rows the user could actually be shown are in
+/// `hidden` — a dismissal whose transcript is gone is nothing the UI can offer,
+/// so it never appears.
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct ExternalListing {
     /// Adoptable rows, newest first.
     pub sessions: Vec<ExternalSession>,
     /// Rows the user deleted and has not adopted since, newest first.
     pub hidden: Vec<ExternalSession>,
-    pub hidden_count: usize,
 }
 
 /// List `project`'s transcripts that this app has no snapshot for, newest first,
@@ -195,7 +198,7 @@ pub fn list_external(
     let dismissed: HashSet<String> = crate::hidden::load(snapshot_base, project).into_iter().collect();
     let (hidden, sessions): (Vec<_>, Vec<_>) =
         out.into_iter().partition(|s| dismissed.contains(&s.uuid));
-    ExternalListing { hidden_count: hidden.len(), sessions, hidden }
+    ExternalListing { sessions, hidden }
 }
 
 /// When `uuid`'s transcript was last written, unix seconds — the input
@@ -431,11 +434,11 @@ mod tests {
         let uuids = |v: &[ExternalSession]| v.iter().map(|s| s.uuid.clone()).collect::<Vec<_>>();
 
         // 삭제 = 숨김. 그 행은 목록에서 빠지고 숨김 버킷으로 간다.
-        crate::hidden::hide(&snaps, &p, new).unwrap();
+        crate::hidden::hide(&snaps, &p, new, None).unwrap();
         let l = list_external(&projects, &snaps, &p, &blind, 0);
         assert_eq!(uuids(&l.sessions), vec![old.to_string()]);
         assert_eq!(uuids(&l.hidden), vec![new.to_string()]);
-        assert_eq!(l.hidden_count, 1);
+        assert_eq!(l.hidden.len(), 1);
 
         // 숨겨도 후보에서 빠지지는 않는다 — 그 전사는 여전히 디스크에 있고
         // 무특정 claude가 쓰고 있을 수 있으므로 live 판정 입력으로 남는다.
@@ -447,11 +450,11 @@ mod tests {
         let l = list_external(&projects, &snaps, &p, &blind, 0);
         assert_eq!(uuids(&l.sessions), vec![new.to_string(), old.to_string()]);
         assert!(l.hidden.is_empty());
-        assert_eq!(l.hidden_count, 0);
+        assert_eq!(l.hidden.len(), 0);
 
         // 전사가 사라진 숨김 uuid는 아무 수에도 잡히지 않는다(보여줄 게 없다).
-        crate::hidden::hide(&snaps, &p, "cccccccc-1111-2222-3333-444444444444").unwrap();
-        assert_eq!(list_external(&projects, &snaps, &p, &blind, 0).hidden_count, 0);
+        crate::hidden::hide(&snaps, &p, "cccccccc-1111-2222-3333-444444444444", None).unwrap();
+        assert!(list_external(&projects, &snaps, &p, &blind, 0).hidden.is_empty());
         let _ = std::fs::remove_dir_all(&base);
     }
 

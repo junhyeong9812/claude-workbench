@@ -191,8 +191,8 @@ describe("externalRows — 최신순 + 열린 세션 제외", () => {
 });
 
 describe("EMPTY_EXTERNAL — 조회 실패 시의 빈 응답", () => {
-  it("세 필드가 모두 비어 있다 (섹션 자체가 사라지는 상태)", () => {
-    expect(EMPTY_EXTERNAL).toEqual({ sessions: [], hidden: [], hidden_count: 0 });
+  it("두 목록이 모두 비어 있다 (섹션 자체가 사라지는 상태)", () => {
+    expect(EMPTY_EXTERNAL).toEqual({ sessions: [], hidden: [] });
   });
 });
 
