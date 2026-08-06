@@ -349,7 +349,8 @@ pub fn claude_open_or_attach(
     // side work above and immediately before the spawn, so nothing runs between
     // the check and the PTY (review #1, audit B2). The runtime lock is held
     // throughout. One /proc pass, measured at ~0.12 s.
-    if adopt.unwrap_or(false) {
+    let adopting = adopt.unwrap_or(false);
+    if adopting {
         if let Some(uuid) = uuid.as_deref() {
             recheck_adoptable(&app, &project, uuid, &cwd)?;
         }
@@ -367,6 +368,17 @@ pub fn claude_open_or_attach(
         cols,
         rows,
     )?;
+    // Adopting a session the user had deleted spends the dismissal: they just
+    // reopened it, so it belongs in the normal list again (`core::hidden`).
+    // Only after the spawn actually succeeded — a refused adopt must leave the
+    // hidden list exactly as it was.
+    if adopting {
+        if let Ok(base) = app.path().app_data_dir() {
+            if let Err(e) = core_lib::hidden::unhide(&base, &project, &session_uuid) {
+                eprintln!("claude_open_or_attach: 숨김 해제 실패 — 이 세션은 숨김 목록에 남습니다 ({e})");
+            }
+        }
+    }
     rt.register(id, project, session_uuid.clone(), label.clone(), stop); // T3
     Ok(ClaudeOpened { id, session_uuid, role: "driver".into(), driver: label, rev: 0 })
 }

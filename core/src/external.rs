@@ -137,18 +137,43 @@ fn newest_mtime(rows: &[(ExternalSession, PathBuf)]) -> Option<u64> {
     rows.iter().map(|(s, _)| s.modified).max()
 }
 
-/// List `project`'s transcripts that this app has no snapshot for, newest first.
+/// What the picker's external section shows, split by the user's own dismissals
+/// ([`crate::hidden`]).
+///
+/// `hidden` is carried in the same response rather than fetched on demand: the
+/// toggle that reveals it must show a **count** before it is expanded, and a
+/// count the user can't act on is worse than the rows themselves. `hidden_count`
+/// is `hidden.len()` — the hidden sessions that still exist as transcripts here,
+/// not the size of the dismissal list (entries whose transcript is gone are
+/// nothing the UI can offer).
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct ExternalListing {
+    /// Adoptable rows, newest first.
+    pub sessions: Vec<ExternalSession>,
+    /// Rows the user deleted and has not adopted since, newest first.
+    pub hidden: Vec<ExternalSession>,
+    pub hidden_count: usize,
+}
+
+/// List `project`'s transcripts that this app has no snapshot for, newest first,
+/// split into visible and hidden.
 ///
 /// `proc_root` is `/proc` in production and is injectable for tests. `self_pid`
 /// is excluded from the liveness scan so the app's own file handles and command
 /// line never make a session look busy.
+///
+/// Hiding happens **after** the liveness verdict, not before: a hidden
+/// transcript is still a file an un-pinned `claude` could be writing, so it must
+/// keep taking part in the mtime ranking (see [`crate::live`]). Dropping hidden
+/// rows earlier would hand their `Newest` slot to a visible row and report a
+/// blocked session as adoptable.
 pub fn list_external(
     projects_root: &Path,
     snapshot_base: &Path,
     project: &str,
     proc_root: &Path,
     self_pid: u32,
-) -> Vec<ExternalSession> {
+) -> ExternalListing {
     let found = candidates(projects_root, snapshot_base, project);
     let newest = newest_mtime(&found);
 
@@ -169,7 +194,11 @@ pub fn list_external(
         })
         .collect();
     out.sort_by(|a, b| b.modified.cmp(&a.modified).then(a.uuid.cmp(&b.uuid)));
-    out
+
+    let dismissed: HashSet<String> = crate::hidden::load(snapshot_base, project).into_iter().collect();
+    let (hidden, sessions): (Vec<_>, Vec<_>) =
+        out.into_iter().partition(|s| dismissed.contains(&s.uuid));
+    ExternalListing { hidden_count: hidden.len(), sessions, hidden }
 }
 
 /// Where `uuid` ranks by mtime among `project`'s adoptable candidates — the
@@ -260,7 +289,7 @@ mod tests {
 
         // No /proc → every verdict is Unknown, but membership is what's asserted.
         let missing_proc = base.join("no-proc");
-        let list = list_external(&projects, &snaps, &project_s, &missing_proc, 0);
+        let list = list_external(&projects, &snaps, &project_s, &missing_proc, 0).sessions;
         assert_eq!(list.iter().map(|s| s.uuid.as_str()).collect::<Vec<_>>(), vec![theirs]);
         assert_eq!(list[0].cwd, project_s);
         assert_eq!(list[0].title, "터미널에서 연 세션");
@@ -268,7 +297,7 @@ mod tests {
         // Adopt: the poll thread writes a snapshot → the row disappears. No flag,
         // no state file — just the difference.
         save(&snaps, &project_s, &snap(theirs)).unwrap();
-        assert!(list_external(&projects, &snaps, &project_s, &missing_proc, 0).is_empty());
+        assert!(list_external(&projects, &snaps, &project_s, &missing_proc, 0).sessions.is_empty());
         let _ = std::fs::remove_dir_all(&base);
     }
 
@@ -287,7 +316,8 @@ mod tests {
         // A scratch slug is skipped outright.
         transcript(&projects, "-tmp-scratch", "cccccccc-1111-2222-3333-444444444444", &mine.to_string_lossy(), "scratch");
 
-        let list = list_external(&projects, &snaps, &mine.to_string_lossy(), &base.join("no-proc"), 0);
+        let list =
+            list_external(&projects, &snaps, &mine.to_string_lossy(), &base.join("no-proc"), 0).sessions;
         assert_eq!(
             list.iter().map(|s| s.uuid.as_str()).collect::<Vec<_>>(),
             vec!["aaaaaaaa-1111-2222-3333-444444444444"]
@@ -310,7 +340,7 @@ mod tests {
             &p,
             crate::knowledge::EXTRACTION_MARKER,
         );
-        assert!(list_external(&projects, &snaps, &p, &base.join("no-proc"), 0).is_empty());
+        assert!(list_external(&projects, &snaps, &p, &base.join("no-proc"), 0).sessions.is_empty());
         let _ = std::fs::remove_dir_all(&base);
     }
 
@@ -324,12 +354,12 @@ mod tests {
         let p = project.to_string_lossy().to_string();
         transcript(&projects, "-p", "aaaaaaaa-1111-2222-3333-444444444444", &p, "hi");
 
-        let blind = list_external(&projects, &snaps, &p, &base.join("no-proc"), 0);
+        let blind = list_external(&projects, &snaps, &p, &base.join("no-proc"), 0).sessions;
         assert_eq!(blind[0].live, Liveness::Unknown);
         // With a real /proc and nothing running on it, the same row is adoptable.
         #[cfg(target_os = "linux")]
         {
-            let seeing = list_external(&projects, &snaps, &p, Path::new("/proc"), 0);
+            let seeing = list_external(&projects, &snaps, &p, Path::new("/proc"), 0).sessions;
             assert_eq!(seeing[0].live, Liveness::Free);
         }
         let _ = std::fs::remove_dir_all(&base);
@@ -401,6 +431,50 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
+    #[test]
+    fn hidden_sessions_move_to_their_own_bucket_and_keep_ranking() {
+        let base = temp("hidden");
+        let projects = base.join("projects-root");
+        let snaps = base.join("app-data");
+        let project = base.join("p");
+        std::fs::create_dir_all(&project).unwrap();
+        let p = project.to_string_lossy().to_string();
+        let (new, old) = (
+            "aaaaaaaa-1111-2222-3333-444444444444",
+            "bbbbbbbb-1111-2222-3333-444444444444",
+        );
+        for (u, ago) in [(new, 10u64), (old, 1000)] {
+            transcript(&projects, "-p", u, &p, "hi");
+            set_mtime(&projects, "-p", u, ago);
+        }
+        let blind = base.join("no-proc");
+        let uuids = |v: &[ExternalSession]| v.iter().map(|s| s.uuid.clone()).collect::<Vec<_>>();
+
+        // 삭제 = 숨김. 그 행은 목록에서 빠지고 숨김 버킷으로 간다.
+        crate::hidden::hide(&snaps, &p, new).unwrap();
+        let l = list_external(&projects, &snaps, &p, &blind, 0);
+        assert_eq!(uuids(&l.sessions), vec![old.to_string()]);
+        assert_eq!(uuids(&l.hidden), vec![new.to_string()]);
+        assert_eq!(l.hidden_count, 1);
+
+        // 숨겨도 후보에서 빠지지는 않는다 — 그 전사는 여전히 디스크에 있고
+        // 무특정 claude가 쓰고 있을 수 있으므로 mtime 순위를 계속 차지한다.
+        assert_eq!(rank_of(&projects, &snaps, &p, new), CwdRank::Newest);
+        assert_eq!(rank_of(&projects, &snaps, &p, old), CwdRank::Older);
+
+        // adopt = 숨김 해제. 목록이 원래대로 돌아온다.
+        crate::hidden::unhide(&snaps, &p, new).unwrap();
+        let l = list_external(&projects, &snaps, &p, &blind, 0);
+        assert_eq!(uuids(&l.sessions), vec![new.to_string(), old.to_string()]);
+        assert!(l.hidden.is_empty());
+        assert_eq!(l.hidden_count, 0);
+
+        // 전사가 사라진 숨김 uuid는 아무 수에도 잡히지 않는다(보여줄 게 없다).
+        crate::hidden::hide(&snaps, &p, "cccccccc-1111-2222-3333-444444444444").unwrap();
+        assert_eq!(list_external(&projects, &snaps, &p, &blind, 0).hidden_count, 0);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
     /// End-to-end for the #69 review item 6 fix: a real un-pinned `claude`
     /// running in the project directory used to make **every** row of that
     /// project unadoptable. Now it costs exactly the newest row.
@@ -423,7 +497,7 @@ mod tests {
             set_mtime(&projects, "-p", u, ago);
         }
         // Nothing running yet: both adoptable.
-        let before = list_external(&projects, &snaps, &p, Path::new("/proc"), 0);
+        let before = list_external(&projects, &snaps, &p, Path::new("/proc"), 0).sessions;
         assert!(before.iter().all(|s| s.live == Liveness::Free), "{before:?}");
 
         // An un-pinned `claude` sitting in the project directory (live.rs's own
@@ -431,7 +505,7 @@ mod tests {
         let mut child = crate::live::spawn_unpinned_claude(&project);
         let mut list = Vec::new();
         for _ in 0..100 {
-            list = list_external(&projects, &snaps, &p, Path::new("/proc"), std::process::id());
+            list = list_external(&projects, &snaps, &p, Path::new("/proc"), std::process::id()).sessions;
             if list.iter().any(|s| s.live == Liveness::Unknown) {
                 break;
             }

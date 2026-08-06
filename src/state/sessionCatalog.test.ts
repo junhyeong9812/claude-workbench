@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  EMPTY_EXTERNAL,
   adoptable,
   archBusyUpdate,
   buildSessionSummaries,
@@ -158,6 +159,22 @@ describe("externalRows — 최신순 + 열린 세션 제외", () => {
     const before = rows.map((r) => r.uuid);
     externalRows(rows, new Set());
     expect(rows.map((r) => r.uuid)).toEqual(before);
+  });
+
+  it("숨긴 행도 같은 규칙을 탄다 — 숨김은 표시 여부일 뿐 다른 목록이 아니다", () => {
+    const hidden: ExternalSessionRow[] = [
+      { uuid: "h1", title: "삭제한 세션", cwd: "/p", modified: 100, live: "free" },
+      { uuid: "h2", title: "삭제한 세션2", cwd: "/p", modified: 400, live: "free" },
+    ];
+    expect(externalRows(hidden, new Set()).map((r) => r.uuid)).toEqual(["h2", "h1"]);
+    // 숨김이라도 이미 열려 있으면 (토글로 펼쳐도) 다시 제안하지 않는다.
+    expect(externalRows(hidden, new Set(["h2"])).map((r) => r.uuid)).toEqual(["h1"]);
+  });
+});
+
+describe("EMPTY_EXTERNAL — 조회 실패 시의 빈 응답", () => {
+  it("세 필드가 모두 비어 있다 (섹션 자체가 사라지는 상태)", () => {
+    expect(EMPTY_EXTERNAL).toEqual({ sessions: [], hidden: [], hidden_count: 0 });
   });
 });
 

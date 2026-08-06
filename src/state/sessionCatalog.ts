@@ -95,6 +95,23 @@ export interface ExternalSessionRow {
   live: "free" | "live" | "unknown";
 }
 
+/**
+ * `claude_external_sessions` 응답 — 보이는 행과 **숨긴** 행(사용자가 삭제한
+ * 세션)이 한 번에 온다. 숨김은 표시 계층 결정이라 전사·스냅샷은 그대로다.
+ *
+ * `hidden_count`는 지금 전사가 실재하는 숨김 세션 수 = `hidden.length`
+ * (백엔드가 계산해 준 값을 그대로 쓴다 — 토글 라벨이 펼치기 전에도 수를 말해야
+ * 한다).
+ */
+export interface ExternalListing {
+  sessions: ExternalSessionRow[];
+  hidden: ExternalSessionRow[];
+  hidden_count: number;
+}
+
+/** 조회 실패·프로젝트 없음일 때의 빈 응답 (한 곳에서만 만든다). */
+export const EMPTY_EXTERNAL: ExternalListing = { sessions: [], hidden: [], hidden_count: 0 };
+
 /** 지금 붙어도 되는 세션인가. `unknown`은 **막는다** — 판정 못 한 세션에 붙으면
  * 같은 전사에 두 프로세스가 append해서 세션이 깨진다(복구 불가). */
 export const adoptable = (row: ExternalSessionRow): boolean => row.live === "free";

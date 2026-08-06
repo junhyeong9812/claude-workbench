@@ -16,6 +16,7 @@ pub mod external;
 pub mod fs;
 pub mod git;
 pub mod graph;
+pub mod hidden;
 pub mod history;
 pub mod jsonl;
 pub mod knowledge;
