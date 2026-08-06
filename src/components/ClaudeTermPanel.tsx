@@ -292,12 +292,14 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
   // 나눠 두는 이유: 정리 패널이 아닌 일반 세션에도 떠야 하고, 둘이 동시에 살아
   // 있을 수 있다(정리 세션의 규약 시드 + 메모 보내기).
   const [seedNote, setSeedNote] = useState<string | null>(null);
-  // 규약 시드가 아직 안 나갔는가 (정리 세션 전용). 초기값은 "이 마운트가 시드를
-  // 들고 있는가" — 이미 굴러가던 세션을 다시 여는 경우엔 params.seed가 비어
-  // 있으므로 곧바로 열린다(codex J4).
-  const [seedPending, setSeedPending] = useState(
-    () => isRefineParams(props.params) && !!props.params.seed,
-  );
+  // 규약 시드가 아직 안 나갔는가 (정리 세션 전용, codex J4).
+  //
+  // **시드를 실제로 예약했을 때만** 켠다. params.seed 유무로 미리 켜 두면, 이
+  // 창이 미러라 시드를 보내지 않는 경우(driver가 아니면 예약 자체를 안 한다)
+  // 영영 켜진 채로 남아 "규약을 보내는 중"이라는 틀린 이유가 미러 안내를 덮는다.
+  // 예약 시점은 세션이 열리는 순간이고 그 전에는 sessionOpen 게이트가 막으므로,
+  // 늦게 켜서 생기는 틈은 없다.
+  const [seedPending, setSeedPending] = useState(false);
   // 메모 저장기의 손잡이 (MemoEditor가 마운트되면 채워진다) — 닫기 전에 저장을
   // 확인하는 유일한 경로.
   const memoHandleRef = useRef<MemoHandle | null>(null);
@@ -1070,6 +1072,9 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
         if (driving && props.params.seed && pendingSeedRef.current == null) {
           pendingSeedRef.current = props.params.seed;
           setLastSeed(props.params.seed);
+          // 규약 시드가 나가기 전까지 [보내기]를 잠근다(정리 세션만 — 일반
+          // 세션의 시드는 순서를 다툴 상대가 없다).
+          if (isRefine) setSeedPending(true);
         }
         // 1회성 필드(seed 주입·adopt 재검증)는 지우고 나머지는 보존 —
         // `spawnCwd`는 **남는다**(재시작 후에도 원 디렉토리에서 띄워야 한다).
