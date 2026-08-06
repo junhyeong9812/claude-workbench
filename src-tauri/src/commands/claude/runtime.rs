@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex};
 
 use core_lib::SessionManager;
 use serde::Serialize;
-use tauri::{AppHandle, Emitter, State, Window};
+use tauri::{AppHandle, Emitter, Manager, State, Window};
 
 use crate::commands::{io_message, AppError};
 
@@ -220,7 +220,18 @@ pub struct ClaudeDetached {
 /// exists, and `spawn_claude` falls back to `--session-id` when it can't find
 /// the file — so letting a missing transcript through would quietly create a
 /// brand-new session wearing the id of the one the user clicked (audit B2).
-fn recheck_adoptable(uuid: &str, cwd: &str) -> Result<(), AppError> {
+///
+/// The mtime rank signal 3b needs is recomputed here from the same candidate set
+/// the picker ranked against (`core::external::rank_of`), so the check the user
+/// saw and the check that gates the spawn cannot disagree about which row an
+/// un-pinned `claude` is presumed to hold. A rank we cannot establish — no app
+/// data dir, uuid no longer a candidate — comes back `Newest`, which blocks.
+fn recheck_adoptable(
+    app: &AppHandle,
+    project: &str,
+    uuid: &str,
+    cwd: &str,
+) -> Result<(), AppError> {
     let Some(root) = core_lib::jsonl::claude_projects_root() else {
         return Err(AppError::new("Claude 전사 디렉토리를 찾을 수 없어 세션을 열지 않았습니다."));
     };
@@ -244,7 +255,14 @@ fn recheck_adoptable(uuid: &str, cwd: &str) -> Result<(), AppError> {
         &targets,
         std::process::id(),
     );
-    match probe.classify(uuid, &jsonl, &dir) {
+    let rank = match app.path().app_data_dir() {
+        Ok(base) => core_lib::external::rank_of(&root, &base, project, uuid),
+        // Fail-closed: without the snapshot base we cannot tell which of this
+        // directory's transcripts are still candidates, so we assume this one is
+        // the newest — the blocking value.
+        Err(_) => core_lib::live::CwdRank::Newest,
+    };
+    match probe.classify(uuid, &jsonl, &dir, rank) {
         core_lib::live::Liveness::Free => Ok(()),
         core_lib::live::Liveness::Live => Err(AppError::new(
             "이 세션은 지금 다른 곳에서 열려 있습니다 — 그 창을 닫은 뒤 다시 시도하세요. \
@@ -252,7 +270,8 @@ fn recheck_adoptable(uuid: &str, cwd: &str) -> Result<(), AppError> {
         )),
         core_lib::live::Liveness::Unknown => Err(AppError::new(
             "이 세션이 열려 있는지 확인할 수 없어 열지 않았습니다 \
-             (같은 디렉토리에서 세션을 특정할 수 없는 claude가 돌고 있습니다).",
+             (같은 디렉토리에서 세션을 특정할 수 없는 claude가 돌고 있고, \
+             이 세션이 그 디렉토리에서 가장 최근에 쓰인 전사입니다).",
         )),
     }
 }
@@ -332,7 +351,7 @@ pub fn claude_open_or_attach(
     // throughout. One /proc pass, measured at ~0.12 s.
     if adopt.unwrap_or(false) {
         if let Some(uuid) = uuid.as_deref() {
-            recheck_adoptable(uuid, &cwd)?;
+            recheck_adoptable(&app, &project, uuid, &cwd)?;
         }
     }
 

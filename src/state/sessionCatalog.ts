@@ -110,7 +110,7 @@ export function liveBadge(row: ExternalSessionRow): { label: string; hint: strin
     case "unknown":
       return {
         label: "확인 불가",
-        hint: "이 세션이 열려 있는지 확인할 수 없습니다 (같은 디렉토리에서 세션을 특정할 수 없는 claude가 돌고 있습니다). 안전을 위해 막습니다",
+        hint: "이 세션이 열려 있는지 확인할 수 없습니다 — 같은 디렉토리에서 세션을 특정할 수 없는 claude가 돌고 있고, 그 claude가 쓰고 있을 가능성이 가장 큰 최신 전사(이 세션)만 막습니다. 같은 디렉토리의 나머지 세션은 그대로 열 수 있습니다",
       };
     default:
       return null;
