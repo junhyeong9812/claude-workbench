@@ -259,9 +259,9 @@ impl ProcInfo {
     }
 
     /// An un-pinned `claude` we positively located **in this directory**. This is
-    /// the one signal-3 case narrow enough to rank: we know where it is, so we
-    /// can ask *which* of that directory's transcripts it is writing (module
-    /// docs, [`CwdRank`]).
+    /// the one signal-3 case narrow enough to bound: we know where it is and when
+    /// it started, so we can say which of that directory's transcripts it cannot
+    /// have written (module docs, [`Threshold`]).
     fn is_unpinned_claude_in(&self, cwd: &Path) -> bool {
         self.is_claude() && !self.names_a_session() && self.cwd.as_deref() == Some(cwd)
     }
