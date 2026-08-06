@@ -1323,7 +1323,10 @@ body {
 }
 
 /* ---- Memo panel (프로젝트 메모장 — 자동 저장 롱폼 에디터) ---- */
-.memo-panel {
+/* `.memo-editor`는 프로젝트 메모장과 프롬프트 정리 초안이 함께 쓰는 에디터
+   껍데기다 — 세로 스택 + 높이 100%만 책임지고, 바깥 배경·패딩은 각 패널 몫. */
+.memo-panel,
+.memo-editor {
   display: flex;
   flex-direction: column;
   height: 100%;
