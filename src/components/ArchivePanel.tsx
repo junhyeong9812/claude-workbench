@@ -32,9 +32,21 @@ interface ArchiveEntry {
   date: string;
   turns: number;
   archived_at?: number | null;
+  /** 세션 종류 — 없거나 null이면 일반 작업 세션, "prompt"면 프롬프트 정리 세션. */
+  kind?: string | null;
   /** 보존된 과거 버전 (최신순) — 내용이 달라진 재아카이브가 만든 것. */
   history: ArchiveHistoryItem[];
 }
+
+/** 종류 필터의 선택지. 값은 `ArchiveEntry.kind`와 맞춘다("" = 전체). */
+const KIND_FILTERS = [
+  { value: "", label: "전체" },
+  { value: "session", label: "세션" },
+  { value: "prompt", label: "프롬프트" },
+] as const;
+
+/** 이 아카이브의 종류 키 — 라벨이 없는(구·일반) 아카이브는 전부 "세션"이다. */
+const kindOf = (s: ArchiveEntry): string => s.kind || "session";
 interface ArchiveGroup {
   project: string;
   index_path?: string | null;
@@ -50,6 +62,8 @@ export function ArchivePanel() {
   const dragPressRef = useRef<EventTarget | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [collapsed, setCollapsed] = useState<Set<string>>(new Set());
+  // 종류 필터 ("" = 전체). 목록은 전량 메모리라 파생 필터 하나로 충분하다.
+  const [kindFilter, setKindFilter] = useState("");
   // 과거 버전 목록이 펼쳐진 세션(uuid)들.
   const [versionsOpen, setVersionsOpen] = useState<Set<string>>(new Set());
   const setPeekFile = useAppStore((s) => s.setPeekFile);
@@ -128,11 +142,33 @@ export function ArchivePanel() {
     invoke("archive_open_path", { path }).catch((e) => alert(`열기 실패: ${errText(e)}`));
   };
 
+  // 필터를 통과한 목록 — 남는 세션이 없는 프로젝트 그룹은 통째로 감춘다(제목만
+  // 남은 빈 그룹은 "여기 뭔가 있다"는 거짓 신호다).
+  const shown =
+    kindFilter === ""
+      ? groups
+      : groups
+          .map((g) => ({ ...g, sessions: g.sessions.filter((s) => kindOf(s) === kindFilter) }))
+          .filter((g) => g.sessions.length > 0);
+
   return (
     <div className="archive-panel">
       <div className="archive-head">
         <span>세션 아카이브</span>
         <span className="archive-head-actions">
+          <select
+            className="archive-kind-filter"
+            value={kindFilter}
+            title="종류로 거르기 — 프롬프트 정리 세션은 닫을 때 '프롬프트'로 남습니다"
+            aria-label="아카이브 종류 필터"
+            onChange={(e) => setKindFilter(e.target.value)}
+          >
+            {KIND_FILTERS.map((k) => (
+              <option key={k.value} value={k.value}>
+                {k.label}
+              </option>
+            ))}
+          </select>
           <button
             className="archive-btn"
             title={`아카이브 설정 (경로: ${archiveRoot ?? "기본"} · 모델: ${archiveModel ?? "opus"} · effort: ${archiveEffort ?? "xhigh"})`}
@@ -219,8 +255,11 @@ export function ArchivePanel() {
           Claude 세션의 <b>종료(아카이브)</b> 버튼으로 만듭니다.
         </div>
       )}
+      {!error && groups.length > 0 && shown.length === 0 && (
+        <div className="archive-empty">이 종류의 아카이브가 없습니다.</div>
+      )}
       <div className="archive-list">
-        {groups.map((g) => {
+        {shown.map((g) => {
           const closed = collapsed.has(g.project);
           return (
             <div key={g.project} className="archive-project">
@@ -283,7 +322,17 @@ export function ArchivePanel() {
                       e.dataTransfer.effectAllowed = "copy";
                     }}
                   >
-                    <div className="archive-session-title">{s.title}</div>
+                    <div className="archive-session-title">
+                      {s.kind === "prompt" && (
+                        <span
+                          className="archive-kind"
+                          title="프롬프트 정리 세션 — 닫을 때 남은 기록입니다 (지식 추출 없음, 요약 자리에는 그때 쓴 메모)"
+                        >
+                          프롬프트
+                        </span>
+                      )}
+                      {s.title}
+                    </div>
                     <div className="archive-session-meta">
                       <span>
                         {s.date} · {s.turns} turns

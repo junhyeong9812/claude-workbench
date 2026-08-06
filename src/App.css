@@ -744,6 +744,25 @@ body {
   white-space: nowrap;
   text-overflow: ellipsis;
 }
+/* 종류 배지 — 일반 세션에는 붙지 않는다(예외만 라벨링). */
+.archive-kind {
+  margin-right: 6px;
+  padding: 0 5px;
+  font-size: 0.75em;
+  vertical-align: middle;
+  color: var(--fg, #cdd6f4);
+  background: color-mix(in srgb, var(--accent-bright) 22%, transparent);
+  border: 1px solid color-mix(in srgb, var(--accent-bright) 45%, transparent);
+  border-radius: 999px;
+}
+.archive-kind-filter {
+  padding: 1px 4px;
+  font-size: 0.9em;
+  color: var(--fg, #cdd6f4);
+  background: var(--bg, #1e1e1e);
+  border: 1px solid var(--border, #333);
+  border-radius: 4px;
+}
 .archive-session-meta {
   display: flex;
   align-items: center;
