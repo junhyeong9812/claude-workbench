@@ -87,12 +87,16 @@ export function openProjectMemo(dock: MemoDock, project: string): "focused" | "o
 export interface AutoSaver<T> {
   /** 값이 바뀌었다 — `delay` 후 1회 저장(버스트는 마지막 값 하나로 합쳐진다). */
   schedule(value: T): void;
-  /** 대기 중인 값을 **지금** 저장한다 (blur·언마운트). 없으면 no-op. */
-  flush(): void;
+  /** 대기 중인 값을 **지금** 저장하고 그 저장이 끝날 때까지 기다린다
+   * (blur·언마운트·창 종료). 대기 값이 없으면 진행 중인 저장만 기다린다. */
+  flush(): Promise<void>;
   /** 대기 중인 저장을 저장하지 않고 버린다 (명시 폐기용). */
   cancel(): void;
-  /** 아직 저장되지 않은 값이 있는가 (테스트·상태 표시). */
+  /** 아직 **디스크에 들어가지 못한** 값이 있는가 = dirty. 실패로 남은 것도
+   * 포함한다 — 그게 이 플래그의 요점이다. */
   pending(): boolean;
+  /** 그 dirty 값 (없으면 undefined). stash·진단용. */
+  peek(): T | undefined;
 }
 
 /**
@@ -104,15 +108,27 @@ export interface AutoSaver<T> {
  * 것은 정확히 그 반대(버리지 말고 지금 쓰기)라 순수 함수로 새로 둔다.
  *
  * 불변식:
- * - flush/저장 실행 후 대기 값은 비워진다 → 같은 값이 두 번 쓰이지 않는다.
- * - flush는 타이머도 함께 끈다 → flush 뒤 시간이 흘러도 재저장이 없다.
- * - 대기 값이 없을 때의 flush는 no-op → 언마운트마다 빈 쓰기가 생기지 않는다.
+ * - **성공했을 때만** 대기 값이 비워진다 (리뷰 P2-2). `save`가 reject하면 값은
+ *   dirty로 남아 다음 flush·편집이 다시 시도한다 — "저장 요청을 보냈다"를
+ *   "저장됐다"로 세던 것이 무음 유실의 통로였다.
+ * - 저장 중 더 새 편집이 들어오면 그 값은 dirty로 남는다 (seq로 판정) — 늦게
+ *   도착한 성공 응답이 새 편집을 clean으로 지워 버리지 않는다.
+ * - 저장은 **직렬화**된다 — 같은 파일에 동시 쓰기를 걸지 않는다.
+ * - flush는 타이머도 함께 끈다 → flush 뒤 시간이 흘러도 중복 저장이 없다.
+ * - 대기 값이 없을 때의 flush는 저장을 부르지 않는다 → 언마운트마다 빈 쓰기가
+ *   생기지 않는다.
+ *
+ * `save`는 **동기적으로** 호출된다(마이크로태스크를 거치지 않는다) — 언마운트
+ * 같은 동기 경로에서 IPC가 실제로 출발하는 것이 유실 방어의 전제다.
  */
-export function makeAutoSaver<T>(save: (value: T) => void, delay: number): AutoSaver<T> {
+export function makeAutoSaver<T>(save: (value: T) => Promise<void>, delay: number): AutoSaver<T> {
   let timer: ReturnType<typeof setTimeout> | undefined;
   // 대기 값은 박스로 감싼다 — T가 ""·null·0일 수 있어 값 자체로는 "대기 없음"을
   // 표현할 수 없다(빈 메모 저장이 조용히 누락되는 실패 모드).
-  let box: { value: T } | null = null;
+  let box: { value: T; seq: number } | null = null;
+  let seq = 0;
+  let inflight = false;
+  let settled: Promise<void> = Promise.resolve();
 
   const clear = () => {
     if (timer !== undefined) {
@@ -120,24 +136,78 @@ export function makeAutoSaver<T>(save: (value: T) => void, delay: number): AutoS
       timer = undefined;
     }
   };
-  const fire = () => {
-    clear();
+
+  const runOnce = (): Promise<void> => {
     const b = box;
-    if (!b) return;
-    box = null;
-    save(b.value);
+    if (!b || inflight) return settled;
+    inflight = true;
+    settled = save(b.value).then(
+      () => {
+        // 저장 중 더 새 편집이 없었을 때만 clean 처리.
+        if (box && box.seq === b.seq) box = null;
+        inflight = false;
+      },
+      () => {
+        // 실패 — dirty 유지. 호출부가 사유를 표시하고, 다음 flush가 재시도한다.
+        inflight = false;
+      },
+    );
+    return settled;
   };
+
+  const flush = (): Promise<void> => {
+    clear();
+    if (!box) return settled;
+    // 진행 중인 저장이 있으면 끝난 뒤 한 번 더 — 그 사이 쌓인 값도 나간다.
+    if (inflight) return settled.then(() => flush());
+    return runOnce();
+  };
+
   return {
     schedule(value: T) {
-      box = { value };
+      box = { value, seq: ++seq };
       clear();
-      timer = setTimeout(fire, delay);
+      timer = setTimeout(() => void runOnce(), delay);
     },
-    flush: fire,
+    flush,
     cancel() {
       clear();
       box = null;
     },
     pending: () => box !== null,
+    peek: () => box?.value,
   };
+}
+
+// ---- 저장 못 한 편집의 임시 보관 (리뷰 P2-2) -------------------------------
+
+/**
+ * 언마운트 순간의 저장이 실패하면 그 본문은 갈 곳이 없다 — 에디터는 이미
+ * 사라졌고 디스크에는 안 들어갔다. 그 값을 웹뷰 메모리에 붙들어 뒀다가 다음
+ * 마운트에서 되살린다(무음 유실 0).
+ *
+ * 창 수명을 넘지는 못한다(메모리다). 그건 한계가 아니라 범위다: 앱이 죽으면
+ * 어차피 그 값을 들고 있던 것이 아무것도 없다. 이 stash가 막는 것은 훨씬 흔한
+ * 쪽 — **탭을 전환했다가 돌아오는 사이의 저장 실패**다.
+ */
+const stash = new Map<string, string>();
+
+export function stashMemo(project: string, text: string): void {
+  stash.set(project, text);
+}
+
+/** 보관된 값을 꺼내며 지운다 (없으면 undefined). */
+export function takeStash(project: string): string | undefined {
+  const v = stash.get(project);
+  stash.delete(project);
+  return v;
+}
+
+export function clearStash(project: string): void {
+  stash.delete(project);
+}
+
+/** 테스트 격리용 — 보관함을 비운다. */
+export function resetStash(): void {
+  stash.clear();
 }

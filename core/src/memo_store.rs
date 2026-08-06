@@ -85,20 +85,58 @@ pub fn load(base: &Path, project: &str) -> io::Result<Option<String>> {
     Ok(Some(String::from_utf8_lossy(&buf).into_owned()))
 }
 
-/// Persist a project's memo atomically (temp + rename).
+/// [`save`]의 결과 — 썼거나, 디스크가 그 사이 바뀌어 **거부했거나**.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SaveOutcome {
+    /// 저장 완료. `hash`는 방금 쓴 본문의 해시 = 다음 저장의 base.
+    Saved { hash: String },
+    /// 디스크가 `base_hash`와 다르다 — 쓰지 않았다. `disk_hash`는 지금 디스크
+    /// 상태(파일이 없으면 `None`).
+    Conflict { disk_hash: Option<String> },
+}
+
+/// Persist a project's memo atomically (temp + rename), **낙관적 잠금**으로.
+///
+/// `base_hash` = 이 편집이 출발한 디스크 상태의 [`content_hash`]. 파일이 없다고
+/// 믿었으면 `None`. 지금 디스크가 그와 다르면 아무것도 쓰지 않고
+/// [`SaveOutcome::Conflict`]를 돌려준다 (리뷰 P2-3).
+///
+/// 왜 필요한가: 메모는 창을 넘어 같은 파일을 두 에디터가 볼 수 있다. 잠금이
+/// 없으면 마지막 쓰기가 상대의 문서를 **통째로** 덮는다 — 부분 병합이 아니라
+/// 전문 교체라 손실이 전부다. 잠금이 있으면 최악이 "저장이 거부됐다"이고,
+/// 사용자의 글자는 아직 에디터에 남아 있다.
+///
+/// 판정과 쓰기 사이에는 TOCTOU 창이 남는다(프로세스 간 파일 잠금은 쓰지 않는다).
+/// 사람이 타이핑하는 속도에서 그 창은 실질적으로 닫혀 있고, 이 방어선의 목적은
+/// 경쟁 조건의 완전 배제가 아니라 **조용한 전문 덮어쓰기를 시끄럽게 만드는 것**
+/// 이다.
 ///
 /// Returns [`io::ErrorKind::InvalidInput`] when `text` exceeds [`MEMO_CAP`] —
 /// the write is refused whole rather than truncated (see module docs).
-pub fn save(base: &Path, project: &str, text: &str) -> io::Result<()> {
+pub fn save(
+    base: &Path,
+    project: &str,
+    text: &str,
+    base_hash: Option<&str>,
+) -> io::Result<SaveOutcome> {
     if text.len() > MEMO_CAP {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "memo exceeds the size cap",
         ));
     }
+    // 읽기 실패는 오류로 올린다 — "못 읽었으니 그냥 덮자"는 P2-4가 막은 바로 그
+    // 경로다.
+    let disk_hash = load(base, project)?.as_deref().map(content_hash);
+    if disk_hash.as_deref() != base_hash {
+        return Ok(SaveOutcome::Conflict { disk_hash });
+    }
     let d = dir(base, project);
     std::fs::create_dir_all(&d)?;
-    atomic_write(&d, text)
+    atomic_write(&d, text)?;
+    Ok(SaveOutcome::Saved {
+        hash: content_hash(text),
+    })
 }
 
 /// temp + rename. **어느 단계에서 실패하든** 임시 파일을 지운다 — 쓰기 실패로
@@ -122,6 +160,21 @@ fn atomic_write(d: &Path, text: &str) -> io::Result<()> {
 mod tests {
     use super::*;
 
+
+    /// 현재 디스크 해시 (base).
+    fn cur(b: &Path, project: &str) -> Option<String> {
+        load(b, project).unwrap().as_deref().map(content_hash)
+    }
+
+    /// 현재 디스크 상태를 base로 삼아 저장하고 Saved임을 확인한다 (충돌 없는 경로).
+    fn put(b: &Path, project: &str, text: &str) {
+        let base = cur(b, project);
+        assert!(matches!(
+            save(b, project, text, base.as_deref()).unwrap(),
+            SaveOutcome::Saved { .. }
+        ));
+    }
+
     static N: AtomicU64 = AtomicU64::new(0);
     fn temp_base(tag: &str) -> PathBuf {
         let n = N.fetch_add(1, Ordering::Relaxed);
@@ -133,7 +186,7 @@ mod tests {
     #[test]
     fn round_trip() {
         let b = temp_base("rt");
-        save(&b, "/home/u/proj", "첫 줄\n둘째 줄\n").unwrap();
+        put(&b, "/home/u/proj", "첫 줄\n둘째 줄\n");
         assert_eq!(load(&b, "/home/u/proj").unwrap().as_deref(), Some("첫 줄\n둘째 줄\n"));
     }
 
@@ -157,8 +210,8 @@ mod tests {
     #[test]
     fn overwrite_replaces_whole_content() {
         let b = temp_base("over");
-        save(&b, "/p", "긴 원본 내용").unwrap();
-        save(&b, "/p", "짧게").unwrap();
+        put(&b, "/p", "긴 원본 내용");
+        put(&b, "/p", "짧게");
         // rename semantics: no leftover tail from the longer previous write.
         assert_eq!(load(&b, "/p").unwrap().as_deref(), Some("짧게"));
     }
@@ -168,16 +221,16 @@ mod tests {
         // Clearing the memo must persist as empty, not as "absent" (which would
         // resurrect the old text on the next mount).
         let b = temp_base("empty");
-        save(&b, "/p", "내용").unwrap();
-        save(&b, "/p", "").unwrap();
+        put(&b, "/p", "내용");
+        put(&b, "/p", "");
         assert_eq!(load(&b, "/p").unwrap().as_deref(), Some(""));
     }
 
     #[test]
     fn projects_are_isolated() {
         let b = temp_base("iso");
-        save(&b, "/a/proj", "A").unwrap();
-        save(&b, "/b/proj", "B").unwrap();
+        put(&b, "/a/proj", "A");
+        put(&b, "/b/proj", "B");
         assert_eq!(load(&b, "/a/proj").unwrap().as_deref(), Some("A"));
         assert_eq!(load(&b, "/b/proj").unwrap().as_deref(), Some("B"));
     }
@@ -185,9 +238,9 @@ mod tests {
     #[test]
     fn over_cap_is_refused_not_truncated() {
         let b = temp_base("cap");
-        save(&b, "/p", "지켜야 할 내용").unwrap();
+        put(&b, "/p", "지켜야 할 내용");
         let huge = "x".repeat(MEMO_CAP + 1);
-        let err = save(&b, "/p", &huge).unwrap_err();
+        let err = save(&b, "/p", &huge, cur(&b, "/p").as_deref()).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
         // The refused write left the previous memo intact.
         assert_eq!(load(&b, "/p").unwrap().as_deref(), Some("지켜야 할 내용"));
@@ -196,7 +249,7 @@ mod tests {
     #[test]
     fn traversal_in_project_is_neutralized() {
         let b = temp_base("trav");
-        save(&b, "../../etc/passwd", "x").unwrap();
+        put(&b, "../../etc/passwd", "x");
         // The file landed under `base/projects/<key>/`, never outside `base`.
         let p = path(&b, "../../etc/passwd");
         assert!(p.starts_with(&b), "{p:?} escaped {b:?}");
@@ -219,24 +272,74 @@ mod tests {
     fn failed_write_leaves_no_temp_file() {
         // rename 실패를 강제한다: 목적지 `memo.md`를 디렉토리로 만들어 두면
         // 파일→디렉토리 rename이 실패한다. 임시 파일은 이미 만들어진 뒤다.
+        // (`save`가 아니라 `atomic_write`를 직접 부른다 — save는 이제 앞단의
+        // load에서 먼저 실패해 쓰기 경로에 닿지도 못하기 때문이다.)
         let b = temp_base("failtmp");
         let d = dir(&b, "/p");
         std::fs::create_dir_all(d.join("memo.md")).unwrap();
-        assert!(save(&b, "/p", "내용").is_err());
+        assert!(atomic_write(&d, "내용").is_err());
         assert!(temps(&d).is_empty(), "실패한 쓰기가 .tmp를 남겼다: {:?}", temps(&d));
     }
 
     #[test]
     fn no_temp_files_left_behind() {
         let b = temp_base("tmp");
-        save(&b, "/p", "내용").unwrap();
-        let d = dir(&b, "/p");
-        let leftovers: Vec<_> = std::fs::read_dir(&d)
-            .unwrap()
-            .filter_map(|e| e.ok())
-            .map(|e| e.file_name().to_string_lossy().into_owned())
-            .filter(|n| n.ends_with(".tmp"))
-            .collect();
-        assert!(leftovers.is_empty(), "leftover temps: {leftovers:?}");
+        put(&b, "/p", "내용");
+        assert!(temps(&dir(&b, "/p")).is_empty());
+    }
+
+    // ---- 낙관적 잠금 (리뷰 P2-3) ----
+
+    #[test]
+    fn stale_base_is_rejected_not_overwritten() {
+        let b = temp_base("lock_stale");
+        put(&b, "/p", "창 A가 읽은 원본");
+        let stale = cur(&b, "/p"); // 창 B가 이 시점에 읽었다
+        put(&b, "/p", "창 A가 나중에 쓴 것"); // 창 A가 먼저 저장
+
+        let out = save(&b, "/p", "창 B가 통째로 덮어쓸 뻔한 것", stale.as_deref()).unwrap();
+        assert_eq!(out, SaveOutcome::Conflict { disk_hash: cur(&b, "/p") });
+        // 거부됐으므로 창 A의 글이 그대로 남아 있다.
+        assert_eq!(load(&b, "/p").unwrap().as_deref(), Some("창 A가 나중에 쓴 것"));
+    }
+
+    #[test]
+    fn missing_file_passes_with_none_base() {
+        let b = temp_base("lock_none");
+        let out = save(&b, "/p", "첫 메모", None).unwrap();
+        assert_eq!(out, SaveOutcome::Saved { hash: content_hash("첫 메모") });
+        assert_eq!(load(&b, "/p").unwrap().as_deref(), Some("첫 메모"));
+    }
+
+    #[test]
+    fn none_base_against_existing_file_conflicts() {
+        // "내가 처음 쓴다"고 믿었는데 이미 남의 메모가 있다 = 충돌이다.
+        let b = temp_base("lock_none_conflict");
+        put(&b, "/p", "이미 있던 메모");
+        let out = save(&b, "/p", "덮어쓸 뻔한 것", None).unwrap();
+        assert!(matches!(out, SaveOutcome::Conflict { .. }));
+        assert_eq!(load(&b, "/p").unwrap().as_deref(), Some("이미 있던 메모"));
+    }
+
+    #[test]
+    fn returned_hash_is_the_next_base() {
+        // 연속 저장이 재조회 없이 이어지려면 Saved.hash가 곧 다음 base여야 한다.
+        let b = temp_base("lock_chain");
+        let SaveOutcome::Saved { hash: h1 } = save(&b, "/p", "1", None).unwrap() else {
+            panic!("첫 저장은 Saved여야 한다");
+        };
+        let SaveOutcome::Saved { hash: h2 } = save(&b, "/p", "2", Some(&h1)).unwrap() else {
+            panic!("이어지는 저장도 Saved여야 한다");
+        };
+        assert_eq!(h2, cur(&b, "/p").unwrap());
+        assert_eq!(load(&b, "/p").unwrap().as_deref(), Some("2"));
+    }
+
+    #[test]
+    fn same_content_hashes_equal_across_calls() {
+        assert_eq!(content_hash("같은 글"), content_hash("같은 글"));
+        assert_ne!(content_hash("가"), content_hash("나"));
+        // 길이 접두사 덕에 길이가 다르면 해시도 반드시 다르다.
+        assert_ne!(content_hash(""), content_hash("a"));
     }
 }

@@ -19,7 +19,7 @@ const invoke = vi.hoisted(() => vi.fn());
 vi.mock("@tauri-apps/api/core", () => ({ invoke }));
 
 import { MemoPanel, type MemoParams } from "./MemoPanel";
-import { MEMO_SAVE_DELAY } from "../state/projectMemo";
+import { MEMO_SAVE_DELAY, resetStash } from "../state/projectMemo";
 
 // CodeMirror measures its DOM; jsdom has no ResizeObserver.
 class NoopResizeObserver {
@@ -50,13 +50,14 @@ function panelProps(params: MemoParams): IDockviewPanelProps<MemoParams> {
 
 /** 저장 호출만 추려낸다 (읽기 호출과 섞이지 않게). */
 const writes = () =>
-  invoke.mock.calls.filter((c) => c[0] === "memo_write").map((c) => c[1] as { text: string });
+  invoke.mock.calls.filter((c) => c[0] === "memo_write").map((c) => c[1] as Record<string, unknown>);
 
 describe("MemoPanel — 언마운트 유실 0", () => {
   let host: HTMLDivElement;
   let root: Root;
 
   beforeEach(() => {
+    resetStash();
     vi.stubGlobal("ResizeObserver", NoopResizeObserver);
     // 자동 저장은 실제 IPC를 타므로 전부 목. 읽기는 저장된 본문을 돌려준다.
     invoke.mockImplementation((cmd: string) =>
@@ -113,7 +114,9 @@ describe("MemoPanel — 언마운트 유실 0", () => {
     expect(writes()).toEqual([]);
     // dockview 탭 전환 = 언마운트.
     act(() => root.unmount());
-    expect(writes()).toEqual([{ project: "/home/u/repo", text: "탭을 바로 전환한다" }]);
+    expect(writes()).toEqual([
+      { project: "/home/u/repo", text: "탭을 바로 전환한다", baseHash: "h0" },
+    ]);
     // 다시 render할 수 있도록 root를 되살린다 (afterEach의 unmount는 no-op).
     root = createRoot(host);
   });
@@ -125,7 +128,9 @@ describe("MemoPanel — 언마운트 유실 0", () => {
     act(() => {
       vi.advanceTimersByTime(MEMO_SAVE_DELAY);
     });
-    expect(writes()).toEqual([{ project: "/home/u/repo", text: "천천히 쓴 메모" }]);
+    expect(writes()).toEqual([
+      { project: "/home/u/repo", text: "천천히 쓴 메모", baseHash: "h0" },
+    ]);
     act(() => root.unmount());
     expect(writes()).toHaveLength(1); // 언마운트 flush는 대기 값이 없으면 no-op
     root = createRoot(host);
@@ -160,6 +165,95 @@ describe("MemoPanel — 언마운트 유실 0", () => {
     });
     expect(host.querySelector(".cm-content")?.textContent).toContain("돌아온 본문");
     expect(host.querySelector(".memo-err")).toBeNull();
+  });
+
+  it("**저장 실패한 편집은 stash로 살아남아 다음 마운트에서 복구된다**", async () => {
+    // 언마운트 순간의 저장이 실패하면 알려 줄 화면이 이미 없다 — 값이 메모리에
+    // 붙들려 있다가 다시 열 때 되살아나야 무음 유실이 0이다 (리뷰 P2-2).
+    invoke.mockImplementation((cmd: string) =>
+      cmd === "memo_read"
+        ? Promise.resolve({ text: "디스크 본문", hash: "h0" })
+        : Promise.reject(new Error("디스크 오류")),
+    );
+    const cm = await mount();
+    type(cm, "저장에 실패할 편집");
+    await act(async () => {
+      root.unmount();
+    });
+    root = createRoot(host);
+
+    // 다시 연다 — 이번엔 저장이 된다.
+    invoke.mockImplementation((cmd: string) =>
+      cmd === "memo_read"
+        ? Promise.resolve({ text: "디스크 본문", hash: "h0" })
+        : Promise.resolve({ status: "saved", hash: "h1" }),
+    );
+    const cm2 = await mount();
+    expect(cm2.textContent, "디스크가 아니라 복구된 편집이 보여야 한다").toContain(
+      "저장에 실패할 편집",
+    );
+    expect(host.querySelector(".memo-status")?.textContent).toContain("복구");
+    expect(host.querySelector(".memo-title")?.textContent).toContain("●"); // dirty
+  });
+
+  it("저장에 성공하면 stash가 남지 않는다 (다음 마운트는 디스크 기준)", async () => {
+    const cm = await mount();
+    type(cm, "잘 저장되는 편집");
+    await act(async () => {
+      root.unmount();
+    });
+    root = createRoot(host);
+    const cm2 = await mount();
+    expect(cm2.textContent).toContain("저장돼 있던 본문");
+    expect(cm2.textContent).not.toContain("잘 저장되는 편집");
+  });
+
+  it("충돌하면 저장을 멈추고 배너를 띄운다 — 편집은 dirty로 남는다", async () => {
+    invoke.mockImplementation((cmd: string) =>
+      cmd === "memo_read"
+        ? Promise.resolve({ text: "원본", hash: "h0" })
+        : Promise.resolve({ status: "conflict", hash: "hOther" }),
+    );
+    vi.useFakeTimers();
+    const cm = await mount();
+    type(cm, "내 편집");
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(MEMO_SAVE_DELAY);
+    });
+    expect(host.querySelector(".memo-conflict"), "충돌 배너").toBeTruthy();
+    expect(host.querySelector(".memo-title")?.textContent).toContain("●");
+    // 에디터 내용은 그대로 — 거부는 사용자의 글을 건드리지 않는다.
+    expect(cm.textContent).toContain("내 편집");
+    vi.useRealTimers();
+  });
+
+  it("[덮어쓰기]는 디스크 해시를 base로 다시 저장한다", async () => {
+    let first = true;
+    invoke.mockImplementation((cmd: string) => {
+      if (cmd === "memo_read") return Promise.resolve({ text: "원본", hash: "h0" });
+      if (first) {
+        first = false;
+        return Promise.resolve({ status: "conflict", hash: "hOther" });
+      }
+      return Promise.resolve({ status: "saved", hash: "h2" });
+    });
+    vi.useFakeTimers();
+    const cm = await mount();
+    type(cm, "내 편집");
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(MEMO_SAVE_DELAY);
+    });
+    const overwrite = host.querySelectorAll(".memo-conflict .memo-retry")[0] as HTMLButtonElement;
+    expect(overwrite.textContent).toContain("덮어쓰기");
+    await act(async () => {
+      overwrite.click();
+    });
+    // 두 번째 쓰기는 충돌이 알려 준 디스크 해시를 base로 나간다.
+    expect(writes()).toHaveLength(2);
+    expect(writes()[1]).toEqual({ project: "/home/u/repo", text: "내 편집", baseHash: "hOther" });
+    expect(host.querySelector(".memo-conflict")).toBeNull();
+    expect(host.querySelector(".memo-title")?.textContent).not.toContain("●");
+    vi.useRealTimers();
   });
 
   it("프로젝트가 없으면 에디터를 만들지 않고 사유를 보여준다", async () => {

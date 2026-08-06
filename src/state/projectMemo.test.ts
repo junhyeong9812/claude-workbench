@@ -8,6 +8,7 @@ import {
   openProjectMemo,
   type MemoDock,
 } from "./projectMemo";
+import { clearStash, resetStash, stashMemo, takeStash } from "./projectMemo";
 import { isEphemeralParams } from "./ephemeralPanels";
 
 /** 최소 dock 스텁 — addPanel은 호출 인자를 기록하고 패널 목록에 반영한다. */
@@ -74,12 +75,40 @@ describe("isMemoParams", () => {
   });
 });
 
+describe("stash — 저장 못 한 편집의 임시 보관", () => {
+  beforeEach(() => resetStash());
+
+  it("넣은 값을 꺼내면서 지운다 (한 번만 복구)", () => {
+    stashMemo("/p", "못 저장한 글");
+    expect(takeStash("/p")).toBe("못 저장한 글");
+    expect(takeStash("/p")).toBeUndefined();
+  });
+
+  it("프로젝트별로 격리된다", () => {
+    stashMemo("/a", "A");
+    stashMemo("/b", "B");
+    expect(takeStash("/b")).toBe("B");
+    expect(takeStash("/a")).toBe("A");
+  });
+
+  it("빈 문자열도 보관된다 (메모 전체 지우기가 유실되면 안 된다)", () => {
+    stashMemo("/p", "");
+    expect(takeStash("/p")).toBe("");
+  });
+
+  it("clearStash는 저장이 성공했을 때 보관분을 버린다", () => {
+    stashMemo("/p", "x");
+    clearStash("/p");
+    expect(takeStash("/p")).toBeUndefined();
+  });
+});
+
 describe("makeAutoSaver — 디바운스 · flush · 유실 0", () => {
   beforeEach(() => vi.useFakeTimers());
   afterEach(() => vi.useRealTimers());
 
   it("입력이 멎고 delay가 지나야 1회 저장한다", () => {
-    const save = vi.fn();
+    const save = vi.fn().mockResolvedValue(undefined);
     const s = makeAutoSaver(save, MEMO_SAVE_DELAY);
     s.schedule("a");
     vi.advanceTimersByTime(MEMO_SAVE_DELAY - 1);
@@ -89,7 +118,7 @@ describe("makeAutoSaver — 디바운스 · flush · 유실 0", () => {
   });
 
   it("타이핑 버스트는 마지막 값 하나로 합쳐진다", () => {
-    const save = vi.fn();
+    const save = vi.fn().mockResolvedValue(undefined);
     const s = makeAutoSaver(save, 1000);
     s.schedule("a");
     vi.advanceTimersByTime(300);
@@ -100,73 +129,134 @@ describe("makeAutoSaver — 디바운스 · flush · 유실 0", () => {
     expect(save.mock.calls).toEqual([["abc"]]);
   });
 
-  it("저장이 나가면 대기 값이 비워져 같은 값을 두 번 쓰지 않는다", () => {
-    const save = vi.fn();
+  it("저장이 **성공한 뒤에야** 대기 값이 비워진다 (같은 값 두 번 쓰지 않음)", async () => {
+    const save = vi.fn().mockResolvedValue(undefined);
     const s = makeAutoSaver(save, 1000);
     s.schedule("a");
     vi.advanceTimersByTime(1000);
+    // 요청은 나갔지만 아직 성공 응답 전 — 여전히 dirty다 (P2-2).
+    expect(s.pending()).toBe(true);
+    await Promise.resolve();
     expect(s.pending()).toBe(false);
-    s.flush();
+    await s.flush();
     vi.advanceTimersByTime(5000);
     expect(save).toHaveBeenCalledTimes(1);
   });
 
-  it("**언마운트 flush: 디바운스 창 안에서 탭이 전환돼도 유실 0**", () => {
+  it("**언마운트 flush: 디바운스 창 안에서 탭이 전환돼도 유실 0**", async () => {
     // dockview는 비활성 탭 패널을 언마운트한다 — 그 순간이 디바운스 창 안이면
     // 타이머는 클로저와 함께 사라지고 마지막 편집이 증발한다. flush가 그 창을
     // 막는 유일한 경로다 (핵심 불변식).
-    const save = vi.fn();
+    const save = vi.fn().mockResolvedValue(undefined);
     const s = makeAutoSaver(save, 1000);
     s.schedule("마지막 편집");
     vi.advanceTimersByTime(10); // 아직 디바운스 창 안
     expect(s.pending()).toBe(true);
-    s.flush(); // 언마운트
+    const done = s.flush(); // 언마운트 — save는 동기적으로 출발해야 한다
     expect(save.mock.calls).toEqual([["마지막 편집"]]);
+    await done;
     expect(s.pending()).toBe(false);
   });
 
-  it("flush는 타이머도 끈다 — flush 뒤 시간이 흘러도 재저장이 없다", () => {
-    const save = vi.fn();
+  it("flush는 타이머도 끈다 — flush 뒤 시간이 흘러도 재저장이 없다", async () => {
+    const save = vi.fn().mockResolvedValue(undefined);
     const s = makeAutoSaver(save, 1000);
     s.schedule("x");
-    s.flush();
+    await s.flush();
     vi.advanceTimersByTime(10_000);
     expect(save).toHaveBeenCalledTimes(1);
   });
 
-  it("대기 값이 없으면 flush는 no-op (언마운트마다 빈 쓰기 금지)", () => {
-    const save = vi.fn();
+  it("대기 값이 없으면 flush는 no-op (언마운트마다 빈 쓰기 금지)", async () => {
+    const save = vi.fn().mockResolvedValue(undefined);
     const s = makeAutoSaver(save, 1000);
-    s.flush();
-    s.flush();
+    await s.flush();
+    await s.flush();
     expect(save).not.toHaveBeenCalled();
   });
 
-  it("빈 문자열도 대기 값으로 취급한다 (메모 전체 지우기가 저장돼야 한다)", () => {
-    const save = vi.fn();
+  it("빈 문자열도 대기 값으로 취급한다 (메모 전체 지우기가 저장돼야 한다)", async () => {
+    const save = vi.fn().mockResolvedValue(undefined);
     const s = makeAutoSaver<string>(save, 1000);
     s.schedule("");
     expect(s.pending()).toBe(true);
-    s.flush();
+    await s.flush();
     expect(save.mock.calls).toEqual([[""]]);
   });
 
-  it("cancel은 저장하지 않고 버린다", () => {
-    const save = vi.fn();
+  it("**저장 실패는 dirty를 유지한다** — 다음 flush가 재시도해 성공한다", async () => {
+    // "저장 요청을 보냈다"를 "저장됐다"로 세면 실패한 편집이 조용히 사라진다
+    // (리뷰 P2-2). 실패 후에도 값이 남아 있어야 재시도가 가능하다.
+    const save = vi
+      .fn()
+      .mockRejectedValueOnce(new Error("디스크 오류"))
+      .mockResolvedValue(undefined);
+    const s = makeAutoSaver<string>(save, 1000);
+    s.schedule("잃으면 안 되는 글");
+    await s.flush();
+    expect(save).toHaveBeenCalledTimes(1);
+    expect(s.pending(), "실패했으니 여전히 dirty").toBe(true);
+    expect(s.peek()).toBe("잃으면 안 되는 글");
+
+    await s.flush(); // 재시도
+    expect(save).toHaveBeenCalledTimes(2);
+    expect(s.pending(), "성공했으니 clean").toBe(false);
+    expect(s.peek()).toBeUndefined();
+  });
+
+  it("저장 중 들어온 새 편집은 늦게 온 성공 응답에 지워지지 않는다", async () => {
+    let release!: () => void;
+    const save = vi.fn().mockImplementation(
+      () =>
+        new Promise<void>((res) => {
+          release = res;
+        }),
+    );
+    const s = makeAutoSaver<string>(save, 1000);
+    s.schedule("v1");
+    void s.flush(); // v1 저장 시작 (아직 미완)
+    s.schedule("v2"); // 저장 중 새 편집
+    release(); // v1 저장 성공 응답이 뒤늦게 도착
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(s.pending(), "v2는 아직 저장 전이므로 dirty여야 한다").toBe(true);
+    expect(s.peek()).toBe("v2");
+  });
+
+  it("저장은 직렬화된다 — 같은 파일에 동시 쓰기를 걸지 않는다", async () => {
+    let live = 0;
+    let peak = 0;
+    const save = vi.fn().mockImplementation(async () => {
+      live++;
+      peak = Math.max(peak, live);
+      await Promise.resolve();
+      live--;
+    });
+    const s = makeAutoSaver<string>(save, 1000);
+    s.schedule("a");
+    void s.flush();
+    s.schedule("b");
+    void s.flush();
+    await s.flush();
+    expect(peak).toBe(1);
+  });
+
+  it("cancel은 저장하지 않고 버린다", async () => {
+    const save = vi.fn().mockResolvedValue(undefined);
     const s = makeAutoSaver(save, 1000);
     s.schedule("버릴 값");
     s.cancel();
     expect(s.pending()).toBe(false);
-    s.flush();
+    await s.flush();
     vi.advanceTimersByTime(10_000);
     expect(save).not.toHaveBeenCalled();
   });
 
-  it("flush 후 다시 타이핑하면 새 디바운스가 정상 동작한다", () => {
-    const save = vi.fn();
+  it("flush 후 다시 타이핑하면 새 디바운스가 정상 동작한다", async () => {
+    const save = vi.fn().mockResolvedValue(undefined);
     const s = makeAutoSaver(save, 1000);
     s.schedule("1");
-    s.flush();
+    await s.flush();
     s.schedule("2");
     vi.advanceTimersByTime(1000);
     expect(save.mock.calls).toEqual([["1"], ["2"]]);

@@ -52,10 +52,31 @@ pub fn memo_read(app: AppHandle, project: String) -> Result<MemoDoc, AppError> {
     }
 }
 
-/// 프로젝트 메모를 저장한다 (원자 교체). 상한 초과는 **잘라서 저장하지 않고
-/// 거부**한다 — 사용자가 쓴 글을 조용히 버리는 쪽이 더 나쁜 실패다.
+/// `memo_write`의 결과. 충돌은 **오류가 아니라 정상 결과**다 — 프론트가 "저장
+/// 실패"와 "다른 창이 먼저 썼다"를 다르게 다뤄야 하기 때문이다(전자는 재시도,
+/// 후자는 사용자 선택).
+#[derive(Serialize)]
+#[serde(tag = "status", rename_all = "camelCase")]
+pub enum MemoSaveResult {
+    Saved { hash: String },
+    Conflict { hash: Option<String> },
+}
+
+/// 프로젝트 메모를 저장한다 (원자 교체 + 낙관적 잠금).
+///
+/// `base_hash` = 이 편집이 출발한 디스크 해시(`memo_read`가 준 것, 없으면 null).
+/// 그 사이 디스크가 바뀌었으면 쓰지 않고 `conflict`를 돌려준다 — 마지막-쓰기-
+/// 승리로 남의 문서를 통째로 덮는 일을 막는다 (리뷰 P2-3).
+///
+/// 상한 초과는 **잘라서 저장하지 않고 거부**한다 — 사용자가 쓴 글을 조용히
+/// 버리는 쪽이 더 나쁜 실패다.
 #[tauri::command]
-pub fn memo_write(app: AppHandle, project: String, text: String) -> Result<(), AppError> {
+pub fn memo_write(
+    app: AppHandle,
+    project: String,
+    text: String,
+    base_hash: Option<String>,
+) -> Result<MemoSaveResult, AppError> {
     if project.trim().is_empty() {
         return Err(AppError::new("메모를 저장할 프로젝트가 지정되지 않았습니다."));
     }
@@ -66,6 +87,12 @@ pub fn memo_write(app: AppHandle, project: String, text: String) -> Result<(), A
         )));
     }
     let base = app_data(&app)?;
-    core_lib::memo_store::save(&base, &project, &text)
-        .map_err(|e| AppError::new(io_message("Cannot save memo", &e)))
+    match core_lib::memo_store::save(&base, &project, &text, base_hash.as_deref())
+        .map_err(|e| AppError::new(io_message("Cannot save memo", &e)))?
+    {
+        core_lib::memo_store::SaveOutcome::Saved { hash } => Ok(MemoSaveResult::Saved { hash }),
+        core_lib::memo_store::SaveOutcome::Conflict { disk_hash } => {
+            Ok(MemoSaveResult::Conflict { hash: disk_hash })
+        }
+    }
 }

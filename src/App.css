@@ -1372,6 +1372,17 @@ body {
   padding: 12px;
   color: var(--st-danger);
 }
+.memo-conflict {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 6px 10px;
+  font-size: 0.8em;
+  color: var(--fg, #cdd6f4);
+  background: color-mix(in srgb, var(--st-warn) 18%, transparent);
+  border-bottom: 1px solid color-mix(in srgb, var(--st-warn) 40%, transparent);
+}
 .memo-retry {
   flex: 0 0 auto;
   padding: 1px 8px;
@@ -2500,7 +2511,7 @@ body {
   line-height: 1.4;
   white-space: pre-line;
   color: var(--fg, #cdd6f4);
-  background: color-mix(in srgb, var(--st-warn, #e5c07b) 18%, transparent);
+  background: color-mix(in srgb, var(--st-warn) 18%, transparent);
   border-bottom: 1px solid var(--border, #333);
 }
 .claudeterm-refine-note-x {
