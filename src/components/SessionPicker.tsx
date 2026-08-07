@@ -262,6 +262,7 @@ export function SessionPicker({
   // 옵션 팝오버(에이전트·모델·강도). 닫혀 있는 것이 기본이고, "+ 만들기"는
   // 마지막 설정을 그대로 재사용한다 — 옵션을 바꾸고 싶을 때만 ▾를 연다.
   const [optsOpen, setOptsOpen] = useState(false);
+  const optsBtnRef = useRef<HTMLButtonElement>(null);
 
   /** `opts` 미지정 = 마지막 설정 상속(보통 클릭). */
   const createNewSession = (opts?: AgentOptions) => {
@@ -303,6 +304,7 @@ export function SessionPicker({
           + 만들기
         </button>
         <button
+          ref={optsBtnRef}
           className={`claude-picker-create${optsOpen ? " claude-picker-create-on" : ""}`}
           title="에이전트 · 모델 · 강도 고르기"
           aria-label="새 세션 옵션"
@@ -315,6 +317,7 @@ export function SessionPicker({
       </div>
       {optsOpen && (
         <AgentOptionsPopover
+          triggerRef={optsBtnRef}
           onClose={() => setOptsOpen(false)}
           onStart={(_agent, opts) => {
             setOptsOpen(false);

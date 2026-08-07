@@ -608,20 +608,10 @@ function AppMain() {
     setFontDraft(null);
   };
 
-  // 새 세션 옵션 팝오버(툴바 ▾) — 외관 팝오버와 같은 아웃사이드 클릭/Escape 관례.
+  // 새 세션 옵션 팝오버(툴바 ▾). 바깥 클릭·Escape·포커스 복원은 팝오버가 소유한다
+  // (호출자 2곳이 각자 들고 있으면 갈라진다) — 여기서는 열림 상태와 트리거 ref만.
   const [agentOptsOpen, setAgentOptsOpen] = useState(false);
-  const agentOptsRef = useRef<HTMLDivElement>(null);
   const agentOptsBtnRef = useRef<HTMLButtonElement>(null);
-  useEffect(() => {
-    if (!agentOptsOpen) return;
-    const onDoc = (e: MouseEvent) => {
-      if (agentOptsRef.current && !agentOptsRef.current.contains(e.target as Node)) {
-        setAgentOptsOpen(false);
-      }
-    };
-    document.addEventListener("mousedown", onDoc);
-    return () => document.removeEventListener("mousedown", onDoc);
-  }, [agentOptsOpen]);
 
   const requestTermMenu = useAppStore((s) => s.requestTermMenu);
   const requestClaudePicker = useAppStore((s) => s.requestClaudePicker);
@@ -681,16 +671,7 @@ function AppMain() {
             >
               <span className="toolbar-ico">▣</span> 터미널 <span className="toolbar-caret">▾</span>
             </button>
-            <div
-              className="agent-opt-menu"
-              ref={agentOptsRef}
-              onKeyDown={(e) => {
-                if (e.key === "Escape" && agentOptsOpen) {
-                  setAgentOptsOpen(false);
-                  agentOptsBtnRef.current?.focus();
-                }
-              }}
-            >
+            <div className="agent-opt-menu">
               <button
                 className="toolbar-btn"
                 title={
@@ -722,6 +703,7 @@ function AppMain() {
               {agentOptsOpen && (
                 <AgentOptionsPopover
                   float
+                  triggerRef={agentOptsBtnRef}
                   disabledReason={
                     activeProject ? undefined : "프로젝트를 연 뒤 세션을 시작할 수 있습니다"
                   }

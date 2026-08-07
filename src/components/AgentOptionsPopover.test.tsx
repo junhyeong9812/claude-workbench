@@ -44,14 +44,22 @@ describe("AgentOptionsPopover", () => {
   afterEach(() => {
     act(() => root.unmount());
     host.remove();
+    trigger?.remove();
     vi.unstubAllGlobals();
   });
 
-  const render = async (props: { disabledReason?: string } = {}) => {
+  /** 트리거 ▾ 버튼 — 팝오버 바깥이지만 "바깥 클릭"으로 세면 안 되는 요소. */
+  let trigger: HTMLButtonElement;
+
+  const render = async (props: { disabledReason?: string; withTrigger?: boolean } = {}) => {
+    const { withTrigger = true, ...rest } = props;
+    trigger = document.createElement("button");
+    document.body.appendChild(trigger);
     await act(async () => {
       root.render(
         <AgentOptionsPopover
-          {...props}
+          {...rest}
+          triggerRef={withTrigger ? { current: trigger } : undefined}
           onStart={(agent, opts) => {
             started = { agent, opts };
           }}
@@ -147,13 +155,65 @@ describe("AgentOptionsPopover", () => {
     expect(started).toBeNull();
   });
 
-  it("Escape로 닫는다", async () => {
-    installStorage();
-    await render();
-    const pop = host.querySelector<HTMLElement>(".agent-opt-pop");
-    await act(async () => {
-      pop?.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
+  describe("포커스·닫힘 계약 (호출자 2곳 공통)", () => {
+    const mousedown = async (target: EventTarget) => {
+      await act(async () => {
+        target.dispatchEvent(new MouseEvent("mousedown", { bubbles: true }));
+      });
+    };
+
+    it("열릴 때 첫 컨트롤로 포커스가 간다", async () => {
+      installStorage();
+      await render();
+      expect(document.activeElement).toBe(btn("Claude"));
     });
-    expect(closed).toBe(1);
+
+    it("비활성 컨트롤은 첫 포커스 대상이 아니다", async () => {
+      installStorage();
+      await render();
+      expect(document.activeElement).not.toBe(btn("Codex"));
+      expect((document.activeElement as HTMLButtonElement).disabled).toBe(false);
+    });
+
+    it("Escape는 닫으면서 트리거로 포커스를 되돌린다", async () => {
+      installStorage();
+      await render();
+      const pop = host.querySelector<HTMLElement>(".agent-opt-pop");
+      await act(async () => {
+        pop?.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
+      });
+      expect(closed).toBe(1);
+      expect(document.activeElement).toBe(trigger);
+    });
+
+    it("바깥 클릭으로 닫힌다", async () => {
+      installStorage();
+      await render();
+      await mousedown(document.body);
+      expect(closed).toBe(1);
+    });
+
+    it("팝오버 안 클릭으로는 닫히지 않는다", async () => {
+      installStorage();
+      await render();
+      await mousedown(sel("모델"));
+      expect(closed).toBe(0);
+    });
+
+    it("트리거 클릭은 '바깥'이 아니다 — 아니면 ▾ 토글이 죽는다", async () => {
+      // mousedown이 닫고 뒤이은 click이 다시 열면 사용자에겐 닫히지 않는 것으로 보인다.
+      installStorage();
+      await render();
+      await mousedown(trigger);
+      expect(closed).toBe(0);
+    });
+
+    it("언마운트 후에는 document 리스너가 남지 않는다", async () => {
+      installStorage();
+      await render();
+      act(() => root.unmount());
+      await mousedown(document.body);
+      expect(closed).toBe(0);
+    });
   });
 });

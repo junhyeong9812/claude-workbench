@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { EffortSelect, ModelSelect } from "./AgentOptionFields";
 import {
   AGENT_CHOICES,
@@ -19,13 +19,23 @@ import {
  * 설정을 바꾸고 싶을 때만 연다.
  *
  * 렌더는 상태 플래그 + 인라인이다(코드베이스에 createPortal 사용처 0건 — 모든
- * 팝오버가 이 관례를 따른다). 열고 닫는 것과 바깥 클릭 처리는 **호출자 소유**다:
- * 툴바(절대 배치)와 피커(흐름 배치)의 앵커가 서로 달라서, 이 컴포넌트가 배치를
- * 들고 있으면 둘 중 하나는 반드시 틀린다.
+ * 팝오버가 이 관례를 따른다). **배치만** 호출자 소유다(툴바=절대, 피커=흐름 —
+ * 앵커가 달라 한쪽은 반드시 틀린다). 반대로 **포커스·닫힘 계약은 여기 한 곳에
+ * 모은다**: 호출자마다 따로 두면 두 벌이 갈라지고, 팝오버가 Escape를 삼키면
+ * (stopPropagation) 호출자 쪽 복원 코드는 영영 돌지 않는다.
+ *
+ * 계약:
+ * - 열릴 때 첫 컨트롤로 1회 포커스 이동
+ * - 바깥 클릭 → 닫힘 (**트리거는 바깥이 아니다** — 제외하지 않으면 mousedown이
+ *   닫고 뒤이은 click이 다시 열어 ▾ 토글이 죽는다)
+ * - Escape → 닫으면서 트리거로 포커스 복원. 바깥 클릭과 [시작]은 복원하지
+ *   않는다: 전자는 사용자가 이미 다른 곳을 눌렀고, 후자는 새 세션이 포커스를
+ *   가져간다. 되돌리면 그게 오히려 포커스를 훔치는 것이 된다.
  */
 export function AgentOptionsPopover({
   float = false,
   disabledReason,
+  triggerRef,
   onStart,
   onClose,
 }: {
@@ -33,9 +43,30 @@ export function AgentOptionsPopover({
   float?: boolean;
   /** 지금 세션을 시작할 수 없는 이유(예: 열린 프로젝트 없음). 있으면 [시작] 비활성. */
   disabledReason?: string;
+  /** 이 팝오버를 연 ▾ 버튼 — 바깥 클릭 판정에서 제외하고 Escape 때 포커스를 돌려준다. */
+  triggerRef?: { current: HTMLButtonElement | null };
   onStart: (agent: AgentId, opts: AgentOptions) => void;
   onClose: () => void;
 }) {
+  const popRef = useRef<HTMLDivElement>(null);
+
+  // 열릴 때 1회만 첫 컨트롤로. 콜백 ref로 하면 매 렌더 재실행되어 사용자가
+  // select를 고르는 도중 포커스를 훔친다(외관 팝오버 A10의 교훈).
+  useEffect(() => {
+    popRef.current?.querySelector<HTMLElement>("button:not(:disabled), select")?.focus();
+  }, []);
+
+  useEffect(() => {
+    const onDoc = (e: MouseEvent) => {
+      const t = e.target as Node;
+      if (popRef.current?.contains(t)) return;
+      if (triggerRef?.current?.contains(t)) return;
+      onClose();
+    };
+    document.addEventListener("mousedown", onDoc);
+    return () => document.removeEventListener("mousedown", onDoc);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
   // 초기값 = 이 에이전트로 마지막에 연 설정. 함수형 초기화라 매 렌더 읽지 않는다.
   const [agent, setAgent] = useState<AgentId>(loadLastAgent);
   const [opts, setOpts] = useState<AgentOptions>(() => loadAgentOptions(loadLastAgent()));
@@ -55,14 +86,17 @@ export function AgentOptionsPopover({
 
   return (
     <div
+      ref={popRef}
       className={`agent-opt-pop${float ? " agent-opt-pop-float" : ""}`}
       role="dialog"
       aria-label="새 세션 옵션"
       onKeyDown={(e) => {
-        if (e.key === "Escape") {
-          e.stopPropagation();
-          onClose();
-        }
+        if (e.key !== "Escape") return;
+        // 삼키는 것이 의도다 — 피커 안에서는 Escape가 피커 전체를 닫는 키라,
+        // 옵션만 접으려던 사용자가 목록까지 잃으면 안 된다.
+        e.stopPropagation();
+        triggerRef?.current?.focus();
+        onClose();
       }}
     >
       <div className="agent-opt-row">
