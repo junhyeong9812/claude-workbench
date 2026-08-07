@@ -616,6 +616,7 @@ function AppMain() {
   const requestTermMenu = useAppStore((s) => s.requestTermMenu);
   const requestClaudePicker = useAppStore((s) => s.requestClaudePicker);
   const requestClaudeOpen = useAppStore((s) => s.requestClaudeOpen);
+  const requestCodexOpen = useAppStore((s) => s.requestCodexOpen);
   const requestDetachPanel = useAppStore((s) => s.requestDetachPanel);
   const requestMemo = useAppStore((s) => s.requestMemo);
 
@@ -708,10 +709,12 @@ function AppMain() {
                     activeProject ? undefined : "프로젝트를 연 뒤 세션을 시작할 수 있습니다"
                   }
                   onClose={() => setAgentOptsOpen(false)}
-                  onStart={(_agent, opts) => {
+                  onStart={(agent, opts) => {
                     setAgentOptsOpen(false);
                     if (!activeProject) return;
-                    requestClaudeOpen({ project: activeProject, ...spawnOptionFields(opts) });
+                    const req = { project: activeProject, ...spawnOptionFields(opts) };
+                    if (agent === "codex") requestCodexOpen(req);
+                    else requestClaudeOpen(req);
                   }}
                 />
               )}

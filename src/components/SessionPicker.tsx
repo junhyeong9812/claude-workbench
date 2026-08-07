@@ -59,20 +59,31 @@ export interface SessionPickerController {
   setNewName: (v: string) => void;
 }
 
-/** 피커가 쓰는 addPanel의 최소 형태 (MainArea가 주입). */
-type PickerAddPanel = (
-  kind: "claudeterm",
-  opts: {
-    loadSessionId: string;
-    project?: string;
-    title: string;
-    spawnCwd?: string;
-    adoptPending?: boolean;
-    /** 스폰 옵션 — 미지정이면 키가 실리지 않고 플래그도 안 붙는다. */
-    model?: string;
-    effort?: string;
-  },
-) => unknown;
+/** 피커가 쓰는 addPanel의 최소 형태 (MainArea가 주입).
+ *
+ * codex는 `loadSessionId`를 안 받는다(옵션이 아니라 **불가**다 — codex에는
+ * `--session-id`가 없어 앱이 세션 uuid를 미리 정해 줄 수 없다). 저장된 세션
+ * 목록·adopt·아카이브가 전부 claude 전용인 것도 같은 뿌리라, 피커에서 codex가
+ * 닿는 곳은 "새로 만들기" 하나뿐이다. */
+type PickerAddPanel = {
+  (
+    kind: "claudeterm",
+    opts: {
+      loadSessionId: string;
+      project?: string;
+      title: string;
+      spawnCwd?: string;
+      adoptPending?: boolean;
+      /** 스폰 옵션 — 미지정이면 키가 실리지 않고 플래그도 안 붙는다. */
+      model?: string;
+      effort?: string;
+    },
+  ): unknown;
+  (
+    kind: "codexterm",
+    opts: { project?: string; cwd?: string; title: string; model?: string; effort?: string },
+  ): unknown;
+};
 
 export function useSessionPicker(deps: {
   /** 피커는 주 surface 전용. */
@@ -264,6 +275,20 @@ export function SessionPicker({
   const [optsOpen, setOptsOpen] = useState(false);
   const optsBtnRef = useRef<HTMLButtonElement>(null);
 
+  /** codex 새 세션 — 순수 터미널 탭이므로 이름 말고는 넘길 것이 없다. */
+  const createCodexSession = (opts: AgentOptions) => {
+    const name = newName.trim() || "Codex";
+    setPicker(null);
+    addPanel("codexterm", {
+      title: name,
+      project: activeProject ?? undefined,
+      // claudeterm과 같은 이유로 cwd를 지금 못 박는다 — 세션이 사는 동안
+      // 사용자가 탭을 바꿔도 스폰 디렉토리가 따라 움직이면 안 된다.
+      cwd: activeProject ?? undefined,
+      ...spawnOptionFields(opts),
+    });
+  };
+
   /** `opts` 미지정 = 마지막 설정 상속(보통 클릭). */
   const createNewSession = (opts?: AgentOptions) => {
     const name = newName.trim() || "에이전트";
@@ -319,9 +344,10 @@ export function SessionPicker({
         <AgentOptionsPopover
           triggerRef={optsBtnRef}
           onClose={() => setOptsOpen(false)}
-          onStart={(_agent, opts) => {
+          onStart={(agent, opts) => {
             setOptsOpen(false);
-            createNewSession(opts);
+            if (agent === "codex") createCodexSession(opts);
+            else createNewSession(opts);
           }}
         />
       )}

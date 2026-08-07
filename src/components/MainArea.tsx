@@ -104,6 +104,8 @@ export function MainArea({
   const requestDiff = useAppStore((s) => s.requestDiff);
   const claudeOpenRequest = useAppStore((s) => s.claudeOpenRequest);
   const requestClaudeOpen = useAppStore((s) => s.requestClaudeOpen);
+  const codexOpenRequest = useAppStore((s) => s.codexOpenRequest);
+  const requestCodexOpen = useAppStore((s) => s.requestCodexOpen);
   const runRequest = useAppStore((s) => s.runRequest);
   const requestRun = useAppStore((s) => s.requestRun);
   const focusMainRequest = useAppStore((s) => s.focusMainRequest);
@@ -457,6 +459,29 @@ export function MainArea({
     });
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [claudeOpenRequest, apiReady, activeProject, layerMode]);
+
+  // 새 codex 세션 요청 소비 (툴바 옵션 팝오버). claude 쪽과 같은 keep-until-
+  // actionable 규칙을 따르되(부 surface 비소비 · 앞 레이어일 때만 · 이 프로젝트의
+  // 마운트만 · dock 준비 후에만 · 실제로 열 수 있을 때 1회 소비) 필드는 세 개뿐
+  // 이다 — codex에는 seed도 adopt도 loadSessionId도 없다(세션 uuid를 앱이 정할
+  // 수 없고, 지속성은 이번 범위 밖).
+  useEffect(() => {
+    if (!isPrimary) return;
+    if (!integratedIsFront(layerMode)) return;
+    if (!codexOpenRequest) return;
+    const { project, model, effort } = codexOpenRequest;
+    if (project !== activeProject) return;
+    const api = apiRef.current;
+    if (!api) return;
+    requestCodexOpen(null);
+    addPanel("codexterm", {
+      project,
+      cwd: project,
+      ...(model ? { model } : {}),
+      ...(effort ? { effort } : {}),
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [codexOpenRequest, apiReady, activeProject, layerMode]);
 
   // (개발 세션 ✓확인/🧪 소비는 DevView로 이관됨 — 통합 dock 안에 "개발 세션"
   // 부분 패널을 끼워 넣던 옛 경로는 제거. 이제 EditorPanel이 dev 레이어를 전면
