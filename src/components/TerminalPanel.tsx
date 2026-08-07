@@ -340,6 +340,13 @@ export function TerminalPanel(props: IDockviewPanelProps<TerminalParams>) {
     });
     const onResize = term.onResize(() => {
       if (sessionId == null) return;
+      // 퇴화 크기는 codex PTY로 내보내지 않는다(ClaudeTermPanel의 같은 백스톱).
+      // 어떤 실제 레이아웃도 두 자리 미만 컬럼을 만들지 않는다 — 이 값이 나온다는
+      // 건 호스트가 0px로 접혔다는 뜻이고(FitAddon의 하한이 만든 2×1), 그대로
+      // 보내면 **전체화면 TUI가 실제로 2×1로 리사이즈되어 화면이 파괴된다**.
+      // 셸(일반 터미널)은 다시 그릴 화면이 없어 무해하므로 codex에만 건다 —
+      // 기존 터미널·SSH 탭의 동작을 바꾸지 않기 위해서다.
+      if (isCodex && (term.cols < 10 || term.rows < 3)) return;
       invoke("terminal_resize", { id: sessionId, cols: term.cols, rows: term.rows }).catch(
         () => {},
       );
