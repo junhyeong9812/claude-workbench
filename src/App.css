@@ -4848,6 +4848,20 @@ body {
 .codexterm-x:hover {
   color: var(--fg);
 }
+/* 지금 보고 있는 전사 파일 — 매칭은 추론이라 어느 파일인지 적어 두지 않으면
+   오매칭과 `/new` 고착이 화면에서 구별되지 않는다. */
+.codexterm-file {
+  flex: 0 0 auto;
+  padding: 2px 8px;
+  font-size: 10px;
+  font-family: "JetBrains Mono", "DejaVu Sans Mono", monospace;
+  color: var(--fg-dim);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  direction: rtl;
+  text-align: left;
+}
 /* 모델·강도·토큰 한 줄. */
 .codexterm-diag {
   flex: 0 0 auto;

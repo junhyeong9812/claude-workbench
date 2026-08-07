@@ -23,11 +23,23 @@ const STATUS_BADGE: Record<CodexTimelineStatus, string> = {
   searching: "전사 찾는 중",
   contested: "전사 미확정",
   ambiguous: "전사 미확정",
+  lost: "전사 소실",
   unavailable: "전사 없음",
   error: "오류",
 };
 
 const fmt = (n: number) => (n >= 1000 ? `${Math.round(n / 100) / 10}k` : `${n}`);
+
+/** 전사 파일명을 짧게 — `rollout-` 접두와 `.jsonl`을 떼면 `<시각>-<uuid>`가 남는다.
+ *
+ * **이걸 화면에 띄우는 이유**: 매칭은 추론이라 틀릴 수 있고(같은 폴더·같은 시각),
+ * TUI 안에서 `/new`를 하면 타임라인이 옛 대화에 고착된다. 어느 파일을 보고 있는지
+ * 적어 두지 않으면 그 두 경우가 **화면에서 구별되지 않는다**(리뷰 #5). */
+export function shortTranscriptName(path: string | null): string | null {
+  if (!path) return null;
+  const base = path.split("/").pop() ?? path;
+  return base.replace(/^rollout-/, "").replace(/\.jsonl$/, "");
+}
 
 export function CodexTermPanel(props: IDockviewPanelProps<TerminalParams>) {
   // TerminalPanel이 세션을 만든 뒤 `updateParameters`로 심는 값이라, 최초 렌더엔
@@ -93,6 +105,7 @@ export function CodexTermPanel(props: IDockviewPanelProps<TerminalParams>) {
   }, []);
 
   const badge = STATUS_BADGE[tl.status];
+  const transcript = shortTranscriptName(tl.path);
   const ctxPct =
     tl.ctxWindow > 0 ? Math.min(100, Math.round((tl.ctxTokens / tl.ctxWindow) * 100)) : null;
   // 진단 줄: 모델·강도·토큰·컨텍스트 + 파싱 이상(있을 때만). claude 탭의 게이지
@@ -169,11 +182,17 @@ export function CodexTermPanel(props: IDockviewPanelProps<TerminalParams>) {
             <div className="codexterm-pane-head">
               <span className="codexterm-pane-head-title">
                 타임라인{badge && ` · ${badge}`}
+                {!tl.alive && " · 세션 종료"}
               </span>
               <span className="codexterm-x" title="타임라인 접기" onClick={() => setCollapsed(true)}>
                 ▶
               </span>
             </div>
+            {transcript && (
+              <div className="codexterm-file" title={tl.path ?? undefined}>
+                {transcript}
+              </div>
+            )}
             {diag && <div className="codexterm-diag">{diag}</div>}
             {tl.note && <div className="codexterm-note">{tl.note}</div>}
             {parseNote && <div className="codexterm-note">{parseNote}</div>}
