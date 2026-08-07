@@ -1218,6 +1218,12 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
         // 구독은 스토어 변경 전부를 받고 게이트가 blocked만 다시 본다 — 사용자가
         // 대화를 처리하면 화면이 다시 그려지고, 그 쓰기가 스캐너를 돌려 여기로
         // 온다.
+        //
+        // 해소 직후 주입이 다시 "너무 이른" 것이 되지 않는 이유는 스캐너의
+        // 디바운스다: 판정은 마지막 쓰기 +300ms에 나오므로, 대화를 답한 뒤의
+        // 재도색이 **끝나고** 화면이 조용해진 뒤에야 blocked가 풀린다. 그
+        // 재도색에는 TUI의 대체 화면 진입(=준비 신호)이 포함되고, 실측상 입력
+        // 임계는 그보다 120~270ms 앞이다 — 즉 해소 판정은 구조적으로 준비 뒤다.
         seedGate = makeSeedGate({
           blocked: isSessionBlocked,
           inject: injectSeed,

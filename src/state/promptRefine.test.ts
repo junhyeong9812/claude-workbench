@@ -953,6 +953,18 @@ describe("makeSeedGate", () => {
     s.setBlocked(false);
     s.bus.notify();
     expect(s.inject).not.toHaveBeenCalled();
+    // 구독을 끊는 것만으로는 부족하다 — 래치가 닫혀야 한다. 안 그러면 취소된
+    // 게이트가 재발사 하나에 죽은 세션으로 주입한다(구독 해제만 한 변이가
+    // 이 줄 없이는 통과했다).
+    s.gate.fire(INFO);
+    expect(s.inject).not.toHaveBeenCalled();
+  });
+
+  it("취소 뒤에는 안 막혀 있어도 발사하지 않는다", () => {
+    const s = setup(false);
+    s.gate.cancel();
+    s.gate.fire(INFO);
+    expect(s.inject).not.toHaveBeenCalled();
   });
 
   it("보류 중 재발사는 무시 — 구독이 겹치지 않는다", () => {
