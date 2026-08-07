@@ -33,7 +33,13 @@ import {
 import { fmtAgo, fmtUnix } from "../utils/time";
 import { useAppStore } from "../state/store";
 import { AgentOptionsPopover } from "./AgentOptionsPopover";
-import { loadAgentOptions, spawnOptionFields, type AgentOptions } from "../state/agentOptions";
+import {
+  loadAgentOptions,
+  loadLastAgent,
+  spawnOptionFields,
+  type AgentId,
+  type AgentOptions,
+} from "../state/agentOptions";
 
 export interface SessionPickerController {
   /** null = 피커 닫힘. */
@@ -57,6 +63,13 @@ export interface SessionPickerController {
   toggleGroup: (key: ArchState) => void;
   newName: string;
   setNewName: (v: string) => void;
+  /** 피커를 열 때 입력창에 **자동으로** 채워 넣은 이름. 사용자가 직접 친 이름과
+   * 구분하는 기준이다 — 손대지 않았다면 에이전트를 바꿀 때 그 에이전트의 기본
+   * 이름으로 갈아 끼워야 한다("에이전트 3"인 채로 codex 탭이 열리면 안 된다). */
+  autoName: string;
+  /** 이 에이전트로 새 세션을 열 때 쓸 기본 이름 — **그 kind로 열려 있는 패널
+   * 수** 기준이라 claude와 codex의 번호가 서로를 밀지 않는다. */
+  defaultNameFor: (agent: AgentId) => string;
 }
 
 /** 피커가 쓰는 addPanel의 최소 형태 (MainArea가 주입).
@@ -109,6 +122,8 @@ export function useSessionPicker(deps: {
   const [pickerCollapsed, setPickerCollapsed] = useState<Set<ArchState>>(new Set());
   // Which kind the open picker creates/reopens: ACP `claude` or A `claudeterm`.
   const [newName, setNewName] = useState("에이전트 1");
+  // 마지막으로 **자동 채움**한 이름 (사용자가 직접 친 것과의 구분 기준).
+  const autoNameRef = useRef("에이전트 1");
   // 터미널에서 연 세션(외부) + 삭제로 숨긴 것들. 피커를 열 때마다 새로 조회한다
   // — live 판정은 지금 이 순간의 프로세스 상태라서 캐시하면 틀린 값을 보여준다.
   const [external, setExternal] = useState<ExternalListing>(EMPTY_EXTERNAL);
@@ -170,7 +185,9 @@ export function useSessionPicker(deps: {
     }
     setExternal(extRows);
     setShowHidden(false);
-    setNewName(`에이전트 ${sessions.length + openKindCount("claudeterm") + 1}`);
+    const auto = `에이전트 ${sessions.length + openKindCount("claudeterm") + 1}`;
+    autoNameRef.current = auto;
+    setNewName(auto);
     setPicker(sessions); // open-session filtering happens at render
   };
 
@@ -253,6 +270,11 @@ export function useSessionPicker(deps: {
     toggleGroup,
     newName,
     setNewName,
+    autoName: autoNameRef.current,
+    // codex는 저장된 세션 목록이 없다(전사를 앱이 못 찾는다) — 번호는 지금 열려
+    // 있는 codexterm 탭 수만으로 센다.
+    defaultNameFor: (agent) =>
+      agent === "codex" ? `Codex ${openKindCount("codexterm") + 1}` : autoNameRef.current,
   };
 }
 
@@ -277,7 +299,11 @@ export function SessionPicker({
 
   /** codex 새 세션 — 순수 터미널 탭이므로 이름 말고는 넘길 것이 없다. */
   const createCodexSession = (opts: AgentOptions) => {
-    const name = newName.trim() || "Codex";
+    // 사용자가 직접 친 이름은 존중하고, 자동 채움("에이전트 3")인 채로 왔으면
+    // codex 계열 이름으로 갈아 끼운다 — 입력창은 claude 기준으로 미리 채워지므로
+    // 그대로 두면 codex 탭이 "에이전트 3"이 된다.
+    const typed = newName.trim();
+    const name = typed && typed !== ctl.autoName ? typed : ctl.defaultNameFor("codex");
     setPicker(null);
     addPanel("codexterm", {
       title: name,
@@ -307,6 +333,19 @@ export function SessionPicker({
     });
   };
 
+  /**
+   * 보통 클릭("+ 만들기")·이름 Enter — **마지막에 고른 에이전트**로 만든다.
+   *
+   * 툴팁이 "마지막에 고른 에이전트·모델·강도로"라고 약속하는데 이전엔 모델·강도만
+   * 상속하고 에이전트는 늘 claude로 떨어졌다(계약 복원). 어휘·기억이 에이전트별로
+   * 갈려 있으므로 옵션도 그 에이전트 것을 읽는다.
+   */
+  const createDefaultSession = () => {
+    const agent = loadLastAgent();
+    if (agent === "codex") createCodexSession(loadAgentOptions("codex"));
+    else createNewSession();
+  };
+
   return (
     <div className="claude-picker">
       <div className="claude-picker-new-row">
@@ -317,14 +356,14 @@ export function SessionPicker({
           placeholder="새 세션 이름"
           onChange={(e) => setNewName(e.target.value)}
           onKeyDown={(e) => {
-            if (e.key === "Enter") createNewSession();
+            if (e.key === "Enter") createDefaultSession();
             else if (e.key === "Escape") setPicker(null);
           }}
         />
         <button
           className="claude-picker-create"
           title="마지막에 고른 에이전트·모델·강도로 새 세션을 만듭니다"
-          onClick={() => createNewSession()}
+          onClick={() => createDefaultSession()}
         >
           + 만들기
         </button>
