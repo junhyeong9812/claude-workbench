@@ -46,8 +46,10 @@ import {
   loadLastRefineModel,
   makeSeedGate,
   makeSeedScheduler,
+  reinjectSeedFlow,
   seedFireLog,
   seedHoldLog,
+  seedToCarry,
   stashPendingSeed,
   takePendingSeed,
   makeSubmitProbe,
@@ -486,21 +488,37 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
    * 시 자동으로 나가고, 없으면 사용자가 대화를 처리한 뒤 다시 누르면 된다.
    * 버튼 한 번이 "나중에 알아서 쏘기"로 바뀌는 편이 오히려 예측하기 어렵다.
    */
-  const reinjectSeed = async (text: string): Promise<void> => {
-    rescanBlockedRef.current?.();
-    if (writeBlockedNow()) {
-      setSeedNote(
-        "세션이 입력을 기다리는 상태입니다(권한 승인·폴더 신뢰·선택 프롬프트 등).\n" +
-          "지금 보내면 시드가 프롬프트가 아니라 그 화면의 키 입력으로 들어갑니다 — " +
-          "먼저 그 프롬프트를 처리하세요. (자동 주입이 예약돼 있으면 해소되는 즉시 알아서 나갑니다.)",
-      );
-      return;
-    }
-    seedGateRef.current?.cancel();
-    seedGateRef.current = null;
-    if (isRefine) await submitSingleLine(text).catch(() => {});
-    else await submitSeed(text);
-  };
+  const reinjectSeed = (text: string): Promise<void> =>
+    reinjectSeedFlow({
+      // ①**맨 먼저** 자동 경로를 통째로 소비한다. 아래 rescan이 스토어를 쓰고,
+      // 스토어 쓰기는 보류 중인 게이트의 구독을 **동기로** 부르기 때문이다
+      // (codex O1). cancel이 래치까지 닫으므로 그 뒤로는 몇 번 울리든 자동
+      // 주입이 낄 자리가 없다.
+      consumeAutoPath: () => {
+        seedGateRef.current?.cancel();
+        seedGateRef.current = null;
+        // 대기 시드도 함께 회수한다 — 남겨 두면 언마운트가 보관함에 맡겨
+        // 다음 마운트가 같은 시드를 또 쏜다. 막혀서 못 쓴 경우에만 되돌린다.
+        pendingSeedRef.current = null;
+      },
+      rescan: () => rescanBlockedRef.current?.(),
+      blocked: writeBlockedNow,
+      onBlocked: () => {
+        // 자동 예약은 이미 소비됐다 — "기다리면 알아서 나간다"고 말하면 거짓말이
+        // 된다. 대신 대기 시드를 되살려 두면, 이 탭을 떠났다 와도 인계가 이어져
+        // (N3) 새 예약으로 다시 붙는다. 이 마운트 안에서는 버튼이 재시도 경로다.
+        pendingSeedRef.current = text;
+        setSeedNote(
+          "세션이 입력을 기다리는 상태입니다(권한 승인·폴더 신뢰·선택 프롬프트 등).\n" +
+            "지금 보내면 시드가 프롬프트가 아니라 그 화면의 키 입력으로 들어갑니다 — " +
+            "그 프롬프트를 처리한 뒤 [시드 재주입]을 다시 눌러 주세요.",
+        );
+      },
+      write: async () => {
+        if (isRefine) await submitSingleLine(text).catch(() => {});
+        else await submitSeed(text);
+      },
+    });
 
   // Dev mode 확인: inject a review prompt into THIS session if it's the target
   // (matched by uuid) and we're its driver and live. The first "open + seed" goes
@@ -1013,6 +1031,8 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
     /** 이 마운트가 연 세션의 uuid — 시드 보관함의 키(N3). statusUuidRef와 달리
      * 정리 세션에도 채운다(보관함은 attention 체계와 무관하다). */
     let openedUuid: string | null = null;
+    /** 세션이 실제로 죽었다(단순 탭 전환 언마운트와 구분) — 인계 차단(O2). */
+    let sessionClosed = false;
     const write = (bytes: Uint8Array | number[], origin: PtyChunkOrigin = "replay") => {
       if (!disposed) {
         const buf = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
@@ -1107,8 +1127,13 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
         // badge must survive that so it stays visible until the user looks.)
         const closedUuid = statusUuidRef.current;
         if (closedUuid) useClaudeStatus.getState().remove(closedUuid);
-        // 세션이 죽었으면 이어받을 곳도 없다 — 보관함을 비운다(N3).
+        // 세션이 죽었으면 이어받을 곳도 없다 — 보관함을 비우고(N3) **대기 시드도
+        // 함께 버린다**. 남겨 두면 뒤이은 cleanup이 죽은 세션의 시드를 다시
+        // 맡겨 부활시킨다(codex O2). 플래그는 그 순서가 어떻게 오든 막는 이중
+        // 방어다(seedToCarry).
+        sessionClosed = true;
         clearPendingSeed(openedUuid);
+        pendingSeedRef.current = null;
         if (!disposed) term.write("\r\n\x1b[2m[세션이 다른 창에서 종료되었습니다]\x1b[0m\r\n");
       });
       if (disposed) return;
@@ -1395,7 +1420,8 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
       // 늘린다. 다음 마운트가 `takePendingSeed`로 이어받아 다시 예약한다(준비
       // 감지·게이트를 처음부터 다시 통과한다 — 그때의 화면으로 새로 판정하는 것이
       // 맞다). 탭을 아주 닫은 경우엔 세션 종료가 보관함을 비운다.
-      if (pendingSeedRef.current) stashPendingSeed(openedUuid, pendingSeedRef.current);
+      const carry = seedToCarry(pendingSeedRef.current, sessionClosed);
+      if (carry) stashPendingSeed(openedUuid, carry);
       blockedScanner.cancel();
       ro.disconnect();
       onData.dispose();
