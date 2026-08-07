@@ -122,6 +122,20 @@ describe("openPromptRefine — 우측 배치 · 탭당 1개", () => {
     openPromptRefine(dock, { ...args, model: "fable" });
     expect(added[0].params).toMatchObject({ model: "fable" });
   });
+
+  it("강도는 넘긴 값만 실리고, 없으면 키 자체가 없다 (플래그 미부착)", () => {
+    const { dock, added } = fakeDock();
+    openPromptRefine(dock, { ...args, effort: "xhigh" });
+    expect(added[0].params).toMatchObject({ effort: "xhigh" });
+
+    const fresh = fakeDock();
+    openPromptRefine(fresh.dock, args); // effort 없음
+    expect("effort" in (fresh.added[0].params as Record<string, unknown>)).toBe(false);
+    // 빈 문자열도 미지정 취급 — `--effort ""`가 되는 경로가 없어야 한다.
+    const blank = fakeDock();
+    openPromptRefine(blank.dock, { ...args, effort: "" });
+    expect("effort" in (blank.added[0].params as Record<string, unknown>)).toBe(false);
+  });
 });
 
 describe("isRefineParams", () => {

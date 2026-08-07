@@ -1538,6 +1538,10 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
     const workdir = props.params.project;
     const sourceProject = refineSourceProject;
     const containerApi = props.containerApi;
+    // 강도는 **이 세션이 뜰 때의 값을 승계**한다. 전역 기억을 다시 읽으면, 그
+    // 사이 다른 표면에서 강도를 바꾼 사용자가 "모델을 바꿀까요?"에만 동의하고서
+    // 강도까지 조용히 갈아타게 된다 — 확인받은 것 이상을 바꾸지 않는다.
+    const effort = props.params.effort;
     const title = ((props.params.title as string) ?? "").replace(/^프롬프트 정리 — /, "") || "세션";
     exitRefine("model-restart");
     // 재생성은 제거가 반영된 뒤에 — 패널 id가 결정적이라 같은 틱에 다시 추가하면
@@ -1550,7 +1554,7 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
         workdir,
         sessionUuid: crypto.randomUUID(),
         model,
-        effort: loadAgentOptions("claude").effort,
+        effort,
         title,
         sourceProject,
       });
