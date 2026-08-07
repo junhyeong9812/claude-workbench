@@ -17,6 +17,7 @@ use tauri::{AppHandle, Emitter, Manager};
 
 pub mod archive;
 pub mod claude;
+pub mod codex;
 pub mod files;
 pub mod git;
 pub mod graph;
