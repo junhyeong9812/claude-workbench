@@ -313,11 +313,15 @@ fn recheck_adoptable(
 /// (the picker's external-session section). Only that path re-checks liveness
 /// here; see [`recheck_adoptable`].
 ///
-/// `model` is passed straight through to the spawn (`--model`), and is therefore
-/// meaningful **only on the driver path**: attaching to an already-running PTY
-/// cannot change the model it was started with, so the mirror branch above
-/// ignores it. The one caller that sets it (prompt refine) always opens a brand
-/// new uuid, which never takes the mirror branch.
+/// `model`/`effort` are passed straight through to the spawn (`--model` /
+/// `--effort`), and are therefore meaningful **only on the driver path**:
+/// attaching to an already-running PTY cannot change the model or effort it was
+/// started with, so the mirror branch above ignores both. Callers that set them
+/// (the new-session options popover, prompt refine, and the surfaces that
+/// inherit the last-used options) open a brand new uuid, which never takes the
+/// mirror branch. Both are `Option`: omitted or blank = the flag is not passed,
+/// so an old frontend (or a panel restored from a pre-options layout) spawns
+/// exactly as before.
 #[tauri::command]
 #[allow(clippy::too_many_arguments)]
 pub fn claude_open_or_attach(
@@ -331,6 +335,7 @@ pub fn claude_open_or_attach(
     name: Option<String>,
     adopt: Option<bool>,
     model: Option<String>,
+    effort: Option<String>,
     cols: u16,
     rows: u16,
 ) -> Result<ClaudeOpened, AppError> {
@@ -398,6 +403,7 @@ pub fn claude_open_or_attach(
         uuid,
         name.unwrap_or_else(|| "Claude".to_string()),
         model,
+        effort,
         cols,
         rows,
     )?;

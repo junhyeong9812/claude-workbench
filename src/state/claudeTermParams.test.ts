@@ -69,6 +69,34 @@ describe("paramsAfterOpen — 1회성만 지우고 나머지는 보존", () => {
   });
 });
 
+describe("model/effort — 스폰 옵션은 유지 필드다", () => {
+  it("세션이 열린 뒤에도, 재시작 뒤에도 남는다 (같은 모델·강도로 재스폰)", () => {
+    const before = {
+      kind: "claudeterm" as const,
+      project: "/home/jun/proj",
+      model: "opus",
+      effort: "xhigh",
+      seed: "리뷰해줘",
+      loadSessionId: "u1",
+    };
+    const after = paramsAfterOpen(before, { id: 1, session_uuid: "u1" });
+    expect(after.model).toBe("opus");
+    expect(after.effort).toBe("xhigh");
+    const restored = persistRoundTrip(after);
+    expect(restored.model).toBe("opus");
+    expect(restored.effort).toBe("xhigh");
+    // 1회성 필드와는 정반대로 움직인다는 것이 이 테스트의 요점이다.
+    expect("seed" in restored).toBe(false);
+  });
+
+  it("옵션 없이 열린 세션은 키 자체가 없다 — 구 레이아웃과 같은 모양", () => {
+    const after = paramsAfterOpen({ project: "/p" }, { id: 1, session_uuid: "u1" });
+    const restored = persistRoundTrip(after);
+    expect("model" in restored).toBe(false);
+    expect("effort" in restored).toBe(false);
+  });
+});
+
 describe("리마운트·앱 재시작 시나리오 (감사 B1)", () => {
   it("인수 1회 뒤에는 재검증이 다시 돌지 않는다 — 탭 전환도, 재시작도", () => {
     const project = "/home/jun/proj";

@@ -288,6 +288,11 @@ interface AppState {
     title?: string;
     /** Open this panel to the right of an existing panel (review: beside the diff). */
     referencePanelId?: string;
+    /** Spawn options (`--model` / `--effort`). Omitted = no flag, exactly as
+     * before options existed. Set by the toolbar's options popover and by the
+     * surfaces that inherit the last-used options (worktree, review). */
+    model?: string;
+    effort?: string;
   } | null;
   /** Inject a prompt into an already-live Claude session (dev mode's 확인 button
    * re-uses the project's dev session). Matched by session uuid in ClaudeTermPanel.
@@ -497,7 +502,14 @@ interface AppState {
   /** Request opening a new Claude session in `project` (MainArea consumes + clears).
    * Optional `seed`/`title` pre-seed a review session. */
   requestClaudeOpen: (
-    req: { project: string; seed?: string; title?: string; referencePanelId?: string } | null,
+    req: {
+      project: string;
+      seed?: string;
+      title?: string;
+      referencePanelId?: string;
+      model?: string;
+      effort?: string;
+    } | null,
   ) => void;
   /** Inject a prompt into a live Claude session (consumed by the matching panel). */
   requestClaudeInject: (
