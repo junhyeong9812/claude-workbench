@@ -4787,3 +4787,128 @@ body {
   border-top: 1px solid var(--border);
   background: var(--bg-alt);
 }
+
+/* ── codex 세션 패널 (작업③) ────────────────────────────────────────────────
+   터미널 | (상세) | 타임라인. claudeterm과 같은 어휘를 쓰되 클래스는 나눠 둔다 —
+   두 패널은 배선이 다르고, 한쪽 레이아웃을 고치다 다른 쪽이 조용히 따라 바뀌는
+   것이 이 기능에서 가장 피하고 싶은 일이다. */
+.codexterm {
+  display: flex;
+  height: 100%;
+  min-height: 0;
+  position: relative;
+}
+.codexterm-pane {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+  height: 100%;
+}
+.codexterm-term-pane {
+  flex: 1 1 0;
+  min-width: 0;
+  min-height: 0;
+}
+/* xterm 호스트는 이 컬럼의 높이를 다 쓴다 (claudeterm-term과 같은 규칙 —
+   flex 자식에게 height:100%만 주면 축소 시 넘친다). */
+.codexterm-term-pane > .terminal-host {
+  flex: 1 1 0;
+  min-height: 0;
+  min-width: 0;
+}
+.codexterm-timeline-pane,
+.codexterm-viewer-pane {
+  border-left: 1px solid var(--border, #333);
+  background: var(--bg, #1e1e1e);
+}
+.codexterm-pane-head {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 3px 8px;
+  font-size: 0.78em;
+  color: var(--fg-dim);
+  background: rgba(127, 127, 127, 0.08);
+  border-bottom: 1px solid var(--border, #333);
+}
+.codexterm-pane-head-title {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.codexterm-x {
+  cursor: pointer;
+  padding: 0 4px;
+  color: var(--fg-dim);
+}
+.codexterm-x:hover {
+  color: var(--fg);
+}
+/* 모델·강도·토큰 한 줄. */
+.codexterm-diag {
+  flex: 0 0 auto;
+  padding: 2px 8px;
+  font-size: 10px;
+  color: var(--fg-dim);
+  border-bottom: 1px solid var(--border, #333);
+}
+/* 매칭 실패 사유·파싱 이상 — 빈 화면 대신 이유를 보여 주는 자리. */
+.codexterm-note {
+  flex: 0 0 auto;
+  padding: 4px 8px;
+  font-size: 11px;
+  line-height: 1.4;
+  color: var(--fg-dim);
+  background: rgba(127, 127, 127, 0.06);
+  border-bottom: 1px solid var(--border, #333);
+}
+.codexterm-timeline {
+  flex: 1 1 0;
+  min-height: 0;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+}
+.codexterm-timeline .timeline-list {
+  flex: 0 0 auto;
+}
+.codexterm-viewer-body {
+  flex: 1 1 0;
+  min-height: 0;
+  overflow: auto;
+  padding: 6px 8px;
+}
+.codexterm-qa {
+  margin: 0;
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-size: 0.85em;
+  line-height: 1.5;
+}
+.codexterm-splitter {
+  flex: 0 0 5px;
+  cursor: col-resize;
+  background: var(--border, #333);
+}
+.codexterm-splitter:hover {
+  background: var(--accent, #89b4fa);
+}
+.codexterm-expand {
+  flex: 0 0 22px;
+  padding: 8px 2px;
+  writing-mode: vertical-rl;
+  font-size: 11px;
+  color: var(--fg-dim);
+  background: var(--bg-alt);
+  border: none;
+  border-left: 1px solid var(--border);
+  cursor: pointer;
+}
+.codexterm-expand:hover {
+  color: var(--fg);
+  background: var(--bg-hover);
+}

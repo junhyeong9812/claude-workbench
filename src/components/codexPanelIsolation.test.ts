@@ -12,20 +12,34 @@
  */
 import { describe, expect, it } from "vitest";
 import { components } from "./panelRegistry";
+import { CodexTermPanel } from "./CodexTermPanel";
 import { TerminalPanel } from "./TerminalPanel";
 import { ClaudeTermPanel } from "./ClaudeTermPanel";
 
-describe("codexterm은 순수 터미널 패널이다", () => {
-  it("레지스트리가 codexterm을 TerminalPanel로 푼다 (ClaudeTermPanel 아님)", () => {
-    expect(components.codexterm).toBe(TerminalPanel);
+describe("codexterm은 claude 배선을 지나지 않는다", () => {
+  /** 작업③에서 codexterm이 TerminalPanel 직결에서 **얇은 래퍼**로 바뀌었다
+   * (터미널 옆에 rollout 타임라인 컬럼이 붙었다). 바뀐 것은 그 한 겹뿐이고
+   * 불변식은 그대로다 — 터미널 자체는 여전히 TerminalPanel이고, claude 패널은
+   * 어느 경로로도 지나지 않는다. */
+  it("레지스트리가 codexterm을 CodexTermPanel로 푼다 (ClaudeTermPanel 아님)", () => {
+    expect(components.codexterm).toBe(CodexTermPanel);
     expect(components.codexterm).not.toBe(ClaudeTermPanel);
     // 대조군 — claudeterm은 그대로 claude 패널이어야 한다(회귀 0).
     expect(components.claudeterm).toBe(ClaudeTermPanel);
   });
 
-  it("일반 터미널·SSH와 같은 컴포넌트를 공유한다 (SSH 선례)", () => {
-    expect(components.codexterm).toBe(components.terminal);
-    expect(components.codexterm).toBe(components.ssh);
+  it("일반 터미널·SSH는 건드리지 않는다 (SSH 선례 보존)", () => {
+    expect(components.terminal).toBe(TerminalPanel);
+    expect(components.ssh).toBe(TerminalPanel);
+  });
+
+  /** 래퍼가 claude 패널로 **되지는 않았다**는 최소 확인. 감싸는 대상이
+   * TerminalPanel이라는 것(= PTY 수명·스폰·재부착이 공용 경로 그대로)과
+   * `claude_*` invoke 0은 소스 감사로 확인했다(log.md 격리 감사) — 여기서
+   * 소스 텍스트를 읽으려면 `?raw` 타입 배관이 필요해 범위 밖으로 뒀다. */
+  it("래퍼는 claude 패널과 다른 컴포넌트다", () => {
+    expect(CodexTermPanel).not.toBe(ClaudeTermPanel);
+    expect(CodexTermPanel).not.toBe(TerminalPanel);
   });
 });
 
