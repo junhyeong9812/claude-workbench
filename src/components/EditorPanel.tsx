@@ -238,7 +238,7 @@ export function EditorPanel(props: IDockviewPanelProps<EditorParams>) {
         </button>
         <button
           className="editor-review"
-          title="저장하고 Claude에게 검토 요청 (오타·import·들여쓰기·맥락 — 지적만)"
+          title="저장하고 에이전트에게 검토 요청 (오타·import·들여쓰기·맥락 — 지적만)"
           onClick={() => void confirmReview()}
           disabled={!path || reviewing}
         >
