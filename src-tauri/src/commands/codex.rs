@@ -212,7 +212,8 @@ fn canonical_str(p: &str) -> Option<String> {
 /// A가 메시지를 보내 전사 생성 → A 탭 종료 → **B가 A의 전사를 자기 것으로 확정**.
 /// 남의 대화가 화면에 뜨는, 이 기능의 유일한 심각 실패다.
 ///
-/// 그래서 기록은 **패널이 실제로 닫힐 때만** 지운다([`codex_timeline_release`]).
+/// 그래서 기록은 패널이 닫혀도 **지우지 않는다** — [`codex_timeline_release`]는
+/// 스캔만 멈추는 보호 tombstone 표식이다(지우면 이웃 탭이 그 전사를 승계한다).
 /// 부수 효과로 세션이 죽은 뒤에도 마지막 전사의 타임라인이 그대로 남는다.
 struct CodexSession {
     cwd: Option<String>,
@@ -626,16 +627,24 @@ pub fn codex_timeline_snapshot(
     })
 }
 
-/// 패널이 **실제로 닫힐 때** 이 탭의 스폰 기록·claim을 버린다.
+/// 패널이 닫혀도 이 탭의 스폰 기록·claim은 **버리지 않는다** — 지우는 순간
+/// 같은 cwd·겹친 창의 미해결 이웃 탭이 이 탭의 전사를 유일 후보로 sticky
+/// 확정할 수 있다(최종 감사 재현: A 확정→A 닫힘→release가 claim 삭제→B가
+/// A의 전사를 Matched). 표식(originator)은 앱 공통이라 탭끼리는 못 가른다.
 ///
-/// 이것이 기록을 지우는 유일한 경로다. PTY가 죽었다는 이유로 지우면 claim이
-/// 사라져 같은 cwd의 다른 탭이 그 전사를 가져간다([`CodexSession`] 참조).
-/// 프론트의 `closePanelSession`이 codexterm 분기에서 부른다. 호출을 놓치면
-/// 남는 것은 기록 한 칸뿐이고(그 창 안에서만 후보를 막는다) 방향은 안전한 쪽이다.
+/// 그래서 이 커맨드는 기록을 **보호 tombstone으로 남기는** 표식만 한다:
+/// resolved면 claim이 계속 남을 막고, 미해결이면 자기 창 동안 경쟁에 남아
+/// Contested를 유지한다(창 10s가 지나면 새 파일에는 영향 없음 — covers()가
+/// 거른다). 메모리 비용은 앱 실행당 닫힌 codex 탭 수 × 한 칸이라 무시 가능.
+/// 유일하게 완전 삭제하는 경로는 subscribe 실패 롤백(그 세션의 전사는 존재
+/// 자체가 불가능한 시점)뿐이다.
 #[tauri::command]
 pub fn codex_timeline_release(state: State<'_, CodexState>, id: u64) {
     if let Ok(mut m) = state.0.lock() {
-        m.remove(&id);
+        if let Some(s) = m.get_mut(&id) {
+            // 폴링 주체가 사라졌으니 스캔만 멈춘다 — 기록·claim은 위 근거로 유지.
+            s.final_scan_done = true;
+        }
     }
 }
 
