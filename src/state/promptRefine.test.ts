@@ -14,6 +14,8 @@ import {
   SEED_READY_SETTLE,
   clearPendingSeed,
   makeSeedGate,
+  reinjectSeedFlow,
+  seedToCarry,
   makeSeedScheduler,
   seedFireLog,
   stashPendingSeed,
@@ -1038,6 +1040,101 @@ describe("makeSeedGate", () => {
     s.setBlocked(false);
     s.bus.notify();
     expect(s.inject).toHaveBeenCalledTimes(1);
+  });
+});
+
+// ---- [시드 재주입]의 순서 (codex O1) --------------------------------------
+
+describe("reinjectSeedFlow", () => {
+  it("소비 → 재스캔 → 판정 → 쓰기 순서로만 진행한다", async () => {
+    const log: string[] = [];
+    await reinjectSeedFlow({
+      consumeAutoPath: () => log.push("consume"),
+      rescan: () => log.push("rescan"),
+      blocked: () => (log.push("blocked?"), false),
+      write: async () => void log.push("write"),
+      onBlocked: () => log.push("onBlocked"),
+    });
+    expect(log).toEqual(["consume", "rescan", "blocked?", "write"]);
+  });
+
+  it("막혀 있으면 쓰지 않는다 — 소비는 이미 끝난 뒤다", async () => {
+    const log: string[] = [];
+    await reinjectSeedFlow({
+      consumeAutoPath: () => log.push("consume"),
+      rescan: () => log.push("rescan"),
+      blocked: () => true,
+      write: async () => void log.push("write"),
+      onBlocked: () => log.push("onBlocked"),
+    });
+    expect(log).toEqual(["consume", "rescan", "onBlocked"]);
+  });
+
+  /**
+   * 실결함 재현 — 재스캔이 스토어를 쓰면 보류 중인 게이트의 구독이 **동기로**
+   * 울린다. 진짜 {@link makeSeedGate}를 물려 두 순서를 나란히 돌린다.
+   */
+  describe("재스캔이 게이트 구독을 동기 실행할 때", () => {
+    const wire = () => {
+      const listeners = new Set<() => void>();
+      let blocked = true;
+      const autoInject = vi.fn();
+      const gate = makeSeedGate({
+        blocked: () => blocked,
+        inject: autoInject,
+        subscribe: (fn) => (listeners.add(fn), () => listeners.delete(fn)),
+      });
+      gate.fire({ path: "ready", elapsedMs: 2000 }); // 보류 진입
+      const manualWrite = vi.fn(async () => {});
+      // 재스캔 = "대화가 사라졌다"를 스토어에 쓰는 것 = 구독 동기 호출.
+      const rescan = () => {
+        blocked = false;
+        [...listeners].forEach((fn) => fn());
+      };
+      return { gate, autoInject, manualWrite, rescan, isBlocked: () => blocked };
+    };
+
+    it("고친 순서(소비 선행) — 자동 주입 0회, 수동 쓰기 1회", async () => {
+      const w = wire();
+      await reinjectSeedFlow({
+        consumeAutoPath: () => w.gate.cancel(),
+        rescan: w.rescan,
+        blocked: w.isBlocked,
+        write: w.manualWrite,
+        onBlocked: () => {},
+      });
+      expect(w.autoInject).not.toHaveBeenCalled();
+      expect(w.manualWrite).toHaveBeenCalledTimes(1);
+    });
+
+    it("옛 순서(재스캔 선행)였다면 이중 제출 — 이 테스트가 지키는 것", () => {
+      // 고친 순서의 반대를 손으로 밟아 위험이 실재함을 고정한다.
+      const w = wire();
+      w.rescan(); // 여기서 게이트가 이미 자동 주입해 버린다
+      expect(w.autoInject).toHaveBeenCalledTimes(1);
+      w.gate.cancel(); // 뒤늦은 소비는 아무것도 못 막는다
+      void w.manualWrite();
+      expect(w.manualWrite).toHaveBeenCalledTimes(1); // 합계 2번 나갔다
+    });
+  });
+});
+
+// ---- 종료된 세션의 시드는 맡기지 않는다 (codex O2) --------------------------
+
+describe("seedToCarry", () => {
+  it("살아 있는 세션 — 대기 시드를 그대로 맡긴다", () => {
+    expect(seedToCarry("리뷰하자", false)).toBe("리뷰하자");
+  });
+
+  it("**종료된 세션 — 맡기지 않는다**", () => {
+    // 종료 통지가 보관함을 비운 뒤 cleanup이 다시 맡기면 죽은 세션의 시드가
+    // 부활해 영영 남는다(codex O2).
+    expect(seedToCarry("리뷰하자", true)).toBeNull();
+  });
+
+  it("맡길 것이 없으면 어느 쪽이든 null", () => {
+    expect(seedToCarry(null, false)).toBeNull();
+    expect(seedToCarry(null, true)).toBeNull();
   });
 });
 

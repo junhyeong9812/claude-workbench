@@ -225,6 +225,59 @@ export function clearPendingSeed(uuid: string | null | undefined): void {
   pendingSeeds.delete(uuid);
 }
 
+/**
+ * 언마운트가 보관함에 맡길 시드 — **세션이 죽었으면 없다**.
+ *
+ * 종료 통지와 언마운트는 따로 온다. 종료가 먼저 와서 보관함을 비워도, 뒤이은
+ * cleanup이 아직 남아 있는 대기 시드를 **다시** 맡기면 죽은 세션의 시드가
+ * 보관함에 부활한다(codex O2). 같은 uuid로 다시 붙을 일은 없으니 그건 영영
+ * 안 없어지는 찌꺼기고, 최악의 경우 재사용된 uuid에 엉뚱한 시드가 실린다.
+ *
+ * 판정을 여기 둔 이유는 그 규칙이 **조건이 둘 뿐인 한 줄**이라서다 — 배선에
+ * 흩어 두면 다음에 종료 경로가 하나 늘 때 또 빠뜨린다.
+ */
+export function seedToCarry(pending: string | null, sessionClosed: boolean): string | null {
+  return sessionClosed ? null : pending;
+}
+
+/**
+ * [시드 재주입] 한 번의 **순서** — 부수효과는 전부 주입받는다.
+ *
+ * 이 함수가 존재하는 이유는 순서 하나가 실결함이었기 때문이다(codex O1).
+ * `rescan`은 화면 스캔 결과를 스토어에 쓰고, 스토어 쓰기는 구독자를 **동기로**
+ * 부른다 — 그 구독자 중 하나가 보류 중인 시드 게이트다. 그래서 "재스캔 → 판정 →
+ * 소비" 순서면, 재스캔 **도중** 게이트가 해소를 보고 자동 주입하고, 돌아온
+ * 수동 경로가 또 쓴다. 같은 시드가 두 번 나간다.
+ *
+ * 고친 순서는 **소비가 맨 앞**이다. `consumeAutoPath`가 게이트를 cancel하면
+ * 래치가 닫히므로({@link makeSeedGate}의 계약), 그 뒤 어떤 구독이 몇 번 울리든
+ * 자동 경로는 낄 자리가 없다. 그다음에야 관측하고, 그다음에 쓴다.
+ *
+ * 막혀 있으면 쓰지 않고 `onBlocked`만 부른다 — 이때 자동 경로는 **이미
+ * 소비됐다**는 것이 호출부가 알아야 할 사실이다(안내 문구가 "다시 누르세요"로
+ * 끝나야 하는 이유).
+ */
+export async function reinjectSeedFlow(deps: {
+  /** 자동 경로를 **동기적으로** 완전히 소비한다(게이트 cancel + 대기 시드 회수). */
+  consumeAutoPath: () => void;
+  /** 화면을 다시 스캔한다 — 구독을 동기 실행시킬 수 있어 소비 **뒤**에 온다. */
+  rescan: () => void;
+  /** 지금 막혀 있는가. */
+  blocked: () => boolean;
+  /** 실제 쓰기. */
+  write: () => Promise<void>;
+  /** 막혀서 못 썼다 — 안내(+인계 복원). */
+  onBlocked: () => void;
+}): Promise<void> {
+  deps.consumeAutoPath();
+  deps.rescan();
+  if (deps.blocked()) {
+    deps.onBlocked();
+    return;
+  }
+  await deps.write();
+}
+
 /** 발사 직전 게이트 — {@link makeSeedGate}의 조작 표면. */
 export interface SeedGate {
   /** 예약기가 쐈다. 통과하면 지금 주입, blocked면 보류. */
