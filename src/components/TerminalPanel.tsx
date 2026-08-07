@@ -240,6 +240,9 @@ export function TerminalPanel(props: IDockviewPanelProps<TerminalParams>) {
       if (sessionId == null) {
         // Opt-in scrollback persistence keys on the (layout-stable) panel id, so
         // a restored panel restores its own prior output (review F11).
+        // codex는 이 opt-in을 **의도적으로 안 탄다**(아래 분기가 persistKey를 안
+        // 넘긴다): 전체화면 TUI의 지난 프레임을 재도장하면 살아 있는 화면처럼
+        // 보이는 죽은 그림이 남고, 곧이어 새 TUI가 그 위에 그린다.
         const persistKey = useAppStore.getState().persistScrollback ? props.api.id : null;
         if (isSsh) {
           // Recreate after restart: no secret here — the backend reads it from
@@ -267,6 +270,15 @@ export function TerminalPanel(props: IDockviewPanelProps<TerminalParams>) {
           // 원인 없는 검은 화면만 남는다. 일반 터미널 경로는 이 분기를 지나지
           // 않으므로 기존 동작 불변.
           const cwd = props.params.cwd ?? useAppStore.getState().activeProject ?? null;
+          // 재부착에 실패해 여기까지 온 경우(재시작·PTY 소멸) = **새 세션**이다.
+          // codex에는 `--session-id`가 없어 앱이 이전 대화를 이어 줄 수 없으므로
+          // (그래서 이 탭은 지속성이 없다) 조용히 빈 TUI를 띄우면 사용자는 이전
+          // 대화가 사라진 것을 화면으로만 추측하게 된다. 한 줄로 밝힌다.
+          if (existing != null) {
+            writeText(
+              "\r\n\x1b[2m[새 codex 세션 — 이전 대화는 codex resume으로만 이어집니다]\x1b[0m\r\n",
+            );
+          }
           try {
             sessionId = await invoke<number>("codex_create", {
               cwd,

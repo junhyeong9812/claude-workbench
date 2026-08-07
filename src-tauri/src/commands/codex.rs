@@ -24,7 +24,8 @@ use super::AppError;
 const NOT_FOUND: &str =
     "codex를 찾을 수 없습니다 — 설치되어 있고 PATH에 있는지 확인하세요 (`npm i -g @openai/codex`).";
 
-/// 한 codex 세션의 argv: `<bin> [-m <model>] [-c model_reasoning_effort=<effort>]`.
+/// 한 codex 세션의 argv:
+/// `<bin> [--model=<model>] [--config=model_reasoning_effort=<effort>]`.
 ///
 /// `build_claude_args`와 같은 이유로 순수 함수다 — **미선택 경로가 인자 없는
 /// `codex` 실행과 바이트 단위로 같아야** 하고(그때는 `~/.codex/config.toml`이
@@ -32,23 +33,34 @@ const NOT_FOUND: &str =
 /// 둘 다 "미지정" = 플래그를 아예 안 붙인다.
 ///
 /// claude와 갈리는 지점 하나: 강도에 **전용 플래그가 없다**. codex는 임의의
-/// config 키를 `-c key=value`로 덮어쓰게 해 두었고(TOML 파싱, 실패 시 리터럴
-/// 문자열), 추론 강도는 그 경로로만 지정된다 — 실측으로 TUI 배너가
+/// config 키를 `--config <key>=<value>`로 덮어쓰게 해 두었고(TOML 파싱, 실패 시
+/// 리터럴 문자열), 추론 강도는 그 경로로만 지정된다 — 실측으로 TUI 배너가
 /// `gpt-5.6-sol low`로 바뀌는 것을 확인했다.
 ///
 /// 그리고 **오값이 안전하지 않다**(claude의 `--effort`와 결정적 차이): codex는
 /// 값을 로컬에서 검증하지 않고 그대로 API에 보내며, 모르는 값은 첫 요청이
 /// `400 invalid_enum_value`로 죽는다. 그래서 프론트의 강도 목록은 큐레이션이고
 /// (`agentOptions.CODEX_EFFORT_CHOICES`), 자유 입력을 노출하지 않는다.
+/// **여기서 어휘를 다시 검증하지는 않는다** — 어휘의 단일 출처는 프론트 목록이고,
+/// 백엔드에 두 번째 목록을 두면 codex가 값을 늘릴 때마다 두 곳이 갈린다.
+///
+/// 값은 **등호형**(`--model=<v>` / `--config=<k>=<v>`)으로 붙인다. 분리형이면
+/// 하이픈으로 시작하는 값이 다음 **옵션으로 재해석**된다 — 실측:
+///
+/// ```text
+/// $ codex -m -x --help
+///   error: unexpected argument '-x' found
+///   tip: to pass '-x' as a value, use '-- -x'
+/// ```
+///
+/// 지금 프론트 어휘엔 그런 값이 없지만, 등호형은 그 가정에 기대지 않는 형태다.
 fn build_codex_args(bin: &str, model: Option<&str>, effort: Option<&str>) -> Vec<String> {
     let mut cmd = vec![bin.to_string()];
     if let Some(m) = model.map(str::trim).filter(|m| !m.is_empty()) {
-        cmd.push("-m".to_string());
-        cmd.push(m.to_string());
+        cmd.push(format!("--model={m}"));
     }
     if let Some(e) = effort.map(str::trim).filter(|e| !e.is_empty()) {
-        cmd.push("-c".to_string());
-        cmd.push(format!("model_reasoning_effort={e}"));
+        cmd.push(format!("--config=model_reasoning_effort={e}"));
     }
     cmd
 }
@@ -152,7 +164,7 @@ mod tests {
         assert_eq!(build_codex_args(BIN, None, None), vec![BIN]);
     }
 
-    /// 프론트에서 새어 나온 빈/공백 문자열은 "미지정"이지 `-m ""`이 아니다.
+    /// 프론트에서 새어 나온 빈/공백 문자열은 "미지정"이지 `--model=`이 아니다.
     /// codex는 강도 오값을 로컬 검증 없이 API로 보내고 400으로 죽으므로, 빈
     /// 값이 `model_reasoning_effort=`로 실려 나가면 세션이 첫 요청에서 죽는다.
     #[test]
@@ -160,12 +172,12 @@ mod tests {
         assert_eq!(build_codex_args(BIN, Some(""), Some("   ")), vec![BIN]);
     }
 
-    /// 강도는 전용 플래그가 아니라 config 덮어쓰기 한 쌍(`-c key=value`)이다.
+    /// 강도는 전용 플래그가 아니라 config 덮어쓰기(`--config=key=value`)다.
     #[test]
     fn effort_goes_through_a_config_override() {
         assert_eq!(
             build_codex_args(BIN, Some("gpt-5.6-sol"), Some("low")),
-            vec![BIN, "-m", "gpt-5.6-sol", "-c", "model_reasoning_effort=low"]
+            vec![BIN, "--model=gpt-5.6-sol", "--config=model_reasoning_effort=low"]
         );
     }
 
@@ -174,25 +186,25 @@ mod tests {
     fn each_option_is_independent() {
         assert_eq!(
             build_codex_args(BIN, Some("gpt-5.6-sol"), None),
-            vec![BIN, "-m", "gpt-5.6-sol"]
+            vec![BIN, "--model=gpt-5.6-sol"]
         );
         assert_eq!(
             build_codex_args(BIN, None, Some("xhigh")),
-            vec![BIN, "-c", "model_reasoning_effort=xhigh"]
+            vec![BIN, "--config=model_reasoning_effort=xhigh"]
         );
     }
 
-    /// 값은 trim만 한다 — argv 벡터로 스폰하므로 인용·이스케이프가 필요 없고,
-    /// `-c`의 값은 `key=value` **한 인자**로 합쳐져야 한다(쪼개면 codex가
-    /// 그것을 프롬프트로 오해한다).
+    /// 값은 trim만 한다 — argv 벡터로 스폰하므로 인용·이스케이프가 필요 없다.
+    /// 등호형이라 옵션과 값이 **한 인자**로 묶인다(쪼개지면 하이픈으로 시작하는
+    /// 값이 다음 옵션으로 재해석되거나 프롬프트로 오해된다).
     #[test]
     fn values_are_trimmed_and_the_override_stays_one_argument() {
         let argv = build_codex_args(BIN, Some("  gpt-5.6-sol "), Some(" medium "));
         assert_eq!(
             argv,
-            vec![BIN, "-m", "gpt-5.6-sol", "-c", "model_reasoning_effort=medium"]
+            vec![BIN, "--model=gpt-5.6-sol", "--config=model_reasoning_effort=medium"]
         );
-        assert_eq!(argv.len(), 5, "config 덮어쓰기는 -c 와 값 두 인자다");
+        assert_eq!(argv.len(), 3, "등호형이라 옵션 하나가 인자 하나다");
     }
 
     /// 해석된 절대경로가 그대로 argv[0]이 된다 — PATH 재탐색에 기대지 않는다
