@@ -10,11 +10,56 @@
  * 조용한 이유: 잘못 배선해도 **화면은 멀쩡히 뜬다**. 타임라인이 영원히 빈 화면이
  * 되거나 스냅샷이 claude 목록을 오염시키는 식으로만 드러난다(survey R1 10지점).
  */
-import { describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { act } from "react";
+import { createRoot, type Root } from "react-dom/client";
+import type { IDockviewPanelProps } from "dockview-react";
+
+const invoke = vi.hoisted(() => vi.fn());
+vi.mock("@tauri-apps/api/core", () => ({ invoke }));
+
+// 무거운 패널 둘을 **가짜로 바꿔 놓고** 래퍼를 실제로 렌더한다: TerminalPanel이
+// 정확히 한 번 쓰이는지(= PTY 경로가 공용 그대로), ClaudeTermPanel이 한 번도
+// 쓰이지 않는지(= claude 배선 미경유)를 렌더로 확인하기 위해서다.
+const termMounts = vi.hoisted(() => ({ n: 0 }));
+const claudeMounts = vi.hoisted(() => ({ n: 0 }));
+vi.mock("./TerminalPanel", async () => {
+  const { useEffect } = await import("react");
+  return {
+    TerminalPanel: () => {
+      useEffect(() => {
+        termMounts.n += 1;
+      }, []);
+      return <div data-testid="term" />;
+    },
+  };
+});
+vi.mock("./ClaudeTermPanel", async () => {
+  const { useEffect } = await import("react");
+  return {
+    ClaudeTermPanel: () => {
+      useEffect(() => {
+        claudeMounts.n += 1;
+      }, []);
+      return <div data-testid="claude" />;
+    },
+  };
+});
+
 import { components } from "./panelRegistry";
-import { CodexTermPanel } from "./CodexTermPanel";
-import { TerminalPanel } from "./TerminalPanel";
+import { CodexTermPanel, shortTranscriptName } from "./CodexTermPanel";
+import { TerminalPanel, type TerminalParams } from "./TerminalPanel";
 import { ClaudeTermPanel } from "./ClaudeTermPanel";
+
+(globalThis as unknown as { IS_REACT_ACT_ENVIRONMENT: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
+
+/** CodexTermPanel이 실제로 읽는 최소 표면. */
+function panelProps(params: TerminalParams): IDockviewPanelProps<TerminalParams> {
+  return {
+    params,
+    api: { id: "p1", onDidParametersChange: () => ({ dispose: () => {} }) },
+  } as unknown as IDockviewPanelProps<TerminalParams>;
+}
 
 describe("codexterm은 claude 배선을 지나지 않는다", () => {
   /** 작업③에서 codexterm이 TerminalPanel 직결에서 **얇은 래퍼**로 바뀌었다
@@ -33,13 +78,78 @@ describe("codexterm은 claude 배선을 지나지 않는다", () => {
     expect(components.ssh).toBe(TerminalPanel);
   });
 
-  /** 래퍼가 claude 패널로 **되지는 않았다**는 최소 확인. 감싸는 대상이
-   * TerminalPanel이라는 것(= PTY 수명·스폰·재부착이 공용 경로 그대로)과
-   * `claude_*` invoke 0은 소스 감사로 확인했다(log.md 격리 감사) — 여기서
-   * 소스 텍스트를 읽으려면 `?raw` 타입 배관이 필요해 범위 밖으로 뒀다. */
   it("래퍼는 claude 패널과 다른 컴포넌트다", () => {
     expect(CodexTermPanel).not.toBe(ClaudeTermPanel);
     expect(CodexTermPanel).not.toBe(TerminalPanel);
+  });
+});
+
+describe("래퍼를 실제로 렌더해도 격리가 유지된다", () => {
+  let host: HTMLDivElement;
+  let root: Root;
+
+  beforeEach(() => {
+    termMounts.n = 0;
+    claudeMounts.n = 0;
+    invoke.mockReset();
+    invoke.mockResolvedValue({
+      status: "searching",
+      note: "전사를 찾지 못했습니다",
+      path: null,
+      alive: true,
+      fingerprint: null,
+      unchanged: false,
+      snapshot: null,
+    });
+    host = document.createElement("div");
+    document.body.appendChild(host);
+    root = createRoot(host);
+  });
+
+  afterEach(() => {
+    act(() => root.unmount());
+    host.remove();
+  });
+
+  /** PTY 수명·스폰·재부착이 codex 전용으로 갈라지지 않았다는 확인. 터미널이 두
+   * 번 렌더되거나(중복 마운트=PTY 두 개) 아예 없으면(자체 구현으로 갈아탐) 여기서
+   * 걸린다. */
+  it("터미널은 공용 TerminalPanel 하나뿐이고 claude 패널은 지나지 않는다", async () => {
+    await act(async () => {
+      root.render(<CodexTermPanel {...panelProps({ kind: "codexterm", cwd: "/proj", sessionId: 7 })} />);
+    });
+    // 인스턴스 하나 — 둘이면 PTY가 둘, 없으면 자체 구현으로 갈아탄 것이다.
+    expect(host.querySelectorAll('[data-testid="term"]').length).toBe(1);
+    expect(host.querySelectorAll('[data-testid="claude"]').length).toBe(0);
+    // 폴링이 돌아 상태가 갱신돼도 **다시 마운트되지는 않는다**(재마운트=PTY 재부착).
+    expect(termMounts.n, "TerminalPanel은 한 번만 마운트돼야 한다").toBe(1);
+    expect(claudeMounts.n, "ClaudeTermPanel은 마운트되면 안 된다").toBe(0);
+  });
+
+  /** 타임라인이 부르는 커맨드는 codex 전용 하나뿐 — `claude_*`가 하나라도 나가면
+   * 그 세션은 claude 파이프라인 취급을 받기 시작한다(survey R1 10지점). */
+  it("codex 전용 커맨드만 부른다", async () => {
+    await act(async () => {
+      root.render(<CodexTermPanel {...panelProps({ kind: "codexterm", cwd: "/proj", sessionId: 7 })} />);
+    });
+    const names = invoke.mock.calls.map((c) => c[0] as string);
+    expect(names.length).toBeGreaterThan(0);
+    expect(names.every((n) => n === "codex_timeline_snapshot")).toBe(true);
+    expect(names.some((n) => n.startsWith("claude_"))).toBe(false);
+  });
+});
+
+describe("전사 파일명 표시 (무음 깨기)", () => {
+  it("rollout 접두·확장자를 떼고 시각+uuid만 남긴다", () => {
+    expect(
+      shortTranscriptName(
+        "/home/u/.codex/sessions/2026/08/07/rollout-2026-08-07T21-08-10-019fdc1f-abbe-7293-b347-7dc82b11c8d0.jsonl",
+      ),
+    ).toBe("2026-08-07T21-08-10-019fdc1f-abbe-7293-b347-7dc82b11c8d0");
+  });
+
+  it("전사가 없으면 표시할 것도 없다", () => {
+    expect(shortTranscriptName(null)).toBeNull();
   });
 });
 
