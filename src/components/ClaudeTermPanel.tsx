@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { buildItemIndex } from "./timelineIndex";
-import { decodePtyData, ptyEventName, pushPendingCapped } from "./pty";
+import { decodePtyData, makePtyReadyDetector, ptyEventName, pushPendingCapped } from "./pty";
 import { ViewModeToggle } from "./ViewModeToggle";
 import { errText } from "../utils/error";
 import type { TerminalOutputEvent, SnapshotResult } from "../types";
@@ -31,13 +31,13 @@ import {
   REFINE_SUBMIT_CONFIRM_MS,
   REFINE_SUBMIT_CR_DELAY,
   REFINE_VIEWS,
-  SEED_READY_DELAY,
   applyBlockReason,
   bracketedPaste,
   extractLatestPromptBlock,
   injectDeliveryDecision,
   isRefineParams,
   loadLastRefineModel,
+  makeSeedScheduler,
   makeSubmitProbe,
   makeTurnClaims,
   openPromptRefine,
@@ -53,6 +53,7 @@ import {
   sendBlockReason,
   shouldNavPanes,
   submitBytes,
+  type SeedScheduler,
   type SubmitSource,
   type RefineExitReason,
   type RefineModel,
@@ -922,9 +923,20 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
     };
     const blockedScanner = makeDebouncedScanner(runBlockedScan, 300);
 
+    // PTY 준비 감지 — 시드를 **언제** 넣을지의 근거(고정 지연 대체).
+    //
+    // 화면에 쓰는 모든 바이트를 그대로 먹인다: 스크롤백 backfill도 이 세션이
+    // 실제로 뱉은 것이고, 시드 예약은 그 backfill **뒤에** 오므로 늦게 물어볼
+    // 수 있어야 한다(그래서 감지기가 `ready`를 래치해 들고 있는다). 이미 돌고
+    // 있는 세션에 붙는 경우엔 backfill 안의 신호가 즉시 잡혀 기다릴 이유 자체가
+    // 없어진다 — 그 세션은 진작 준비돼 있다.
+    const ptyReady = makePtyReadyDetector();
+    let seedScheduler: SeedScheduler | null = null;
     const write = (bytes: Uint8Array | number[]) => {
       if (!disposed) {
-        term.write(bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes));
+        const buf = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
+        term.write(buf);
+        if (ptyReady.push(buf)) seedScheduler?.signalReady();
         blockedScanner.trigger(scanOrigin);
       }
     };
@@ -1139,12 +1151,14 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
         blockedScanner.trigger(scanOrigin);
       }
 
-      // Seed (review/dev one-shot prompt): inject once the session should be at a
-      // prompt. Ready detection is best-effort — a fixed settle delay, with a
-      // manual re-inject button if it missed.
+      // Seed (review/dev one-shot prompt): inject once the TUI is actually taking
+      // input. 예전에는 고정 지연 하나였고, 그 값이 임계 바로 아래면 시드가 통째로
+      // 사라졌다(#74). 이제는 PTY 출력의 준비 신호가 시점을 정하고 고정 지연은
+      // 신호가 안 올 때의 폴백으로만 남는다 — 놓쳤을 때의 "시드 재주입" 버튼도
+      // 그대로다.
       if (pendingSeedRef.current) {
         const seed = pendingSeedRef.current;
-        setTimeout(() => {
+        seedScheduler = makeSeedScheduler(() => {
           if (!disposed && pendingSeedRef.current === seed) {
             // 정리 세션의 규약 시드는 대화를 **시작**시켜야 하므로 제출까지 한다
             // (한 줄 + CR — 실측 근거는 submitSingleLine). 나머지 시드는 기존
@@ -1163,7 +1177,10 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
             } else void submitSeed(seed);
             pendingSeedRef.current = null;
           }
-        }, SEED_READY_DELAY);
+        });
+        // 예약보다 **먼저** 도착한 신호(이미 돌던 세션의 backfill 등)를 잇는다 —
+        // 감지기가 래치를 들고 있으므로 여기서 한 번 물어보면 된다.
+        if (ptyReady.ready) seedScheduler.signalReady();
       }
 
       // Seed the timeline from the saved snapshot (reopen or tab-switch
@@ -1236,6 +1253,9 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
       // mapping — a done-unseen badge must survive a tab-switch remount (the
       // session is only truly removed on claude-session-closed).
       if (attachedUuid) useClaudeStatus.getState().detachPanel(attachedUuid);
+      // 예약된 시드 주입을 끊는다 — `disposed` 가드가 이미 막지만, 타이머를
+      // 남겨 두면 언마운트 뒤에도 최대 3초 살아 있다.
+      seedScheduler?.cancel();
       blockedScanner.cancel();
       ro.disconnect();
       onData.dispose();
