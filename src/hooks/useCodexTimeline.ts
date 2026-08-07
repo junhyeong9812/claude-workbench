@@ -54,6 +54,8 @@ export type CodexTimelineStatus =
   | "searching"
   | "contested"
   | "ambiguous"
+  /** 잡았던 전사 파일이 사라졌다 — 다시 찾지 않는다(다른 세션을 집을 위험). */
+  | "lost"
   | "unavailable"
   | "error";
 
@@ -61,6 +63,8 @@ interface CodexTimelinePayload {
   status: Exclude<CodexTimelineStatus, "error">;
   note: string | null;
   path: string | null;
+  /** 이 탭의 PTY가 살아 있는가. 죽어도 타임라인은 남는다(마지막 상태 보존). */
+  alive: boolean;
   fingerprint: string | null;
   unchanged: boolean;
   snapshot: CodexRolloutSnapshot | null;
@@ -72,6 +76,7 @@ export interface CodexTimelineState {
   /** 매칭 실패·오류의 사람 말 설명. `status === "matched"`면 null. */
   note: string | null;
   path: string | null;
+  alive: boolean;
   items: TimelineItem[];
   turns: Map<number, string>;
   answers: Map<number, string>;
@@ -90,6 +95,7 @@ const EMPTY: CodexTimelineState = {
   status: "searching",
   note: null,
   path: null,
+  alive: true,
   items: [],
   turns: new Map(),
   answers: new Map(),
@@ -108,11 +114,13 @@ const EMPTY: CodexTimelineState = {
 export function stateFromSnapshot(
   s: CodexRolloutSnapshot,
   path: string | null,
+  alive = true,
 ): CodexTimelineState {
   return {
     status: "matched",
     note: null,
     path,
+    alive,
     items: [...s.items].sort((a, b) => a.seq - b.seq),
     turns: new Map(s.turns),
     answers: new Map(s.answers),
@@ -153,11 +161,13 @@ export function useCodexTimeline({
         });
         if (stopped) return;
         since = p.fingerprint;
-        if (p.snapshot) setState(stateFromSnapshot(p.snapshot, p.path));
-        else if (p.unchanged) setState((s) => ({ ...s, status: p.status, note: p.note, path: p.path }));
-        // 전사를 잃은 경우(매칭 해제·삭제)는 목록을 남겨 두지 않는다 — 화면에
-        // 남은 옛 타임라인이 지금 세션의 것으로 읽힌다.
-        else setState({ ...EMPTY, status: p.status, note: p.note });
+        if (p.snapshot) setState(stateFromSnapshot(p.snapshot, p.path, p.alive));
+        else if (p.unchanged)
+          setState((s) => ({ ...s, status: p.status, note: p.note, path: p.path, alive: p.alive }));
+        // 전사를 잃은 경우(파일 삭제)는 목록을 남겨 두지 않는다 — 화면에 남은 옛
+        // 타임라인이 지금 세션의 것으로 읽힌다. 세션 **종료**는 여기가 아니다:
+        // 그때는 백엔드가 마지막 전사를 계속 돌려주므로 타임라인이 그대로 남는다.
+        else setState({ ...EMPTY, status: p.status, note: p.note, alive: p.alive });
       } catch (e) {
         if (stopped) return;
         setState((s) => ({ ...s, status: "error", note: errText(e, "타임라인을 읽지 못했습니다.") }));

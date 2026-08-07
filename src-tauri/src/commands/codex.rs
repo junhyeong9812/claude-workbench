@@ -22,8 +22,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use chrono::TimeZone;
 use core_lib::codex_rollout::{
-    self, MatchOutcome, RolloutCandidate, RolloutParse, SpawnRef, MATCH_SKEW_MS,
+    self, MatchOutcome, RolloutCandidate, RolloutParse, SpawnRef, MATCH_SKEW_MS, MATCH_WINDOW_MS,
 };
 use core_lib::SessionManager;
 use serde::Serialize;
@@ -192,7 +193,16 @@ fn canonical_str(p: &str) -> Option<String> {
     std::fs::canonicalize(p).ok().map(|c| c.to_string_lossy().to_string())
 }
 
-/// 살아 있는 codex 탭 하나의 스폰 기록.
+/// 한 codex 탭의 스폰 기록.
+///
+/// **탭이 죽어도 지우지 않는다.** 예전엔 매 조회마다 `mgr.exists`로 죽은 항목을
+/// 청소했는데, 그러면 claim(이 전사는 내 것)과 경쟁 자격(이 창은 내 것일 수도
+/// 있다)이 **동시에** 사라진다. 리뷰가 재현한 경로: A 스폰 → B 스폰(같은 cwd) →
+/// A가 메시지를 보내 전사 생성 → A 탭 종료 → **B가 A의 전사를 자기 것으로 확정**.
+/// 남의 대화가 화면에 뜨는, 이 기능의 유일한 심각 실패다.
+///
+/// 그래서 기록은 **패널이 실제로 닫힐 때만** 지운다([`codex_timeline_release`]).
+/// 부수 효과로 세션이 죽은 뒤에도 마지막 전사의 타임라인이 그대로 남는다.
 struct CodexSession {
     cwd: Option<String>,
     spawned_ms: i64,
@@ -202,6 +212,8 @@ struct CodexSession {
     /// 마지막으로 돌려준 (파일 서명, 페이로드) — 폴링이 같은 내용을 반복해서
     /// 직렬화·전송하지 않게.
     cache: Option<(String, RolloutParse)>,
+    /// 마지막으로 후보 디렉토리를 훑은 시각.
+    last_scan_ms: i64,
 }
 
 /// codex 탭들의 스폰 기록. **매칭의 유일한 출처**다.
@@ -211,7 +223,16 @@ pub struct CodexState(Mutex<HashMap<u64, CodexSession>>);
 impl CodexState {
     fn register(&self, id: u64, cwd: Option<String>, spawned_ms: i64) {
         if let Ok(mut m) = self.0.lock() {
-            m.insert(id, CodexSession { cwd, spawned_ms, resolved: None, cache: None });
+            m.insert(
+                id,
+                CodexSession {
+                    cwd,
+                    spawned_ms,
+                    resolved: None,
+                    cache: None,
+                    last_scan_ms: 0,
+                },
+            );
         }
     }
 }
@@ -220,11 +241,14 @@ impl CodexState {
 /// 사람 말로 담는다 — 빈 화면만 남기지 않는다(spec ②, 무음 금지).
 #[derive(Serialize)]
 pub struct CodexTimelinePayload {
-    /// `matched` | `searching` | `contested` | `ambiguous` | `unavailable`
+    /// `matched` | `searching` | `contested` | `ambiguous` | `lost` | `unavailable`
     status: &'static str,
     note: Option<String>,
-    /// 매칭된 전사 파일 경로(표시·디버깅용).
+    /// 매칭된 전사 파일 경로. 헤더가 파일명을 띄운다 — 오매칭이나 `/new` 고착을
+    /// 사용자가 알아챌 수 있는 유일한 표면이다(리뷰 #5).
     path: Option<String>,
+    /// 이 탭의 PTY가 살아 있는가. 죽어도 타임라인은 남는다(마지막 상태 보존).
+    alive: bool,
     /// 파일 서명. 프론트가 다음 폴에 `since`로 되돌려 주면 변화 없을 때
     /// `unchanged`만 돌아온다(전사 전문을 1.5초마다 재전송하지 않게).
     fingerprint: Option<String>,
@@ -233,11 +257,12 @@ pub struct CodexTimelinePayload {
 }
 
 impl CodexTimelinePayload {
-    fn pending(status: &'static str, note: impl Into<String>) -> Self {
+    fn pending(status: &'static str, alive: bool, note: impl Into<String>) -> Self {
         Self {
             status,
             note: Some(note.into()),
             path: None,
+            alive,
             fingerprint: None,
             unchanged: false,
             snapshot: None,
@@ -257,23 +282,39 @@ fn file_sig(path: &Path) -> Option<String> {
     Some(format!("{}:{mtime}", md.len()))
 }
 
-/// `~/.codex/sessions` 아래의 전사 후보를 모은다.
+/// 스폰 시각이 속한 날짜 디렉토리들 (`<root>/YYYY/MM/DD`), 전날·다음날 포함.
 ///
-/// **mtime 선필터**가 비용을 잡는다: 전사 파일은 세션이 열린 뒤에 만들어지므로
-/// `mtime >= 스폰시각 - 오차`가 반드시 성립한다(≒ 후보를 몇 개로 줄인다).
-/// 첫 줄을 읽는 것은 그 통과분에만 한다.
-fn scan_candidates(root: &Path, not_before_ms: i64) -> Vec<RolloutCandidate> {
+/// codex는 전사를 **세션이 열린 날**(로컬 시각) 폴더에 넣고 파일명도 그 시각이다.
+/// 우리 창은 스폰 ±10초이므로 그 하루면 충분하고, 자정 경계만 앞뒤로 한 칸씩
+/// 넓힌다. 루트 전체를 훑던 것(날짜 폴더 60여 개)을 3개로 줄이는 것이 요점이다.
+fn day_dirs(root: &Path, spawned_ms: i64) -> Vec<PathBuf> {
+    let Some(base) = chrono::Local.timestamp_millis_opt(spawned_ms).single() else {
+        return vec![root.to_path_buf()];
+    };
+    [-1, 0, 1]
+        .iter()
+        .filter_map(|d| base.checked_add_signed(chrono::Duration::days(*d)))
+        .map(|t| {
+            root.join(t.format("%Y").to_string())
+                .join(t.format("%m").to_string())
+                .join(t.format("%d").to_string())
+        })
+        .collect()
+}
+
+/// 이 탭의 전사가 있을 만한 곳에서 후보를 모은다.
+///
+/// 세 겹으로 좁힌다: ①날짜 폴더 3개만([`day_dirs`]) ②`mtime >= 스폰-오차`
+/// (전사 파일은 세션이 열린 뒤에 생기므로 반드시 성립 — 유효 후보를 배제하지
+/// 않는다) ③첫 줄을 읽어 **앱이 띄운 TUI 전사만**(`app_spawnable` — 실코퍼스의
+/// 89%가 exec·서브에이전트다).
+fn scan_candidates(root: &Path, spawned_ms: i64) -> Vec<RolloutCandidate> {
+    let not_before_ms = spawned_ms - MATCH_SKEW_MS;
     let mut out = Vec::new();
-    let mut stack = vec![root.to_path_buf()];
-    while let Some(dir) = stack.pop() {
+    for dir in day_dirs(root, spawned_ms) {
         let Ok(rd) = std::fs::read_dir(&dir) else { continue };
         for e in rd.flatten() {
             let p = e.path();
-            let Ok(ft) = e.file_type() else { continue };
-            if ft.is_dir() {
-                stack.push(p);
-                continue;
-            }
             if p.extension().and_then(|x| x.to_str()) != Some("jsonl") {
                 continue;
             }
@@ -287,11 +328,20 @@ fn scan_candidates(root: &Path, not_before_ms: i64) -> Vec<RolloutCandidate> {
             if !recent {
                 continue;
             }
-            let meta = codex_rollout::read_meta(&p);
+            let Some(meta) = codex_rollout::read_meta(&p) else { continue };
+            if !codex_rollout::app_spawnable(&meta) {
+                continue;
+            }
             out.push(RolloutCandidate {
                 path: p,
-                cwd: meta.as_ref().and_then(|m| m.cwd.clone()),
-                started_ms: meta.as_ref().and_then(|m| m.started_ms),
+                // 스폰 cwd와 같은 규칙(canonical)으로 맞춘다 — 심링크 표기가
+                // 갈리면 매칭이 조용히 실패하고 화면엔 "아직 없음"만 뜬다.
+                cwd: meta
+                    .cwd
+                    .as_deref()
+                    .and_then(canonical_str)
+                    .or(meta.cwd),
+                started_ms: meta.started_ms,
             });
         }
     }
@@ -315,6 +365,40 @@ fn cap_contents(items: &mut [core_lib::TimelineItem]) {
     }
 }
 
+/// 레지스트리 → 매칭의 두 입력: **경쟁 집합**과 **이미 임자 있는 파일 목록**.
+///
+/// 규칙 두 줄이지만 리뷰 #1이 걸린 지점이라 따로 뽑아 테스트한다.
+///
+/// - 경쟁 집합 = **아직 자기 전사를 못 잡은 탭 전부**. PTY가 살아 있는지는 **보지
+///   않는다**: 죽었다고 그 탭이 그 전사의 주인이 아니게 되지는 않는다. 죽은 탭을
+///   빼면 "A 스폰 → B 스폰 → A가 메시지 → A 종료 → B가 A의 전사를 확정"이 열린다.
+/// - 이미 잡은 탭은 경쟁에서 빠진다(새 파일을 가져갈 일이 없으므로 남을 막지
+///   않는다) — 대신 그 파일이 claim 목록에 올라 남이 못 가져간다.
+fn contest_inputs(map: &HashMap<u64, CodexSession>) -> (Vec<SpawnRef>, Vec<PathBuf>) {
+    let live = map
+        .iter()
+        .filter(|(_, s)| s.resolved.is_none())
+        .map(|(sid, s)| SpawnRef {
+            id: *sid,
+            cwd: s.cwd.clone(),
+            spawned_ms: s.spawned_ms,
+        })
+        .collect();
+    let claimed = map.values().filter_map(|s| s.resolved.clone()).collect();
+    (live, claimed)
+}
+
+const SEARCHING_NOTE: &str =
+    "전사를 찾지 못했습니다 — codex는 첫 메시지를 보낼 때 전사 파일을 만듭니다.";
+
+/// 창이 지난 뒤의 재스캔 간격. 전사 파일은 사용자가 첫 메시지를 보낼 때 생기므로
+/// **시간이 지났다고 후보가 없어지지는 않는다**(파일이 나중에 생겨도 그 안의
+/// 세션 오픈 시각은 여전히 창 안이다). 그래서 창이 지났다고 스캔을 아주 멈추면
+/// "탭 열어 두고 5분 뒤 첫 질문" 같은 정상 사용에서 타임라인이 영영 안 뜬다.
+/// 대신 간격을 늘려 정상 상태 비용을 없앤다. **진짜로 멈추는 경우는 하나뿐** —
+/// PTY가 죽은 탭(더는 전사를 만들 수 없다는 사실상의 불가능).
+const RESCAN_MS: i64 = 15_000;
+
 /// 이 codex 탭의 전사 타임라인을 돌려준다. 프론트가 타임라인을 펼친 동안 주기적
 /// 으로 부른다.
 ///
@@ -324,6 +408,11 @@ fn cap_contents(items: &mut [core_lib::TimelineItem]) {
 /// 붙이면 "아직 없는 파일을 기다리는 스레드"의 수명·정리 문제가 새로 생기는데,
 /// 얻는 것은 1.5초의 지연뿐이다. 대신 (길이,mtime) 서명으로 **변화 없을 때는
 /// 전사를 다시 읽지도, 다시 보내지도 않는다**.
+///
+/// **락 규율**: 상태 락은 읽기/쓰기 순간에만 잡는다. 디렉토리 스캔·첫 줄 읽기·
+/// 전사 파싱은 전부 락 **밖**이다 — 탭이 여러 개일 때 한 탭의 파싱이 다른 탭의
+/// 폴을 막지 않게. 그래서 claim은 스캔 전 상태가 아니라 **스캔 후 다시 잡은 락
+/// 안의 최신 상태**로 판정한다(그 사이 다른 탭이 같은 파일을 가져갔을 수 있다).
 #[tauri::command]
 pub fn codex_timeline_snapshot(
     mgr: State<'_, SessionManager>,
@@ -331,97 +420,124 @@ pub fn codex_timeline_snapshot(
     id: u64,
     since: Option<String>,
 ) -> Result<CodexTimelinePayload, AppError> {
+    let alive = mgr.exists(id);
     let Some(root) = codex_rollout::codex_sessions_root().filter(|r| r.is_dir()) else {
         return Ok(CodexTimelinePayload::pending(
             "unavailable",
+            alive,
             "codex 전사 디렉토리(~/.codex/sessions)가 없습니다.",
         ));
     };
-    let mut guard = self_lock(&state)?;
-    // 죽은 탭의 기록은 버린다 — 남아 있으면 그 탭의 창이 다른 탭의 후보를 영원히
-    // 가로막는다(Contested 고착).
-    guard.retain(|sid, _| mgr.exists(*sid));
 
-    let Some(me) = guard.get(&id) else {
-        return Ok(CodexTimelinePayload::pending(
-            "unavailable",
-            "이 탭의 codex 세션 정보를 앱이 들고 있지 않습니다 (앱 재시작 후 재부착된 탭).",
-        ));
+    // ── 1) 상태 읽기 (락) ────────────────────────────────────────────────
+    let (spawned_ms, cwd, resolved, last_scan_ms) = {
+        let guard = lock(&state)?;
+        let Some(me) = guard.get(&id) else {
+            return Ok(CodexTimelinePayload::pending(
+                "unavailable",
+                alive,
+                "이 탭의 codex 세션 정보를 앱이 들고 있지 않습니다.",
+            ));
+        };
+        (me.spawned_ms, me.cwd.clone(), me.resolved.clone(), me.last_scan_ms)
     };
-    let (spawned_ms, cwd) = (me.spawned_ms, me.cwd.clone());
 
-    // 이미 잡은 파일이 있으면 다시 찾지 않는다(sticky).
-    let matched = match me.resolved.clone() {
-        Some(p) if p.is_file() => Some(p),
-        _ => {
+    let path = match resolved {
+        Some(p) if p.is_file() => p,
+        // 잡았던 파일이 사라졌다. **다시 찾지 않는다** — 재탐색은 같은 창의 다른
+        // 전사를 새로 집을 뿐이고, 그건 남의 대화를 띄우는 경로다.
+        Some(_) => {
+            return Ok(CodexTimelinePayload::pending(
+                "lost",
+                alive,
+                "매칭됐던 전사 파일이 사라졌습니다 — 다시 찾지 않습니다(다른 세션을 집을 위험).",
+            ))
+        }
+        None => {
+            // 죽은 탭은 새 전사를 만들 수 없다 — 여기서 스캔을 멈춘다.
+            if !alive {
+                return Ok(CodexTimelinePayload::pending(
+                    "searching",
+                    alive,
+                    "이 세션은 전사를 남기지 않고 끝났습니다 (메시지를 보내기 전에 종료).",
+                ));
+            }
+            let now = now_ms();
+            if now > spawned_ms + MATCH_WINDOW_MS
+                && now - last_scan_ms < RESCAN_MS
+            {
+                return Ok(CodexTimelinePayload::pending("searching", alive, SEARCHING_NOTE));
+            }
+
+            // ── 2) 스캔 (락 밖) ──────────────────────────────────────────
+            let cands = scan_candidates(&root, spawned_ms);
+
+            // ── 3) 판정 + claim (락) ────────────────────────────────────
+            let mut guard = lock(&state)?;
+            if let Some(s) = guard.get_mut(&id) {
+                s.last_scan_ms = now;
+            }
             let target = SpawnRef { id, cwd, spawned_ms };
-            // 후보를 다투는 상대 = **아직 자기 전사를 못 잡은** 다른 탭들. 이미
-            // 잡은 탭은 새 파일을 가져갈 일이 없으므로 남을 막지 않는다.
-            let live: Vec<SpawnRef> = guard
-                .iter()
-                .filter(|(_, s)| s.resolved.is_none())
-                .map(|(sid, s)| SpawnRef {
-                    id: *sid,
-                    cwd: s.cwd.clone(),
-                    spawned_ms: s.spawned_ms,
-                })
-                .collect();
-            let claimed: Vec<PathBuf> = guard.values().filter_map(|s| s.resolved.clone()).collect();
-            let cands = scan_candidates(&root, spawned_ms - MATCH_SKEW_MS);
+            let (live, claimed) = contest_inputs(&guard);
             match codex_rollout::match_rollout(&target, &live, &cands, &claimed) {
                 MatchOutcome::Matched(p) => {
                     if let Some(s) = guard.get_mut(&id) {
                         s.resolved = Some(p.clone());
                     }
-                    Some(p)
+                    p
                 }
                 MatchOutcome::NoCandidate => {
-                    return Ok(CodexTimelinePayload::pending(
-                        "searching",
-                        "전사를 찾지 못했습니다 — codex는 첫 메시지를 보낼 때 전사 파일을 만듭니다.",
-                    ))
+                    return Ok(CodexTimelinePayload::pending("searching", alive, SEARCHING_NOTE))
                 }
                 MatchOutcome::Contested => {
                     return Ok(CodexTimelinePayload::pending(
                         "contested",
+                        alive,
                         "전사를 찾지 못했습니다 — 같은 프로젝트에서 codex 탭이 거의 동시에 열려 어느 전사가 이 탭의 것인지 확정할 수 없습니다.",
                     ))
                 }
                 MatchOutcome::Multiple => {
                     return Ok(CodexTimelinePayload::pending(
                         "ambiguous",
+                        alive,
                         "전사를 찾지 못했습니다 — 같은 시각·같은 폴더에 codex 세션이 둘 이상 열렸습니다.",
                     ))
                 }
             }
         }
     };
-    let Some(path) = matched else {
-        return Ok(CodexTimelinePayload::pending("searching", "전사를 찾지 못했습니다."));
-    };
 
+    // ── 4) 서명 비교 → 필요할 때만 파싱 (파싱은 락 밖) ───────────────────
     let sig = file_sig(&path);
+    let path_s = Some(path.to_string_lossy().to_string());
     if sig.is_some() && sig == since {
         return Ok(CodexTimelinePayload {
             status: "matched",
             note: None,
-            path: Some(path.to_string_lossy().to_string()),
+            path: path_s,
+            alive,
             fingerprint: sig,
             unchanged: true,
             snapshot: None,
         });
     }
-    // 서명이 같은 캐시가 있으면 파일을 다시 읽지 않는다(다른 창이 같은 탭을
-    // 처음 물었을 때처럼 since가 없는 호출).
-    if let (Some(s), Some(entry)) = (sig.as_ref(), guard.get(&id).and_then(|s| s.cache.as_ref())) {
-        if &entry.0 == s {
+    // 서명이 같은 캐시가 있으면 파일을 다시 읽지 않는다(`since` 없이 처음 묻는
+    // 호출 — 창을 새로 열었을 때).
+    if let Some(s) = sig.as_ref() {
+        let cached = lock(&state)?
+            .get(&id)
+            .and_then(|c| c.cache.as_ref())
+            .filter(|(cs, _)| cs == s)
+            .map(|(_, p)| p.clone());
+        if let Some(parsed) = cached {
             return Ok(CodexTimelinePayload {
                 status: "matched",
                 note: None,
-                path: Some(path.to_string_lossy().to_string()),
-                fingerprint: sig.clone(),
+                path: path_s,
+                alive,
+                fingerprint: sig,
                 unchanged: false,
-                snapshot: Some(entry.1.clone()),
+                snapshot: Some(parsed),
             });
         }
     }
@@ -429,20 +545,36 @@ pub fn codex_timeline_snapshot(
     let mut parsed = codex_rollout::parse_rollout(&path)
         .map_err(|_| AppError::new("전사 파일을 읽지 못했습니다."))?;
     cap_contents(&mut parsed.items);
-    if let (Some(s), Some(slot)) = (sig.clone(), guard.get_mut(&id)) {
-        slot.cache = Some((s, parsed.clone()));
+    if let Some(s) = sig.clone() {
+        if let Some(slot) = lock(&state)?.get_mut(&id) {
+            slot.cache = Some((s, parsed.clone()));
+        }
     }
     Ok(CodexTimelinePayload {
         status: "matched",
         note: None,
-        path: Some(path.to_string_lossy().to_string()),
+        path: path_s,
+        alive,
         fingerprint: sig,
         unchanged: false,
         snapshot: Some(parsed),
     })
 }
 
-fn self_lock<'a>(
+/// 패널이 **실제로 닫힐 때** 이 탭의 스폰 기록·claim을 버린다.
+///
+/// 이것이 기록을 지우는 유일한 경로다. PTY가 죽었다는 이유로 지우면 claim이
+/// 사라져 같은 cwd의 다른 탭이 그 전사를 가져간다([`CodexSession`] 참조).
+/// 프론트의 `closePanelSession`이 codexterm 분기에서 부른다. 호출을 놓치면
+/// 남는 것은 기록 한 칸뿐이고(그 창 안에서만 후보를 막는다) 방향은 안전한 쪽이다.
+#[tauri::command]
+pub fn codex_timeline_release(state: State<'_, CodexState>, id: u64) {
+    if let Ok(mut m) = state.0.lock() {
+        m.remove(&id);
+    }
+}
+
+fn lock<'a>(
     state: &'a State<'_, CodexState>,
 ) -> Result<std::sync::MutexGuard<'a, HashMap<u64, CodexSession>>, AppError> {
     state.0.lock().map_err(|_| AppError::new("codex 세션 상태를 읽지 못했습니다."))
@@ -450,8 +582,10 @@ fn self_lock<'a>(
 
 #[cfg(test)]
 mod tests {
-    use super::{build_codex_args, cap_contents, child_path, CONTENT_CAP};
-    use std::path::Path;
+    use super::{build_codex_args, cap_contents, child_path, day_dirs, scan_candidates, CONTENT_CAP};
+    use chrono::TimeZone;
+    use std::collections::HashMap;
+    use std::path::{Path, PathBuf};
 
     const BIN: &str = "/home/u/.nvm/versions/node/v20.19.6/bin/codex";
     const BIN_DIR: &str = "/home/u/.nvm/versions/node/v20.19.6/bin";
@@ -584,5 +718,154 @@ mod tests {
         let mut items = vec![item(&"가".repeat(CONTENT_CAP))];
         cap_contents(&mut items);
         assert!(items[0].content_text.is_some(), "패닉 없이 잘려야 한다");
+    }
+
+    // -- 후보 스캔 ---------------------------------------------------------
+
+    fn temp_root(tag: &str) -> PathBuf {
+        let mut p = std::env::temp_dir();
+        p.push(format!("cw-codex-scan-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&p);
+        std::fs::create_dir_all(&p).unwrap();
+        p
+    }
+
+    /// 전사 첫 줄 하나짜리 파일. `source`/`originator`가 후보 자격을 가른다.
+    fn write_rollout(dir: &Path, name: &str, ts: &str, cwd: &str, originator: &str, source: &str) {
+        std::fs::create_dir_all(dir).unwrap();
+        let line = format!(
+            r#"{{"timestamp":"{ts}","type":"session_meta","payload":{{"session_id":"{name}","id":"{name}","timestamp":"{ts}","cwd":"{cwd}","originator":"{originator}","cli_version":"0.144.1","source":{source}}}}}"#
+        );
+        std::fs::write(dir.join(format!("rollout-{name}.jsonl")), line).unwrap();
+    }
+
+    /// 스폰 시각의 날짜 폴더 3개(전날·당일·다음날)만 본다 — 루트 전체(날짜 폴더
+    /// 60여 개)를 훑던 것을 대신한다.
+    #[test]
+    fn only_three_day_directories_are_scanned() {
+        let dirs = day_dirs(Path::new("/r"), super::now_ms());
+        assert_eq!(dirs.len(), 3);
+        for d in &dirs {
+            let parts: Vec<_> = d.strip_prefix("/r").unwrap().components().collect();
+            assert_eq!(parts.len(), 3, "YYYY/MM/DD 세 칸이어야 한다: {d:?}");
+        }
+        // 가운데가 당일, 앞뒤가 하루씩 — 서로 달라야 한다.
+        assert_ne!(dirs[0], dirs[1]);
+        assert_ne!(dirs[1], dirs[2]);
+    }
+
+    /// **리뷰 재현(#2)**: 같은 창·같은 cwd에 앱 밖 전사(`codex exec` 원샷·
+    /// 서브에이전트)가 있으면 예전 스캔은 그것들까지 후보로 올렸고, 그러면
+    /// 매칭이 `Multiple`로 죽거나 최악 남의 전사를 붙였다. 실코퍼스의 89%가
+    /// 그 두 종류다.
+    #[test]
+    fn transcripts_the_app_did_not_spawn_are_not_candidates() {
+        let root = temp_root("filter");
+        let spawned = super::now_ms();
+        let dir = day_dirs(&root, spawned).remove(1); // 당일 폴더
+        let ts = chrono::Local
+            .timestamp_millis_opt(spawned)
+            .single()
+            .unwrap()
+            .to_rfc3339();
+        write_rollout(&dir, "mine", &ts, "/tmp", "codex-tui", "\"cli\"");
+        write_rollout(&dir, "oneshot", &ts, "/tmp", "codex_exec", "\"exec\"");
+        write_rollout(
+            &dir,
+            "sub",
+            &ts,
+            "/tmp",
+            "codex-tui",
+            r#"{"subagent":{"thread_spawn":{"depth":1}}}"#,
+        );
+
+        let cands = scan_candidates(&root, spawned);
+        let names: Vec<String> = cands
+            .iter()
+            .map(|c| c.path.file_name().unwrap().to_string_lossy().to_string())
+            .collect();
+        assert_eq!(names, vec!["rollout-mine.jsonl"], "앱이 띄운 TUI 전사만 후보다");
+        assert_eq!(cands[0].cwd.as_deref(), Some("/tmp"));
+        assert!(cands[0].started_ms.is_some());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // -- 경쟁 집합 / claim (리뷰 #1) ---------------------------------------
+
+    fn session(spawned_ms: i64, resolved: Option<&str>) -> super::CodexSession {
+        super::CodexSession {
+            cwd: Some("/proj".into()),
+            spawned_ms,
+            resolved: resolved.map(PathBuf::from),
+            cache: None,
+            last_scan_ms: 0,
+        }
+    }
+
+    /// **리뷰 재현(#1)**: A 스폰 → B 스폰(같은 cwd·같은 창) → A가 메시지를 보내
+    /// 전사 생성 → **A 탭의 PTY 종료**. 예전에는 죽은 탭 기록을 매 조회마다
+    /// 청소했으므로 A가 경쟁에서 사라지고, B가 A의 전사를 자기 것으로 확정했다
+    /// (= 남의 대화가 B 화면에 뜬다). 지금은 기록이 패널 닫힘까지 남으므로
+    /// 살아 있든 죽었든 경쟁 집합이 같고, 결과는 양쪽 다 `Contested`다.
+    #[test]
+    fn a_dead_tabs_claim_and_contest_survive_until_the_panel_closes() {
+        use core_lib::codex_rollout::{match_rollout, MatchOutcome, RolloutCandidate};
+        let t = 1_000_000;
+        let mut map: HashMap<u64, super::CodexSession> = HashMap::new();
+        map.insert(1, session(t, None)); // A — 곧 죽지만 기록은 남는다
+        map.insert(2, session(t + 2_000, None)); // B
+        let file = RolloutCandidate {
+            path: PathBuf::from("/r/a.jsonl"),
+            cwd: Some("/proj".into()),
+            started_ms: Some(t + 900),
+        };
+        let (live, claimed) = super::contest_inputs(&map);
+        assert_eq!(live.len(), 2, "죽음 여부와 무관하게 둘 다 경쟁한다");
+        assert!(claimed.is_empty());
+        for id in [1, 2] {
+            let me = live.iter().find(|s| s.id == id).unwrap().clone();
+            assert_eq!(
+                match_rollout(&me, &live, &[file.clone()], &claimed),
+                MatchOutcome::Contested,
+                "id={id} — 어느 쪽도 남의 전사를 가져가지 않는다"
+            );
+        }
+
+        // 대조군 = 고친 동작. A의 기록을 지우면(예전 청소 코드가 하던 일) 그
+        // 즉시 B가 A의 전사를 확정한다 — 이 한 줄이 리뷰가 지적한 결함이다.
+        let b = live.iter().find(|s| s.id == 2).unwrap().clone();
+        map.remove(&1);
+        let (live_after, claimed_after) = super::contest_inputs(&map);
+        assert_eq!(
+            match_rollout(&b, &live_after, &[file.clone()], &claimed_after),
+            MatchOutcome::Matched(file.path),
+            "기록을 지우면 오매칭이 열린다 — 그래서 패널 닫힘까지 남긴다"
+        );
+    }
+
+    /// 이미 잡은 탭은 경쟁에서 빠지고, 그 파일은 claim으로 잠긴다 — 죽어도 그대로
+    /// (tombstone). 그래서 같은 cwd의 새 탭이 그 전사를 물려받지 않는다.
+    #[test]
+    fn a_resolved_tab_locks_its_file_and_stops_competing() {
+        let t = 1_000_000;
+        let mut map: HashMap<u64, super::CodexSession> = HashMap::new();
+        map.insert(1, session(t, Some("/r/a.jsonl")));
+        map.insert(2, session(t + 2_000, None));
+        let (live, claimed) = super::contest_inputs(&map);
+        assert_eq!(live.len(), 1);
+        assert_eq!(live[0].id, 2, "잡은 탭은 경쟁하지 않는다");
+        assert_eq!(claimed, vec![PathBuf::from("/r/a.jsonl")]);
+    }
+
+    /// 다른 날짜 폴더는 아예 열지 않는다.
+    #[test]
+    fn a_transcript_in_another_day_folder_is_out_of_range() {
+        let root = temp_root("range");
+        let spawned = super::now_ms();
+        let far = super::now_ms() - 10 * 86_400_000; // 열흘 전 폴더
+        let ts = chrono::Local.timestamp_millis_opt(spawned).single().unwrap().to_rfc3339();
+        write_rollout(&day_dirs(&root, far).remove(1), "old", &ts, "/tmp", "codex-tui", "\"cli\"");
+        assert!(scan_candidates(&root, spawned).is_empty());
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

@@ -21,6 +21,13 @@ export async function closePanelSession(
       closeIfLast: opts?.closeIfLast ?? true,
     }).catch(() => {});
   } else {
+    // codex 탭의 전사 claim은 **패널이 실제로 닫힐 때만** 풀린다. PTY가 죽었다고
+    // 푸는 게 아니라서(그러면 같은 폴더의 다른 탭이 그 전사를 물려받는다) 여기가
+    // 유일한 해제 지점이다. 이 함수는 창 이동(transfer) 중에는 호출되지 않으므로
+    // 탭이 창을 옮겨 다녀도 claim이 유지된다.
+    if (params.kind === "codexterm") {
+      await invoke("codex_timeline_release", { id: params.sessionId }).catch(() => {});
+    }
     await invoke("terminal_close", { id: params.sessionId }).catch(() => {});
   }
 }
