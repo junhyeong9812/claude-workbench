@@ -22,6 +22,11 @@ export const components = {
   placeholder: PlaceholderPanel,
   terminal: TerminalPanel,
   ssh: TerminalPanel,
+  // codex 세션은 **순수 터미널 탭**이다 — SSH와 같은 이유로 TerminalPanel을
+  // 재사용한다(스폰 커맨드만 다르고 그 뒤는 PTY 릴레이·xterm이 전부). 이것이
+  // 격리의 구조적 보장이기도 하다: ClaudeTermPanel을 안 지나므로 타임라인·
+  // 스냅샷·시드·상태 배지 배선이 붙을 자리 자체가 없다.
+  codexterm: TerminalPanel,
   claudeterm: ClaudeTermPanel,
   editor: EditorPanel,
   diff: DiffPanel,
@@ -32,7 +37,7 @@ export const components = {
 };
 
 /** Panel kinds that can be created/transferred. */
-export type PanelKind = "terminal" | "editor" | "claudeterm";
+export type PanelKind = "terminal" | "editor" | "claudeterm" | "codexterm";
 
 /** Default tab for all panels. Both Claude panel kinds (ACP `claude` and the
  * architecture-A `claudeterm`) use the custom tab — its × raises a 닫기/삭제

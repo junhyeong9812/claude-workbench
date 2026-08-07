@@ -45,6 +45,10 @@ import { HostKeyModal } from "./ssh/HostKeyModal";
  * panel's last sub-area; it retries across a few frames in case content is still
  * laying out. Under dockview's onlyWhenVisible mode only the active panel's
  * content is in `.dv-active-group`, so this never targets a hidden panel. */
+/** 내부 kind → 기본 탭 제목의 사람 이름. 여기 없는 kind는 kind 이름을 대문자로
+ * 시작해 그대로 쓴다(기존 동작). */
+const KIND_LABEL: Partial<Record<PanelKind, string>> = { codexterm: "Codex" };
+
 function focusActivePanelContent(area?: PanelArea) {
   let tries = 0;
   const tick = () => {
@@ -312,17 +316,24 @@ export function MainArea({
     const api = apiRef.current;
     if (!api) return null;
     const n = ++counterRef.current;
-    const title = opts?.title ?? `${kind[0].toUpperCase()}${kind.slice(1)} ${n}`;
+    // 기본 탭 제목. kind 이름을 그대로 쓰면 "Codexterm 3"이 되므로 내부 kind와
+    // 사용자 표기를 여기서 갈라 둔다(kind 자체는 레이아웃에 직렬화되는 식별자라
+    // 표기 사정으로 바꾸지 않는다).
+    const label = KIND_LABEL[kind] ?? `${kind[0].toUpperCase()}${kind.slice(1)}`;
+    const title = opts?.title ?? `${label} ${n}`;
     // Terminals get the real PTY panel, claudeterm the real claude CLI + timeline,
-    // editor a CodeMirror editor; anything else is a stub.
+    // codexterm the same PTY panel with a codex spawn, editor a CodeMirror
+    // editor; anything else is a stub.
     const component =
       kind === "terminal"
         ? "terminal"
         : kind === "claudeterm"
           ? "claudeterm"
-          : kind === "editor"
-            ? "editor"
-            : "placeholder";
+          : kind === "codexterm"
+            ? "codexterm"
+            : kind === "editor"
+              ? "editor"
+              : "placeholder";
     // Counter suffix: two same-kind panels in one millisecond (rapid dev-mode
     // opens) must not collide — dockview requires unique ids.
     // surface 접두사(m/s): 두 dock의 id 충돌 방지 (closeRequest 소유 판정 D3).

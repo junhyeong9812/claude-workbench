@@ -9,6 +9,7 @@ import { useAppStore } from "../state/store";
 import { xtermTheme } from "./xtermTheme";
 import type { TerminalOutputEvent, SnapshotResult } from "../types";
 import { decodePtyData, ptyEventName, pushPendingCapped } from "./pty";
+import { errText } from "../utils/error";
 
 /** Params attached to a terminal panel. `sessionId` is persisted into the
  * dockview layout so a remount (tab/project switch) re-attaches the same PTY.
@@ -20,7 +21,7 @@ import { decodePtyData, ptyEventName, pushPendingCapped } from "./pty";
  * (review F8). An unsaved ad-hoc connection has no `connectionId`, so it cannot
  * auto-reconnect after restart (expected). */
 export interface TerminalParams {
-  kind?: "terminal" | "editor" | "ssh";
+  kind?: "terminal" | "editor" | "ssh" | "codexterm";
   title?: string;
   sessionId?: number;
   /** One-shot command run once when a fresh terminal starts (build/test runner).
@@ -29,6 +30,12 @@ export interface TerminalParams {
   /** Working directory for a fresh terminal (build/test runner pins it to the
    * target project); falls back to the active project when absent. */
   cwd?: string;
+  /** codexterm 전용 스폰 옵션 — `-m <model>` / `-c model_reasoning_effort=<e>`.
+   * 미지정이면 키가 실리지 않고 백엔드도 플래그를 붙이지 않는다(= `~/.codex/
+   * config.toml` 그대로). 레이아웃에 직렬화되므로 재시작 후 같은 모델·강도로
+   * 다시 뜬다 — claudeterm의 model/effort와 같은 계약. */
+  model?: string;
+  effort?: string;
   // SSH-only (non-secret):
   host?: string;
   port?: number;
@@ -122,6 +129,9 @@ export function TerminalPanel(props: IDockviewPanelProps<TerminalParams>) {
     let ready = false;
     const pending: TerminalOutputEvent[] = [];
     const isSsh = props.params.kind === "ssh";
+    // codex 세션 — 스폰 커맨드만 다르고 그 뒤(구독·스냅샷·drain·입력·리사이즈·
+    // 닫기)는 일반 터미널과 완전히 같다.
+    const isCodex = props.params.kind === "codexterm";
 
     const write = (bytes: Uint8Array | number[]) => {
       if (!disposed) term.write(bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes));
@@ -250,6 +260,25 @@ export function TerminalPanel(props: IDockviewPanelProps<TerminalParams>) {
             cols: term.cols,
             rows: term.rows,
           });
+        } else if (isCodex) {
+          // codex TUI를 프로젝트에 뿌리내려 띄운다. 스폰 실패는 **터미널 안에
+          // 찍는다**: 가장 흔한 실패가 "설치 안 됨"(백엔드가 바이너리를 못 찾아
+          // 스폰조차 시도하지 않는 경우)인데, 그때 아무것도 안 하면 사용자에게는
+          // 원인 없는 검은 화면만 남는다. 일반 터미널 경로는 이 분기를 지나지
+          // 않으므로 기존 동작 불변.
+          const cwd = props.params.cwd ?? useAppStore.getState().activeProject ?? null;
+          try {
+            sessionId = await invoke<number>("codex_create", {
+              cwd,
+              model: props.params.model ?? null,
+              effort: props.params.effort ?? null,
+              cols: term.cols,
+              rows: term.rows,
+            });
+          } catch (e) {
+            writeText(`\r\n\x1b[31m${errText(e, "codex 세션을 시작하지 못했습니다.")}\x1b[0m\r\n`);
+            return; // 세션 없음 — 구독/스냅샷/drain 할 것이 없다
+          }
         } else {
           // Pin to the requested cwd (build/test runner) over the live active
           // project, so a project switch between request and create can't run in
