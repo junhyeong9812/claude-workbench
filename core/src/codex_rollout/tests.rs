@@ -243,41 +243,51 @@ fn a_foreign_tui_in_the_same_window_is_structurally_excluded() {
     assert_eq!(match_rollout(&a, &[a.clone()], &all, &[]), MatchOutcome::Multiple);
 
     // 표식으로 좁히면 우리 것 하나만 남는다.
-    let (narrowed, marked) = narrow_to_marked(&all);
-    assert!(marked);
+    let narrowed = narrow_to_marked(&all);
     assert_eq!(narrowed, vec![mine.clone()]);
     assert_eq!(match_rollout(&a, &[a.clone()], &narrowed, &[]), MatchOutcome::Matched(mine.path));
 }
 
-/// codex가 표식을 더 이상 반영하지 않으면(버전 드리프트) 옛 규칙으로 물러난다 —
-/// 표식 일치만 고집하면 타임라인이 영영 안 뜨고 이유도 안 보인다. 물러난 사실은
-/// `false`로 알려 화면에 적는다.
+/// **U1 재현 — 폴백을 두면 안 되는 이유.**
+///
+/// 앱 탭이 뜬 직후, 사용자가 아직 첫 메시지를 안 보낸 구간에는 **우리 전사가 없다**.
+/// 그 구간에 같은 폴더의 외부 codex TUI 전사가 하나 있으면, "표식 후보가 없으면 옛
+/// 규칙으로 물러난다"는 폴백은 그것을 집어 sticky claim으로 굳힌다 — 남의 대화가
+/// 영구히 내 탭에 뜬다. 창을 좁혀도 못 막는다(양쪽 다 정상 범위 안이다).
+///
+/// 그래서 표식 없는 후보는 **한 번도 매칭 대상이 되지 않는다**.
 #[test]
-fn without_any_marked_transcript_the_old_rule_still_applies() {
-    let all = [foreign("a", 1_000_900)];
-    let (narrowed, marked) = narrow_to_marked(&all);
-    assert!(!marked, "표식으로 좁히지 못했음을 알려야 한다");
-    assert_eq!(narrowed.len(), 1, "후보를 0으로 만들지 않는다");
+fn an_unmarked_transcript_is_never_matched_even_when_it_is_the_only_one() {
+    let a = spawn(1, 1_000_000);
+    let theirs = foreign("theirs", 1_000_500);
+
+    // ① 우리 전사가 생기기 전 — 외부 전사만 있다. 폴백이 있었다면 여기서
+    //    Matched(theirs)가 나왔다(= U1이 지적한 오매칭).
+    let narrowed = narrow_to_marked(&[theirs.clone()]);
+    assert!(narrowed.is_empty(), "표식 없는 후보는 목록에 남지 않는다");
+    assert_eq!(
+        match_rollout(&a, &[a.clone()], &narrowed, &[]),
+        MatchOutcome::NoCandidate,
+        "표식이 없으면 아무것도 매칭하지 않는다"
+    );
+
+    // ② 첫 메시지 뒤 우리 전사가 생기면 그때 확정된다 — 기다린 값이 있다.
+    let mine = cand("mine", 1_000_900);
+    let narrowed = narrow_to_marked(&[theirs, mine.clone()]);
+    assert_eq!(
+        match_rollout(&a, &[a.clone()], &narrowed, &[]),
+        MatchOutcome::Matched(mine.path)
+    );
 }
 
-/// 표식이 하나라도 있으면 표식 없는 것은 전부 빠진다(둘이 섞인 상태 = 정상).
+/// 표식 없는 후보는 몇 개가 있든 전부 빠진다.
 #[test]
-fn marked_transcripts_win_outright_when_any_exist() {
+fn unmarked_transcripts_never_survive_narrowing() {
     let all = [foreign("x", 1), cand("mine", 2), foreign("y", 3)];
-    let (narrowed, marked) = narrow_to_marked(&all);
-    assert!(marked);
+    let narrowed = narrow_to_marked(&all);
     assert_eq!(narrowed.len(), 1);
     assert_eq!(narrowed[0].originator.as_deref(), Some(APP_ORIGINATOR));
-}
-
-/// cwd를 모르는 탭(스폰 시 cwd 미지정)은 어떤 전사도 갖지 못한다.
-#[test]
-fn a_spawn_without_a_cwd_matches_nothing() {
-    let a = SpawnRef { id: 1, cwd: None, spawned_ms: 1_000_000 };
-    assert_eq!(
-        match_rollout(&a, &[a.clone()], &[cand("a", 1_000_900)], &[]),
-        MatchOutcome::NoCandidate
-    );
+    assert!(narrow_to_marked(&[foreign("x", 1), foreign("y", 2)]).is_empty());
 }
 
 // ---------------------------------------------------------------------------

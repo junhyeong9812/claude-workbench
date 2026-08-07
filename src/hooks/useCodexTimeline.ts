@@ -65,9 +65,6 @@ interface CodexTimelinePayload {
   path: string | null;
   /** 이 탭의 PTY가 살아 있는가. 죽어도 타임라인은 남는다(마지막 상태 보존). */
   alive: boolean;
-  /** 후보를 앱 표식(originator)으로 좁혔는가. `false`면 이 codex가 표식을 남기지
-   * 않아 시각·경로 추측으로 골랐다는 뜻 — `note`가 그 사실을 담는다. */
-  marked: boolean;
   fingerprint: string | null;
   unchanged: boolean;
   snapshot: CodexRolloutSnapshot | null;
@@ -118,12 +115,10 @@ export function stateFromSnapshot(
   s: CodexRolloutSnapshot,
   path: string | null,
   alive = true,
-  note: string | null = null,
 ): CodexTimelineState {
   return {
     status: "matched",
-    // 매칭돼도 note가 붙을 수 있다 — 표식 없이 시각으로만 골랐을 때.
-    note,
+    note: null,
     path,
     alive,
     items: [...s.items].sort((a, b) => a.seq - b.seq),
@@ -166,7 +161,7 @@ export function useCodexTimeline({
         });
         if (stopped) return;
         since = p.fingerprint;
-        if (p.snapshot) setState(stateFromSnapshot(p.snapshot, p.path, p.alive, p.note));
+        if (p.snapshot) setState(stateFromSnapshot(p.snapshot, p.path, p.alive));
         else if (p.unchanged)
           setState((s) => ({ ...s, status: p.status, note: p.note, path: p.path, alive: p.alive }));
         // 전사를 잃은 경우(파일 삭제)는 목록을 남겨 두지 않는다 — 화면에 남은 옛

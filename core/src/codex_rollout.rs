@@ -253,28 +253,32 @@ pub struct RolloutCandidate {
     pub originator: Option<String>,
 }
 
-/// 후보를 **표식 있는 것만**으로 좁힌다. 표식이 하나도 없으면 그대로 둔다.
+/// 후보를 **표식 있는 것만** 남긴다. 표식이 하나도 없으면 **빈 목록**이다.
 ///
-/// 반환의 `bool`은 "표식으로 좁혔는가" — 뷰가 **어느 규칙으로 골랐는지** 알아야
-/// 하기 때문이다. 표식이 없는 경우는 둘 중 하나인데:
+/// # 폴백을 두지 않는 이유
 ///
-/// - codex가 `CODEX_INTERNAL_ORIGINATOR_OVERRIDE`를 더 이상 반영하지 않는다
-///   (버전 드리프트), 또는
-/// - 이 탭이 표식을 심기 전 앱 버전에서 스폰됐다.
+/// 초안은 "표식 후보가 없으면 옛 규칙(cwd+시각 창)으로 물러난다"였는데 그게 틀렸다.
+/// **"표식 전무"는 두 가지를 동시에 뜻한다**:
 ///
-/// 그때 표식 일치만 고집하면 타임라인이 **영영 안 뜨고** 이유도 안 보인다. 그래서
-/// 옛 규칙(cwd+시각 창)으로 물러나되, 물러났다는 사실을 화면에 적는다(무음 금지).
-pub fn narrow_to_marked(cands: &[RolloutCandidate]) -> (Vec<RolloutCandidate>, bool) {
-    let marked: Vec<RolloutCandidate> = cands
+/// 1. codex가 `CODEX_INTERNAL_ORIGINATOR_OVERRIDE`를 더 이상 반영하지 않는다, 그리고
+/// 2. **우리 전사가 아직 안 생겼다**(사용자가 첫 메시지를 아직 안 보냈다).
+///
+/// 2번은 모든 세션이 반드시 지나는 정상 구간이고, 그 구간에 같은 폴더·같은 창의
+/// 외부 codex TUI 전사가 하나라도 있으면 폴백이 그것을 집어 **sticky claim으로
+/// 굳는다** — 남의 대화가 영구히 내 탭에 뜬다. 창을 좁혀도, 시각을 봐도 막을 수
+/// 없다(둘 다 정상 범위 안이다).
+///
+/// 그래서 **1급 불변식(남의 세션 표시 금지)이 미래 버전 호환보다 앞선다**. codex가
+/// 표식을 안 남기게 되면 증상은 "타임라인 없음 + 사유 표시"라는 **가시적 강등**이지
+/// 오작동이 아니다. 조용히 틀린 화면을 보여 주는 쪽이 훨씬 나쁘다.
+///
+/// 앱 탭끼리의 다툼(같은 표식을 단 두 탭)은 여전히 cwd·시각 창·Contested가 막는다.
+pub fn narrow_to_marked(cands: &[RolloutCandidate]) -> Vec<RolloutCandidate> {
+    cands
         .iter()
         .filter(|c| c.originator.as_deref() == Some(APP_ORIGINATOR))
         .cloned()
-        .collect();
-    if marked.is_empty() {
-        (cands.to_vec(), false)
-    } else {
-        (marked, true)
-    }
+        .collect()
 }
 
 /// 매칭 결과. **`Matched` 외에는 전부 "전사를 찾지 못함"**이고, 이유가 다를 뿐이다

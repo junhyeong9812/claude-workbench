@@ -229,9 +229,6 @@ struct CodexSession {
     /// "전사 생성 → 첫 조회 전 종료"(빠른 원샷·즉시 닫기)에서 멀쩡히 있는 전사를
     /// 영영 못 찾는다 — 한 번은 더 본다.
     final_scan_done: bool,
-    /// 이 탭의 전사를 **표식으로** 골랐는가. 확정 시점의 값을 들고 있는다(이후
-    /// 조회는 스캔을 안 하므로 다시 알 수 없다).
-    marked: bool,
 }
 
 /// codex 탭들의 스폰 기록. **매칭의 유일한 출처**다.
@@ -250,7 +247,6 @@ impl CodexState {
                     cache: None,
                     last_scan_ms: 0,
                     final_scan_done: false,
-                    marked: true,
                 },
             );
         }
@@ -275,9 +271,6 @@ pub struct CodexTimelinePayload {
     path: Option<String>,
     /// 이 탭의 PTY가 살아 있는가. 죽어도 타임라인은 남는다(마지막 상태 보존).
     alive: bool,
-    /// 후보를 **표식(originator)으로** 좁혔는가. `false`면 이 codex가 표식을
-    /// 반영하지 않아 옛 규칙(cwd+시각 창)으로 골랐다는 뜻 — 화면에 적는다.
-    marked: bool,
     /// 파일 서명. 프론트가 다음 폴에 `since`로 되돌려 주면 변화 없을 때
     /// `unchanged`만 돌아온다(전사 전문을 1.5초마다 재전송하지 않게).
     fingerprint: Option<String>,
@@ -292,7 +285,6 @@ impl CodexTimelinePayload {
             note: Some(note.into()),
             path: None,
             alive,
-            marked: true,
             fingerprint: None,
             unchanged: false,
             snapshot: None,
@@ -430,6 +422,13 @@ const SEARCHING_NOTE: &str =
 /// PTY가 죽은 탭(더는 전사를 만들 수 없다는 사실상의 불가능).
 const RESCAN_MS: i64 = 15_000;
 
+/// 창 안에 전사는 있는데 **전부 앱 표식이 없을 때**. 이 codex가 표식을 기록하지
+/// 않는다는 신호일 수 있다(버전 드리프트). 그때도 시각·경로 추측으로 물러나지
+/// 않는 이유는 [`codex_rollout::narrow_to_marked`]에 있다 — 요약하면 그 물러섬이
+/// "우리 전사가 아직 안 생긴 정상 구간"에서 외부 세션을 집어 굳힌다. 여기서
+/// 멈추는 대가는 **가시적 강등**(타임라인 없음 + 사유)이지 오작동이 아니다.
+const UNMARKED_NOTE: &str = "전사를 연결하지 못했습니다 — 이 폴더에서 찾은 codex 전사에 앱 표식이 없습니다. codex 업데이트로 표식(originator)이 기록되지 않으면 이 표시가 계속 남습니다 (다른 세션을 잘못 붙이지 않기 위해 추측하지 않습니다).";
+
 /// 죽은 채 전사를 못 찾은 탭에 보여 줄 안내.
 const DEAD_NOTE: &str = "이 세션은 전사를 남기지 않고 끝났습니다 (메시지를 보내기 전에 종료).";
 
@@ -487,7 +486,7 @@ pub fn codex_timeline_snapshot(
     };
 
     // ── 1) 상태 읽기 (락) ────────────────────────────────────────────────
-    let (spawned_ms, cwd, resolved, last_scan_ms, final_scan_done, was_marked) = {
+    let (spawned_ms, cwd, resolved, last_scan_ms, final_scan_done) = {
         let guard = lock(&state)?;
         let Some(me) = guard.get(&id) else {
             return Ok(CodexTimelinePayload::pending(
@@ -502,7 +501,6 @@ pub fn codex_timeline_snapshot(
             me.resolved.clone(),
             me.last_scan_ms,
             me.final_scan_done,
-            me.marked,
         )
     };
 
@@ -526,9 +524,14 @@ pub fn codex_timeline_snapshot(
 
             // ── 2) 스캔 (락 밖) ──────────────────────────────────────────
             let scanned = scan_candidates(&root, spawned_ms);
-            // 앱이 심은 표식이 있는 전사만 남긴다(T1). 표식이 하나도 없으면 옛
-            // 규칙으로 물러나되 그 사실을 화면에 적는다.
-            let (cands, narrowed_by_marker) = codex_rollout::narrow_to_marked(&scanned);
+            // 앱이 심은 표식이 있는 전사만 남긴다(T1·U1). **폴백은 없다** —
+            // narrow_to_marked 주석 참조: "표식 전무"는 미지원만이 아니라 "우리
+            // 전사가 아직 안 생김"도 뜻해서, 물러나면 그 정상 구간에 외부 전사를
+            // 집어 굳힌다.
+            let cands = codex_rollout::narrow_to_marked(&scanned);
+            // 걸러낸 수 — 후보가 있었는데 전부 표식이 없었다면 "이 codex가 표식을
+            // 기록하지 않는다"는 뜻일 수 있어 사유를 다르게 적는다.
+            let unmarked = scanned.len() - cands.len();
 
             // ── 3) 판정 + claim (락) ────────────────────────────────────
             let mut guard = lock(&state)?;
@@ -544,12 +547,12 @@ pub fn codex_timeline_snapshot(
                 MatchOutcome::Matched(p) => {
                     if let Some(s) = guard.get_mut(&id) {
                         s.resolved = Some(p.clone());
-                        s.marked = narrowed_by_marker;
                     }
                     p
                 }
                 MatchOutcome::NoCandidate => {
-                    return Ok(CodexTimelinePayload::pending("searching", alive, SEARCHING_NOTE))
+                    let note = if unmarked > 0 { UNMARKED_NOTE } else { SEARCHING_NOTE };
+                    return Ok(CodexTimelinePayload::pending("searching", alive, note));
                 }
                 MatchOutcome::Contested => {
                     return Ok(CodexTimelinePayload::pending(
@@ -572,21 +575,12 @@ pub fn codex_timeline_snapshot(
     // ── 4) 서명 비교 → 필요할 때만 파싱 (파싱은 락 밖) ───────────────────
     let sig = file_sig(&path);
     let path_s = Some(path.to_string_lossy().to_string());
-    // 확정 시점의 값(sticky) — 재확정 없이 다시 알 수 없다.
-    let marked = lock(&state)?.get(&id).map(|s| s.marked).unwrap_or(was_marked);
-    // 표식으로 좁히지 못했다는 것은 "이 codex 버전이 표식을 안 남긴다"는 뜻이고,
-    // 그러면 이 탭의 전사는 시각 창 추측으로 고른 것이다 — 조용히 두지 않는다.
-    let note = (!marked).then(|| {
-        "이 codex가 앱 표식을 남기지 않아 시각·경로만으로 골랐습니다 — 같은 폴더에서 직접 띄운 codex와 섞였을 수 있습니다."
-            .to_string()
-    });
     if sig.is_some() && sig == since {
         return Ok(CodexTimelinePayload {
             status: "matched",
-            note,
+            note: None,
             path: path_s,
             alive,
-            marked,
             fingerprint: sig,
             unchanged: true,
             snapshot: None,
@@ -603,10 +597,9 @@ pub fn codex_timeline_snapshot(
         if let Some(parsed) = cached {
             return Ok(CodexTimelinePayload {
                 status: "matched",
-                note,
+                note: None,
                 path: path_s,
                 alive,
-                marked,
                 fingerprint: sig,
                 unchanged: false,
                 snapshot: Some(parsed),
@@ -624,10 +617,9 @@ pub fn codex_timeline_snapshot(
     }
     Ok(CodexTimelinePayload {
         status: "matched",
-        note,
+        note: None,
         path: path_s,
         alive,
-        marked,
         fingerprint: sig,
         unchanged: false,
         snapshot: Some(parsed),
@@ -873,7 +865,6 @@ mod tests {
             cache: None,
             last_scan_ms: 0,
             final_scan_done: false,
-            marked: true,
         }
     }
 
@@ -951,10 +942,29 @@ mod tests {
         assert_eq!(scanned.len(), 2, "표식 전에는 구별할 방법이 없다");
 
         // 표식으로 좁히면 우리 것 하나.
-        let (narrowed, marked) = narrow_to_marked(&scanned);
-        assert!(marked);
+        let narrowed = narrow_to_marked(&scanned);
         assert_eq!(narrowed.len(), 1);
         assert!(narrowed[0].path.ends_with("rollout-mine.jsonl"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// **U1 재현(실파일)**: 우리 전사가 아직 없는 구간 — 외부 전사만 있다. 폴백이
+    /// 있었다면 그것이 후보로 올라 sticky claim으로 굳었다. 지금은 후보가 0이다.
+    #[test]
+    fn before_our_transcript_exists_a_foreign_one_is_not_a_candidate() {
+        use core_lib::codex_rollout::narrow_to_marked;
+        let root = temp_root("nofallback");
+        let spawned = super::now_ms();
+        let dir = day_dirs(&root, spawned).remove(1);
+        let ts = chrono::Local.timestamp_millis_opt(spawned).single().unwrap().to_rfc3339();
+        write_rollout(&dir, "theirs", &ts, "/tmp", "codex-tui", "\"cli\"");
+
+        let scanned = scan_candidates(&root, spawned);
+        assert_eq!(scanned.len(), 1, "스캔에는 잡힌다(대화형 TUI다)");
+        assert!(
+            narrow_to_marked(&scanned).is_empty(),
+            "표식이 없으므로 후보가 되지 않는다 — 폴백 없음"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 
