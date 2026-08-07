@@ -1,4 +1,4 @@
-import { EFFORT_CHOICES, MODEL_CHOICES } from "../state/agentOptions";
+import { DEFAULT_AGENT, effortChoices, modelChoices, type AgentId } from "../state/agentOptions";
 
 /**
  * 모델/강도 선택 `<select>` 두 개 — 아카이브 설정과 새 세션 옵션 팝오버가
@@ -8,6 +8,10 @@ import { EFFORT_CHOICES, MODEL_CHOICES } from "../state/agentOptions";
  * settings-row` vs `.agent-opt-row`)이 다르고, 공유해야 하는 건 **어휘와
  * 옵션 구성**이지 배치가 아니다. 그래서 이 컴포넌트는 `<select>` 하나만 그리고
  * 라벨·행 래퍼는 호출자가 소유한다.
+ *
+ * `agent`는 **어휘를 고르는 축**이다(claude와 codex는 모델도 강도도 값이
+ * 다르다). 생략하면 claude — 아카이브 추출처럼 claude 고정인 호출자는 그대로
+ * 두면 된다.
  */
 
 /** `""` = 기본(미지정), `"custom"` = 직접 입력(호출자가 처리). */
@@ -15,6 +19,7 @@ export function ModelSelect({
   value,
   defaultLabel,
   allowCustom = false,
+  agent = DEFAULT_AGENT,
   onChange,
   title,
   ariaLabel,
@@ -22,6 +27,7 @@ export function ModelSelect({
   value: string;
   defaultLabel: string;
   allowCustom?: boolean;
+  agent?: AgentId;
   onChange: (v: string) => void;
   title?: string;
   ariaLabel?: string;
@@ -34,7 +40,7 @@ export function ModelSelect({
       onChange={(e) => onChange(e.target.value)}
     >
       <option value="">{defaultLabel}</option>
-      {MODEL_CHOICES.map((m) => (
+      {modelChoices(agent).map((m) => (
         <option key={m} value={m}>
           {m}
         </option>
@@ -48,12 +54,14 @@ export function ModelSelect({
 export function EffortSelect({
   value,
   defaultLabel,
+  agent = DEFAULT_AGENT,
   onChange,
   title,
   ariaLabel,
 }: {
   value: string;
   defaultLabel: string;
+  agent?: AgentId;
   onChange: (v: string) => void;
   title?: string;
   ariaLabel?: string;
@@ -66,7 +74,7 @@ export function EffortSelect({
       onChange={(e) => onChange(e.target.value)}
     >
       <option value="">{defaultLabel}</option>
-      {EFFORT_CHOICES.map((ef) => (
+      {effortChoices(agent).map((ef) => (
         <option key={ef} value={ef}>
           {ef}
         </option>

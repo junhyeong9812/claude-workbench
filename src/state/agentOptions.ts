@@ -10,7 +10,7 @@
  * argv는 이 기능이 없던 때와 바이트 단위로 같다(`spawn.rs::build_claude_args`).
  */
 
-/** 세션을 돌리는 CLI. `codex`는 아직 스폰 경로가 없다(작업②). */
+/** 세션을 돌리는 CLI. */
 export type AgentId = "claude" | "codex";
 
 export interface AgentChoice {
@@ -26,8 +26,8 @@ export const AGENT_CHOICES: readonly AgentChoice[] = [
   {
     id: "codex",
     label: "Codex",
-    enabled: false,
-    hint: "작업②에서 — codex 세션 탭은 아직 없습니다",
+    enabled: true,
+    hint: "codex CLI 세션 (순수 터미널 탭 — 타임라인·아카이브 없음)",
   },
 ];
 
@@ -53,6 +53,61 @@ export const MODEL_CHOICES = ["opus", "sonnet", "haiku"] as const;
  */
 export const EFFORT_CHOICES = ["max", "xhigh", "high", "medium", "low"] as const;
 
+/**
+ * codex 모델 — codex 자신의 `/model` 피커가 내놓는 목록 그대로다(실측
+ * 2026-08-07, codex-cli 0.144.1). 피커는 이 6개를 보여주고 그 아래에
+ * "Access legacy models by running codex -m <model_name>"이라고 적는다 — 즉
+ * 이것이 CLI가 스스로 정한 큐레이션이고, 우리가 따로 고를 이유가 없다.
+ *
+ * 순서는 피커 순서(강한 것 먼저). `~/.codex/config.toml`의 기본은 여기서
+ * 건드리지 않는다 — 미지정으로 두면 그 설정이 그대로 산다.
+ */
+export const CODEX_MODEL_CHOICES = [
+  "gpt-5.6-sol",
+  "gpt-5.6-terra",
+  "gpt-5.6-luna",
+  "gpt-5.5",
+  "gpt-5.4",
+  "gpt-5.4-mini",
+] as const;
+
+/**
+ * codex 추론 강도 — `-c model_reasoning_effort=<v>`로 나간다(전용 플래그 없음).
+ * 목록은 codex `/model` 피커의 2단계("Select Reasoning Level") 그대로다:
+ * Low·Medium·High·Extra high(=xhigh)·Max·Ultra.
+ *
+ * **claude와 달리 오값이 안전하지 않다** — 그래서 목록이 claude 것과 우연히
+ * 겹치더라도 상수를 나눠 둔다. claude CLI는 모르는 `--effort`를 경고 후
+ * 기본값으로 폴백하지만, codex는 값을 로컬에서 검증하지 않고 그대로 API에
+ * 보내고 **첫 요청이 400으로 죽는다**(실측):
+ *
+ * ```
+ * -c model_reasoning_effort=bogusvalue
+ *   → 400 invalid_enum_value: Supported values are: 'none','minimal','low',
+ *     'medium','high','xhigh','max'
+ * -c model_reasoning_effort=minimal
+ *   → 400 unsupported_value: 'minimal' is not supported with the 'gpt-5.6-sol…'
+ *     model. Supported values are: 'none','low','medium','high','xhigh','max'
+ * ```
+ *
+ * 두 번째가 이 목록을 피커에 맞춘 이유다: **지원 값이 모델마다 다르다.**
+ * 팝오버는 모델별 목록을 들고 있지 않으므로, 어느 모델에서나 codex 자신이
+ * 제시하는 집합(=피커)만 노출하는 것이 유일하게 안전한 큐레이션이다.
+ * 그래서 `minimal`·`none`은 API가 받더라도 뺐다(피커가 안 내놓고, `minimal`은
+ * 현재 기본 모델이 거부한다 — 골랐다면 첫 질문에서 세션이 죽는다).
+ */
+export const CODEX_EFFORT_CHOICES = ["ultra", "max", "xhigh", "high", "medium", "low"] as const;
+
+/** 이 에이전트의 모델 어휘. */
+export function modelChoices(agent: AgentId): readonly string[] {
+  return agent === "codex" ? CODEX_MODEL_CHOICES : MODEL_CHOICES;
+}
+
+/** 이 에이전트의 강도 어휘. */
+export function effortChoices(agent: AgentId): readonly string[] {
+  return agent === "codex" ? CODEX_EFFORT_CHOICES : EFFORT_CHOICES;
+}
+
 /** 한 에이전트에 대해 기억되는 선택. `""` = 미지정(= 플래그 미부착). */
 export interface AgentOptions {
   model: string;
@@ -68,8 +123,12 @@ const LAST_AGENT_KEY = "agentOptionsAgent";
  * 저장된 JSON을 **검증 파서**로 통과시킨다 — 모르는 값(구 버전이 쓴 값, 손으로
  * 고친 값, 어휘에서 빠진 값)은 조용히 "미지정"으로 떨어뜨린다. 기억은 편의지
  * 계약이 아니므로 손상된 저장값이 세션 스폰을 망가뜨려선 안 된다.
+ *
+ * 검증은 **그 에이전트의 어휘로만** 한다 — 키가 갈려 있어도(`agentOptions:*`)
+ * 사용자가 손으로 고치거나 어휘가 개정되면 남의 값이 들어올 수 있고, codex 쪽은
+ * 오값이 경고가 아니라 첫 요청 400이다.
  */
-export function parseAgentOptions(raw: string | null): AgentOptions {
+export function parseAgentOptions(raw: string | null, agent: AgentId = DEFAULT_AGENT): AgentOptions {
   if (!raw) return UNSET_OPTIONS;
   let obj: unknown;
   try {
@@ -79,15 +138,15 @@ export function parseAgentOptions(raw: string | null): AgentOptions {
   }
   if (typeof obj !== "object" || obj === null) return UNSET_OPTIONS;
   const rec = obj as Record<string, unknown>;
-  const model = MODEL_CHOICES.some((m) => m === rec.model) ? (rec.model as string) : "";
-  const effort = EFFORT_CHOICES.some((e) => e === rec.effort) ? (rec.effort as string) : "";
+  const model = modelChoices(agent).some((m) => m === rec.model) ? (rec.model as string) : "";
+  const effort = effortChoices(agent).some((e) => e === rec.effort) ? (rec.effort as string) : "";
   return { model, effort };
 }
 
 /** 이 에이전트로 마지막에 연 세션의 설정 (없거나 이상하면 미지정). */
 export function loadAgentOptions(agent: AgentId): AgentOptions {
   try {
-    return parseAgentOptions(localStorage.getItem(optionsKey(agent)));
+    return parseAgentOptions(localStorage.getItem(optionsKey(agent)), agent);
   } catch {
     return UNSET_OPTIONS; // 저장소가 막힌 환경 — 미지정으로 계속 동작한다
   }

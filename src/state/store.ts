@@ -294,6 +294,17 @@ interface AppState {
     model?: string;
     effort?: string;
   } | null;
+  /**
+   * A request to open a new **codex** session bound to `project` (consumed by
+   * MainArea), or null.
+   *
+   * `claudeOpenRequest`와 합치지 않은 것이 의도다. 저쪽은 seed·referencePanelId·
+   * adopt 같은 claude 전용 개념을 들고 있고 소비부도 그만큼 크다 — codex를 그
+   * 분기 안에 끼워 넣으면 claude 경로에 손이 가고(회귀 0이 이 작업의 불변식),
+   * codex가 절대 쓰지 않을 필드를 계속 지나치게 된다. 두 요청은 각자 작고
+   * 각자 완결이다.
+   */
+  codexOpenRequest: { project: string; model?: string; effort?: string } | null;
   /** Inject a prompt into an already-live Claude session (dev mode's 확인 button
    * re-uses the project's dev session). Matched by session uuid in ClaudeTermPanel.
    *
@@ -511,6 +522,8 @@ interface AppState {
       effort?: string;
     } | null,
   ) => void;
+  /** Request opening a new codex session in `project` (MainArea consumes + clears). */
+  requestCodexOpen: (req: { project: string; model?: string; effort?: string } | null) => void;
   /** Inject a prompt into a live Claude session (consumed by the matching panel). */
   requestClaudeInject: (
     req: { id: string; uuid: string; text: string; mode?: "submit" | "fill" } | null,
@@ -664,6 +677,7 @@ export const useAppStore = create<AppState>((set, get) => ({
   editorOpenRequest: null,
   diffRequest: null,
   claudeOpenRequest: null,
+  codexOpenRequest: null,
   claudeInjectRequest: null,
   claudeInjectAcks: [],
   devReviewQueue: [],
@@ -863,6 +877,7 @@ export const useAppStore = create<AppState>((set, get) => ({
   requestEditorOpen: (path) => set({ editorOpenRequest: path }),
   requestDiff: (spec) => set({ diffRequest: spec }),
   requestClaudeOpen: (req) => set({ claudeOpenRequest: req }),
+  requestCodexOpen: (req) => set({ codexOpenRequest: req }),
   requestClaudeInject: (req) => set({ claudeInjectRequest: req }),
   reportClaudeInjectAck: (ack) =>
     set((s) => ({

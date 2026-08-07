@@ -45,6 +45,10 @@ import { HostKeyModal } from "./ssh/HostKeyModal";
  * panel's last sub-area; it retries across a few frames in case content is still
  * laying out. Under dockview's onlyWhenVisible mode only the active panel's
  * content is in `.dv-active-group`, so this never targets a hidden panel. */
+/** 내부 kind → 기본 탭 제목의 사람 이름. 여기 없는 kind는 kind 이름을 대문자로
+ * 시작해 그대로 쓴다(기존 동작). */
+const KIND_LABEL: Partial<Record<PanelKind, string>> = { codexterm: "Codex" };
+
 function focusActivePanelContent(area?: PanelArea) {
   let tries = 0;
   const tick = () => {
@@ -100,6 +104,8 @@ export function MainArea({
   const requestDiff = useAppStore((s) => s.requestDiff);
   const claudeOpenRequest = useAppStore((s) => s.claudeOpenRequest);
   const requestClaudeOpen = useAppStore((s) => s.requestClaudeOpen);
+  const codexOpenRequest = useAppStore((s) => s.codexOpenRequest);
+  const requestCodexOpen = useAppStore((s) => s.requestCodexOpen);
   const runRequest = useAppStore((s) => s.runRequest);
   const requestRun = useAppStore((s) => s.requestRun);
   const focusMainRequest = useAppStore((s) => s.focusMainRequest);
@@ -312,17 +318,24 @@ export function MainArea({
     const api = apiRef.current;
     if (!api) return null;
     const n = ++counterRef.current;
-    const title = opts?.title ?? `${kind[0].toUpperCase()}${kind.slice(1)} ${n}`;
+    // 기본 탭 제목. kind 이름을 그대로 쓰면 "Codexterm 3"이 되므로 내부 kind와
+    // 사용자 표기를 여기서 갈라 둔다(kind 자체는 레이아웃에 직렬화되는 식별자라
+    // 표기 사정으로 바꾸지 않는다).
+    const label = KIND_LABEL[kind] ?? `${kind[0].toUpperCase()}${kind.slice(1)}`;
+    const title = opts?.title ?? `${label} ${n}`;
     // Terminals get the real PTY panel, claudeterm the real claude CLI + timeline,
-    // editor a CodeMirror editor; anything else is a stub.
+    // codexterm the same PTY panel with a codex spawn, editor a CodeMirror
+    // editor; anything else is a stub.
     const component =
       kind === "terminal"
         ? "terminal"
         : kind === "claudeterm"
           ? "claudeterm"
-          : kind === "editor"
-            ? "editor"
-            : "placeholder";
+          : kind === "codexterm"
+            ? "codexterm"
+            : kind === "editor"
+              ? "editor"
+              : "placeholder";
     // Counter suffix: two same-kind panels in one millisecond (rapid dev-mode
     // opens) must not collide — dockview requires unique ids.
     // surface 접두사(m/s): 두 dock의 id 충돌 방지 (closeRequest 소유 판정 D3).
@@ -446,6 +459,29 @@ export function MainArea({
     });
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [claudeOpenRequest, apiReady, activeProject, layerMode]);
+
+  // 새 codex 세션 요청 소비 (툴바 옵션 팝오버). claude 쪽과 같은 keep-until-
+  // actionable 규칙을 따르되(부 surface 비소비 · 앞 레이어일 때만 · 이 프로젝트의
+  // 마운트만 · dock 준비 후에만 · 실제로 열 수 있을 때 1회 소비) 필드는 세 개뿐
+  // 이다 — codex에는 seed도 adopt도 loadSessionId도 없다(세션 uuid를 앱이 정할
+  // 수 없고, 지속성은 이번 범위 밖).
+  useEffect(() => {
+    if (!isPrimary) return;
+    if (!integratedIsFront(layerMode)) return;
+    if (!codexOpenRequest) return;
+    const { project, model, effort } = codexOpenRequest;
+    if (project !== activeProject) return;
+    const api = apiRef.current;
+    if (!api) return;
+    requestCodexOpen(null);
+    addPanel("codexterm", {
+      project,
+      cwd: project,
+      ...(model ? { model } : {}),
+      ...(effort ? { effort } : {}),
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [codexOpenRequest, apiReady, activeProject, layerMode]);
 
   // (개발 세션 ✓확인/🧪 소비는 DevView로 이관됨 — 통합 dock 안에 "개발 세션"
   // 부분 패널을 끼워 넣던 옛 경로는 제거. 이제 EditorPanel이 dev 레이어를 전면

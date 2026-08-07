@@ -120,6 +120,7 @@ export function AgentOptionsPopover({
         <span className="agent-opt-label">모델</span>
         <ModelSelect
           value={opts.model}
+          agent={agent}
           defaultLabel="기본 (미지정)"
           ariaLabel="모델"
           title="세션의 모델은 스폰될 때 정해집니다 — 나중에 바꾸려면 재스폰(대화 파기)입니다"
@@ -130,9 +131,14 @@ export function AgentOptionsPopover({
         <span className="agent-opt-label">강도</span>
         <EffortSelect
           value={opts.effort}
+          agent={agent}
           defaultLabel="기본 (미지정)"
           ariaLabel="추론 강도"
-          title="추론 강도(--effort) — 미지정이면 CLI 기본값을 씁니다"
+          title={
+            agent === "codex"
+              ? "추론 강도(-c model_reasoning_effort) — 미지정이면 ~/.codex/config.toml 값을 씁니다"
+              : "추론 강도(--effort) — 미지정이면 CLI 기본값을 씁니다"
+          }
           onChange={(v) => setOpts((o) => ({ ...o, effort: v }))}
         />
       </div>

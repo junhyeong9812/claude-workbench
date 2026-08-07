@@ -27,6 +27,7 @@ const KNOWN_COMPONENTS = new Set([
   "terminal",
   "ssh",
   "claudeterm",
+  "codexterm",
   "editor",
   "diff",
 ]);

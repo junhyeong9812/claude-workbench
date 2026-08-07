@@ -110,6 +110,10 @@ pub fn run() {
             commands::terminal::terminal_resize,
             commands::terminal::terminal_snapshot,
             commands::terminal::terminal_close,
+            // codex 세션은 스폰만 전용이고 write/resize/snapshot/close는 위의
+            // terminal_* 를 그대로 쓴다 (순수 터미널 탭 — claude 커맨드 표면과
+            // 접점 없음).
+            commands::codex::codex_create,
             commands::ssh::ssh_create,
             commands::ssh::ssh_hostkey_decision,
             commands::ssh::ssh_store_secret,

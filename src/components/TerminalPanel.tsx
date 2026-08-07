@@ -9,6 +9,7 @@ import { useAppStore } from "../state/store";
 import { xtermTheme } from "./xtermTheme";
 import type { TerminalOutputEvent, SnapshotResult } from "../types";
 import { decodePtyData, ptyEventName, pushPendingCapped } from "./pty";
+import { errText } from "../utils/error";
 
 /** Params attached to a terminal panel. `sessionId` is persisted into the
  * dockview layout so a remount (tab/project switch) re-attaches the same PTY.
@@ -20,7 +21,7 @@ import { decodePtyData, ptyEventName, pushPendingCapped } from "./pty";
  * (review F8). An unsaved ad-hoc connection has no `connectionId`, so it cannot
  * auto-reconnect after restart (expected). */
 export interface TerminalParams {
-  kind?: "terminal" | "editor" | "ssh";
+  kind?: "terminal" | "editor" | "ssh" | "codexterm";
   title?: string;
   sessionId?: number;
   /** One-shot command run once when a fresh terminal starts (build/test runner).
@@ -29,6 +30,12 @@ export interface TerminalParams {
   /** Working directory for a fresh terminal (build/test runner pins it to the
    * target project); falls back to the active project when absent. */
   cwd?: string;
+  /** codexterm 전용 스폰 옵션 — `-m <model>` / `-c model_reasoning_effort=<e>`.
+   * 미지정이면 키가 실리지 않고 백엔드도 플래그를 붙이지 않는다(= `~/.codex/
+   * config.toml` 그대로). 레이아웃에 직렬화되므로 재시작 후 같은 모델·강도로
+   * 다시 뜬다 — claudeterm의 model/effort와 같은 계약. */
+  model?: string;
+  effort?: string;
   // SSH-only (non-secret):
   host?: string;
   port?: number;
@@ -122,6 +129,9 @@ export function TerminalPanel(props: IDockviewPanelProps<TerminalParams>) {
     let ready = false;
     const pending: TerminalOutputEvent[] = [];
     const isSsh = props.params.kind === "ssh";
+    // codex 세션 — 스폰 커맨드만 다르고 그 뒤(구독·스냅샷·drain·입력·리사이즈·
+    // 닫기)는 일반 터미널과 완전히 같다.
+    const isCodex = props.params.kind === "codexterm";
 
     const write = (bytes: Uint8Array | number[]) => {
       if (!disposed) term.write(bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes));
@@ -230,6 +240,9 @@ export function TerminalPanel(props: IDockviewPanelProps<TerminalParams>) {
       if (sessionId == null) {
         // Opt-in scrollback persistence keys on the (layout-stable) panel id, so
         // a restored panel restores its own prior output (review F11).
+        // codex는 이 opt-in을 **의도적으로 안 탄다**(아래 분기가 persistKey를 안
+        // 넘긴다): 전체화면 TUI의 지난 프레임을 재도장하면 살아 있는 화면처럼
+        // 보이는 죽은 그림이 남고, 곧이어 새 TUI가 그 위에 그린다.
         const persistKey = useAppStore.getState().persistScrollback ? props.api.id : null;
         if (isSsh) {
           // Recreate after restart: no secret here — the backend reads it from
@@ -250,6 +263,39 @@ export function TerminalPanel(props: IDockviewPanelProps<TerminalParams>) {
             cols: term.cols,
             rows: term.rows,
           });
+        } else if (isCodex) {
+          // codex TUI를 프로젝트에 뿌리내려 띄운다. 스폰 실패는 **터미널 안에
+          // 찍는다**: 가장 흔한 실패가 "설치 안 됨"(백엔드가 바이너리를 못 찾아
+          // 스폰조차 시도하지 않는 경우)인데, 그때 아무것도 안 하면 사용자에게는
+          // 원인 없는 검은 화면만 남는다. 일반 터미널 경로는 이 분기를 지나지
+          // 않으므로 기존 동작 불변.
+          const cwd = props.params.cwd ?? useAppStore.getState().activeProject ?? null;
+          // 재부착에 실패해 여기까지 온 경우(재시작·PTY 소멸) = **새 세션**이다.
+          // codex에는 `--session-id`가 없어 앱이 이전 대화를 이어 줄 수 없으므로
+          // (그래서 이 탭은 지속성이 없다) 조용히 빈 TUI를 띄우면 사용자는 이전
+          // 대화가 사라진 것을 화면으로만 추측하게 된다. 한 줄로 밝힌다.
+          if (existing != null) {
+            writeText(
+              "\r\n\x1b[2m[새 codex 세션 — 이전 대화는 codex resume으로만 이어집니다]\x1b[0m\r\n",
+            );
+          }
+          // 초기 크기에도 아래 onResize와 같은 퇴화 가드(감사) — 마운트 직후
+          // 호스트가 아직 0px이면 FitAddon이 2×1을 주고, 그걸로 만들면 TUI가
+          // 부서진 채 시작한다. 유효 크기는 첫 정상 resize가 곧바로 따라온다.
+          const initCols = term.cols < 10 ? 80 : term.cols;
+          const initRows = term.rows < 3 ? 24 : term.rows;
+          try {
+            sessionId = await invoke<number>("codex_create", {
+              cwd,
+              model: props.params.model ?? null,
+              effort: props.params.effort ?? null,
+              cols: initCols,
+              rows: initRows,
+            });
+          } catch (e) {
+            writeText(`\r\n\x1b[31m${errText(e, "codex 세션을 시작하지 못했습니다.")}\x1b[0m\r\n`);
+            return; // 세션 없음 — 구독/스냅샷/drain 할 것이 없다
+          }
         } else {
           // Pin to the requested cwd (build/test runner) over the live active
           // project, so a project switch between request and create can't run in
@@ -311,6 +357,13 @@ export function TerminalPanel(props: IDockviewPanelProps<TerminalParams>) {
     });
     const onResize = term.onResize(() => {
       if (sessionId == null) return;
+      // 퇴화 크기는 codex PTY로 내보내지 않는다(ClaudeTermPanel의 같은 백스톱).
+      // 어떤 실제 레이아웃도 두 자리 미만 컬럼을 만들지 않는다 — 이 값이 나온다는
+      // 건 호스트가 0px로 접혔다는 뜻이고(FitAddon의 하한이 만든 2×1), 그대로
+      // 보내면 **전체화면 TUI가 실제로 2×1로 리사이즈되어 화면이 파괴된다**.
+      // 셸(일반 터미널)은 다시 그릴 화면이 없어 무해하므로 codex에만 건다 —
+      // 기존 터미널·SSH 탭의 동작을 바꾸지 않기 위해서다.
+      if (isCodex && (term.cols < 10 || term.rows < 3)) return;
       invoke("terminal_resize", { id: sessionId, cols: term.cols, rows: term.rows }).catch(
         () => {},
       );

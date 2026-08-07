@@ -4,8 +4,8 @@
  * 어휘·기억의 순수 규칙은 `state/agentOptions.test.ts`가 본다. 여기서 보는 건 그
  * 위 한 칸 — 팝오버가 (a) 열릴 때 마지막 설정을 실제로 채워 넣는가, (b) [시작]이
  * 그 선택을 기억하고 호출자에게 넘기는가, (c) 아무것도 안 고르면 **플래그가 하나도
- * 안 붙는 형태**로 넘기는가(현행 스폰 바이트 동일의 UI 쪽 끝), (d) Codex를 표시는
- * 하되 고를 수 없게 두는가다.
+ * 안 붙는 형태**로 넘기는가(현행 스폰 바이트 동일의 UI 쪽 끝), (d) 에이전트를
+ * 바꿀 때 어휘와 기억이 **함께** 갈리는가다.
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { act } from "react";
@@ -138,12 +138,71 @@ describe("AgentOptionsPopover", () => {
     expect(spawnOptionFields(started!.opts)).toEqual({ effort: "low" });
   });
 
-  it("Codex는 보이되 고를 수 없다 (작업② 전)", async () => {
+  it("두 에이전트 다 고를 수 있고 Claude가 기본 선택이다", async () => {
     installStorage();
     await render();
-    expect(btn("Codex").disabled).toBe(true);
+    expect(btn("Codex").disabled).toBe(false);
     expect(btn("Claude").disabled).toBe(false);
     expect(btn("Claude").getAttribute("aria-pressed")).toBe("true");
+  });
+
+  describe("에이전트를 바꾸면 어휘와 기억이 함께 갈린다", () => {
+    it("Codex를 고르면 codex 어휘가 뜬다 (claude 값은 안 보인다)", async () => {
+      installStorage();
+      await render();
+      expect([...sel("모델").options].map((o) => o.value)).toContain("opus");
+
+      await click(btn("Codex"));
+      const models = [...sel("모델").options].map((o) => o.value);
+      const efforts = [...sel("추론 강도").options].map((o) => o.value);
+      expect(models).toContain("gpt-5.6-sol");
+      expect(models).not.toContain("opus");
+      // codex `/model` 피커 그대로 — ultra 포함, claude에만 있는 값은 없다.
+      expect(efforts).toEqual(["", "ultra", "max", "xhigh", "high", "medium", "low"]);
+    });
+
+    it("에이전트를 바꾸면 그 에이전트의 기억을 다시 읽는다", async () => {
+      installStorage({
+        "agentOptions:claude": '{"model":"sonnet","effort":"max"}',
+        "agentOptions:codex": '{"model":"gpt-5.6-luna","effort":"low"}',
+      });
+      await render();
+      expect(sel("모델").value).toBe("sonnet");
+      await click(btn("Codex"));
+      expect(sel("모델").value).toBe("gpt-5.6-luna");
+      expect(sel("추론 강도").value).toBe("low");
+      await click(btn("Claude"));
+      expect(sel("모델").value).toBe("sonnet");
+      expect(sel("추론 강도").value).toBe("max");
+    });
+
+    it("claude 값이 codex 기억에 저장돼 있어도 어휘 밖이라 미지정으로 열린다", async () => {
+      installStorage({ "agentOptions:codex": '{"model":"opus","effort":"max"}' });
+      await render();
+      await click(btn("Codex"));
+      expect(sel("모델").value).toBe("");
+      // "max"는 두 어휘에 다 있다 — 교차 오염이 아니라 진짜 유효값이다.
+      expect(sel("추론 강도").value).toBe("max");
+    });
+
+    it("[시작]이 고른 에이전트를 넘기고 그 에이전트 키에만 저장한다", async () => {
+      const store = installStorage();
+      await render();
+      await click(btn("Codex"));
+      await choose("모델", "gpt-5.6-terra");
+      await choose("추론 강도", "ultra");
+      await click(btn("시작"));
+
+      expect(started).toEqual({
+        agent: "codex",
+        opts: { model: "gpt-5.6-terra", effort: "ultra" },
+      });
+      expect(store.get("agentOptions:codex")).toBe(
+        '{"model":"gpt-5.6-terra","effort":"ultra"}',
+      );
+      expect(store.get("agentOptionsAgent")).toBe("codex");
+      expect(store.has("agentOptions:claude")).toBe(false);
+    });
   });
 
   it("시작할 수 없는 상태면 [시작]이 잠기고 이유를 보여준다", async () => {
