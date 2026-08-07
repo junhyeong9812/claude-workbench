@@ -143,6 +143,30 @@ pub struct RolloutMeta {
     pub started_ms: Option<i64>,
     pub originator: Option<String>,
     pub cli_version: Option<String>,
+    /// `"cli"`(대화형 TUI) · `"exec"`(일회성 `codex exec`) 등. **서브에이전트 세션은
+    /// 문자열이 아니라 객체**(`{"subagent":{"thread_spawn":…}}`)라 그때는 `None`이고
+    /// [`Self::subagent`]가 선다.
+    pub source: Option<String>,
+    pub subagent: bool,
+}
+
+/// 이 전사가 **앱이 띄운 codex 탭의 것일 수 있는가**.
+///
+/// 실전사 211개 중 189개가 `codex exec`(원샷 리뷰 워커)이고 5개가 서브에이전트다
+/// — 즉 **89%가 구조적으로 앱 탭이 아니다**. 그것들이 후보에 남아 있으면 시각 창
+/// 안에 우연히 들어올 때마다 `Multiple`/`Contested`로 타임라인을 죽이거나, 최악
+/// 남의 전사를 붙인다. 앱은 TUI만 띄우므로(`codex_create`) 여기서 걸러낸다.
+///
+/// **거부 목록**이지 허용 목록이 아니다: codex가 `originator` 값을 늘리면 허용
+/// 목록은 타임라인을 통째로 죽이지만, 거부 목록은 최악 후보가 하나 더 남을 뿐이다.
+pub fn app_spawnable(meta: &RolloutMeta) -> bool {
+    if meta.subagent {
+        return false;
+    }
+    if meta.source.as_deref() == Some("exec") {
+        return false;
+    }
+    !matches!(meta.originator.as_deref(), Some("codex_exec"))
 }
 
 fn str_field(v: &Value, k: &str) -> Option<String> {
@@ -159,12 +183,15 @@ pub fn parse_meta_line(line: &str) -> Option<RolloutMeta> {
         return None;
     }
     let p = v.get("payload")?;
+    let source = p.get("source");
     Some(RolloutMeta {
         session_id: str_field(p, "session_id").or_else(|| str_field(p, "id")),
         cwd: str_field(p, "cwd"),
         started_ms: str_field(p, "timestamp").as_deref().and_then(parse_rfc3339_ms),
         originator: str_field(p, "originator"),
         cli_version: str_field(p, "cli_version"),
+        source: str_field(p, "source"),
+        subagent: source.is_some_and(|s| s.is_object()),
     })
 }
 
@@ -182,10 +209,13 @@ pub fn read_meta(path: &Path) -> Option<RolloutMeta> {
 
 /// 시계 오차 여유 — 전사 시각이 스폰 시각보다 **앞설** 수 있는 한계.
 pub const MATCH_SKEW_MS: i64 = 2_000;
-/// 스폰 후 전사 세션이 열리기까지 허용하는 창. 실측 0.9초라 30초는 넉넉하면서도,
-/// **다음 탭이 이 창 안에 들어오지 않을 만큼** 짧아야 한다(창이 넓을수록 남의
-/// 세션을 덮을 위험이 커진다).
-pub const MATCH_WINDOW_MS: i64 = 30_000;
+/// 스폰 후 전사 세션이 열리기까지 허용하는 창.
+///
+/// 실측 지연은 0.92초·1.399초 두 번 — 10초는 그 **5배 이상 여유**를 두면서도,
+/// 창이 좁을수록 좋은 이유(창 안에 들어오는 남의 세션 = 오매칭·미확정의 원인)에
+/// 부합하는 값이다. 리뷰가 지적한 "앱 밖 codex TUI가 창 안에 들어오는" 잔여
+/// 위험을 30초에서 1/3로 줄인다.
+pub const MATCH_WINDOW_MS: i64 = 10_000;
 
 /// 살아 있는 codex 탭 하나 — 매칭의 주체이자, 다른 탭의 후보를 **가로막는** 존재.
 #[derive(Debug, Clone, PartialEq)]
@@ -360,6 +390,13 @@ impl RolloutMapper {
         *self.skipped.entry(key).or_insert(0) += 1;
     }
 
+    /// 읽을 수조차 없던 줄(무효 UTF-8 등)을 센다. 전사는 codex가 쓰는 파일이라
+    /// 그럴 일이 드물지만, **말없이 건너뛰면** 타임라인이 이유 없이 얇아진다.
+    pub fn note_unreadable_line(&mut self) {
+        self.lines += 1;
+        self.bad_lines += 1;
+    }
+
     /// 한 줄을 적용한다. 어떤 입력에도 panic하지 않는다 — 못 읽으면 세고 넘어간다.
     pub fn apply_line(&mut self, line: &str) {
         let line = line.trim();
@@ -484,8 +521,7 @@ impl RolloutMapper {
             "function_call" => self.apply_function_call(p),
             "function_call_output" => {
                 let Some(cid) = str_field(p, "call_id") else { return };
-                let out = p.get("output").and_then(Value::as_str).map(str::to_string);
-                self.complete(&cid, out, None);
+                self.complete(&cid, output_text(p.get("output")), None);
             }
             "custom_tool_call" => self.apply_custom_call(p),
             "custom_tool_call_output" => {
@@ -493,8 +529,7 @@ impl RolloutMapper {
                 // apply_patch는 `patch_apply_end`가 더 읽기 좋은 본문을 이미 넣는다
                 // — 여기 output은 JSON 봉투라 덮어쓰지 않는다(complete가 기존 본문
                 // 을 보존한다).
-                let out = p.get("output").and_then(Value::as_str).map(str::to_string);
-                self.complete(&cid, out, None);
+                self.complete(&cid, output_text(p.get("output")), None);
             }
             // call_id가 없어 붙일 데가 없다 — 같은 호출을 event_msg/web_search_end가
             // call_id·query와 함께 들고 온다(그쪽이 아이템의 주인).
@@ -781,7 +816,12 @@ pub fn parse_rollout(path: &Path) -> std::io::Result<RolloutParse> {
     let mut mapper = RolloutMapper::new(path.parent().unwrap_or(Path::new("/")));
     let mut first = true;
     for line in BufReader::new(f).lines() {
-        let Ok(line) = line else { continue };
+        let Ok(line) = line else {
+            // 무효 UTF-8 — 조용히 넘기지 않는다(S6, 리뷰 #6).
+            mapper.note_unreadable_line();
+            first = false;
+            continue;
+        };
         if first {
             first = false;
             if let Some(meta) = parse_meta_line(&line) {
@@ -798,6 +838,26 @@ pub fn parse_rollout(path: &Path) -> std::io::Result<RolloutParse> {
 // ---------------------------------------------------------------------------
 // 작은 순수 도우미
 // ---------------------------------------------------------------------------
+
+/// 도구 결과 본문. **두 형태가 실전사에 병존한다**: 그냥 문자열(1,632건)과
+/// `[{"type":"input_text","text":…}, …]` 배열(29건 — `exec` 커스텀 도구가 헤더와
+/// 본문을 두 조각으로 준다). 배열을 문자열로만 읽으면 그 29건의 출력이 통째로
+/// 사라진다(항목은 남고 내용만 빈다 — 조용한 유실).
+fn output_text(v: Option<&Value>) -> Option<String> {
+    match v? {
+        Value::String(s) => Some(s.clone()),
+        Value::Array(items) => {
+            // 조각들은 이어 붙이면 한 덩어리다(구분자를 넣으면 원문이 바뀐다).
+            let joined: String = items
+                .iter()
+                .filter_map(|it| it.get("text").and_then(Value::as_str))
+                .collect();
+            (!joined.is_empty()).then_some(joined)
+        }
+        // 모르는 형태는 지어내지 않고 원문 JSON을 보여 준다.
+        other => Some(other.to_string()),
+    }
+}
 
 fn usage_from(v: &Value) -> TokenUsage {
     let n = |k: &str| v.get(k).and_then(Value::as_u64).unwrap_or(0);

@@ -66,6 +66,43 @@ fn meta_line_of_another_type_is_not_meta() {
 }
 
 // ---------------------------------------------------------------------------
+// 후보 자격 — 앱이 띄운 TUI 전사만 후보다
+// ---------------------------------------------------------------------------
+
+/// 실전사에서 그대로 가져온 첫 줄들. 211개 중 **189개가 exec·5개가 서브에이전트**라,
+/// 거르지 않으면 후보 대부분이 앱과 무관한 전사다(리뷰 #2).
+const META_EXEC: &str = r#"{"timestamp":"2026-08-05T09:19:27.802Z","type":"session_meta","payload":{"session_id":"019fd138-7af4-72b2-8496-097b4880addf","id":"019fd138-7af4-72b2-8496-097b4880addf","timestamp":"2026-08-05T09:19:27.476Z","cwd":"/proj","originator":"codex_exec","cli_version":"0.144.1","source":"exec"}}"#;
+const META_SUBAGENT: &str = r#"{"timestamp":"2026-06-01T09:19:27.802Z","type":"session_meta","payload":{"session_id":"019e8030-1111-7000-8000-000000000001","id":"019e8030-1111-7000-8000-000000000001","timestamp":"2026-06-01T09:19:27.476Z","cwd":"/proj","originator":"codex-tui","cli_version":"0.137.0","source":{"subagent":{"thread_spawn":{"parent_thread_id":"019e8030-afda-7713-99bf-63f6fdb17e33","depth":1,"agent_nickname":"Fermat"}}}}}"#;
+
+#[test]
+fn only_the_interactive_tui_transcript_can_be_ours() {
+    // 앱이 띄우는 것 = 대화형 TUI. 이것만 후보다.
+    assert!(app_spawnable(&parse_meta_line(META).unwrap()));
+    // `codex exec` 원샷(리뷰 워커 등) — 앱 탭이 아니다.
+    assert!(!app_spawnable(&parse_meta_line(META_EXEC).unwrap()));
+    // 서브에이전트 스레드 — `source`가 문자열이 아니라 객체다.
+    let sub = parse_meta_line(META_SUBAGENT).unwrap();
+    assert!(sub.subagent, "객체형 source는 서브에이전트로 읽혀야 한다");
+    assert!(!app_spawnable(&sub));
+}
+
+/// 허용 목록이 아니라 **거부 목록**이다 — codex가 originator를 늘려도 타임라인이
+/// 통째로 죽지 않는다(최악 후보가 하나 더 남을 뿐).
+#[test]
+fn an_unknown_originator_is_still_a_candidate() {
+    let m = RolloutMeta {
+        session_id: Some("x".into()),
+        cwd: Some("/proj".into()),
+        started_ms: Some(1),
+        originator: Some("codex-tui-next".into()),
+        cli_version: None,
+        source: Some("cli".into()),
+        subagent: false,
+    };
+    assert!(app_spawnable(&m));
+}
+
+// ---------------------------------------------------------------------------
 // 매칭
 // ---------------------------------------------------------------------------
 
@@ -419,6 +456,50 @@ fn an_output_without_its_call_still_lands() {
     ]);
     assert_eq!(out.items.len(), 1);
     assert_eq!(out.items[0].content_text.as_deref(), Some("결과만 있다"));
+}
+
+/// 도구 결과가 **배열**로 오는 형태(실전사 29건 — `exec` 커스텀 도구가 헤더와
+/// 본문을 두 조각으로 준다). 문자열로만 읽으면 항목은 남고 내용만 비는 조용한 유실.
+#[test]
+fn array_shaped_tool_output_is_joined() {
+    let out = map(&[
+        META,
+        USER,
+        r#"{"timestamp":"2026-08-07T11:52:11.000Z","type":"response_item","payload":{"type":"custom_tool_call","status":"completed","call_id":"c1","name":"exec","input":"tools.exec_command(…)"}}"#,
+        r#"{"timestamp":"2026-08-07T11:52:12.000Z","type":"response_item","payload":{"type":"custom_tool_call_output","call_id":"c1","output":[{"type":"input_text","text":"Script completed\nOutput:\n"},{"type":"input_text","text":"hooks/git-guard.sh\n"}]}}"#,
+    ]);
+    assert_eq!(
+        out.items[0].content_text.as_deref(),
+        Some("Script completed\nOutput:\nhooks/git-guard.sh\n"),
+    );
+}
+
+#[test]
+fn an_unknown_output_shape_is_shown_rather_than_dropped() {
+    let out = map(&[
+        META,
+        USER,
+        r#"{"timestamp":"2026-08-07T11:52:12.000Z","type":"response_item","payload":{"type":"function_call_output","call_id":"c1","output":{"future":"shape"}}}"#,
+    ]);
+    assert_eq!(out.items[0].content_text.as_deref(), Some(r#"{"future":"shape"}"#));
+}
+
+/// 읽을 수조차 없는 줄(무효 UTF-8)도 세어서 화면에 드러낸다 — 말없이 건너뛰면
+/// 타임라인이 이유 없이 얇아진다(리뷰 #6).
+#[test]
+fn unreadable_bytes_are_counted_as_bad_lines() {
+    let mut p = std::env::temp_dir();
+    p.push(format!("cw-codex-rollout-{}.jsonl", std::process::id()));
+    let mut bytes = META.as_bytes().to_vec();
+    bytes.push(b'\n');
+    bytes.extend_from_slice(&[0xff, 0xfe, 0xff, b'\n']); // 무효 UTF-8 한 줄
+    bytes.extend_from_slice(USER.as_bytes());
+    bytes.push(b'\n');
+    std::fs::write(&p, &bytes).unwrap();
+    let out = parse_rollout(&p).unwrap();
+    std::fs::remove_file(&p).ok();
+    assert_eq!(out.bad_lines, 1);
+    assert_eq!(out.turns.len(), 1, "읽을 수 있는 줄은 그대로 살아야 한다");
 }
 
 #[test]
