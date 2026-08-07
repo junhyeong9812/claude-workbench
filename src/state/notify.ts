@@ -245,8 +245,8 @@ export async function refreshNotifyPermission(): Promise<NotifyPermission> {
 function bodyFor(uuid: string, kind: NotifKind): { title: string; body: string } {
   const short = uuid.slice(0, 8);
   return kind === "blocked"
-    ? { title: "Claude — 입력 대기 중", body: `세션 ${short}이(가) 응답을 기다립니다` }
-    : { title: "Claude — 작업 완료", body: `세션 ${short}의 작업이 끝났습니다` };
+    ? { title: "에이전트 — 입력 대기 중", body: `세션 ${short}이(가) 응답을 기다립니다` }
+    : { title: "에이전트 — 작업 완료", body: `세션 ${short}의 작업이 끝났습니다` };
 }
 
 /**

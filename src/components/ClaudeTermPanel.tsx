@@ -75,6 +75,7 @@ import {
   type RefineModel,
   type RefineView,
 } from "../state/promptRefine";
+import { loadAgentOptions } from "../state/agentOptions";
 import { MemoEditor, type MemoDoc, type MemoHandle, type MemoSaveResult } from "./MemoEditor";
 import { useClaudeUi } from "../state/claudeUi";
 import { SubagentsPane } from "./SubagentsPane";
@@ -147,9 +148,12 @@ export interface ClaudeTermParams {
   sourcePanelId?: string;
   /** 정리 세션 전용: [적용]이 최종본을 채워 넣을 원본 세션의 uuid. **유지**. */
   targetUuid?: string;
-  /** 스폰 시 `--model` 별칭(`opus`/`fable`). 정리 세션만 설정한다 — 없으면 CLI
-   * 기본값(기존 모든 세션의 동작). **유지**: 재시작 후에도 같은 모델로 떠야 한다. */
+  /** 스폰 시 `--model` 별칭(`opus`/`fable`). 새 세션 옵션 팝오버·정리 세션·마지막
+   * 설정을 상속하는 표면들이 설정한다 — 없으면 CLI 기본값(옵션이 없던 때의 동작).
+   * **유지**: 재시작 후에도 같은 모델로 떠야 한다. */
   model?: string;
+  /** 스폰 시 `--effort` 강도(`low`~`max`). model과 같은 규칙·같은 수명. */
+  effort?: string;
 }
 
 /** Result of `claude_open_or_attach`: attached to a live PTY (mirror) or started
@@ -1154,9 +1158,11 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
           uuid: openUuid,
           cwd,
           adopt,
-          // 정리 세션만 모델을 못박는다. null이면 백엔드가 `--model`을 아예 붙이지
-          // 않으므로 기존 세션의 동작은 그대로다.
+          // 스폰 옵션(새 세션 팝오버·정리 세션·마지막 설정 상속). null이면
+          // 백엔드가 `--model`/`--effort`를 아예 붙이지 않으므로, 옵션 없이
+          // 열린 세션과 구 레이아웃에서 복원된 세션은 예전 그대로 뜬다.
           model: (props.params.model as string | undefined) ?? null,
+          effort: (props.params.effort as string | undefined) ?? null,
           name: (props.params.title as string) ?? null,
           cols: term.cols,
           rows: term.rows,
@@ -1223,7 +1229,7 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
           term.write(`\r\n\x1b[31m[세션을 열지 못했습니다]\x1b[0m ${errText(e)}\r\n`);
           if (props.params.adoptPending === true) {
             term.write(
-              "\x1b[2m이 탭을 닫고 \"+ Claude\" 목록을 다시 열면 최신 상태로 다시 확인합니다.\x1b[0m\r\n",
+              "\x1b[2m이 탭을 닫고 \"✦ 에이전트\" 목록을 다시 열면 최신 상태로 다시 확인합니다.\x1b[0m\r\n",
             );
           }
         }
@@ -1499,6 +1505,8 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
         workdir,
         sessionUuid: crypto.randomUUID(),
         model,
+        // 강도는 새 세션 옵션에서 마지막에 고른 값을 상속한다(정리 세션엔 강도 UI 없음).
+        effort: loadAgentOptions("claude").effort,
         title: (props.params.title as string) ?? "세션",
         // 닫기=아카이브가 이 세션을 기록할 프로젝트(격리 cwd가 아니다).
         sourceProject: props.params.project ?? useAppStore.getState().activeProject ?? null,
@@ -1530,6 +1538,10 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
     const workdir = props.params.project;
     const sourceProject = refineSourceProject;
     const containerApi = props.containerApi;
+    // 강도는 **이 세션이 뜰 때의 값을 승계**한다. 전역 기억을 다시 읽으면, 그
+    // 사이 다른 표면에서 강도를 바꾼 사용자가 "모델을 바꿀까요?"에만 동의하고서
+    // 강도까지 조용히 갈아타게 된다 — 확인받은 것 이상을 바꾸지 않는다.
+    const effort = props.params.effort;
     const title = ((props.params.title as string) ?? "").replace(/^프롬프트 정리 — /, "") || "세션";
     exitRefine("model-restart");
     // 재생성은 제거가 반영된 뒤에 — 패널 id가 결정적이라 같은 틱에 다시 추가하면
@@ -1542,6 +1554,7 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
         workdir,
         sessionUuid: crypto.randomUUID(),
         model,
+        effort,
         title,
         sourceProject,
       });
@@ -1952,7 +1965,7 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
   const paneHead = (
         <div className="claudeterm-pane-head">
           <span className="claudeterm-pane-head-title">
-            Claude — {(props.params.title as string) ?? "터미널"}
+            에이전트 — {(props.params.title as string) ?? "터미널"}
           </span>
           <span className="claudeterm-head-controls">
             {!isDriver && (
@@ -2173,7 +2186,7 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
       {(applyPending || applyNote) && (
         <div className="claudeterm-refine-note" role="status">
             {applyPending
-              ? "전달 대기 중 — 원래 Claude 탭이 열려 있어야 전달됩니다. 그 탭을 활성화해 주세요.\n(전달이 확인되면 이 정리 세션은 자동으로 닫힙니다.)"
+              ? "전달 대기 중 — 원래 에이전트 탭이 열려 있어야 전달됩니다. 그 탭을 활성화해 주세요.\n(전달이 확인되면 이 정리 세션은 자동으로 닫힙니다.)"
               : applyNote}
             <span
               className="claudeterm-refine-note-x"

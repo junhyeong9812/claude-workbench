@@ -18,7 +18,7 @@ const lines = css.split("\n");
 // Component namespaces (first hyphen-segment of a rule-starting class).
 // Extend deliberately when adding a new component family — not ad hoc.
 const PREFIXES = new Set([
-  "activity", "app", "appearance", "archive", "badge", "cfs", "claude", "claudeterm",
+  "activity", "agent", "app", "appearance", "archive", "badge", "cfs", "claude", "claudeterm",
   "cm", "commit", "ctx", "dev", "diff", "dock", "drop", "dropzone", "dual", "editor", "font",
   "git", "graph", "main", "memo", "modal", "pane", "panes", "peek", "placeholder", "resize",
   "run", "search", "seg", "sidebar", "ssh", "study", "tab", "tabbar", "terminal",

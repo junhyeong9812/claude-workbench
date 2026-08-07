@@ -17,6 +17,13 @@ export interface OpenParams {
   adoptPending?: boolean;
   /** 최초 1회 주입 프롬프트 — 1회성. */
   seed?: string;
+  /** 스폰 때 못박을 모델 별칭(`--model`) — **유지**. 세션의 모델은 스폰 인자라
+   * 나중에 못 바꾸므로(재스폰 = 대화 파기), 재시작 후에도 같은 모델로 다시
+   * 떠야 "이 탭은 opus 탭"이라는 사용자의 기대가 유지된다. */
+  model?: string;
+  /** 스폰 때 못박을 추론 강도(`--effort`) — **유지**(model과 같은 이유).
+   * 없거나 빈 값이면 백엔드가 플래그를 아예 붙이지 않는다. */
+  effort?: string;
 }
 
 /** `claude_open_or_attach`에 보낼 cwd·adopt 인자. */

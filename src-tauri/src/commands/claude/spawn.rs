@@ -17,6 +17,33 @@ fn new_session_uuid() -> Result<String, AppError> {
         .map_err(|_| AppError::new("Cannot generate a session id"))
 }
 
+/// The `claude` argv for one session, up to (not including) the hook `--settings`
+/// injection: `claude <--session-id|--resume> <uuid> [--model M] [--effort E]`.
+///
+/// Split out as a pure function so the **no-option path stays byte-identical**
+/// under test: `None` (and blank, which is what a stray `""` from the frontend
+/// looks like) means the flag is not pushed at all, so every pre-existing caller
+/// produces exactly the argv it produced before options existed. Blank-rejection
+/// matters asymmetrically: `--model ""` is rejected by the CLI and kills the
+/// session outright, while a bad `--effort` only warns and falls back.
+fn build_claude_args(
+    flag: &str,
+    session_uuid: &str,
+    model: Option<&str>,
+    effort: Option<&str>,
+) -> Vec<String> {
+    let mut cmd = vec!["claude".to_string(), flag.to_string(), session_uuid.to_string()];
+    if let Some(m) = model.map(str::trim).filter(|m| !m.is_empty()) {
+        cmd.push("--model".to_string());
+        cmd.push(m.to_string());
+    }
+    if let Some(e) = effort.map(str::trim).filter(|e| !e.is_empty()) {
+        cmd.push("--effort".to_string());
+        cmd.push(e.to_string());
+    }
+    cmd
+}
+
 /// Spawn the real `claude` CLI in a PTY rooted at `cwd` and start (a) relaying
 /// its output to `terminal-output` (xterm) and (b) tailing its session JSONL to
 /// emit `claude-timeline` items. Does NOT register into `ClaudeRuntime` — the
@@ -30,11 +57,9 @@ fn new_session_uuid() -> Result<String, AppError> {
 /// writes must stay keyed by the **app's** project, or the adopted session would
 /// be filed under a name nothing else in the app uses.
 ///
-/// `model` pins the session's model (`--model <alias>`, e.g. `opus`/`fable`).
-/// **None = the flag is not passed at all**, which is what every pre-existing
-/// caller does: the CLI then picks its own default exactly as before, so adding
-/// this parameter changed no existing session's behaviour. Only the prompt-refine
-/// panel sets it (the user picks the model before the session is spawned).
+/// `model`/`effort` pin the session's model (`--model <alias>`, e.g.
+/// `opus`/`fable`) and reasoning effort (`--effort <level>`). For both,
+/// **None/blank = the flag is not passed at all** — see [`build_claude_args`].
 #[allow(clippy::too_many_arguments)]
 pub(super) fn spawn_claude(
     app: &AppHandle,
@@ -44,6 +69,7 @@ pub(super) fn spawn_claude(
     resume: Option<String>,
     name: String,
     model: Option<String>,
+    effort: Option<String>,
     cols: u16,
     rows: u16,
 ) -> Result<(u64, String, Arc<AtomicBool>), AppError> {
@@ -59,13 +85,7 @@ pub(super) fn spawn_claude(
             .and_then(|root| core_lib::jsonl::find_session_jsonl(&root, &session_uuid).ok().flatten())
             .is_some();
     let flag = if resuming { "--resume" } else { "--session-id" };
-    let mut cmd = vec!["claude".to_string(), flag.to_string(), session_uuid.clone()];
-    // Empty/blank is treated as "unset" so a stray "" from the frontend can never
-    // become `--model ""` (which the CLI rejects, killing the session outright).
-    if let Some(m) = model.as_deref().map(str::trim).filter(|m| !m.is_empty()) {
-        cmd.push("--model".to_string());
-        cmd.push(m.to_string());
-    }
+    let mut cmd = build_claude_args(flag, &session_uuid, model.as_deref(), effort.as_deref());
 
     // hook-status: 수신기가 살아 있으면 세션 한정 hook 설정을 주입한다
     // (--settings 인자 — 사용자 ~/.claude 무수정, spec §2). 세션별 토큰은
@@ -119,3 +139,65 @@ pub(super) fn spawn_claude(
     Ok((id, session_uuid, stop))
 }
 
+
+#[cfg(test)]
+mod tests {
+    use super::build_claude_args;
+
+    const UUID: &str = "11111111-2222-3333-4444-555555555555";
+
+    /// The regression that guards every pre-existing spawn surface: with no
+    /// options the argv must be exactly what it was before options existed.
+    #[test]
+    fn no_options_is_byte_identical_to_the_old_argv() {
+        assert_eq!(
+            build_claude_args("--session-id", UUID, None, None),
+            vec!["claude", "--session-id", UUID]
+        );
+        assert_eq!(
+            build_claude_args("--resume", UUID, None, None),
+            vec!["claude", "--resume", UUID]
+        );
+    }
+
+    /// A stray empty/blank string from the frontend must not become `--model ""`
+    /// (session-killing) nor `--effort ""`.
+    #[test]
+    fn blank_options_are_unset() {
+        assert_eq!(
+            build_claude_args("--session-id", UUID, Some(""), Some("   ")),
+            vec!["claude", "--session-id", UUID]
+        );
+    }
+
+    #[test]
+    fn options_are_appended_after_the_session_flag() {
+        assert_eq!(
+            build_claude_args("--session-id", UUID, Some("opus"), Some("xhigh")),
+            vec!["claude", "--session-id", UUID, "--model", "opus", "--effort", "xhigh"]
+        );
+    }
+
+    /// Either one alone — the two flags are independent.
+    #[test]
+    fn each_option_is_independent() {
+        assert_eq!(
+            build_claude_args("--session-id", UUID, Some("fable"), None),
+            vec!["claude", "--session-id", UUID, "--model", "fable"]
+        );
+        assert_eq!(
+            build_claude_args("--session-id", UUID, None, Some("max")),
+            vec!["claude", "--session-id", UUID, "--effort", "max"]
+        );
+    }
+
+    /// Values are trimmed, not quoted or escaped — the PTY spawn takes an argv
+    /// vector, so a value with spaces stays one argument.
+    #[test]
+    fn values_are_trimmed() {
+        assert_eq!(
+            build_claude_args("--session-id", UUID, Some("  opus  "), Some(" low ")),
+            vec!["claude", "--session-id", UUID, "--model", "opus", "--effort", "low"]
+        );
+    }
+}

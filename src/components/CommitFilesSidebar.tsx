@@ -3,6 +3,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { errText } from "../utils/error";
 import { useAppStore } from "../state/store";
 import { commitReviewSeed } from "../state/seedPrompts";
+import { loadAgentOptions, spawnOptionFields } from "../state/agentOptions";
 
 interface CommitFile {
   path: string;
@@ -115,6 +116,8 @@ export function CommitFilesSidebar() {
       seed,
       title: `리뷰 ${commit.slice(0, 8)}`,
       referencePanelId: `diff:${root}:${commit}`,
+      // 모델·강도는 마지막에 고른 설정을 상속한다 (옵션 UI는 주 표면 2곳에만).
+      ...spawnOptionFields(loadAgentOptions("claude")),
     });
     closeGitHistory();
   };
@@ -131,7 +134,7 @@ export function CommitFilesSidebar() {
         <span className="commit-files-count">{files.length}개 파일</span>
         <button
           className="commit-review-btn"
-          title="이 커밋을 Claude와 코드리뷰 (리뷰 전용 세션)"
+          title="이 커밋을 에이전트와 코드리뷰 (리뷰 전용 세션)"
           disabled={files.length === 0}
           onClick={startReview}
         >

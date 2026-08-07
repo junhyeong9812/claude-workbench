@@ -5,11 +5,13 @@ import { errText } from "../utils/error";
 import { fmtUnix } from "../utils/time";
 import { useAppStore } from "../state/store";
 import { SESSION_DRAG_MIME, encodeSessionDrag } from "./sessionDropZone";
+import { EffortSelect, ModelSelect } from "./AgentOptionFields";
+import { MODEL_CHOICES } from "../state/agentOptions";
 
-/** 추출 모델 선택지 — claude CLI에 목록 명령이 없어 별칭을 큐레이션한다.
- * "custom"은 자유 입력(전체 모델명 등). null(기본) = opus. */
-const MODEL_CHOICES = ["opus", "sonnet", "haiku"] as const;
-const EFFORT_CHOICES = ["xhigh", "high", "medium", "low"] as const;
+/* 추출 모델/강도 선택지는 새 세션 옵션 팝오버와 **같은 어휘**를 쓴다
+ * (`state/agentOptions` → `AgentOptionFields`). 여기서 "custom"은 자유 입력
+ * (전체 모델명 등), 빈 값은 기본(모델=opus · 강도=xhigh — 백엔드 archive.rs가
+ * 채운다)이다. */
 
 /**
  * Archive browser (관찰 → 아카이브 전환 P3): the sidebar tree of archived
@@ -194,25 +196,19 @@ export function ArchivePanel() {
           </label>
           <label className="archive-settings-row">
             <span>모델</span>
-            <select
+            <ModelSelect
               value={customModel ? "custom" : formModel}
-              onChange={(e) => {
-                if (e.target.value === "custom") {
+              defaultLabel="기본 (opus)"
+              allowCustom
+              onChange={(v) => {
+                if (v === "custom") {
                   setCustomModel(true);
                 } else {
                   setCustomModel(false);
-                  setFormModel(e.target.value);
+                  setFormModel(v);
                 }
               }}
-            >
-              <option value="">기본 (opus)</option>
-              {MODEL_CHOICES.map((m) => (
-                <option key={m} value={m}>
-                  {m}
-                </option>
-              ))}
-              <option value="custom">직접 입력…</option>
-            </select>
+            />
           </label>
           {customModel && (
             <label className="archive-settings-row">
@@ -228,14 +224,11 @@ export function ArchivePanel() {
           )}
           <label className="archive-settings-row">
             <span>effort</span>
-            <select value={formEffort} onChange={(e) => setFormEffort(e.target.value)}>
-              <option value="">기본 (xhigh)</option>
-              {EFFORT_CHOICES.map((ef) => (
-                <option key={ef} value={ef}>
-                  {ef}
-                </option>
-              ))}
-            </select>
+            <EffortSelect
+              value={formEffort}
+              defaultLabel="기본 (xhigh)"
+              onChange={setFormEffort}
+            />
           </label>
           <div className="archive-settings-foot">
             <button className="archive-btn" onClick={() => setSettingsOpen(false)}>
@@ -252,7 +245,7 @@ export function ArchivePanel() {
         <div className="archive-empty">
           아직 아카이브가 없습니다.
           <br />
-          Claude 세션의 <b>종료(아카이브)</b> 버튼으로 만듭니다.
+          에이전트 세션의 <b>종료(아카이브)</b> 버튼으로 만듭니다.
         </div>
       )}
       {!error && groups.length > 0 && shown.length === 0 && (

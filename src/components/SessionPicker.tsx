@@ -32,6 +32,8 @@ import {
 } from "../state/sessionCatalog";
 import { fmtAgo, fmtUnix } from "../utils/time";
 import { useAppStore } from "../state/store";
+import { AgentOptionsPopover } from "./AgentOptionsPopover";
+import { loadAgentOptions, spawnOptionFields, type AgentOptions } from "../state/agentOptions";
 
 export interface SessionPickerController {
   /** null = 피커 닫힘. */
@@ -66,6 +68,9 @@ type PickerAddPanel = (
     title: string;
     spawnCwd?: string;
     adoptPending?: boolean;
+    /** 스폰 옵션 — 미지정이면 키가 실리지 않고 플래그도 안 붙는다. */
+    model?: string;
+    effort?: string;
   },
 ) => unknown;
 
@@ -92,7 +97,7 @@ export function useSessionPicker(deps: {
   // Collapsed picker groups (아카이브됨/아카이브 이후 작업/아카이브 없음).
   const [pickerCollapsed, setPickerCollapsed] = useState<Set<ArchState>>(new Set());
   // Which kind the open picker creates/reopens: ACP `claude` or A `claudeterm`.
-  const [newName, setNewName] = useState("Claude 1");
+  const [newName, setNewName] = useState("에이전트 1");
   // 터미널에서 연 세션(외부) + 삭제로 숨긴 것들. 피커를 열 때마다 새로 조회한다
   // — live 판정은 지금 이 순간의 프로세스 상태라서 캐시하면 틀린 값을 보여준다.
   const [external, setExternal] = useState<ExternalListing>(EMPTY_EXTERNAL);
@@ -154,7 +159,7 @@ export function useSessionPicker(deps: {
     }
     setExternal(extRows);
     setShowHidden(false);
-    setNewName(`Claude ${sessions.length + openKindCount("claudeterm") + 1}`);
+    setNewName(`에이전트 ${sessions.length + openKindCount("claudeterm") + 1}`);
     setPicker(sessions); // open-session filtering happens at render
   };
 
@@ -254,9 +259,14 @@ export function SessionPicker({
   // draggable 조상(행)이라 내부 버튼 판별이 불가능하다(리뷰 S6 감사, WHATWG
   // dnd). mousedown 캡처로 기록해 dragstart에서 판별한다.
   const dragPressRef = useRef<EventTarget | null>(null);
+  // 옵션 팝오버(에이전트·모델·강도). 닫혀 있는 것이 기본이고, "+ 만들기"는
+  // 마지막 설정을 그대로 재사용한다 — 옵션을 바꾸고 싶을 때만 ▾를 연다.
+  const [optsOpen, setOptsOpen] = useState(false);
+  const optsBtnRef = useRef<HTMLButtonElement>(null);
 
-  const createNewSession = () => {
-    const name = newName.trim() || "Claude";
+  /** `opts` 미지정 = 마지막 설정 상속(보통 클릭). */
+  const createNewSession = (opts?: AgentOptions) => {
+    const name = newName.trim() || "에이전트";
     setPicker(null);
     // Give the new session a stable UUID up front so it's saved in the layout
     // immediately → resumes the same session after restart (create-or-resume in
@@ -268,6 +278,7 @@ export function SessionPicker({
       title: name,
       loadSessionId: crypto.randomUUID(),
       project: activeProject ?? undefined,
+      ...spawnOptionFields(opts ?? loadAgentOptions("claude")),
     });
   };
 
@@ -285,10 +296,35 @@ export function SessionPicker({
             else if (e.key === "Escape") setPicker(null);
           }}
         />
-        <button className="claude-picker-create" onClick={createNewSession}>
+        <button
+          className="claude-picker-create"
+          title="마지막에 고른 에이전트·모델·강도로 새 세션을 만듭니다"
+          onClick={() => createNewSession()}
+        >
           + 만들기
         </button>
+        <button
+          ref={optsBtnRef}
+          className={`claude-picker-create${optsOpen ? " claude-picker-create-on" : ""}`}
+          title="에이전트 · 모델 · 강도 고르기"
+          aria-label="새 세션 옵션"
+          aria-haspopup="dialog"
+          aria-expanded={optsOpen}
+          onClick={() => setOptsOpen((v) => !v)}
+        >
+          ▾
+        </button>
       </div>
+      {optsOpen && (
+        <AgentOptionsPopover
+          triggerRef={optsBtnRef}
+          onClose={() => setOptsOpen(false)}
+          onStart={(_agent, opts) => {
+            setOptsOpen(false);
+            createNewSession(opts);
+          }}
+        />
+      )}
       {archBusy && (
         <div className="claude-picker-busy" title="이 프로젝트의 세션 아카이브가 실행 중입니다 (책·요약·지식 추출 — 1~2분)">
           ⏳ 아카이브 진행 중…

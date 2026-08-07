@@ -297,6 +297,11 @@ export function MainArea({
       /** claudeterm 전용: 인수 직전 live 재검증 요청 (1회성 — 세션이 열리면
        * 패널이 스스로 지운다). */
       adoptPending?: boolean;
+      /** claudeterm 전용 스폰 옵션 — 모델 별칭(`--model`)·추론 강도(`--effort`).
+       * 빈 값/미지정은 키가 실리지 않고, 그러면 백엔드도 플래그를 붙이지 않는다
+       * (`spawnOptionFields`). addPanel을 타는 5개 표면이 이 한 쌍으로 커버된다. */
+      model?: string;
+      effort?: string;
       /** "within" = referencePanel의 그룹에 탭으로 추가 (드롭 존 중앙). */
       position?: {
         referencePanel: string;
@@ -342,6 +347,8 @@ export function MainArea({
         ...(opts?.cwd ? { cwd: opts.cwd } : {}),
         ...(opts?.spawnCwd ? { spawnCwd: opts.spawnCwd } : {}),
         ...(opts?.adoptPending ? { adoptPending: true } : {}),
+        ...(opts?.model ? { model: opts.model } : {}),
+        ...(opts?.effort ? { effort: opts.effort } : {}),
       },
     });
     return id;
@@ -416,7 +423,7 @@ export function MainArea({
     if (!isPrimary) return; // 부 surface는 요청 버스 비소비 (spec §2)
     if (!integratedIsFront(layerMode)) return; // dev layer in front — leave the request
     if (!claudeOpenRequest) return;
-    const { project, seed, title: reqTitle, referencePanelId } = claudeOpenRequest;
+    const { project, seed, title: reqTitle, referencePanelId, model, effort } = claudeOpenRequest;
     // Only THIS project's mount may consume the request (MainArea is keyed by
     // activeProject): otherwise a not-yet-switched old mount would add the Claude
     // panel to the wrong project's dock (codex P1). Keep the request until the
@@ -425,12 +432,14 @@ export function MainArea({
     const api = apiRef.current;
     if (!api) return; // dock not ready (project-switch remount) — keep the request; apiReady re-runs this
     requestClaudeOpen(null); // consume only once we can actually act
-    const title = reqTitle ?? `Claude ${counterRef.current + 1}`;
+    const title = reqTitle ?? `에이전트 ${counterRef.current + 1}`;
     addPanel("claudeterm", {
       project,
       loadSessionId: crypto.randomUUID(),
       title,
       seed,
+      ...(model ? { model } : {}),
+      ...(effort ? { effort } : {}),
       ...(referencePanelId
         ? { position: { referencePanel: referencePanelId, direction: "right" as const } }
         : {}),

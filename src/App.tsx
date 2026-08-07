@@ -19,6 +19,8 @@ import { CommitFileView } from "./components/CommitFileView";
 import { TerminalSettings } from "./components/TerminalSettings";
 import { SearchPanel } from "./components/SearchPanel";
 import { RunMenu } from "./components/RunMenu";
+import { AgentOptionsPopover } from "./components/AgentOptionsPopover";
+import { spawnOptionFields } from "./state/agentOptions";
 import { StudyView } from "./components/StudyView";
 import { PopoutWorkbench } from "./components/PopoutWorkbench";
 import { DropZoneWindow } from "./components/DropZoneWindow";
@@ -606,8 +608,14 @@ function AppMain() {
     setFontDraft(null);
   };
 
+  // 새 세션 옵션 팝오버(툴바 ▾). 바깥 클릭·Escape·포커스 복원은 팝오버가 소유한다
+  // (호출자 2곳이 각자 들고 있으면 갈라진다) — 여기서는 열림 상태와 트리거 ref만.
+  const [agentOptsOpen, setAgentOptsOpen] = useState(false);
+  const agentOptsBtnRef = useRef<HTMLButtonElement>(null);
+
   const requestTermMenu = useAppStore((s) => s.requestTermMenu);
   const requestClaudePicker = useAppStore((s) => s.requestClaudePicker);
+  const requestClaudeOpen = useAppStore((s) => s.requestClaudeOpen);
   const requestDetachPanel = useAppStore((s) => s.requestDetachPanel);
   const requestMemo = useAppStore((s) => s.requestMemo);
 
@@ -663,18 +671,51 @@ function AppMain() {
             >
               <span className="toolbar-ico">▣</span> 터미널 <span className="toolbar-caret">▾</span>
             </button>
-            <button
-              className="toolbar-btn"
-              title={
-                layerMode === "dev"
-                  ? "Claude 세션 열기는 통합 모드에서 사용할 수 있습니다"
-                  : "Claude 세션 열기 (새 세션 또는 저장된 세션)"
-              }
-              disabled={layerMode === "dev"}
-              onClick={() => requestClaudePicker()}
-            >
-              <span className="toolbar-ico">✦</span> Claude
-            </button>
+            <div className="agent-opt-menu">
+              <button
+                className="toolbar-btn"
+                title={
+                  layerMode === "dev"
+                    ? "에이전트 세션 열기는 통합 모드에서 사용할 수 있습니다"
+                    : "에이전트 세션 열기 (새 세션 또는 저장된 세션)"
+                }
+                disabled={layerMode === "dev"}
+                onClick={() => requestClaudePicker()}
+              >
+                <span className="toolbar-ico">✦</span> 에이전트
+              </button>
+              <button
+                ref={agentOptsBtnRef}
+                className={`toolbar-btn${agentOptsOpen ? " toolbar-btn-on" : ""}`}
+                title={
+                  layerMode === "dev"
+                    ? "세션 옵션은 통합 모드에서 사용할 수 있습니다"
+                    : "새 세션 옵션 — 에이전트 · 모델 · 강도"
+                }
+                aria-label="새 세션 옵션"
+                aria-haspopup="dialog"
+                aria-expanded={agentOptsOpen}
+                disabled={layerMode === "dev"}
+                onClick={() => setAgentOptsOpen((v) => !v)}
+              >
+                <span className="toolbar-caret">▾</span>
+              </button>
+              {agentOptsOpen && (
+                <AgentOptionsPopover
+                  float
+                  triggerRef={agentOptsBtnRef}
+                  disabledReason={
+                    activeProject ? undefined : "프로젝트를 연 뒤 세션을 시작할 수 있습니다"
+                  }
+                  onClose={() => setAgentOptsOpen(false)}
+                  onStart={(_agent, opts) => {
+                    setAgentOptsOpen(false);
+                    if (!activeProject) return;
+                    requestClaudeOpen({ project: activeProject, ...spawnOptionFields(opts) });
+                  }}
+                />
+              )}
+            </div>
             <button
               className="toolbar-btn"
               title={

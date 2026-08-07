@@ -111,7 +111,7 @@ export function EditorPanel(props: IDockviewPanelProps<EditorParams>) {
     try {
       await invoke("write_file", { path, content });
       if (versionRef.current === savedVersion) setDirty(false);
-      setStatus("저장됨 — Claude 검토 요청");
+      setStatus("저장됨 — 에이전트 검토 요청");
     } catch (e) {
       setStatus(`저장 실패: ${errText(e)}`);
       setReviewing(false);
@@ -238,15 +238,15 @@ export function EditorPanel(props: IDockviewPanelProps<EditorParams>) {
         </button>
         <button
           className="editor-review"
-          title="저장하고 Claude에게 검토 요청 (오타·import·들여쓰기·맥락 — 지적만)"
+          title="저장하고 에이전트에게 검토 요청 (오타·import·들여쓰기·맥락 — 지적만)"
           onClick={() => void confirmReview()}
           disabled={!path || reviewing}
         >
-          {reviewing ? "검토 요청 중…" : "✓ 확인 (Claude 검토)"}
+          {reviewing ? "검토 요청 중…" : "✓ 확인 (에이전트 검토)"}
         </button>
         <button
           className="editor-review"
-          title="이 파일의 단위 테스트를 미러 경로에 Claude가 생성"
+          title="이 파일의 단위 테스트를 미러 경로에 에이전트가 생성"
           onClick={() => void genTest()}
           disabled={!path}
         >

@@ -463,7 +463,7 @@ export function TimelineView({
   return (
     <div className="timeline-list" ref={listRef} tabIndex={0} onKeyDown={onKeyDown}>
       {turnNos.length === 0 && (
-        <div className="timeline-empty">Claude에게 질문하면 여기에 쌓입니다.</div>
+        <div className="timeline-empty">에이전트에게 질문하면 여기에 쌓입니다.</div>
       )}
       {hiddenCount > 0 && (
         <button

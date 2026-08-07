@@ -7,6 +7,7 @@ import { ClaudeTermPanel } from "./ClaudeTermPanel";
 import { StudyFileView } from "./StudyFileView";
 import { useAppStore } from "../state/store";
 import { fileReviewSeed } from "../state/seedPrompts";
+import { loadAgentOptions, spawnOptionFields } from "../state/agentOptions";
 import {
   resolveLayerMode,
   devIsFront,
@@ -106,6 +107,8 @@ export function DevView({ project }: { project: string }) {
         project,
         loadSessionId: uuid,
         ...(prompt ? { seed: prompt } : {}),
+        // 모델·강도는 마지막에 고른 설정을 상속한다 (옵션 UI는 주 표면 2곳에만).
+        ...spawnOptionFields(loadAgentOptions("claude")),
       },
     });
   };

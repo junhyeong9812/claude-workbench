@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { errText } from "../utils/error";
 import { invoke } from "@tauri-apps/api/core";
 import { useAppStore } from "../state/store";
+import { loadAgentOptions, spawnOptionFields } from "../state/agentOptions";
 import {
   groupWorktrees,
   type RepoWorktrees,
@@ -40,9 +41,13 @@ export function WorktreePanel() {
   // flips, and MainArea is keyed by activeProject (remounts per project). Requesting
   // before the switch would land the panel in the OLD project's dock; awaiting lets
   // the new mount pick the request up (via apiReady).
+  //
+  // 모델·강도는 **마지막 설정을 상속**한다: 여기에 옵션 UI를 또 두면 세션을 여는
+  // 모든 버튼마다 팝오버가 붙는다(표면 11곳). 옵션은 주 표면(툴바·피커) 두 곳에서만
+  // 고르고, 나머지는 그 선택을 따라간다.
   const openClaude = async (path: string) => {
     await addProject(path);
-    requestClaudeOpen({ project: path });
+    requestClaudeOpen({ project: path, ...spawnOptionFields(loadAgentOptions("claude")) });
   };
   const [groups, setGroups] = useState<WorktreeGroup[]>([]);
   const [sessions, setSessions] = useState<SessionCwd[]>([]);
@@ -183,7 +188,7 @@ export function WorktreePanel() {
         {wtSessions.length > 0 && (
           <span
             className="git-ref git-ref-head"
-            title={`이 워크트리에서 도는 Claude 세션:\n${wtSessions.map((s) => s.uuid).join("\n")}`}
+            title={`이 워크트리에서 도는 에이전트 세션:\n${wtSessions.map((s) => s.uuid).join("\n")}`}
           >
             ● 세션 {wtSessions.length}
           </span>
@@ -203,10 +208,10 @@ export function WorktreePanel() {
         <button
           className="git-mini"
           disabled={busy}
-          title="이 워크트리에서 Claude 세션 열기"
+          title="이 워크트리에서 에이전트 세션 열기"
           onClick={() => void openClaude(w.path)}
         >
-          Claude
+          에이전트
         </button>
         <button
           className="git-mini git-ico"
