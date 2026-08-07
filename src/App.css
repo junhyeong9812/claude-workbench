@@ -323,6 +323,8 @@ body {
   gap: 2px;
 }
 .agent-opt-pop {
+  /* 피커(세로 flex + overflow-y)의 자식일 때 눌리지 않도록 고정 크기. */
+  flex: 0 0 auto;
   display: flex;
   flex-direction: column;
   gap: 8px;

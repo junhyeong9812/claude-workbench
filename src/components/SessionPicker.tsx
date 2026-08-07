@@ -68,6 +68,9 @@ type PickerAddPanel = (
     title: string;
     spawnCwd?: string;
     adoptPending?: boolean;
+    /** 스폰 옵션 — 미지정이면 키가 실리지 않고 플래그도 안 붙는다. */
+    model?: string;
+    effort?: string;
   },
 ) => unknown;
 
