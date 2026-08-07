@@ -114,7 +114,12 @@ fn cand(name: &str, at: i64) -> RolloutCandidate {
         path: PathBuf::from(format!("/r/{name}.jsonl")),
         cwd: Some("/proj".into()),
         started_ms: Some(at),
+        originator: Some(APP_ORIGINATOR.into()),
     }
+}
+/// 앱이 띄우지 않은 대화형 TUI — 사용자가 터미널에서 직접 `codex`를 친 경우.
+fn foreign(name: &str, at: i64) -> RolloutCandidate {
+    RolloutCandidate { originator: Some("codex-tui".into()), ..cand(name, at) }
 }
 
 #[test]
@@ -154,9 +159,8 @@ fn a_file_outside_the_window_is_never_taken() {
 fn a_file_from_another_directory_is_never_taken() {
     let a = spawn(1, 1_000_000);
     let other = RolloutCandidate {
-        path: "/r/x.jsonl".into(),
         cwd: Some("/somewhere-else".into()),
-        started_ms: Some(1_000_900),
+        ..cand("x", 1_000_900)
     };
     assert_eq!(match_rollout(&a, &[a.clone()], &[other], &[]), MatchOutcome::NoCandidate);
 }
@@ -210,8 +214,60 @@ fn two_files_in_one_window_are_ambiguous() {
 #[test]
 fn a_candidate_without_identity_is_ignored() {
     let a = spawn(1, 1_000_000);
-    let blind = RolloutCandidate { path: "/r/x.jsonl".into(), cwd: None, started_ms: None };
+    let blind = RolloutCandidate {
+        path: "/r/x.jsonl".into(),
+        cwd: None,
+        started_ms: None,
+        originator: Some(APP_ORIGINATOR.into()),
+    };
     assert_eq!(match_rollout(&a, &[a.clone()], &[blind], &[]), MatchOutcome::NoCandidate);
+}
+
+// ---------------------------------------------------------------------------
+// 결정적 표식 (T1) — 앱이 띄운 세션만 후보로 남긴다
+// ---------------------------------------------------------------------------
+
+/// **리뷰 재현(T1)**: 사용자가 터미널에서 직접 띄운 codex TUI가 같은 폴더·같은
+/// 10초 안에 있으면, cwd+시각만으로는 우리 것과 구별할 방법이 없다 — 후보가 둘이
+/// 되어 타임라인이 죽거나(`Multiple`) 최악 남의 전사가 붙는다.
+///
+/// 표식(`CODEX_INTERNAL_ORIGINATOR_OVERRIDE`)이 그 경우를 구조적으로 없앤다.
+#[test]
+fn a_foreign_tui_in_the_same_window_is_structurally_excluded() {
+    let a = spawn(1, 1_000_000);
+    let mine = cand("mine", 1_000_900);
+    let theirs = foreign("theirs", 1_001_200);
+    let all = [mine.clone(), theirs.clone()];
+
+    // 표식 없이 보면 구별이 안 된다 — 이게 T1이 지적한 상태다.
+    assert_eq!(match_rollout(&a, &[a.clone()], &all, &[]), MatchOutcome::Multiple);
+
+    // 표식으로 좁히면 우리 것 하나만 남는다.
+    let (narrowed, marked) = narrow_to_marked(&all);
+    assert!(marked);
+    assert_eq!(narrowed, vec![mine.clone()]);
+    assert_eq!(match_rollout(&a, &[a.clone()], &narrowed, &[]), MatchOutcome::Matched(mine.path));
+}
+
+/// codex가 표식을 더 이상 반영하지 않으면(버전 드리프트) 옛 규칙으로 물러난다 —
+/// 표식 일치만 고집하면 타임라인이 영영 안 뜨고 이유도 안 보인다. 물러난 사실은
+/// `false`로 알려 화면에 적는다.
+#[test]
+fn without_any_marked_transcript_the_old_rule_still_applies() {
+    let all = [foreign("a", 1_000_900)];
+    let (narrowed, marked) = narrow_to_marked(&all);
+    assert!(!marked, "표식으로 좁히지 못했음을 알려야 한다");
+    assert_eq!(narrowed.len(), 1, "후보를 0으로 만들지 않는다");
+}
+
+/// 표식이 하나라도 있으면 표식 없는 것은 전부 빠진다(둘이 섞인 상태 = 정상).
+#[test]
+fn marked_transcripts_win_outright_when_any_exist() {
+    let all = [foreign("x", 1), cand("mine", 2), foreign("y", 3)];
+    let (narrowed, marked) = narrow_to_marked(&all);
+    assert!(marked);
+    assert_eq!(narrowed.len(), 1);
+    assert_eq!(narrowed[0].originator.as_deref(), Some(APP_ORIGINATOR));
 }
 
 /// cwd를 모르는 탭(스폰 시 cwd 미지정)은 어떤 전사도 갖지 못한다.

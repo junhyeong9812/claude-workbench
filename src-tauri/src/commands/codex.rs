@@ -146,9 +146,17 @@ pub fn codex_create(
     let bin = core_lib::codex_cli::find_codex().ok_or_else(|| AppError::new(NOT_FOUND))?;
     let cmd = build_codex_args(&bin.to_string_lossy(), model.as_deref(), effort.as_deref());
     // shim(`#!/usr/bin/env node`)이 node를 찾을 수 있게 — [`child_path`] 참조.
-    let envs: Vec<(String, String)> = child_path(&bin, std::env::var("PATH").ok().as_deref())
+    let mut envs: Vec<(String, String)> = child_path(&bin, std::env::var("PATH").ok().as_deref())
         .map(|p| vec![("PATH".to_string(), p)])
         .unwrap_or_default();
+    // 전사에 **앱이 띄웠다는 표식**을 남긴다. codex가 이 값을 그대로
+    // `session_meta.originator`에 적어 주므로(실측), 사용자가 터미널에서 직접 띄운
+    // codex와 우리 탭을 시각·경로 추측이 아니라 값 하나로 가른다
+    // ([`codex_rollout::APP_ORIGINATOR`]에 실측 원시 관찰).
+    envs.push((
+        "CODEX_INTERNAL_ORIGINATOR_OVERRIDE".to_string(),
+        codex_rollout::APP_ORIGINATOR.to_string(),
+    ));
     // 전사 매칭의 두 입력(스폰 시각·cwd)을 **스폰 직전에** 잡는다. codex는 기동
     // 0.9초 뒤 세션을 열고 그 시각을 전사 첫 줄에 쓴다(실측) — 여기가 그 창의
     // 시작점이다. cwd는 codex가 `session_meta.cwd`에 적는 것과 같은 형태여야
@@ -214,6 +222,9 @@ struct CodexSession {
     cache: Option<(String, RolloutParse)>,
     /// 마지막으로 후보 디렉토리를 훑은 시각.
     last_scan_ms: i64,
+    /// 이 탭의 전사를 **표식으로** 골랐는가. 확정 시점의 값을 들고 있는다(이후
+    /// 조회는 스캔을 안 하므로 다시 알 수 없다).
+    marked: bool,
 }
 
 /// codex 탭들의 스폰 기록. **매칭의 유일한 출처**다.
@@ -231,10 +242,12 @@ impl CodexState {
                     resolved: None,
                     cache: None,
                     last_scan_ms: 0,
+                    marked: true,
                 },
             );
         }
     }
+
 }
 
 /// 뷰가 받는 것. `status`가 `matched`가 아니면 `snapshot`은 없고 `note`가 이유를
@@ -249,6 +262,9 @@ pub struct CodexTimelinePayload {
     path: Option<String>,
     /// 이 탭의 PTY가 살아 있는가. 죽어도 타임라인은 남는다(마지막 상태 보존).
     alive: bool,
+    /// 후보를 **표식(originator)으로** 좁혔는가. `false`면 이 codex가 표식을
+    /// 반영하지 않아 옛 규칙(cwd+시각 창)으로 골랐다는 뜻 — 화면에 적는다.
+    marked: bool,
     /// 파일 서명. 프론트가 다음 폴에 `since`로 되돌려 주면 변화 없을 때
     /// `unchanged`만 돌아온다(전사 전문을 1.5초마다 재전송하지 않게).
     fingerprint: Option<String>,
@@ -263,6 +279,7 @@ impl CodexTimelinePayload {
             note: Some(note.into()),
             path: None,
             alive,
+            marked: true,
             fingerprint: None,
             unchanged: false,
             snapshot: None,
@@ -342,6 +359,7 @@ fn scan_candidates(root: &Path, spawned_ms: i64) -> Vec<RolloutCandidate> {
                     .and_then(canonical_str)
                     .or(meta.cwd),
                 started_ms: meta.started_ms,
+                originator: meta.originator,
             });
         }
     }
@@ -399,6 +417,9 @@ const SEARCHING_NOTE: &str =
 /// PTY가 죽은 탭(더는 전사를 만들 수 없다는 사실상의 불가능).
 const RESCAN_MS: i64 = 15_000;
 
+/// 죽은 채 전사를 못 찾은 탭에 보여 줄 안내.
+const DEAD_NOTE: &str = "이 세션은 전사를 남기지 않고 끝났습니다 (메시지를 보내기 전에 종료).";
+
 /// 이 codex 탭의 전사 타임라인을 돌려준다. 프론트가 타임라인을 펼친 동안 주기적
 /// 으로 부른다.
 ///
@@ -430,7 +451,7 @@ pub fn codex_timeline_snapshot(
     };
 
     // ── 1) 상태 읽기 (락) ────────────────────────────────────────────────
-    let (spawned_ms, cwd, resolved, last_scan_ms) = {
+    let (spawned_ms, cwd, resolved, last_scan_ms, was_marked) = {
         let guard = lock(&state)?;
         let Some(me) = guard.get(&id) else {
             return Ok(CodexTimelinePayload::pending(
@@ -439,7 +460,13 @@ pub fn codex_timeline_snapshot(
                 "이 탭의 codex 세션 정보를 앱이 들고 있지 않습니다.",
             ));
         };
-        (me.spawned_ms, me.cwd.clone(), me.resolved.clone(), me.last_scan_ms)
+        (
+            me.spawned_ms,
+            me.cwd.clone(),
+            me.resolved.clone(),
+            me.last_scan_ms,
+            me.marked,
+        )
     };
 
     let path = match resolved {
@@ -456,21 +483,18 @@ pub fn codex_timeline_snapshot(
         None => {
             // 죽은 탭은 새 전사를 만들 수 없다 — 여기서 스캔을 멈춘다.
             if !alive {
-                return Ok(CodexTimelinePayload::pending(
-                    "searching",
-                    alive,
-                    "이 세션은 전사를 남기지 않고 끝났습니다 (메시지를 보내기 전에 종료).",
-                ));
+                return Ok(CodexTimelinePayload::pending("searching", alive, DEAD_NOTE));
             }
             let now = now_ms();
-            if now > spawned_ms + MATCH_WINDOW_MS
-                && now - last_scan_ms < RESCAN_MS
-            {
+            if now > spawned_ms + MATCH_WINDOW_MS && now - last_scan_ms < RESCAN_MS {
                 return Ok(CodexTimelinePayload::pending("searching", alive, SEARCHING_NOTE));
             }
 
             // ── 2) 스캔 (락 밖) ──────────────────────────────────────────
-            let cands = scan_candidates(&root, spawned_ms);
+            let scanned = scan_candidates(&root, spawned_ms);
+            // 앱이 심은 표식이 있는 전사만 남긴다(T1). 표식이 하나도 없으면 옛
+            // 규칙으로 물러나되 그 사실을 화면에 적는다.
+            let (cands, narrowed_by_marker) = codex_rollout::narrow_to_marked(&scanned);
 
             // ── 3) 판정 + claim (락) ────────────────────────────────────
             let mut guard = lock(&state)?;
@@ -483,6 +507,7 @@ pub fn codex_timeline_snapshot(
                 MatchOutcome::Matched(p) => {
                     if let Some(s) = guard.get_mut(&id) {
                         s.resolved = Some(p.clone());
+                        s.marked = narrowed_by_marker;
                     }
                     p
                 }
@@ -510,12 +535,21 @@ pub fn codex_timeline_snapshot(
     // ── 4) 서명 비교 → 필요할 때만 파싱 (파싱은 락 밖) ───────────────────
     let sig = file_sig(&path);
     let path_s = Some(path.to_string_lossy().to_string());
+    // 확정 시점의 값(sticky) — 재확정 없이 다시 알 수 없다.
+    let marked = lock(&state)?.get(&id).map(|s| s.marked).unwrap_or(was_marked);
+    // 표식으로 좁히지 못했다는 것은 "이 codex 버전이 표식을 안 남긴다"는 뜻이고,
+    // 그러면 이 탭의 전사는 시각 창 추측으로 고른 것이다 — 조용히 두지 않는다.
+    let note = (!marked).then(|| {
+        "이 codex가 앱 표식을 남기지 않아 시각·경로만으로 골랐습니다 — 같은 폴더에서 직접 띄운 codex와 섞였을 수 있습니다."
+            .to_string()
+    });
     if sig.is_some() && sig == since {
         return Ok(CodexTimelinePayload {
             status: "matched",
-            note: None,
+            note,
             path: path_s,
             alive,
+            marked,
             fingerprint: sig,
             unchanged: true,
             snapshot: None,
@@ -532,9 +566,10 @@ pub fn codex_timeline_snapshot(
         if let Some(parsed) = cached {
             return Ok(CodexTimelinePayload {
                 status: "matched",
-                note: None,
+                note,
                 path: path_s,
                 alive,
+                marked,
                 fingerprint: sig,
                 unchanged: false,
                 snapshot: Some(parsed),
@@ -552,9 +587,10 @@ pub fn codex_timeline_snapshot(
     }
     Ok(CodexTimelinePayload {
         status: "matched",
-        note: None,
+        note,
         path: path_s,
         alive,
+        marked,
         fingerprint: sig,
         unchanged: false,
         snapshot: Some(parsed),
@@ -799,6 +835,7 @@ mod tests {
             resolved: resolved.map(PathBuf::from),
             cache: None,
             last_scan_ms: 0,
+            marked: true,
         }
     }
 
@@ -818,6 +855,7 @@ mod tests {
             path: PathBuf::from("/r/a.jsonl"),
             cwd: Some("/proj".into()),
             started_ms: Some(t + 900),
+            originator: Some(core_lib::codex_rollout::APP_ORIGINATOR.into()),
         };
         let (live, claimed) = super::contest_inputs(&map);
         assert_eq!(live.len(), 2, "죽음 여부와 무관하게 둘 다 경쟁한다");
@@ -855,6 +893,31 @@ mod tests {
         assert_eq!(live.len(), 1);
         assert_eq!(live[0].id, 2, "잡은 탭은 경쟁하지 않는다");
         assert_eq!(claimed, vec![PathBuf::from("/r/a.jsonl")]);
+    }
+
+    /// **T1 재현**: 사용자가 터미널에서 직접 띄운 codex TUI(`originator=codex-tui`)가
+    /// 같은 폴더에 있어도, 앱이 심은 표식으로 좁히면 우리 것만 남는다. 표식이
+    /// 없던 동안에는 이 둘을 가를 방법이 아예 없었다(cwd·시각이 같으면 동률).
+    #[test]
+    fn a_foreign_tui_transcript_is_dropped_by_the_marker() {
+        use core_lib::codex_rollout::{narrow_to_marked, APP_ORIGINATOR};
+        let root = temp_root("marker");
+        let spawned = super::now_ms();
+        let dir = day_dirs(&root, spawned).remove(1);
+        let ts = chrono::Local.timestamp_millis_opt(spawned).single().unwrap().to_rfc3339();
+        write_rollout(&dir, "mine", &ts, "/tmp", APP_ORIGINATOR, "\"cli\"");
+        write_rollout(&dir, "theirs", &ts, "/tmp", "codex-tui", "\"cli\"");
+
+        // 스캔은 둘 다 올린다(둘 다 대화형 TUI라 거부 목록에 안 걸린다).
+        let scanned = scan_candidates(&root, spawned);
+        assert_eq!(scanned.len(), 2, "표식 전에는 구별할 방법이 없다");
+
+        // 표식으로 좁히면 우리 것 하나.
+        let (narrowed, marked) = narrow_to_marked(&scanned);
+        assert!(marked);
+        assert_eq!(narrowed.len(), 1);
+        assert!(narrowed[0].path.ends_with("rollout-mine.jsonl"));
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// 다른 날짜 폴더는 아예 열지 않는다.

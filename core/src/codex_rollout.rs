@@ -150,6 +150,23 @@ pub struct RolloutMeta {
     pub subagent: bool,
 }
 
+/// 앱이 스폰하는 codex에 심는 **결정적 표식**. `CODEX_INTERNAL_ORIGINATOR_OVERRIDE`
+/// 환경변수로 넘기면 codex가 그대로 `session_meta.originator`에 적는다.
+///
+/// 실측(2026-08-07, codex-cli 0.144.1) — 같은 프롬프트로 두 번 스폰:
+///
+/// ```text
+/// OVERRIDE : originator "claude-workbench" · agent_message "OK" · duration 2724ms
+/// CONTROL  : originator "codex-tui"        · agent_message "OK" · duration 2269ms
+/// ```
+///
+/// 즉 값이 전사에 반영되고 **API 턴도 정상 완료**한다(오류·거부 없음).
+///
+/// 이 표식이 있기 전의 후보 선별은 "cwd가 같고 시각 창 안"이라는 **확률적** 규칙
+/// 뿐이었다 — 사용자가 터미널에서 직접 띄운 codex TUI가 같은 폴더에서 그 10초에
+/// 걸리면 구별할 방법이 없었다. 표식은 그 경우를 **구조적으로** 없앤다.
+pub const APP_ORIGINATOR: &str = "claude-workbench";
+
 /// 이 전사가 **앱이 띄운 codex 탭의 것일 수 있는가**.
 ///
 /// 실전사 211개 중 189개가 `codex exec`(원샷 리뷰 워커)이고 5개가 서브에이전트다
@@ -232,6 +249,32 @@ pub struct RolloutCandidate {
     pub path: PathBuf,
     pub cwd: Option<String>,
     pub started_ms: Option<i64>,
+    /// `session_meta.originator`. 앱이 띄운 세션이면 [`APP_ORIGINATOR`]다.
+    pub originator: Option<String>,
+}
+
+/// 후보를 **표식 있는 것만**으로 좁힌다. 표식이 하나도 없으면 그대로 둔다.
+///
+/// 반환의 `bool`은 "표식으로 좁혔는가" — 뷰가 **어느 규칙으로 골랐는지** 알아야
+/// 하기 때문이다. 표식이 없는 경우는 둘 중 하나인데:
+///
+/// - codex가 `CODEX_INTERNAL_ORIGINATOR_OVERRIDE`를 더 이상 반영하지 않는다
+///   (버전 드리프트), 또는
+/// - 이 탭이 표식을 심기 전 앱 버전에서 스폰됐다.
+///
+/// 그때 표식 일치만 고집하면 타임라인이 **영영 안 뜨고** 이유도 안 보인다. 그래서
+/// 옛 규칙(cwd+시각 창)으로 물러나되, 물러났다는 사실을 화면에 적는다(무음 금지).
+pub fn narrow_to_marked(cands: &[RolloutCandidate]) -> (Vec<RolloutCandidate>, bool) {
+    let marked: Vec<RolloutCandidate> = cands
+        .iter()
+        .filter(|c| c.originator.as_deref() == Some(APP_ORIGINATOR))
+        .cloned()
+        .collect();
+    if marked.is_empty() {
+        (cands.to_vec(), false)
+    } else {
+        (marked, true)
+    }
 }
 
 /// 매칭 결과. **`Matched` 외에는 전부 "전사를 찾지 못함"**이고, 이유가 다를 뿐이다
