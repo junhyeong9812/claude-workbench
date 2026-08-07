@@ -1,6 +1,12 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { buildItemIndex } from "./timelineIndex";
-import { decodePtyData, makePtyReadyDetector, ptyEventName, pushPendingCapped } from "./pty";
+import {
+  decodePtyData,
+  makePtyReadyDetector,
+  ptyEventName,
+  pushPendingCapped,
+  type PtyChunkOrigin,
+} from "./pty";
 import { ViewModeToggle } from "./ViewModeToggle";
 import { errText } from "../utils/error";
 import type { TerminalOutputEvent, SnapshotResult } from "../types";
@@ -925,18 +931,21 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
 
     // PTY 준비 감지 — 시드를 **언제** 넣을지의 근거(고정 지연 대체).
     //
-    // 화면에 쓰는 모든 바이트를 그대로 먹인다: 스크롤백 backfill도 이 세션이
-    // 실제로 뱉은 것이고, 시드 예약은 그 backfill **뒤에** 오므로 늦게 물어볼
-    // 수 있어야 한다(그래서 감지기가 `ready`를 래치해 들고 있는다). 이미 돌고
-    // 있는 세션에 붙는 경우엔 backfill 안의 신호가 즉시 잡혀 기다릴 이유 자체가
-    // 없어진다 — 그 세션은 진작 준비돼 있다.
+    // **live 바이트만** 먹인다(`origin`). 화면 복원용 재생분에는 그 세션이 예전에
+    // 화면을 넘겨받을 때 쓴 신호가 그대로 들어 있어서, 그걸 지금의 준비로 읽으면
+    // 이미 돌고 있는 세션에 붙는 순간 화면 상태와 무관하게 300ms 뒤 주입이 된다 —
+    // 권한 대화가 떠 있어도 들어간다. 고정 3000ms보다 이른 회귀다(codex P2).
+    // 그런 attach 경로의 시드는 폴백 타이머만 탄다(=예전 동작 그대로).
+    //
+    // 예약 시점이 backfill·drain **뒤**라 신호가 예약보다 먼저 올 수 있어,
+    // 감지기가 `ready`를 래치해 들고 있고 예약 직후 한 번 물어본다.
     const ptyReady = makePtyReadyDetector();
     let seedScheduler: SeedScheduler | null = null;
-    const write = (bytes: Uint8Array | number[]) => {
+    const write = (bytes: Uint8Array | number[], origin: PtyChunkOrigin = "replay") => {
       if (!disposed) {
         const buf = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
         term.write(buf);
-        if (ptyReady.push(buf)) seedScheduler?.signalReady();
+        if (ptyReady.push(buf, origin)) seedScheduler?.signalReady();
         blockedScanner.trigger(scanOrigin);
       }
     };
@@ -944,7 +953,7 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
       if (ev.session_id === sessionId && ev.seq > lastApplied) {
         // Genuinely new PTY output — from here on, scans report live edges (S4a).
         scanOrigin = "live";
-        write(decodePtyData(ev.data));
+        write(decodePtyData(ev.data), "live");
         lastApplied = ev.seq;
       }
     };
@@ -1178,8 +1187,8 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
             pendingSeedRef.current = null;
           }
         });
-        // 예약보다 **먼저** 도착한 신호(이미 돌던 세션의 backfill 등)를 잇는다 —
-        // 감지기가 래치를 들고 있으므로 여기서 한 번 물어보면 된다.
+        // 예약보다 **먼저** 도착한 live 신호(pending drain 분)를 잇는다 — 감지기가
+        // 래치를 들고 있으므로 여기서 한 번 물어보면 된다.
         if (ptyReady.ready) seedScheduler.signalReady();
       }
 

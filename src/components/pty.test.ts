@@ -4,6 +4,7 @@ import {
   PTY_READY_SIGNAL,
   decodePtyData,
   makePtyReadyDetector,
+  type PtyReadyDetector,
   ptyEventName,
   pushPendingCapped,
 } from "./pty";
@@ -40,6 +41,9 @@ describe("ptyEventName", () => {
 
 describe("makePtyReadyDetector", () => {
   const enc = (s: string) => new TextEncoder().encode(s);
+  /** 기본 호출은 live — 이 감지기의 본업이 실시간 스트림이라 테스트도 그렇게 읽힌다. */
+  const live = (d: PtyReadyDetector, s: string) => d.push(enc(s), "live");
+  const replay = (d: PtyReadyDetector, s: string) => d.push(enc(s), "replay");
   const ALT = "\x1b[?1049h";
   /** 실측(2026-08-07, claude 2.1.223)한 **신호 이전 전량** — 51바이트.
    * 준비 전에 오는 것이 이게 전부라, 여기서 ready가 뜨면 그것이 곧 오탐이다. */
@@ -52,14 +56,14 @@ describe("makePtyReadyDetector", () => {
 
   it("실측 프렐루드 51바이트 전체 — ready 없음(오탐 0)", () => {
     const d = makePtyReadyDetector();
-    expect(d.push(enc(PRELUDE))).toBe(false);
+    expect(live(d, PRELUDE)).toBe(false);
     expect(d.ready).toBe(false);
   });
 
   it("프렐루드 → 신호 청크 = 그 청크에서 ready", () => {
     const d = makePtyReadyDetector();
-    expect(d.push(enc(PRELUDE))).toBe(false);
-    expect(d.push(enc(`${ALT}\x1b[2J\x1b[H\x1b[?1000h`))).toBe(true);
+    expect(live(d, PRELUDE)).toBe(false);
+    expect(live(d, `${ALT}\x1b[2J\x1b[H\x1b[?1000h`)).toBe(true);
     expect(d.ready).toBe(true);
   });
 
@@ -67,8 +71,8 @@ describe("makePtyReadyDetector", () => {
     const stream = `${PRELUDE}${ALT}rest`;
     for (let cut = 0; cut <= stream.length; cut++) {
       const d = makePtyReadyDetector();
-      d.push(enc(stream.slice(0, cut)));
-      d.push(enc(stream.slice(cut)));
+      live(d, stream.slice(0, cut));
+      live(d, stream.slice(cut));
       expect(d.ready).toBe(true);
     }
   });
@@ -78,42 +82,77 @@ describe("makePtyReadyDetector", () => {
     const bytes = enc(`${PRELUDE}${ALT}`);
     const hits: number[] = [];
     for (let i = 0; i < bytes.length; i++) {
-      if (d.push(bytes.subarray(i, i + 1))) hits.push(i);
+      if (d.push(bytes.subarray(i, i + 1), "live")) hits.push(i);
     }
     expect(hits).toEqual([bytes.length - 1]);
   });
 
   it("가짜 시작(ESC ESC[·중도 이탈) 뒤 진짜 신호 — 되감기 정확", () => {
     // ESC 뒤에 또 ESC: 되감기가 0이면 두 번째 ESC를 놓친다.
-    expect(makePtyReadyDetector().push(enc(`\x1b${ALT}`))).toBe(true);
+    expect(live(makePtyReadyDetector(), `\x1b${ALT}`)).toBe(true);
     // 중간까지 갔다가 이탈한 뒤 다시 시작.
-    expect(makePtyReadyDetector().push(enc(`\x1b[?10${ALT}`))).toBe(true);
+    expect(live(makePtyReadyDetector(), `\x1b[?10${ALT}`)).toBe(true);
     // 접두사만 있고 끝나지 않으면 ready 아님.
     const d = makePtyReadyDetector();
-    expect(d.push(enc("\x1b[?1049"))).toBe(false);
+    expect(live(d, "\x1b[?1049")).toBe(false);
     expect(d.ready).toBe(false);
-    expect(d.push(enc("h"))).toBe(true);
+    expect(live(d, "h")).toBe(true);
   });
 
   it("비슷하지만 다른 시퀀스는 무시 (?1049l 복귀·?1047h 구형)", () => {
     const d = makePtyReadyDetector();
-    expect(d.push(enc("\x1b[?1049l\x1b[?1047h\x1b[?2004h"))).toBe(false);
+    expect(live(d, "\x1b[?1049l\x1b[?1047h\x1b[?2004h")).toBe(false);
     expect(d.ready).toBe(false);
   });
 
   it("1회성 — 이후 신호가 또 와도 true는 한 번뿐", () => {
     const d = makePtyReadyDetector();
-    expect(d.push(enc(ALT))).toBe(true);
-    expect(d.push(enc(ALT))).toBe(false);
+    expect(live(d, ALT)).toBe(true);
+    expect(live(d, ALT)).toBe(false);
     expect(d.ready).toBe(true);
   });
 
   it("빈 청크는 상태를 바꾸지 않는다", () => {
     const d = makePtyReadyDetector();
-    expect(d.push(new Uint8Array(0))).toBe(false);
-    expect(d.push(enc("\x1b[?1049"))).toBe(false);
-    expect(d.push(new Uint8Array(0))).toBe(false);
-    expect(d.push(enc("h"))).toBe(true);
+    expect(d.push(new Uint8Array(0), "live")).toBe(false);
+    expect(live(d, "\x1b[?1049")).toBe(false);
+    expect(d.push(new Uint8Array(0), "live")).toBe(false);
+    expect(live(d, "h")).toBe(true);
+  });
+
+  // ---- 재생분은 준비가 아니다 (codex P2) ----------------------------------
+
+  it("**backfill에만** 신호가 있으면 ready 아님 — 이미 돌던 세션의 과거 진입", () => {
+    // 실경로: 스크롤백 스냅샷에는 그 세션이 예전에 화면을 넘겨받을 때 쓴
+    // ESC[?1049h가 그대로 들어 있다. 이걸 지금의 준비로 읽으면 권한 대화가 떠
+    // 있든 말든 300ms 뒤 주입 = 고정 3000ms보다 이른 회귀.
+    const d = makePtyReadyDetector();
+    expect(replay(d, `${PRELUDE}${ALT}\x1b[2J\x1b[H과거 대화 내용…`)).toBe(false);
+    expect(d.ready).toBe(false);
+  });
+
+  it("출처를 안 넘기면 replay 취급 — 기본값이 안전한 쪽", () => {
+    const d = makePtyReadyDetector();
+    expect(d.push(enc(ALT))).toBe(false);
+    expect(d.ready).toBe(false);
+  });
+
+  it("backfill에 신호가 있어도 그 뒤 live 신호는 정상 인정(fast path 유지)", () => {
+    const d = makePtyReadyDetector();
+    replay(d, `${ALT}과거 화면`);
+    expect(d.ready).toBe(false);
+    expect(live(d, `${PRELUDE}${ALT}`)).toBe(true);
+  });
+
+  it("live 부분 일치가 재생분에 걸쳐 완성되지 않는다 — 이어진 바이트가 아니다", () => {
+    // 드롭 갭 재스냅샷이 live 스트림 중간에 끼어드는 실경로. 앞뒤를 이어 붙여
+    // 매칭하면 있지도 않은 신호를 만들어 낸다.
+    const d = makePtyReadyDetector();
+    expect(live(d, "\x1b[?1049")).toBe(false);
+    expect(replay(d, "\x1bc")).toBe(false); // RIS
+    expect(live(d, "h")).toBe(false); // 걸친 매칭 없음
+    expect(d.ready).toBe(false);
+    expect(live(d, ALT)).toBe(true); // 온전한 live 신호는 그대로 잡힌다
   });
 });
 
