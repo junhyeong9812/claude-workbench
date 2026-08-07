@@ -1107,8 +1107,11 @@ export interface RefineOpenArgs {
   workdir: string;
   /** 새 정리 세션의 uuid (`crypto.randomUUID()` — 호출부가 만든다). */
   sessionUuid: string;
-  /** `--model` 별칭. */
+  /** `--model` 별칭 — 정리 세션은 자기 모델 세그를 갖고 있어 여기서 직접 정한다. */
   model: RefineModel;
+  /** `--effort` 강도 — 정리 세션에는 강도 UI가 없어 **마지막에 고른 설정을
+   * 상속**한다(옵션 UI는 주 표면 2곳에만). 없으면 플래그 미부착. */
+  effort?: string;
   /** 헤더·탭 제목에 쓸 원본 세션 이름. */
   title: string;
   /** 정리 세션을 연 **원본 프로젝트** 경로.
@@ -1141,6 +1144,7 @@ export function openPromptRefine(dock: RefineDock, args: RefineOpenArgs): "focus
       project: args.workdir,
       loadSessionId: args.sessionUuid,
       model: args.model,
+      ...(args.effort ? { effort: args.effort } : {}),
       seed: refineSeedPrompt(),
       sourcePanelId: args.sourcePanelId,
       targetUuid: args.targetUuid,

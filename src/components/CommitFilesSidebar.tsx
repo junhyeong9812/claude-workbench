@@ -3,6 +3,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { errText } from "../utils/error";
 import { useAppStore } from "../state/store";
 import { commitReviewSeed } from "../state/seedPrompts";
+import { loadAgentOptions, spawnOptionFields } from "../state/agentOptions";
 
 interface CommitFile {
   path: string;
@@ -115,6 +116,8 @@ export function CommitFilesSidebar() {
       seed,
       title: `리뷰 ${commit.slice(0, 8)}`,
       referencePanelId: `diff:${root}:${commit}`,
+      // 모델·강도는 마지막에 고른 설정을 상속한다 (옵션 UI는 주 표면 2곳에만).
+      ...spawnOptionFields(loadAgentOptions("claude")),
     });
     closeGitHistory();
   };

@@ -75,6 +75,7 @@ import {
   type RefineModel,
   type RefineView,
 } from "../state/promptRefine";
+import { loadAgentOptions } from "../state/agentOptions";
 import { MemoEditor, type MemoDoc, type MemoHandle, type MemoSaveResult } from "./MemoEditor";
 import { useClaudeUi } from "../state/claudeUi";
 import { SubagentsPane } from "./SubagentsPane";
@@ -1504,6 +1505,8 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
         workdir,
         sessionUuid: crypto.randomUUID(),
         model,
+        // 강도는 새 세션 옵션에서 마지막에 고른 값을 상속한다(정리 세션엔 강도 UI 없음).
+        effort: loadAgentOptions("claude").effort,
         title: (props.params.title as string) ?? "세션",
         // 닫기=아카이브가 이 세션을 기록할 프로젝트(격리 cwd가 아니다).
         sourceProject: props.params.project ?? useAppStore.getState().activeProject ?? null,
@@ -1547,6 +1550,7 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
         workdir,
         sessionUuid: crypto.randomUUID(),
         model,
+        effort: loadAgentOptions("claude").effort,
         title,
         sourceProject,
       });

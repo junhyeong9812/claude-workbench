@@ -19,6 +19,8 @@ import { CommitFileView } from "./components/CommitFileView";
 import { TerminalSettings } from "./components/TerminalSettings";
 import { SearchPanel } from "./components/SearchPanel";
 import { RunMenu } from "./components/RunMenu";
+import { AgentOptionsPopover } from "./components/AgentOptionsPopover";
+import { spawnOptionFields } from "./state/agentOptions";
 import { StudyView } from "./components/StudyView";
 import { PopoutWorkbench } from "./components/PopoutWorkbench";
 import { DropZoneWindow } from "./components/DropZoneWindow";
@@ -606,8 +608,24 @@ function AppMain() {
     setFontDraft(null);
   };
 
+  // 새 세션 옵션 팝오버(툴바 ▾) — 외관 팝오버와 같은 아웃사이드 클릭/Escape 관례.
+  const [agentOptsOpen, setAgentOptsOpen] = useState(false);
+  const agentOptsRef = useRef<HTMLDivElement>(null);
+  const agentOptsBtnRef = useRef<HTMLButtonElement>(null);
+  useEffect(() => {
+    if (!agentOptsOpen) return;
+    const onDoc = (e: MouseEvent) => {
+      if (agentOptsRef.current && !agentOptsRef.current.contains(e.target as Node)) {
+        setAgentOptsOpen(false);
+      }
+    };
+    document.addEventListener("mousedown", onDoc);
+    return () => document.removeEventListener("mousedown", onDoc);
+  }, [agentOptsOpen]);
+
   const requestTermMenu = useAppStore((s) => s.requestTermMenu);
   const requestClaudePicker = useAppStore((s) => s.requestClaudePicker);
+  const requestClaudeOpen = useAppStore((s) => s.requestClaudeOpen);
   const requestDetachPanel = useAppStore((s) => s.requestDetachPanel);
   const requestMemo = useAppStore((s) => s.requestMemo);
 
@@ -663,18 +681,59 @@ function AppMain() {
             >
               <span className="toolbar-ico">▣</span> 터미널 <span className="toolbar-caret">▾</span>
             </button>
-            <button
-              className="toolbar-btn"
-              title={
-                layerMode === "dev"
-                  ? "Claude 세션 열기는 통합 모드에서 사용할 수 있습니다"
-                  : "Claude 세션 열기 (새 세션 또는 저장된 세션)"
-              }
-              disabled={layerMode === "dev"}
-              onClick={() => requestClaudePicker()}
+            <div
+              className="agent-opt-menu"
+              ref={agentOptsRef}
+              onKeyDown={(e) => {
+                if (e.key === "Escape" && agentOptsOpen) {
+                  setAgentOptsOpen(false);
+                  agentOptsBtnRef.current?.focus();
+                }
+              }}
             >
-              <span className="toolbar-ico">✦</span> Claude
-            </button>
+              <button
+                className="toolbar-btn"
+                title={
+                  layerMode === "dev"
+                    ? "Claude 세션 열기는 통합 모드에서 사용할 수 있습니다"
+                    : "Claude 세션 열기 (새 세션 또는 저장된 세션)"
+                }
+                disabled={layerMode === "dev"}
+                onClick={() => requestClaudePicker()}
+              >
+                <span className="toolbar-ico">✦</span> Claude
+              </button>
+              <button
+                ref={agentOptsBtnRef}
+                className={`toolbar-btn${agentOptsOpen ? " toolbar-btn-on" : ""}`}
+                title={
+                  layerMode === "dev"
+                    ? "세션 옵션은 통합 모드에서 사용할 수 있습니다"
+                    : "새 세션 옵션 — 에이전트 · 모델 · 강도"
+                }
+                aria-label="새 세션 옵션"
+                aria-haspopup="dialog"
+                aria-expanded={agentOptsOpen}
+                disabled={layerMode === "dev"}
+                onClick={() => setAgentOptsOpen((v) => !v)}
+              >
+                <span className="toolbar-caret">▾</span>
+              </button>
+              {agentOptsOpen && (
+                <AgentOptionsPopover
+                  float
+                  disabledReason={
+                    activeProject ? undefined : "프로젝트를 연 뒤 세션을 시작할 수 있습니다"
+                  }
+                  onClose={() => setAgentOptsOpen(false)}
+                  onStart={(_agent, opts) => {
+                    setAgentOptsOpen(false);
+                    if (!activeProject) return;
+                    requestClaudeOpen({ project: activeProject, ...spawnOptionFields(opts) });
+                  }}
+                />
+              )}
+            </div>
             <button
               className="toolbar-btn"
               title={

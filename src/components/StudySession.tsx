@@ -4,6 +4,7 @@ import { DockviewReact, type DockviewApi, type DockviewReadyEvent } from "dockvi
 import "dockview-react/dist/styles/dockview.css";
 import { ClaudeTermPanel } from "./ClaudeTermPanel";
 import { useAppStore } from "../state/store";
+import { loadAgentOptions, spawnOptionFields } from "../state/agentOptions";
 
 const components = { claudeterm: ClaudeTermPanel };
 
@@ -45,7 +46,14 @@ export function StudySession() {
         id: "study-claude",
         component: "claudeterm",
         title: "스터디 세션",
-        params: { kind: "claudeterm", title: "스터디 세션", project: cwd, loadSessionId: uuid },
+        params: {
+          kind: "claudeterm",
+          title: "스터디 세션",
+          project: cwd,
+          loadSessionId: uuid,
+          // 모델·강도는 마지막에 고른 설정을 상속한다 (옵션 UI는 주 표면 2곳에만).
+          ...spawnOptionFields(loadAgentOptions("claude")),
+        },
       });
     }
 
