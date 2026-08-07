@@ -39,6 +39,7 @@ import {
   REFINE_VIEWS,
   applyBlockReason,
   bracketedPaste,
+  clearPendingSeed,
   extractLatestPromptBlock,
   injectDeliveryDecision,
   isRefineParams,
@@ -47,6 +48,8 @@ import {
   makeSeedScheduler,
   seedFireLog,
   seedHoldLog,
+  stashPendingSeed,
+  takePendingSeed,
   makeSubmitProbe,
   makeTurnClaims,
   openPromptRefine,
@@ -78,6 +81,7 @@ import {
   useClaudeStatus,
   deriveSessionActivity,
   hasOpenQuestion,
+  isWriteBlocked,
   scanBottomForPrompt,
   makeDebouncedScanner,
   makeScanGate,
@@ -316,6 +320,25 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
   // 예약 시점은 세션이 열리는 순간이고 그 전에는 sessionOpen 게이트가 막으므로,
   // 늦게 켜서 생기는 틈은 없다.
   const [seedPending, setSeedPending] = useState(false);
+  // 시드 발사 게이트와 그 판정에 필요한 화면 재스캔 — 마운트 이펙트가 채우고
+  // **[시드 재주입] 버튼도 같은 것을 쓴다**(codex N1). 버튼이 제 갈 길로 쓰면
+  // 게이트가 우회되어 ①대화가 떠 있는데 바이트+CR이 그 대화로 들어가고
+  // ②자동 보류가 살아남아 해소될 때 같은 시드가 한 번 더 나간다.
+  const seedGateRef = useRef<SeedGate | null>(null);
+  const rescanBlockedRef = useRef<(() => void) | null>(null);
+  /**
+   * 지금 이 세션에 **써도 되는가** — 표시용 status가 아니라 원시 차단 신호의
+   * 합집합을 본다(codex N2 · {@link isWriteBlocked}).
+   *
+   * uuid가 없으면 false. 해당자는 정리 세션 하나뿐인데(attention 체계에 일부러
+   * 등록하지 않아 화면 스캔도 안 돈다) 관측 수단 자체가 없다. true로 몰면
+   * 규약 시드가 영영 안 나가므로 통과시키고 미커버로 남긴다.
+   */
+  const writeBlockedNow = (): boolean => {
+    const uuid = statusUuidRef.current;
+    if (!uuid) return false;
+    return isWriteBlocked(useClaudeStatus.getState().entries[uuid]);
+  };
   // 메모 저장기의 손잡이 (MemoEditor가 마운트되면 채워진다) — 닫기 전에 저장을
   // 확인하는 유일한 경로.
   const memoHandleRef = useRef<MemoHandle | null>(null);
@@ -442,6 +465,42 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
    * 그나마도 입력 버퍼가 **한 줄일 때만** 제출된다. 그래서 시드는 한 줄이고
    * (`refineSeedPrompt`), 개행이 섞여 들어와도 공백으로 접어 계약을 지킨다. */
   const submitSingleLine = (text: string) => writeToSession(`${text.replace(/\s*\n\s*/g, " ")}\r`);
+
+  /**
+   * [시드 재주입] — 자동 주입이 빗나갔을 때 사용자가 직접 누르는 길.
+   *
+   * **자동 발사와 똑같은 게이트를 통과한다**(codex N1). 예전에는 버튼이 곧장
+   * 제출로 갔고, 그래서 보류 중에 누르면 두 가지가 한꺼번에 어긋났다:
+   *
+   * 1. 권한·trust 대화가 떠 있는 채로 바이트+CR이 나가 **그 대화의 키 입력**이
+   *    된다 — 시드 첫 글자가 메뉴를 고르고 CR이 확정한다.
+   * 2. 자동 보류는 소비되지 않은 채 남아, 대화가 풀리는 순간 **같은 시드가 한 번
+   *    더** 나간다(이중 제출).
+   *
+   * 그래서 순서가 이렇다: 화면을 다시 스캔(디바운스를 앞지른다) → 막혀 있으면
+   * 쓰지 않고 안내만 → 열려 있으면 **먼저 보류를 소비**하고(그래야 뒤늦은 자동
+   * 발사가 겹치지 않는다) 그 다음에 쓴다. 취소는 동기라 그 사이에 구독이 끼어들
+   * 수 없다.
+   *
+   * 막혀 있을 때 보류를 새로 만들지는 않는다 — 이미 있으면 그대로 살아서 해소
+   * 시 자동으로 나가고, 없으면 사용자가 대화를 처리한 뒤 다시 누르면 된다.
+   * 버튼 한 번이 "나중에 알아서 쏘기"로 바뀌는 편이 오히려 예측하기 어렵다.
+   */
+  const reinjectSeed = async (text: string): Promise<void> => {
+    rescanBlockedRef.current?.();
+    if (writeBlockedNow()) {
+      setSeedNote(
+        "세션이 입력을 기다리는 상태입니다(권한 승인·폴더 신뢰·선택 프롬프트 등).\n" +
+          "지금 보내면 시드가 프롬프트가 아니라 그 화면의 키 입력으로 들어갑니다 — " +
+          "먼저 그 프롬프트를 처리하세요. (자동 주입이 예약돼 있으면 해소되는 즉시 알아서 나갑니다.)",
+      );
+      return;
+    }
+    seedGateRef.current?.cancel();
+    seedGateRef.current = null;
+    if (isRefine) await submitSingleLine(text).catch(() => {});
+    else await submitSeed(text);
+  };
 
   // Dev mode 확인: inject a review prompt into THIS session if it's the target
   // (matched by uuid) and we're its driver and live. The first "open + seed" goes
@@ -933,20 +992,9 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
       useClaudeStatus.getState().setScreenBlocked(uuid, scanBottomForPrompt(lines), origin);
     };
     const blockedScanner = makeDebouncedScanner(runBlockedScan, 300);
-    /**
-     * 이 세션이 지금 입력 대기(권한·trust 프롬프트)인가 — 시드 게이트의 판정원.
-     *
-     * uuid가 없으면 **모른다**를 "안 막혔다"로 답한다. 실제 해당자는 정리 세션
-     * 하나뿐인데(리뷰 #12: attention 체계에 일부러 등록하지 않는다) 그건 곧
-     * 화면 스캔도 안 돈다는 뜻이라 관측 수단 자체가 없다. 여기서 true로
-     * 몰면 정리 세션의 규약 시드가 영영 안 나가므로, 모르면 통과시키고
-     * 미커버로 남긴다(#76 이전과 동일한 노출 — 이 변경으로 나빠지지 않는다).
-     */
-    const isSessionBlocked = (): boolean => {
-      const uuid = statusUuidRef.current;
-      if (!uuid) return false;
-      return useClaudeStatus.getState().entries[uuid]?.status === "blocked";
-    };
+    // 디바운스를 앞지르는 즉시 스캔 — 게이트 판정 직전에 쓴다. [시드 재주입]
+    // 버튼도 같은 손잡이를 잡는다(component scope의 rescanBlockedRef).
+    rescanBlockedRef.current = () => runBlockedScan(scanOrigin);
 
     // PTY 준비 감지 — 시드를 **언제** 넣을지의 근거(고정 지연 대체).
     //
@@ -962,6 +1010,9 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
     let seedScheduler: SeedScheduler | null = null;
     /** 발사 직전 blocked 게이트 (보류 중이면 해소 구독을 들고 있다). */
     let seedGate: SeedGate | null = null;
+    /** 이 마운트가 연 세션의 uuid — 시드 보관함의 키(N3). statusUuidRef와 달리
+     * 정리 세션에도 채운다(보관함은 attention 체계와 무관하다). */
+    let openedUuid: string | null = null;
     const write = (bytes: Uint8Array | number[], origin: PtyChunkOrigin = "replay") => {
       if (!disposed) {
         const buf = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
@@ -1056,6 +1107,8 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
         // badge must survive that so it stays visible until the user looks.)
         const closedUuid = statusUuidRef.current;
         if (closedUuid) useClaudeStatus.getState().remove(closedUuid);
+        // 세션이 죽었으면 이어받을 곳도 없다 — 보관함을 비운다(N3).
+        clearPendingSeed(openedUuid);
         if (!disposed) term.write("\r\n\x1b[2m[세션이 다른 창에서 종료되었습니다]\x1b[0m\r\n");
       });
       if (disposed) return;
@@ -1112,15 +1165,23 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
           }
         }
         driverRevRef.current = opened.rev;
+        openedUuid = opened.session_uuid;
         const driving = opened.driver === myLabel;
         isDriverRef.current = driving;
         setIsDriver(driving);
         // Fresh review/dev session: queue the one-shot seed prompt (only if no
         // handoff seed is already pending — that one wins). It's injected by the
         // pendingSeed block below once the session settles.
-        if (driving && props.params.seed && pendingSeedRef.current == null) {
-          pendingSeedRef.current = props.params.seed;
-          setLastSeed(props.params.seed);
+        //
+        // `params.seed`는 `paramsAfterOpen`이 한 번 쓰고 지운다. 그래서 앞선
+        // 마운트가 **아직 못 쏜 채** 사라졌다면 params에는 아무것도 없다 —
+        // 보관함(takePendingSeed)이 그 경우를 잇는다(codex N3). 읽기가 곧
+        // 소비라, 이 마운트가 소유권을 가져가고 다시 보류하면 다시 맡긴다.
+        const carriedSeed = driving ? takePendingSeed(opened.session_uuid) : null;
+        const seedToQueue = props.params.seed ?? carriedSeed;
+        if (driving && seedToQueue && pendingSeedRef.current == null) {
+          pendingSeedRef.current = seedToQueue;
+          setLastSeed(seedToQueue);
           // 규약 시드가 나가기 전까지 [보내기]를 잠근다(정리 세션만 — 일반
           // 세션의 시드는 순서를 다툴 상대가 없다).
           if (isRefine) setSeedPending(true);
@@ -1213,6 +1274,8 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
               .finally(() => setSeedPending(false));
           } else void submitSeed(seed);
           pendingSeedRef.current = null;
+          // 주입했으니 이어받을 것이 없다 — 보관함을 비운다(N3).
+          clearPendingSeed(openedUuid);
         };
         // 보류/해소 정책은 순수 모듈이 소유한다(테스트가 규칙을 고정). 해소
         // 구독은 스토어 변경 전부를 받고 게이트가 blocked만 다시 본다 — 사용자가
@@ -1225,11 +1288,13 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
         // 재도색에는 TUI의 대체 화면 진입(=준비 신호)이 포함되고, 실측상 입력
         // 임계는 그보다 120~270ms 앞이다 — 즉 해소 판정은 구조적으로 준비 뒤다.
         seedGate = makeSeedGate({
-          blocked: isSessionBlocked,
+          blocked: writeBlockedNow,
           inject: injectSeed,
           subscribe: (onChange) => useClaudeStatus.subscribe(onChange),
           onHold: () => console.warn(seedHoldLog()),
         });
+        // [시드 재주입] 버튼이 같은 게이트를 통과하도록 손잡이를 넘긴다(N1).
+        seedGateRef.current = seedGate;
         seedScheduler = makeSeedScheduler((info) => {
           if (disposed || pendingSeedRef.current !== seed) return;
           // **스캔을 여기서 한 번 직접 돌린다**: 화면 스캐너는 마지막 쓰기
@@ -1322,6 +1387,15 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
       // 보류 중이던 시드의 해소 구독도 함께 끊는다 — 안 그러면 언마운트된
       // 패널의 클로저가 스토어 리스너로 살아남는다(누수 + 죽은 세션 쓰기).
       seedGate?.cancel();
+      seedGateRef.current = null;
+      rescanBlockedRef.current = null;
+      // **아직 못 쏜 시드는 맡기고 간다**(codex N3). 예약은 이 마운트와 함께
+      // 죽는데, 탭 전환은 언마운트라(onlyWhenVisible) 그냥 두면 시드가 조용히
+      // 사라진다 — 원래도 폴백 3초의 창이 있었고 blocked 보류는 그 창을 무기한으로
+      // 늘린다. 다음 마운트가 `takePendingSeed`로 이어받아 다시 예약한다(준비
+      // 감지·게이트를 처음부터 다시 통과한다 — 그때의 화면으로 새로 판정하는 것이
+      // 맞다). 탭을 아주 닫은 경우엔 세션 종료가 보관함을 비운다.
+      if (pendingSeedRef.current) stashPendingSeed(openedUuid, pendingSeedRef.current);
       blockedScanner.cancel();
       ro.disconnect();
       onData.dispose();
@@ -2006,11 +2080,7 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
               <button
                 className="claudeterm-head-btn"
                 title="시드 프롬프트를 현재 세션에 다시 보냅니다 (자동 주입이 빗나갔을 때)"
-                onClick={() =>
-                  void (isRefine
-                    ? submitSingleLine(lastSeed).catch(() => {})
-                    : submitSeed(lastSeed))
-                }
+                onClick={() => void reinjectSeed(lastSeed)}
               >
                 시드 재주입
               </button>
