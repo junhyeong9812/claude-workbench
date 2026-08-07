@@ -1,5 +1,12 @@
 import { describe, expect, it } from "vitest";
-import { PENDING_MAX_CHARS, decodePtyData, ptyEventName, pushPendingCapped } from "./pty";
+import {
+  PENDING_MAX_CHARS,
+  PTY_READY_SIGNAL,
+  decodePtyData,
+  makePtyReadyDetector,
+  ptyEventName,
+  pushPendingCapped,
+} from "./pty";
 
 /** P3 특성테스트 — base64 왕복 무손실(손계산 픽스처)·pending 상한. */
 
@@ -28,6 +35,85 @@ describe("decodePtyData", () => {
 describe("ptyEventName", () => {
   it("세션 id 스코프", () => {
     expect(ptyEventName(42)).toBe("terminal-output-42");
+  });
+});
+
+describe("makePtyReadyDetector", () => {
+  const enc = (s: string) => new TextEncoder().encode(s);
+  const ALT = "\x1b[?1049h";
+  /** 실측(2026-08-07, claude 2.1.223)한 **신호 이전 전량** — 51바이트.
+   * 준비 전에 오는 것이 이게 전부라, 여기서 ready가 뜨면 그것이 곧 오탐이다. */
+  const PRELUDE = "\x1b7\x1b[r\x1b8\x1b[?25h\x1b[?25l\x1b[?2004h\x1b[?1004h\x1b[?2031h\x1b[>0q\x1b[c";
+
+  it("신호 바이트는 ESC[?1049h (대체 화면 진입)", () => {
+    expect(Array.from(PTY_READY_SIGNAL)).toEqual(Array.from(enc(ALT)));
+    expect(PRELUDE.length).toBe(51); // 실측 고정
+  });
+
+  it("실측 프렐루드 51바이트 전체 — ready 없음(오탐 0)", () => {
+    const d = makePtyReadyDetector();
+    expect(d.push(enc(PRELUDE))).toBe(false);
+    expect(d.ready).toBe(false);
+  });
+
+  it("프렐루드 → 신호 청크 = 그 청크에서 ready", () => {
+    const d = makePtyReadyDetector();
+    expect(d.push(enc(PRELUDE))).toBe(false);
+    expect(d.push(enc(`${ALT}\x1b[2J\x1b[H\x1b[?1000h`))).toBe(true);
+    expect(d.ready).toBe(true);
+  });
+
+  it("청크 경계로 쪼개져 도착해도 잡는다 — 바이트 단위 전 분할", () => {
+    const stream = `${PRELUDE}${ALT}rest`;
+    for (let cut = 0; cut <= stream.length; cut++) {
+      const d = makePtyReadyDetector();
+      d.push(enc(stream.slice(0, cut)));
+      d.push(enc(stream.slice(cut)));
+      expect(d.ready).toBe(true);
+    }
+  });
+
+  it("한 바이트씩 도착 — 신호 마지막 바이트에서 정확히 한 번 true", () => {
+    const d = makePtyReadyDetector();
+    const bytes = enc(`${PRELUDE}${ALT}`);
+    const hits: number[] = [];
+    for (let i = 0; i < bytes.length; i++) {
+      if (d.push(bytes.subarray(i, i + 1))) hits.push(i);
+    }
+    expect(hits).toEqual([bytes.length - 1]);
+  });
+
+  it("가짜 시작(ESC ESC[·중도 이탈) 뒤 진짜 신호 — 되감기 정확", () => {
+    // ESC 뒤에 또 ESC: 되감기가 0이면 두 번째 ESC를 놓친다.
+    expect(makePtyReadyDetector().push(enc(`\x1b${ALT}`))).toBe(true);
+    // 중간까지 갔다가 이탈한 뒤 다시 시작.
+    expect(makePtyReadyDetector().push(enc(`\x1b[?10${ALT}`))).toBe(true);
+    // 접두사만 있고 끝나지 않으면 ready 아님.
+    const d = makePtyReadyDetector();
+    expect(d.push(enc("\x1b[?1049"))).toBe(false);
+    expect(d.ready).toBe(false);
+    expect(d.push(enc("h"))).toBe(true);
+  });
+
+  it("비슷하지만 다른 시퀀스는 무시 (?1049l 복귀·?1047h 구형)", () => {
+    const d = makePtyReadyDetector();
+    expect(d.push(enc("\x1b[?1049l\x1b[?1047h\x1b[?2004h"))).toBe(false);
+    expect(d.ready).toBe(false);
+  });
+
+  it("1회성 — 이후 신호가 또 와도 true는 한 번뿐", () => {
+    const d = makePtyReadyDetector();
+    expect(d.push(enc(ALT))).toBe(true);
+    expect(d.push(enc(ALT))).toBe(false);
+    expect(d.ready).toBe(true);
+  });
+
+  it("빈 청크는 상태를 바꾸지 않는다", () => {
+    const d = makePtyReadyDetector();
+    expect(d.push(new Uint8Array(0))).toBe(false);
+    expect(d.push(enc("\x1b[?1049"))).toBe(false);
+    expect(d.push(new Uint8Array(0))).toBe(false);
+    expect(d.push(enc("h"))).toBe(true);
   });
 });
 
