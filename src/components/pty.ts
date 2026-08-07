@@ -25,6 +25,122 @@ export function decodePtyData(b64: string): Uint8Array {
   return out;
 }
 
+/**
+ * claude TUI가 **입력을 받기 시작했다**는 신호 — 대체 화면 진입 `ESC [ ? 1049 h`.
+ *
+ * **실측(2026-08-07, claude CLI 2.1.223, 실 PTY + 전사 `type=="user"` 판정)**.
+ * 스폰 직후의 PTY는 바이트를 받고도 버린다(#74가 고정 지연을 1800→3000ms로
+ * 올린 이유). 그 "받기 시작하는 순간"이 출력의 어디에 대응하는지 재 봤다.
+ *
+ * 시작~준비까지 PTY가 뱉는 것은 **51바이트의 터미널 모드 설정뿐**이고(6초 관측
+ * 1060바이트 중 신호는 정확히 1회):
+ *
+ * ```text
+ * ESC7 ESC[r ESC8 ESC[?25h · ESC[?25l ESC[?2004h ESC[?1004h ESC[?2031h · ESC[>0q ESC[c
+ * ↑ t≈0.81s                  ↑ t≈0.87s                                  ↑ t≈0.91s
+ *   … (JS 번들 로드 ~0.9s) …
+ * ESC[?1049h ESC[2J ESC[H ESC[?1000h…   ← 이 신호. t≈1.59~2.12s
+ * ```
+ *
+ * 즉 신호 **이전에는 배너도 스피너도 없다** — 오탐으로 삼을 출력 자체가 없고,
+ * 신호는 관측 창 전체에서 한 번만 나온다(TUI가 화면을 넘겨받는 그 순간).
+ *
+ * 임계와의 순서(핵심):
+ *
+ * | 주입 시점 | 결과 |
+ * |---|---|
+ * | `ESC[?2004h` 직후 (t≈0.85s) | **NOT_SUBMITTED** 2/2 |
+ * | 신호보다 0.37·0.27s 앞 | **NOT_SUBMITTED** 2/2 |
+ * | 신호보다 0.12·0.11·0.05s 앞 | SUBMITTED 3/3 |
+ * | **신호 직후(+0ms)** | **SUBMITTED 6/6** (실주입 1.67~2.12s) |
+ * | **신호 +300ms** | **SUBMITTED 3/3** |
+ *
+ * 실제 임계는 신호보다 **120~270ms 앞**에 있다 — 신호는 언제나 임계 뒤이고,
+ * 그 여유가 {@link SEED_READY_SETTLE}이 지키려는 마진이다.
+ *
+ * 같은 날 **고정 1.8s는 2/2 제출됐다** — #74에서 2/2 실패했던 그 값이다. 벽시계는
+ * 기계·캐시 상태마다 움직이지만 이 신호는 그 세션의 실제 준비를 따라간다. 그것이
+ * 고정 지연을 신호로 바꾸는 이유 전부다.
+ *
+ * 버전이 바뀌어 이 시퀀스가 사라지면 감지가 그냥 안 될 뿐이고, 주입은
+ * {@link SEED_READY_DELAY} 폴백으로 예전과 똑같이 동작한다(조용히 더 일찍
+ * 넣는 실패 모드는 만들지 않는다).
+ */
+export const PTY_READY_SIGNAL = new Uint8Array([
+  0x1b, 0x5b, 0x3f, 0x31, 0x30, 0x34, 0x39, 0x68,
+]); // ESC [ ? 1 0 4 9 h
+
+/**
+ * 이 바이트가 **지금 일어나는 일**인가, 과거의 재생인가.
+ *
+ * 감지기에 이 축이 필요한 이유는 하나뿐이다: 화면 복원용 재생분에는 그 세션이
+ * **예전에** 진입할 때 쓴 신호가 그대로 들어 있다. 그걸 지금의 준비로 읽으면
+ * 이미 돌고 있는 세션에 붙는 순간(스크롤백 backfill·드롭 갭 재스냅샷) 무조건
+ * 조기 주입이 된다 — 그 세션은 권한 대화가 떠 있을 수도, 다른 작업 중일 수도
+ * 있는데 화면의 현재 상태와 무관하게 300ms 뒤에 시드가 들어간다(codex P2).
+ * 그건 고정 3000ms보다도 이른 **회귀**다.
+ */
+export type PtyChunkOrigin =
+  /** PTY가 방금 뱉은 것 (terminal-output 이벤트). */
+  | "live"
+  /** 화면 복원용 재생 (스냅샷 backfill·재스냅샷·RIS). */
+  | "replay";
+
+/** PTY 출력 스트림에서 {@link PTY_READY_SIGNAL}을 찾는 1회성 감지기. */
+export interface PtyReadyDetector {
+  /** 청크 하나를 먹인다. **이 청크에서 신호가 처음 완성됐으면** true (이후
+   * 호출은 항상 false — 준비는 한 번만 일어나는 사건이다).
+   *
+   * `origin`이 생략되면 `"replay"` — 안전한 쪽이 기본값이다. 출처를 안 넘긴
+   * 호출부가 만들 수 있는 최악이 "감지 못 함 = 폴백"이어야지, "과거 신호로
+   * 조기 주입"이면 안 된다. */
+  push(bytes: Uint8Array, origin?: PtyChunkOrigin): boolean;
+  /** 지금까지 **live로** 신호를 봤는가 (호출부가 뒤늦게 물어볼 수 있게 — 시드
+   * 예약이 스크롤백 backfill보다 **뒤에** 오므로 이 조회가 필요하다). */
+  readonly ready: boolean;
+}
+
+/**
+ * 청크 경계를 가로지르는 매칭 — 신호가 `ESC[?1049` / `h`로 쪼개져 도착해도 잡는다.
+ *
+ * 이어 맞은 접두사 길이 하나만 들고 다닌다(꼬리 버퍼 없음). 불일치 시 0으로
+ * 되감고 현재 바이트만 다시 보는 것이 **이 패턴에 한해** 정확하다: `ESC`(0x1b)가
+ * 패턴의 0번에만 있어서 어떤 접두사의 진부분 접미사도 `ESC`로 시작할 수 없다 —
+ * 즉 KMP border가 항상 0이다. (다른 신호로 바꾸려면 이 전제부터 다시 봐야 한다.)
+ *
+ * replay 청크는 매칭에서 **빠지고 진행 중이던 부분 일치도 버린다**. 재생분이
+ * live 스트림 중간에 끼어들면(드롭 갭 재스냅샷) 그 앞뒤는 이어진 바이트가
+ * 아니므로, 걸쳐서 완성되는 매칭은 가짜다.
+ */
+export function makePtyReadyDetector(signal: Uint8Array = PTY_READY_SIGNAL): PtyReadyDetector {
+  let matched = 0;
+  let ready = false;
+  return {
+    get ready() {
+      return ready;
+    },
+    push(bytes: Uint8Array, origin: PtyChunkOrigin = "replay"): boolean {
+      if (ready) return false;
+      if (origin !== "live") {
+        matched = 0;
+        return false;
+      }
+      for (let i = 0; i < bytes.length; i++) {
+        if (bytes[i] === signal[matched]) {
+          matched++;
+          if (matched === signal.length) {
+            ready = true;
+            return true;
+          }
+        } else {
+          matched = bytes[i] === signal[0] ? 1 : 0;
+        }
+      }
+      return false;
+    },
+  };
+}
+
 /** ready 전 수신 버퍼 상한(디코드 전 base64 문자 기준 ≈ 원시 바이트 ×1.33).
  * 초과 시 오래된 청크부터 드롭 — 스크롤백 상단 소실과 같은 의미(spec F3).
  * ready 전 한정이라 스냅샷 backfill(seq 게이트)이 정확성을 지킨다. */

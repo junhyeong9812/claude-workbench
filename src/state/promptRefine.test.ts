@@ -11,6 +11,8 @@ import {
   isRefineParams,
   REFINE_SUBMIT_CONFIRM_MS,
   SEED_READY_DELAY,
+  SEED_READY_SETTLE,
+  makeSeedScheduler,
   REFINE_SUBMIT_CR_DELAY,
   openPromptRefine,
   makeSubmitProbe,
@@ -844,9 +846,98 @@ describe("submitBytes — 본문 모양이 바이트를 정한다", () => {
     expect(submitBytes("첫 줄\n둘째 줄\n")).toHaveLength(2);
   });
 
-  it("시드 주입 지연은 실측 준비 임계(1.8s<t≤2.0s)보다 위다", () => {
-    // 1800ms는 임계 바로 아래라 시드가 통째로 사라졌다(실측 재현).
+  it("시드 주입 폴백 지연은 실측 준비 임계(1.8s<t≤2.0s)보다 위다", () => {
+    // 1800ms는 임계 바로 아래라 시드가 통째로 사라졌다(실측 재현). 감지가
+    // 깨져 폴백만 남아도 이 값은 그 임계 위여야 한다.
     expect(SEED_READY_DELAY).toBeGreaterThan(2000);
+  });
+});
+
+// ---- 준비 신호 vs 폴백: 먼저 오는 쪽이 한 번만 -----------------------------
+
+describe("makeSeedScheduler", () => {
+  const setup = () => {
+    vi.useFakeTimers();
+    const fire = vi.fn();
+    return { fire, s: makeSeedScheduler(fire) };
+  };
+  const teardown = () => vi.useRealTimers();
+
+  it("신호가 없으면 폴백 시각에 정확히 한 번 — 그 전에는 안 쏜다", () => {
+    const { fire, s } = setup();
+    vi.advanceTimersByTime(SEED_READY_DELAY - 1);
+    expect(fire).not.toHaveBeenCalled();
+    vi.advanceTimersByTime(1);
+    expect(fire).toHaveBeenCalledTimes(1);
+    vi.advanceTimersByTime(10_000);
+    expect(fire).toHaveBeenCalledTimes(1);
+    s.cancel();
+    teardown();
+  });
+
+  it("신호를 보면 신호 + 여유에 쏘고, 폴백은 다시 쏘지 않는다", () => {
+    const { fire, s } = setup();
+    vi.advanceTimersByTime(1000);
+    s.signalReady();
+    vi.advanceTimersByTime(SEED_READY_SETTLE - 1);
+    expect(fire).not.toHaveBeenCalled(); // 여유를 다 채우기 전엔 안 쏜다
+    vi.advanceTimersByTime(1);
+    expect(fire).toHaveBeenCalledTimes(1);
+    vi.advanceTimersByTime(SEED_READY_DELAY); // 폴백 시각 통과
+    expect(fire).toHaveBeenCalledTimes(1);
+    teardown();
+  });
+
+  it("신호가 빨라도 폴백보다 이르게 쏘는 것이 이 기능의 전부다", () => {
+    const { fire, s } = setup();
+    s.signalReady();
+    vi.advanceTimersByTime(SEED_READY_SETTLE);
+    expect(fire).toHaveBeenCalledTimes(1);
+    expect(SEED_READY_SETTLE).toBeLessThan(SEED_READY_DELAY);
+    teardown();
+  });
+
+  it("신호가 폴백 직전이면 폴백이 이긴다 — 감지 전과 같은 시점(회귀 아님)", () => {
+    const { fire, s } = setup();
+    vi.advanceTimersByTime(SEED_READY_DELAY - 100);
+    s.signalReady(); // 신호 + 300ms = 폴백 + 200ms
+    vi.advanceTimersByTime(100);
+    expect(fire).toHaveBeenCalledTimes(1); // 폴백 시각에 쐈다
+    vi.advanceTimersByTime(1000);
+    expect(fire).toHaveBeenCalledTimes(1); // 뒤늦은 여유 타이머는 무시
+    teardown();
+  });
+
+  it("신호 반복은 첫 신호만 — 여유가 매번 다시 시작되지 않는다", () => {
+    const { fire, s } = setup();
+    s.signalReady();
+    vi.advanceTimersByTime(SEED_READY_SETTLE - 50);
+    s.signalReady();
+    s.signalReady();
+    vi.advanceTimersByTime(50);
+    expect(fire).toHaveBeenCalledTimes(1);
+    teardown();
+  });
+
+  it("cancel = 영영 안 쏜다 (언마운트 뒤 죽은 세션 쓰기 차단)", () => {
+    const { fire, s } = setup();
+    s.cancel();
+    vi.advanceTimersByTime(10_000);
+    expect(fire).not.toHaveBeenCalled();
+    s.signalReady(); // 취소 뒤의 신호도 무효
+    vi.advanceTimersByTime(10_000);
+    expect(fire).not.toHaveBeenCalled();
+    teardown();
+  });
+
+  it("신호를 받은 뒤 cancel — 여유 타이머도 함께 죽는다", () => {
+    const { fire, s } = setup();
+    s.signalReady();
+    vi.advanceTimersByTime(SEED_READY_SETTLE - 1);
+    s.cancel();
+    vi.advanceTimersByTime(10_000);
+    expect(fire).not.toHaveBeenCalled();
+    teardown();
   });
 });
 

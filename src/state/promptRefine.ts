@@ -104,21 +104,88 @@ export function submitPasteBytes(text: string): [string, string] {
 }
 
 /**
- * 세션 시작 후 시드를 주입하기까지의 지연(ms).
+ * 준비 신호를 못 본 채 시드를 주입하기까지의 **폴백** 지연(ms).
  *
  * **실측(2026-08-06, claude CLI 2.1.223, 실 PTY)**: 스폰 직후의 TUI는 바이트를
  * 받지 못한다 — 화면은 이미 그려져 있어도 입력 처리기가 아직 붙지 않았다.
  * 1.8s에 쓴 시드는 단일행·멀티라인 **둘 다 사라졌고**(전사 자체가 생기지 않음),
- * 2.0s·2.5s·3.0s·5.0s·8.0s는 전부 제출됐다. 준비 임계가 1.8s < t ≤ 2.0s다.
+ * 2.0s·2.5s·3.0s·5.0s·8.0s는 전부 제출됐다. 준비 임계가 1.8s < t ≤ 2.0s였다.
  *
  * 그래서 예전 값 1800ms는 임계 **바로 아래**였다 — 리뷰/개발 모드 시드가 조용히
- * 증발하던 두 번째 원인이다(첫 번째는 LF가 제출 신호가 아니라는 것). 3000ms는
- * 관측 임계의 1.5배지만, 느린 기계·콜드 캐시에서는 이 값도 모자랄 수 있다.
- * **고정 지연은 근본 해법이 아니고**, 그래서 남는 위험은 제출 확인
- * ({@link makeSubmitProbe})과 "Enter로 제출" 안내가 받는다 — 조용히 사라지는
- * 대신 사용자가 알고 한 번 누르면 되는 실패로 낮춘다.
+ * 증발하던 두 번째 원인이다(첫 번째는 LF가 제출 신호가 아니라는 것).
+ *
+ * 이 값은 이제 **평상시 쓰이지 않는다**: PTY 출력에서 준비 신호를 보면
+ * ({@link makePtyReadyDetector}) 그쪽이 먼저 주입한다. 남겨 둔 이유는 신호가
+ * 안 올 때(버전이 시퀀스를 바꾸거나 감지가 깨질 때) **예전과 똑같이** 동작해야
+ * 하기 때문이다 — 감지 실패가 "더 일찍 넣는" 회귀가 되지 않게 하는 하한이 아니라
+ * 상한이다. 3000ms로도 모자란 느린 기계의 위험은 여전히 제출 확인
+ * ({@link makeSubmitProbe})과 "Enter로 제출" 안내가 받는다.
  */
 export const SEED_READY_DELAY = 3000;
+
+/**
+ * 준비 신호를 본 뒤 실제 주입까지 두는 여유(ms).
+ *
+ * 0이어도 실측은 6/6 제출됐다. 그래도 두는 이유는 **마진을 재현하기 위해서**다:
+ * 실측 임계는 신호보다 120~270ms 앞이었고(그 구간에 주입한 3회는 전부 제출,
+ * 270·365ms 앞은 전부 미제출), 300ms는 관측된 그 여유를 대략 두 배로 되돌려
+ * 놓는다. 이 마진이 얇아질 수 있는 축이 실제로 있다 — 신호가 빨리 오는 기계일수록
+ * 임계와 신호의 간격도 함께 줄 수 있고, 여기서 틀리면 실패 모드가 **시드 무음
+ * 소실**이라 사용자가 알아채기 어렵다(반대 방향은 300ms 늦는 것뿐이다).
+ *
+ * 신호 + 이 여유가 {@link SEED_READY_DELAY}를 넘으면 폴백이 먼저 쏜다 — 그건
+ * 개선 전 동작 그대로라 회귀가 아니다({@link makeSeedScheduler}).
+ */
+export const SEED_READY_SETTLE = 300;
+
+/** 시드 주입 시점을 잡는 1회성 예약 — {@link makeSeedScheduler}의 조작 표면. */
+export interface SeedScheduler {
+  /** PTY 준비 신호를 봤다 (여러 번 불려도 무해). */
+  signalReady(): void;
+  /** 언마운트 — 아직 안 쐈으면 영영 쏘지 않는다. */
+  cancel(): void;
+}
+
+/**
+ * "준비 신호 + 여유" vs "폴백 지연" — **먼저 오는 쪽이 한 번만** 쏜다.
+ *
+ * 두 타이머를 두고 래치 하나로 잠그는 구조인 이유는, 어느 쪽이 이길지를 계산으로
+ * 정하지 않기 위해서다. 신호가 폴백 직전(예: 2.9s)에 오면 여유를 다 못 채우고
+ * 폴백이 이기는데, 그건 감지 도입 **전과 똑같은 시점**이라 회귀가 아니다 —
+ * 계산으로 늦추려 들면 "신호를 봤는데도 더 기다린다"는 새 실패 모드가 생긴다.
+ *
+ * `cancel`이 래치까지 닫는 것이 계약이다. 패널이 언마운트된 뒤 도착한 타이머가
+ * 죽은 세션에 쓰는 일이 없어야 한다.
+ */
+export function makeSeedScheduler(
+  fire: () => void,
+  opts: { fallbackMs?: number; settleMs?: number } = {},
+): SeedScheduler {
+  const fallbackMs = opts.fallbackMs ?? SEED_READY_DELAY;
+  const settleMs = opts.settleMs ?? SEED_READY_SETTLE;
+  let done = false;
+  let settle: ReturnType<typeof setTimeout> | null = null;
+  const fallback = setTimeout(() => shoot(), fallbackMs);
+  function shoot() {
+    if (done) return;
+    done = true;
+    clearTimeout(fallback);
+    if (settle !== null) clearTimeout(settle);
+    fire();
+  }
+  return {
+    signalReady() {
+      // 이미 쐈거나 이미 신호를 받았으면 무시 — 신호는 한 번만 의미가 있다.
+      if (done || settle !== null) return;
+      settle = setTimeout(() => shoot(), settleMs);
+    },
+    cancel() {
+      done = true;
+      clearTimeout(fallback);
+      if (settle !== null) clearTimeout(settle);
+    },
+  };
+}
 
 /**
  * 본문이 어디서 왔는가 — **인코딩** 정책을 가르는 축.
