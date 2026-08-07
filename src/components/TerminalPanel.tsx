@@ -279,13 +279,18 @@ export function TerminalPanel(props: IDockviewPanelProps<TerminalParams>) {
               "\r\n\x1b[2m[새 codex 세션 — 이전 대화는 codex resume으로만 이어집니다]\x1b[0m\r\n",
             );
           }
+          // 초기 크기에도 아래 onResize와 같은 퇴화 가드(감사) — 마운트 직후
+          // 호스트가 아직 0px이면 FitAddon이 2×1을 주고, 그걸로 만들면 TUI가
+          // 부서진 채 시작한다. 유효 크기는 첫 정상 resize가 곧바로 따라온다.
+          const initCols = term.cols < 10 ? 80 : term.cols;
+          const initRows = term.rows < 3 ? 24 : term.rows;
           try {
             sessionId = await invoke<number>("codex_create", {
               cwd,
               model: props.params.model ?? null,
               effort: props.params.effort ?? null,
-              cols: term.cols,
-              rows: term.rows,
+              cols: initCols,
+              rows: initRows,
             });
           } catch (e) {
             writeText(`\r\n\x1b[31m${errText(e, "codex 세션을 시작하지 못했습니다.")}\x1b[0m\r\n`);
