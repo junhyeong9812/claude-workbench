@@ -4,6 +4,7 @@ import {
 } from "dockview-react";
 import { PlaceholderPanel } from "./PlaceholderPanel";
 import { TerminalPanel } from "./TerminalPanel";
+import { CodexTermPanel } from "./CodexTermPanel";
 import { ClaudeTermPanel } from "./ClaudeTermPanel";
 import { EditorPanel } from "./EditorPanel";
 import { DiffPanel } from "./DiffPanel";
@@ -22,11 +23,12 @@ export const components = {
   placeholder: PlaceholderPanel,
   terminal: TerminalPanel,
   ssh: TerminalPanel,
-  // codex 세션은 **순수 터미널 탭**이다 — SSH와 같은 이유로 TerminalPanel을
-  // 재사용한다(스폰 커맨드만 다르고 그 뒤는 PTY 릴레이·xterm이 전부). 이것이
-  // 격리의 구조적 보장이기도 하다: ClaudeTermPanel을 안 지나므로 타임라인·
-  // 스냅샷·시드·상태 배지 배선이 붙을 자리 자체가 없다.
-  codexterm: TerminalPanel,
+  // codex 세션 = TerminalPanel(터미널 그대로) + rollout 전사 타임라인 컬럼.
+  // 작업③에서 얇은 래퍼 하나가 생겼지만 **격리의 구조적 보장은 그대로다**:
+  // CodexTermPanel은 TerminalPanel을 감싸기만 하고(스폰·릴레이·스냅샷·리사이즈·
+  // 닫기 전부 공용 경로 그대로) ClaudeTermPanel은 여전히 지나지 않는다 —
+  // claude의 타임라인 이벤트·스냅샷·시드·상태 배지 배선이 붙을 자리가 없다.
+  codexterm: CodexTermPanel,
   claudeterm: ClaudeTermPanel,
   editor: EditorPanel,
   diff: DiffPanel,

@@ -96,6 +96,7 @@ pub fn run() {
         .manage(commands::claude::runtime::ClaudeState::default())
         .manage(commands::ssh::SshState::default())
         .manage(commands::ScrollbackState::default())
+        .manage(commands::codex::CodexState::default())
         .invoke_handler(tauri::generate_handler![
             commands::files::read_dir,
             commands::files::detect_project_types,
@@ -114,6 +115,10 @@ pub fn run() {
             // terminal_* 를 그대로 쓴다 (순수 터미널 탭 — claude 커맨드 표면과
             // 접점 없음).
             commands::codex::codex_create,
+            // 읽기 전용 rollout 타임라인 (작업③). 프론트가 주기 조회한다 —
+            // claude의 tail 스레드·라이브 이벤트 계약과 접점 없음.
+            commands::codex::codex_timeline_snapshot,
+            commands::codex::codex_timeline_release,
             commands::ssh::ssh_create,
             commands::ssh::ssh_hostkey_decision,
             commands::ssh::ssh_store_secret,
