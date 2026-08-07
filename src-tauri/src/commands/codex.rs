@@ -10,11 +10,23 @@
 //!
 //! 그래서 여기서 하는 일은 `terminal_create`와 같다 — PTY를 띄우고 출력을
 //! relay한다. 그 이상은 없다(타임라인 폴 스레드 없음·스냅샷 없음·ClaudeRuntime
-//! 등록 없음·hook `--settings` 없음). rollout 전사를 읽는 타임라인은 작업③.
+//! 등록 없음·hook `--settings` 없음).
+//!
+//! 작업③에서 **읽기 전용 타임라인**이 하나 붙었다([`codex_timeline_snapshot`]).
+//! 그것도 claude 경로를 지나지 않는다: 전사는 `core_lib::codex_rollout`이 따로
+//! 파싱하고, 스폰↔파일 연결은 여기 [`CodexState`]가 들고 있는 스폰 기록만으로
+//! 한다. codex 쪽에서 PTY 동작이 달라지는 것은 하나도 없다.
 
-use std::path::Path;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+use std::time::{SystemTime, UNIX_EPOCH};
 
+use core_lib::codex_rollout::{
+    self, MatchOutcome, RolloutCandidate, RolloutParse, SpawnRef, MATCH_SKEW_MS,
+};
 use core_lib::SessionManager;
+use serde::Serialize;
 use tauri::{AppHandle, State};
 
 use super::AppError;
@@ -119,9 +131,11 @@ fn child_path(bin: &Path, current: Option<&str>) -> Option<String> {
 /// 로만 발견). 못 찾으면 스폰을 시도하지 않고 안내 문구를 오류로 돌려준다 —
 /// 패널이 그걸 터미널 안에 찍는다(빈 검은 화면 대신).
 #[tauri::command]
+#[allow(clippy::too_many_arguments)]
 pub fn codex_create(
     app: AppHandle,
     mgr: State<'_, SessionManager>,
+    state: State<'_, CodexState>,
     cwd: Option<String>,
     model: Option<String>,
     effort: Option<String>,
@@ -134,9 +148,17 @@ pub fn codex_create(
     let envs: Vec<(String, String)> = child_path(&bin, std::env::var("PATH").ok().as_deref())
         .map(|p| vec![("PATH".to_string(), p)])
         .unwrap_or_default();
+    // 전사 매칭의 두 입력(스폰 시각·cwd)을 **스폰 직전에** 잡는다. codex는 기동
+    // 0.9초 뒤 세션을 열고 그 시각을 전사 첫 줄에 쓴다(실측) — 여기가 그 창의
+    // 시작점이다. cwd는 codex가 `session_meta.cwd`에 적는 것과 같은 형태여야
+    // 하므로 canonical로 맞춘다(심링크·`..` 표기 차이로 매칭이 조용히 실패하지
+    // 않게).
+    let spawned_ms = now_ms();
+    let match_cwd = cwd.as_deref().and_then(canonical_str);
     let id = mgr
         .create_with_env(Some(cmd), cwd, cols, rows, envs)
         .map_err(AppError::new)?;
+    state.register(id, match_cwd, spawned_ms);
     // 구독 실패 시 고아 PTY를 남기지 않는다 (spawn_claude와 같은 방어선).
     let rx = match mgr.subscribe(id) {
         Ok(rx) => rx,
@@ -149,9 +171,286 @@ pub fn codex_create(
     Ok(id)
 }
 
+// ===========================================================================
+// 타임라인 (작업③ H) — 스폰 ↔ rollout 전사 연결 + 읽기 전용 스냅샷
+// ===========================================================================
+
+/// 표시 경계에서 자르는 도구 출력 상한. claude 쪽과 같은 32KB지만 **상수를 공유
+/// 하지 않는다** — 두 경로를 엮지 않는 것이 이 기능의 불변식이고, 이건 12줄짜리
+/// 순수 규칙이다. codex엔 원문 lazy 조회(`claude_item_detail` 상당)가 없으므로
+/// 자른 자리에 그 사실을 남긴다(무음 절단 금지).
+const CONTENT_CAP: usize = 32 * 1024;
+
+fn now_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+fn canonical_str(p: &str) -> Option<String> {
+    std::fs::canonicalize(p).ok().map(|c| c.to_string_lossy().to_string())
+}
+
+/// 살아 있는 codex 탭 하나의 스폰 기록.
+struct CodexSession {
+    cwd: Option<String>,
+    spawned_ms: i64,
+    /// 한 번 확정되면 유지한다(sticky). 나중에 같은 창에 새 전사가 생겨도 이미
+    /// 잡은 파일이 흔들리지 않고, 그 파일은 다른 탭의 후보에서도 빠진다.
+    resolved: Option<PathBuf>,
+    /// 마지막으로 돌려준 (파일 서명, 페이로드) — 폴링이 같은 내용을 반복해서
+    /// 직렬화·전송하지 않게.
+    cache: Option<(String, RolloutParse)>,
+}
+
+/// codex 탭들의 스폰 기록. **매칭의 유일한 출처**다.
+#[derive(Default)]
+pub struct CodexState(Mutex<HashMap<u64, CodexSession>>);
+
+impl CodexState {
+    fn register(&self, id: u64, cwd: Option<String>, spawned_ms: i64) {
+        if let Ok(mut m) = self.0.lock() {
+            m.insert(id, CodexSession { cwd, spawned_ms, resolved: None, cache: None });
+        }
+    }
+}
+
+/// 뷰가 받는 것. `status`가 `matched`가 아니면 `snapshot`은 없고 `note`가 이유를
+/// 사람 말로 담는다 — 빈 화면만 남기지 않는다(spec ②, 무음 금지).
+#[derive(Serialize)]
+pub struct CodexTimelinePayload {
+    /// `matched` | `searching` | `contested` | `ambiguous` | `unavailable`
+    status: &'static str,
+    note: Option<String>,
+    /// 매칭된 전사 파일 경로(표시·디버깅용).
+    path: Option<String>,
+    /// 파일 서명. 프론트가 다음 폴에 `since`로 되돌려 주면 변화 없을 때
+    /// `unchanged`만 돌아온다(전사 전문을 1.5초마다 재전송하지 않게).
+    fingerprint: Option<String>,
+    unchanged: bool,
+    snapshot: Option<RolloutParse>,
+}
+
+impl CodexTimelinePayload {
+    fn pending(status: &'static str, note: impl Into<String>) -> Self {
+        Self {
+            status,
+            note: Some(note.into()),
+            path: None,
+            fingerprint: None,
+            unchanged: false,
+            snapshot: None,
+        }
+    }
+}
+
+/// 파일의 (길이, 수정시각) 서명 — 내용이 바뀌었는지 싸게 판별한다.
+fn file_sig(path: &Path) -> Option<String> {
+    let md = std::fs::metadata(path).ok()?;
+    let mtime = md
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    Some(format!("{}:{mtime}", md.len()))
+}
+
+/// `~/.codex/sessions` 아래의 전사 후보를 모은다.
+///
+/// **mtime 선필터**가 비용을 잡는다: 전사 파일은 세션이 열린 뒤에 만들어지므로
+/// `mtime >= 스폰시각 - 오차`가 반드시 성립한다(≒ 후보를 몇 개로 줄인다).
+/// 첫 줄을 읽는 것은 그 통과분에만 한다.
+fn scan_candidates(root: &Path, not_before_ms: i64) -> Vec<RolloutCandidate> {
+    let mut out = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(rd) = std::fs::read_dir(&dir) else { continue };
+        for e in rd.flatten() {
+            let p = e.path();
+            let Ok(ft) = e.file_type() else { continue };
+            if ft.is_dir() {
+                stack.push(p);
+                continue;
+            }
+            if p.extension().and_then(|x| x.to_str()) != Some("jsonl") {
+                continue;
+            }
+            let recent = e
+                .metadata()
+                .ok()
+                .and_then(|m| m.modified().ok())
+                .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                .map(|d| d.as_millis() as i64 >= not_before_ms)
+                .unwrap_or(false);
+            if !recent {
+                continue;
+            }
+            let meta = codex_rollout::read_meta(&p);
+            out.push(RolloutCandidate {
+                path: p,
+                cwd: meta.as_ref().and_then(|m| m.cwd.clone()),
+                started_ms: meta.as_ref().and_then(|m| m.started_ms),
+            });
+        }
+    }
+    out
+}
+
+/// 표시 경계 절단 — 자른 아이템은 자른 사실을 본문에 남긴다.
+fn cap_contents(items: &mut [core_lib::TimelineItem]) {
+    for it in items.iter_mut() {
+        let Some(text) = it.content_text.as_ref() else { continue };
+        if text.len() <= CONTENT_CAP {
+            continue;
+        }
+        let mut cut = CONTENT_CAP;
+        while cut > 0 && !text.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        let full = text.len();
+        it.content_text = Some(format!("{}\n\n… (전체 {full}바이트 중 앞부분만)", &text[..cut]));
+        it.content_truncated = true;
+    }
+}
+
+/// 이 codex 탭의 전사 타임라인을 돌려준다. 프론트가 타임라인을 펼친 동안 주기적
+/// 으로 부른다.
+///
+/// **폴링을 고른 이유**: claude 쪽은 세션마다 tail 스레드를 띄우지만(라이브 이벤트
+/// 계약이 있어서), codex 전사는 ①스폰 시점에 파일이 아예 없고(첫 메시지 때 생긴다)
+/// ②경로를 매 번 다시 찾아야 하며 ③파일이 작다(실전사 평균 48줄). 감시 스레드를
+/// 붙이면 "아직 없는 파일을 기다리는 스레드"의 수명·정리 문제가 새로 생기는데,
+/// 얻는 것은 1.5초의 지연뿐이다. 대신 (길이,mtime) 서명으로 **변화 없을 때는
+/// 전사를 다시 읽지도, 다시 보내지도 않는다**.
+#[tauri::command]
+pub fn codex_timeline_snapshot(
+    mgr: State<'_, SessionManager>,
+    state: State<'_, CodexState>,
+    id: u64,
+    since: Option<String>,
+) -> Result<CodexTimelinePayload, AppError> {
+    let Some(root) = codex_rollout::codex_sessions_root().filter(|r| r.is_dir()) else {
+        return Ok(CodexTimelinePayload::pending(
+            "unavailable",
+            "codex 전사 디렉토리(~/.codex/sessions)가 없습니다.",
+        ));
+    };
+    let mut guard = self_lock(&state)?;
+    // 죽은 탭의 기록은 버린다 — 남아 있으면 그 탭의 창이 다른 탭의 후보를 영원히
+    // 가로막는다(Contested 고착).
+    guard.retain(|sid, _| mgr.exists(*sid));
+
+    let Some(me) = guard.get(&id) else {
+        return Ok(CodexTimelinePayload::pending(
+            "unavailable",
+            "이 탭의 codex 세션 정보를 앱이 들고 있지 않습니다 (앱 재시작 후 재부착된 탭).",
+        ));
+    };
+    let (spawned_ms, cwd) = (me.spawned_ms, me.cwd.clone());
+
+    // 이미 잡은 파일이 있으면 다시 찾지 않는다(sticky).
+    let matched = match me.resolved.clone() {
+        Some(p) if p.is_file() => Some(p),
+        _ => {
+            let target = SpawnRef { id, cwd, spawned_ms };
+            // 후보를 다투는 상대 = **아직 자기 전사를 못 잡은** 다른 탭들. 이미
+            // 잡은 탭은 새 파일을 가져갈 일이 없으므로 남을 막지 않는다.
+            let live: Vec<SpawnRef> = guard
+                .iter()
+                .filter(|(_, s)| s.resolved.is_none())
+                .map(|(sid, s)| SpawnRef {
+                    id: *sid,
+                    cwd: s.cwd.clone(),
+                    spawned_ms: s.spawned_ms,
+                })
+                .collect();
+            let claimed: Vec<PathBuf> = guard.values().filter_map(|s| s.resolved.clone()).collect();
+            let cands = scan_candidates(&root, spawned_ms - MATCH_SKEW_MS);
+            match codex_rollout::match_rollout(&target, &live, &cands, &claimed) {
+                MatchOutcome::Matched(p) => {
+                    if let Some(s) = guard.get_mut(&id) {
+                        s.resolved = Some(p.clone());
+                    }
+                    Some(p)
+                }
+                MatchOutcome::NoCandidate => {
+                    return Ok(CodexTimelinePayload::pending(
+                        "searching",
+                        "전사를 찾지 못했습니다 — codex는 첫 메시지를 보낼 때 전사 파일을 만듭니다.",
+                    ))
+                }
+                MatchOutcome::Contested => {
+                    return Ok(CodexTimelinePayload::pending(
+                        "contested",
+                        "전사를 찾지 못했습니다 — 같은 프로젝트에서 codex 탭이 거의 동시에 열려 어느 전사가 이 탭의 것인지 확정할 수 없습니다.",
+                    ))
+                }
+                MatchOutcome::Multiple => {
+                    return Ok(CodexTimelinePayload::pending(
+                        "ambiguous",
+                        "전사를 찾지 못했습니다 — 같은 시각·같은 폴더에 codex 세션이 둘 이상 열렸습니다.",
+                    ))
+                }
+            }
+        }
+    };
+    let Some(path) = matched else {
+        return Ok(CodexTimelinePayload::pending("searching", "전사를 찾지 못했습니다."));
+    };
+
+    let sig = file_sig(&path);
+    if sig.is_some() && sig == since {
+        return Ok(CodexTimelinePayload {
+            status: "matched",
+            note: None,
+            path: Some(path.to_string_lossy().to_string()),
+            fingerprint: sig,
+            unchanged: true,
+            snapshot: None,
+        });
+    }
+    // 서명이 같은 캐시가 있으면 파일을 다시 읽지 않는다(다른 창이 같은 탭을
+    // 처음 물었을 때처럼 since가 없는 호출).
+    if let (Some(s), Some(entry)) = (sig.as_ref(), guard.get(&id).and_then(|s| s.cache.as_ref())) {
+        if &entry.0 == s {
+            return Ok(CodexTimelinePayload {
+                status: "matched",
+                note: None,
+                path: Some(path.to_string_lossy().to_string()),
+                fingerprint: sig.clone(),
+                unchanged: false,
+                snapshot: Some(entry.1.clone()),
+            });
+        }
+    }
+
+    let mut parsed = codex_rollout::parse_rollout(&path)
+        .map_err(|_| AppError::new("전사 파일을 읽지 못했습니다."))?;
+    cap_contents(&mut parsed.items);
+    if let (Some(s), Some(slot)) = (sig.clone(), guard.get_mut(&id)) {
+        slot.cache = Some((s, parsed.clone()));
+    }
+    Ok(CodexTimelinePayload {
+        status: "matched",
+        note: None,
+        path: Some(path.to_string_lossy().to_string()),
+        fingerprint: sig,
+        unchanged: false,
+        snapshot: Some(parsed),
+    })
+}
+
+fn self_lock<'a>(
+    state: &'a State<'_, CodexState>,
+) -> Result<std::sync::MutexGuard<'a, HashMap<u64, CodexSession>>, AppError> {
+    state.0.lock().map_err(|_| AppError::new("codex 세션 상태를 읽지 못했습니다."))
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{build_codex_args, child_path};
+    use super::{build_codex_args, cap_contents, child_path, CONTENT_CAP};
     use std::path::Path;
 
     const BIN: &str = "/home/u/.nvm/versions/node/v20.19.6/bin/codex";
@@ -244,5 +543,46 @@ mod tests {
     fn child_path_without_an_existing_path() {
         assert_eq!(child_path(Path::new(BIN), None).unwrap(), BIN_DIR);
         assert_eq!(child_path(Path::new(BIN), Some("")).unwrap(), BIN_DIR);
+    }
+
+    fn item(text: &str) -> core_lib::TimelineItem {
+        core_lib::TimelineItem {
+            session_id: "s".into(),
+            tool_call_id: "c".into(),
+            turn: 1,
+            seq: 0,
+            kind: core_lib::ItemKind::Execute,
+            title: "t".into(),
+            locations: Vec::new(),
+            project_label: None,
+            cwd: None,
+            diffs: Vec::new(),
+            content_text: Some(text.to_string()),
+            content_truncated: false,
+            raw_input: None,
+            agent_status: core_lib::AgentStatus::Completed,
+            write_status: core_lib::WriteStatus::None,
+            revision: 0,
+        }
+    }
+
+    /// codex엔 원문 lazy 조회가 없으므로 **자른 사실이 화면에 남아야** 한다 —
+    /// 조용히 잘리면 사용자는 도구 출력이 원래 그만큼이라고 읽는다.
+    #[test]
+    fn capping_marks_the_cut_and_keeps_short_output_untouched() {
+        let mut items = vec![item(&"a".repeat(CONTENT_CAP + 10)), item("짧다")];
+        cap_contents(&mut items);
+        assert!(items[0].content_truncated);
+        assert!(items[0].content_text.as_deref().unwrap().contains("앞부분만"));
+        assert!(!items[1].content_truncated);
+        assert_eq!(items[1].content_text.as_deref(), Some("짧다"));
+    }
+
+    /// 멀티바이트 경계에서 잘라도 문자열이 깨지지 않는다(한국어 출력이 기본이다).
+    #[test]
+    fn capping_respects_char_boundaries() {
+        let mut items = vec![item(&"가".repeat(CONTENT_CAP))];
+        cap_contents(&mut items);
+        assert!(items[0].content_text.is_some(), "패닉 없이 잘려야 한다");
     }
 }
