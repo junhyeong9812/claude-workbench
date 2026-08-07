@@ -1165,6 +1165,10 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
       // 사라졌다(#74). 이제는 PTY 출력의 준비 신호가 시점을 정하고 고정 지연은
       // 신호가 안 올 때의 폴백으로만 남는다 — 놓쳤을 때의 "시드 재주입" 버튼도
       // 그대로다.
+      // 위의 await(스냅샷·갭 치유) 동안 언마운트됐다면 여기서 끊는다 — cleanup의
+      // cancel은 이 시점엔 아직 null을 봐서, 지금 만들면 폴백 타이머가 언마운트
+      // 뒤 최대 3초 생존한다(리뷰 P3-1 — fire 내부 가드로 무해하지만 잔존 자체를 제거).
+      if (disposed) return;
       if (pendingSeedRef.current) {
         const seed = pendingSeedRef.current;
         seedScheduler = makeSeedScheduler(() => {
