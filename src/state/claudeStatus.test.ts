@@ -309,6 +309,28 @@ const SELECT_MENU = [
   "How should I structure P2?",
 ];
 
+/**
+ * 미신뢰 폴더의 trust 대화 — **실측 고정**(2026-08-07, claude 2.1.223).
+ *
+ * 새 /tmp 디렉토리에서 실 PTY로 띄운 화면을 xterm 버퍼에 넣고
+ * `translateToString(true)`로 뽑은 줄을 **그대로** 옮긴 것이다(bottom-first).
+ * 손으로 지어낸 모양이 아니라 실제로 렌더된 글자라, 시드 발사 게이트가 trust
+ * 대화까지 덮는다는 근거가 이 픽스처다 — 규칙을 손대다 이게 깨지면 미신뢰
+ * 폴더에서 시드가 trust 메뉴의 키 입력으로 들어간다.
+ */
+const TRUST_DIALOG = [
+  " Enter to confirm · Esc to cancel",
+  "   2. No, exit",
+  " ❯ 1. Yes, I trust this folder",
+  " Security guide",
+  " Claude Code'll be able to read, edit, and execute files here.",
+  " take a moment to review what's in this folder first.",
+  " own code, a well-known open source project, or work from your team). If not,",
+  " Quick safety check: Is this a project you created or one you trust? (Like your",
+  " /tmp/wb-trust-probe-23051",
+  " Accessing workspace:",
+];
+
 describe("scanBottomForPrompt — rule positives", () => {
   it("E-pos1: permission dialog (Do you want to… + numbered Yes) → blocked", () => {
     expect(scanBottomForPrompt(PERMISSION_PROMPT)).toBe(true);
@@ -316,6 +338,12 @@ describe("scanBottomForPrompt — rule positives", () => {
 
   it("E-pos2: numbered select menu (❯ cursor + ≥2 options) → blocked", () => {
     expect(scanBottomForPrompt(SELECT_MENU)).toBe(true);
+  });
+
+  it("E-pos3: 미신뢰 폴더 trust 대화(실측 화면 그대로) → blocked", () => {
+    // 규칙 2(❯ 커서 + 숫자 옵션 ≥2)가 이미 덮는다 — 패턴 보강 없이 커버된다는
+    // 실확인 결과를 코드에 고정한다.
+    expect(scanBottomForPrompt(TRUST_DIALOG)).toBe(true);
   });
 
   it("E1: a prompt within the bottom ≤20 non-empty lines is detected", () => {
