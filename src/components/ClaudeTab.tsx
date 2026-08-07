@@ -30,7 +30,7 @@ function TabBadge({ sessionId }: { sessionId: string | null }) {
  * 모달, 탭 로컬 메뉴는 overflow:hidden에 잘린다)만 이 파일 소유.
  */
 export function ClaudeTab(props: IDockviewPanelHeaderProps) {
-  const title = (props.params.title as string) ?? "Claude";
+  const title = (props.params.title as string) ?? "에이전트";
   // The architecture-A terminal keys by `sessionUuid` (its Claude session id).
   const sessionId =
     (props.params.sessionUuid as string) ?? (props.params.loadSessionId as string) ?? null;

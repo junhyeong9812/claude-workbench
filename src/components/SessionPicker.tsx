@@ -94,7 +94,7 @@ export function useSessionPicker(deps: {
   // Collapsed picker groups (아카이브됨/아카이브 이후 작업/아카이브 없음).
   const [pickerCollapsed, setPickerCollapsed] = useState<Set<ArchState>>(new Set());
   // Which kind the open picker creates/reopens: ACP `claude` or A `claudeterm`.
-  const [newName, setNewName] = useState("Claude 1");
+  const [newName, setNewName] = useState("에이전트 1");
   // 터미널에서 연 세션(외부) + 삭제로 숨긴 것들. 피커를 열 때마다 새로 조회한다
   // — live 판정은 지금 이 순간의 프로세스 상태라서 캐시하면 틀린 값을 보여준다.
   const [external, setExternal] = useState<ExternalListing>(EMPTY_EXTERNAL);
@@ -156,7 +156,7 @@ export function useSessionPicker(deps: {
     }
     setExternal(extRows);
     setShowHidden(false);
-    setNewName(`Claude ${sessions.length + openKindCount("claudeterm") + 1}`);
+    setNewName(`에이전트 ${sessions.length + openKindCount("claudeterm") + 1}`);
     setPicker(sessions); // open-session filtering happens at render
   };
 
@@ -262,7 +262,7 @@ export function SessionPicker({
 
   /** `opts` 미지정 = 마지막 설정 상속(보통 클릭). */
   const createNewSession = (opts?: AgentOptions) => {
-    const name = newName.trim() || "Claude";
+    const name = newName.trim() || "에이전트";
     setPicker(null);
     // Give the new session a stable UUID up front so it's saved in the layout
     // immediately → resumes the same session after restart (create-or-resume in

@@ -21,7 +21,7 @@ export function CloseSessionModal({
   return (
     <div className="claude-modal-backdrop" onClick={onCancel}>
       <div className="claude-modal" onClick={(e) => e.stopPropagation()}>
-        <div className="claude-modal-title">이 Claude 세션을 어떻게 할까요?</div>
+        <div className="claude-modal-title">이 에이전트 세션을 어떻게 할까요?</div>
         <button className="claude-modal-opt" onClick={onClose}>
           닫기 <span className="claude-modal-hint">세션 히스토리 보존 (나중에 다시 열기)</span>
         </button>

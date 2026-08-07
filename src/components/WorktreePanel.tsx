@@ -188,7 +188,7 @@ export function WorktreePanel() {
         {wtSessions.length > 0 && (
           <span
             className="git-ref git-ref-head"
-            title={`이 워크트리에서 도는 Claude 세션:\n${wtSessions.map((s) => s.uuid).join("\n")}`}
+            title={`이 워크트리에서 도는 에이전트 세션:\n${wtSessions.map((s) => s.uuid).join("\n")}`}
           >
             ● 세션 {wtSessions.length}
           </span>
@@ -208,10 +208,10 @@ export function WorktreePanel() {
         <button
           className="git-mini"
           disabled={busy}
-          title="이 워크트리에서 Claude 세션 열기"
+          title="이 워크트리에서 에이전트 세션 열기"
           onClick={() => void openClaude(w.path)}
         >
-          Claude
+          에이전트
         </button>
         <button
           className="git-mini git-ico"

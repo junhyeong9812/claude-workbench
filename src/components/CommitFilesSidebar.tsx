@@ -134,7 +134,7 @@ export function CommitFilesSidebar() {
         <span className="commit-files-count">{files.length}개 파일</span>
         <button
           className="commit-review-btn"
-          title="이 커밋을 Claude와 코드리뷰 (리뷰 전용 세션)"
+          title="이 커밋을 에이전트와 코드리뷰 (리뷰 전용 세션)"
           disabled={files.length === 0}
           onClick={startReview}
         >

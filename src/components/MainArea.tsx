@@ -432,7 +432,7 @@ export function MainArea({
     const api = apiRef.current;
     if (!api) return; // dock not ready (project-switch remount) — keep the request; apiReady re-runs this
     requestClaudeOpen(null); // consume only once we can actually act
-    const title = reqTitle ?? `Claude ${counterRef.current + 1}`;
+    const title = reqTitle ?? `에이전트 ${counterRef.current + 1}`;
     addPanel("claudeterm", {
       project,
       loadSessionId: crypto.randomUUID(),

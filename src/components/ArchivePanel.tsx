@@ -245,7 +245,7 @@ export function ArchivePanel() {
         <div className="archive-empty">
           아직 아카이브가 없습니다.
           <br />
-          Claude 세션의 <b>종료(아카이브)</b> 버튼으로 만듭니다.
+          에이전트 세션의 <b>종료(아카이브)</b> 버튼으로 만듭니다.
         </div>
       )}
       {!error && groups.length > 0 && shown.length === 0 && (

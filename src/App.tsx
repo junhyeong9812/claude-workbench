@@ -695,13 +695,13 @@ function AppMain() {
                 className="toolbar-btn"
                 title={
                   layerMode === "dev"
-                    ? "Claude 세션 열기는 통합 모드에서 사용할 수 있습니다"
-                    : "Claude 세션 열기 (새 세션 또는 저장된 세션)"
+                    ? "에이전트 세션 열기는 통합 모드에서 사용할 수 있습니다"
+                    : "에이전트 세션 열기 (새 세션 또는 저장된 세션)"
                 }
                 disabled={layerMode === "dev"}
                 onClick={() => requestClaudePicker()}
               >
-                <span className="toolbar-ico">✦</span> Claude
+                <span className="toolbar-ico">✦</span> 에이전트
               </button>
               <button
                 ref={agentOptsBtnRef}

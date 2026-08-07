@@ -1229,7 +1229,7 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
           term.write(`\r\n\x1b[31m[세션을 열지 못했습니다]\x1b[0m ${errText(e)}\r\n`);
           if (props.params.adoptPending === true) {
             term.write(
-              "\x1b[2m이 탭을 닫고 \"+ Claude\" 목록을 다시 열면 최신 상태로 다시 확인합니다.\x1b[0m\r\n",
+              "\x1b[2m이 탭을 닫고 \"✦ 에이전트\" 목록을 다시 열면 최신 상태로 다시 확인합니다.\x1b[0m\r\n",
             );
           }
         }
@@ -1961,7 +1961,7 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
   const paneHead = (
         <div className="claudeterm-pane-head">
           <span className="claudeterm-pane-head-title">
-            Claude — {(props.params.title as string) ?? "터미널"}
+            에이전트 — {(props.params.title as string) ?? "터미널"}
           </span>
           <span className="claudeterm-head-controls">
             {!isDriver && (
@@ -2182,7 +2182,7 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
       {(applyPending || applyNote) && (
         <div className="claudeterm-refine-note" role="status">
             {applyPending
-              ? "전달 대기 중 — 원래 Claude 탭이 열려 있어야 전달됩니다. 그 탭을 활성화해 주세요.\n(전달이 확인되면 이 정리 세션은 자동으로 닫힙니다.)"
+              ? "전달 대기 중 — 원래 에이전트 탭이 열려 있어야 전달됩니다. 그 탭을 활성화해 주세요.\n(전달이 확인되면 이 정리 세션은 자동으로 닫힙니다.)"
               : applyNote}
             <span
               className="claudeterm-refine-note-x"
