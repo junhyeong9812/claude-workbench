@@ -402,9 +402,32 @@ function emitAttention(ev: AttentionEvent): void {
 /** Recompute the display status from the internal fields. Blocked wins; a
  * hook-backed session ignores the screen-scan heuristic (hook이 정본 — 스캔은
  * hook 미수신 세션의 폴백일 뿐이다, hook-status spec §2). */
-function statusOf(e: SessionEntry): SessionStatus {
+export function statusOf(e: SessionEntry): SessionStatus {
   if (e.questionBlocked || e.hookBlocked || (e.screenBlocked && !e.hookBacked)) return "blocked";
   return e.activity === "working" ? "working" : "idle";
+}
+
+/**
+ * **쓰기 게이트**용 차단 판정 — 원시 신호의 단순 합집합.
+ *
+ * {@link statusOf}(표시용)와 일부러 다르다. 표시에는 정본이 하나여야 해서
+ * hook을 받은 세션은 화면 스캔을 무시하지만(`screenBlocked && !hookBacked`),
+ * 그 우선순위를 쓰기 게이트에 그대로 쓰면 구멍이 난다: hook의 해제 이벤트가
+ * 화면 재도색보다 **먼저** 도착하면 대화가 아직 떠 있는데 aggregate는 이미
+ * 열린다 — 그 창에 시드를 쓰면 바이트가 프롬프트가 아니라 그 대화의 키 입력이
+ * 된다(codex N2). 게이트가 기대는 "해소 = 재도색 뒤" 전제가 깨지는 지점이 정확히
+ * 거기다.
+ *
+ * 그래서 여기서는 **어느 신호든 하나라도 서 있으면 막는다**. 두 판정의 오판
+ * 비용이 반대라서 규칙도 반대여야 한다: 표시는 과민하면 배지가 시끄러워질 뿐이고,
+ * 쓰기는 과민하면 시드가 조금 늦을 뿐이지만 관대하면 사용자가 누른 적 없는
+ * 확정이 일어난다.
+ *
+ * 엔트리가 없으면 false — 신호가 없는 것이지 막힌 것이 아니다.
+ */
+export function isWriteBlocked(e: SessionEntry | undefined | null): boolean {
+  if (!e) return false;
+  return e.questionBlocked || e.hookBlocked || e.screenBlocked;
 }
 
 /** working→quiet is confirmed only after this quiet hold, so a micro-pause

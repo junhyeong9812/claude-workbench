@@ -12,6 +12,8 @@ import {
   onAttentionEvent,
   PROMPT_SCAN_MAX_LINES,
   rollup,
+  isWriteBlocked,
+  statusOf,
   scanBottomForPrompt,
   shouldShowRollup,
   useClaudeStatus,
@@ -335,6 +337,47 @@ const TRUST_DIALOG = [
   " /tmp/wb-trust-probe-23051",
   " Accessing workspace:",
 ];
+
+// --- 쓰기 게이트 판정: 원시 신호 합집합 (codex N2) --------------------------
+
+describe("isWriteBlocked", () => {
+  const entry = (over: Partial<SessionEntry> = {}): SessionEntry => ({
+    status: "idle",
+    unseen: false,
+    activity: "quiet",
+    questionBlocked: false,
+    screenBlocked: false,
+    seen: true,
+    seenDuringHold: false,
+    hookBacked: false,
+    hookBlocked: false,
+    ...over,
+  });
+
+  it("신호가 하나도 없으면 통과", () => {
+    expect(isWriteBlocked(entry())).toBe(false);
+  });
+
+  it("엔트리가 없으면 통과 — 신호가 없는 것이지 막힌 것이 아니다", () => {
+    expect(isWriteBlocked(undefined)).toBe(false);
+    expect(isWriteBlocked(null)).toBe(false);
+  });
+
+  it("세 신호 각각 단독으로 막는다", () => {
+    expect(isWriteBlocked(entry({ questionBlocked: true }))).toBe(true);
+    expect(isWriteBlocked(entry({ hookBlocked: true }))).toBe(true);
+    expect(isWriteBlocked(entry({ screenBlocked: true }))).toBe(true);
+  });
+
+  it("**hookBacked여도 화면 신호를 무시하지 않는다** — 표시 판정과 갈리는 지점", () => {
+    // 표시(statusOf)는 hook을 정본으로 삼아 이 조합을 "안 막힘"으로 읽는다.
+    // 쓰기 게이트가 그걸 그대로 쓰면, hook 해제가 화면 재도색보다 먼저 도착한
+    // 순간 대화가 아직 떠 있는데 게이트가 열린다(codex N2).
+    const e = entry({ hookBacked: true, hookBlocked: false, screenBlocked: true });
+    expect(isWriteBlocked(e)).toBe(true);
+    expect(statusOf(e)).toBe("idle"); // 표시는 반대로 읽는다 — 의도된 차이
+  });
+});
 
 describe("scanBottomForPrompt — rule positives", () => {
   it("E-pos1: permission dialog (Do you want to… + numbered Yes) → blocked", () => {
