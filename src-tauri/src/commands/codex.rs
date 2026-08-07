@@ -168,11 +168,14 @@ pub fn codex_create(
         .create_with_env(Some(cmd), cwd, cols, rows, envs)
         .map_err(AppError::new)?;
     state.register(id, match_cwd, spawned_ms);
-    // 구독 실패 시 고아 PTY를 남기지 않는다 (spawn_claude와 같은 방어선).
+    // 구독 실패 시 고아 PTY를 남기지 않는다 (spawn_claude와 같은 방어선). 방금
+    // 넣은 스폰 기록도 함께 지운다 — 남겨 두면 그 tombstone이 (같은 폴더에서
+    // 다시 여는) 다음 탭의 후보를 자기 창 동안 가로막는다.
     let rx = match mgr.subscribe(id) {
         Ok(rx) => rx,
         Err(e) => {
             let _ = mgr.remove(id);
+            state.release(id);
             return Err(AppError::new(e));
         }
     };
@@ -222,6 +225,10 @@ struct CodexSession {
     cache: Option<(String, RolloutParse)>,
     /// 마지막으로 후보 디렉토리를 훑은 시각.
     last_scan_ms: i64,
+    /// PTY가 죽은 뒤 **마지막 한 번**의 스캔을 이미 했는가. 죽었다고 즉시 포기하면
+    /// "전사 생성 → 첫 조회 전 종료"(빠른 원샷·즉시 닫기)에서 멀쩡히 있는 전사를
+    /// 영영 못 찾는다 — 한 번은 더 본다.
+    final_scan_done: bool,
     /// 이 탭의 전사를 **표식으로** 골랐는가. 확정 시점의 값을 들고 있는다(이후
     /// 조회는 스캔을 안 하므로 다시 알 수 없다).
     marked: bool,
@@ -242,12 +249,18 @@ impl CodexState {
                     resolved: None,
                     cache: None,
                     last_scan_ms: 0,
+                    final_scan_done: false,
                     marked: true,
                 },
             );
         }
     }
 
+    fn release(&self, id: u64) {
+        if let Ok(mut m) = self.0.lock() {
+            m.remove(&id);
+        }
+    }
 }
 
 /// 뷰가 받는 것. `status`가 `matched`가 아니면 `snapshot`은 없고 `note`가 이유를
@@ -420,6 +433,29 @@ const RESCAN_MS: i64 = 15_000;
 /// 죽은 채 전사를 못 찾은 탭에 보여 줄 안내.
 const DEAD_NOTE: &str = "이 세션은 전사를 남기지 않고 끝났습니다 (메시지를 보내기 전에 종료).";
 
+/// 지금 후보 디렉토리를 훑어야 하는가.
+///
+/// 세 갈래다:
+/// - **살아 있고 창 안** → 매번 훑는다(전사가 곧 생긴다).
+/// - **살아 있고 창 밖** → [`RESCAN_MS`] 간격으로 늦춘다. 멈추지는 않는다 —
+///   전사 파일은 첫 메시지 때 생기고 그 안의 세션 오픈 시각은 여전히 창 안이라,
+///   시간이 지났다고 후보가 없어지지 않는다("탭 열어 두고 5분 뒤 첫 질문").
+/// - **죽었다** → 더는 전사를 만들 수 없으니 결국 멈춘다. 단 **딱 한 번은 더**
+///   본다: 전사를 만들자마자 닫힌 탭은 파일이 멀쩡히 있는데도 즉시 포기하면
+///   영영 못 찾는다(마이크로 감사 T2). 간격도 적용하지 않는다 — 다음 기회가 없다.
+fn should_scan(
+    alive: bool,
+    final_scan_done: bool,
+    now: i64,
+    spawned_ms: i64,
+    last_scan_ms: i64,
+) -> bool {
+    if !alive {
+        return !final_scan_done;
+    }
+    now <= spawned_ms + MATCH_WINDOW_MS || now - last_scan_ms >= RESCAN_MS
+}
+
 /// 이 codex 탭의 전사 타임라인을 돌려준다. 프론트가 타임라인을 펼친 동안 주기적
 /// 으로 부른다.
 ///
@@ -451,7 +487,7 @@ pub fn codex_timeline_snapshot(
     };
 
     // ── 1) 상태 읽기 (락) ────────────────────────────────────────────────
-    let (spawned_ms, cwd, resolved, last_scan_ms, was_marked) = {
+    let (spawned_ms, cwd, resolved, last_scan_ms, final_scan_done, was_marked) = {
         let guard = lock(&state)?;
         let Some(me) = guard.get(&id) else {
             return Ok(CodexTimelinePayload::pending(
@@ -465,6 +501,7 @@ pub fn codex_timeline_snapshot(
             me.cwd.clone(),
             me.resolved.clone(),
             me.last_scan_ms,
+            me.final_scan_done,
             me.marked,
         )
     };
@@ -481,13 +518,10 @@ pub fn codex_timeline_snapshot(
             ))
         }
         None => {
-            // 죽은 탭은 새 전사를 만들 수 없다 — 여기서 스캔을 멈춘다.
-            if !alive {
-                return Ok(CodexTimelinePayload::pending("searching", alive, DEAD_NOTE));
-            }
             let now = now_ms();
-            if now > spawned_ms + MATCH_WINDOW_MS && now - last_scan_ms < RESCAN_MS {
-                return Ok(CodexTimelinePayload::pending("searching", alive, SEARCHING_NOTE));
+            if !should_scan(alive, final_scan_done, now, spawned_ms, last_scan_ms) {
+                let note = if alive { SEARCHING_NOTE } else { DEAD_NOTE };
+                return Ok(CodexTimelinePayload::pending("searching", alive, note));
             }
 
             // ── 2) 스캔 (락 밖) ──────────────────────────────────────────
@@ -500,6 +534,9 @@ pub fn codex_timeline_snapshot(
             let mut guard = lock(&state)?;
             if let Some(s) = guard.get_mut(&id) {
                 s.last_scan_ms = now;
+                if !alive {
+                    s.final_scan_done = true;
+                }
             }
             let target = SpawnRef { id, cwd, spawned_ms };
             let (live, claimed) = contest_inputs(&guard);
@@ -835,6 +872,7 @@ mod tests {
             resolved: resolved.map(PathBuf::from),
             cache: None,
             last_scan_ms: 0,
+            final_scan_done: false,
             marked: true,
         }
     }
@@ -918,6 +956,40 @@ mod tests {
         assert_eq!(narrowed.len(), 1);
         assert!(narrowed[0].path.ends_with("rollout-mine.jsonl"));
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // -- 스캔 시점 판단 (T2) ------------------------------------------------
+
+    /// 살아 있는 탭: 창 안에서는 매번, 창 밖에서는 간격을 두고 — 멈추지는 않는다.
+    #[test]
+    fn a_live_tab_keeps_looking_just_more_slowly_after_the_window() {
+        let t = 1_000_000;
+        let win = core_lib::codex_rollout::MATCH_WINDOW_MS;
+        assert!(super::should_scan(true, false, t + 1_000, t, 0), "창 안이면 매번");
+        assert!(
+            !super::should_scan(true, false, t + win + 1_000, t, t + win),
+            "창 밖 + 방금 훑었으면 쉰다"
+        );
+        assert!(
+            super::should_scan(true, false, t + win + super::RESCAN_MS + 1, t, t + win),
+            "간격이 지나면 다시 훑는다 — 첫 질문은 몇 분 뒤에도 온다"
+        );
+    }
+
+    /// **T2 재현**: 죽은 탭이라고 즉시 포기하면, 전사를 만들자마자 닫힌 탭은
+    /// 파일이 멀쩡히 있는데도 영영 못 찾는다(거짓 음성). 딱 한 번은 더 본다.
+    #[test]
+    fn a_dead_tab_gets_one_last_look_then_stops() {
+        let t = 1_000_000;
+        let long_after = t + 10 * 60 * 1_000;
+        assert!(
+            super::should_scan(false, false, long_after, t, t),
+            "죽었어도 마지막 한 번은 — 간격·창과 무관하게"
+        );
+        assert!(
+            !super::should_scan(false, true, long_after, t, long_after),
+            "그 한 번을 마치면 고착한다(더는 전사가 생기지 않는다)"
+        );
     }
 
     /// 다른 날짜 폴더는 아예 열지 않는다.
