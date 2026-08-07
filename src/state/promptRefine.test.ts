@@ -12,7 +12,10 @@ import {
   REFINE_SUBMIT_CONFIRM_MS,
   SEED_READY_DELAY,
   SEED_READY_SETTLE,
+  makeSeedGate,
   makeSeedScheduler,
+  seedFireLog,
+  seedHoldLog,
   REFINE_SUBMIT_CR_DELAY,
   openPromptRefine,
   makeSubmitProbe,
@@ -855,6 +858,139 @@ describe("submitBytes — 본문 모양이 바이트를 정한다", () => {
 
 // ---- 준비 신호 vs 폴백: 먼저 오는 쪽이 한 번만 -----------------------------
 
+// ---- 발사 직전 blocked 게이트 (권한·trust 대화) ---------------------------
+
+describe("makeSeedGate", () => {
+  /** 스토어 구독 흉내 — 리스너 목록 + 수동 통지. */
+  const makeBus = () => {
+    const listeners = new Set<() => void>();
+    return {
+      subscribe: (fn: () => void) => {
+        listeners.add(fn);
+        return () => listeners.delete(fn);
+      },
+      notify: () => [...listeners].forEach((fn) => fn()),
+      get count() {
+        return listeners.size;
+      },
+    };
+  };
+  const setup = (blockedAtFire: boolean) => {
+    const bus = makeBus();
+    const inject = vi.fn();
+    const onHold = vi.fn();
+    let blocked = blockedAtFire;
+    let t = 1000;
+    const gate = makeSeedGate({
+      blocked: () => blocked,
+      inject,
+      subscribe: bus.subscribe,
+      onHold,
+      now: () => t,
+    });
+    return {
+      gate,
+      bus,
+      inject,
+      onHold,
+      setBlocked: (v: boolean) => (blocked = v),
+      tick: (ms: number) => (t += ms),
+    };
+  };
+  const INFO = { path: "ready", elapsedMs: 2203 } as const;
+
+  it("안 막혀 있으면 즉시 주입 — 구독도 남기지 않는다", () => {
+    const s = setup(false);
+    s.gate.fire(INFO);
+    expect(s.inject).toHaveBeenCalledWith(INFO);
+    expect(s.onHold).not.toHaveBeenCalled();
+    expect(s.bus.count).toBe(0);
+  });
+
+  it("blocked면 **주입하지 않고** 보류한다", () => {
+    const s = setup(true);
+    s.gate.fire(INFO);
+    expect(s.inject).not.toHaveBeenCalled();
+    expect(s.onHold).toHaveBeenCalledTimes(1);
+    expect(s.bus.count).toBe(1); // 해소를 기다린다
+  });
+
+  it("보류 중 상태가 안 풀리면 통지가 와도 그대로 보류", () => {
+    const s = setup(true);
+    s.gate.fire(INFO);
+    s.bus.notify();
+    s.bus.notify();
+    expect(s.inject).not.toHaveBeenCalled();
+    expect(s.bus.count).toBe(1);
+  });
+
+  it("해소되면 자동 발사 — 보류 시간(heldMs)을 달고, 구독은 스스로 푼다", () => {
+    const s = setup(true);
+    s.gate.fire(INFO);
+    s.tick(4500);
+    s.setBlocked(false);
+    s.bus.notify();
+    expect(s.inject).toHaveBeenCalledTimes(1);
+    expect(s.inject).toHaveBeenCalledWith(INFO, 4500);
+    expect(s.bus.count).toBe(0); // 영구 구독 아님
+  });
+
+  it("해소 후 통지가 더 와도 두 번 주입하지 않는다", () => {
+    const s = setup(true);
+    s.gate.fire(INFO);
+    s.setBlocked(false);
+    s.bus.notify();
+    s.bus.notify();
+    s.bus.notify();
+    expect(s.inject).toHaveBeenCalledTimes(1);
+  });
+
+  it("cancel = 보류를 접고 영영 주입하지 않는다 (언마운트)", () => {
+    const s = setup(true);
+    s.gate.fire(INFO);
+    s.gate.cancel();
+    expect(s.bus.count).toBe(0);
+    s.setBlocked(false);
+    s.bus.notify();
+    expect(s.inject).not.toHaveBeenCalled();
+  });
+
+  it("보류 중 재발사는 무시 — 구독이 겹치지 않는다", () => {
+    const s = setup(true);
+    s.gate.fire(INFO);
+    s.gate.fire(INFO);
+    expect(s.bus.count).toBe(1);
+    expect(s.onHold).toHaveBeenCalledTimes(1);
+    s.setBlocked(false);
+    s.bus.notify();
+    expect(s.inject).toHaveBeenCalledTimes(1);
+  });
+});
+
+// ---- 로깅: 경로 가시화 (버전 드리프트) ------------------------------------
+
+describe("seedFireLog / seedHoldLog", () => {
+  it("경로 2종이 문자열에서 구분된다", () => {
+    expect(seedFireLog({ path: "ready", elapsedMs: 2203 })).toBe(
+      "[seed] fired via ready-signal +2203ms",
+    );
+    expect(seedFireLog({ path: "fallback", elapsedMs: 3001 })).toBe(
+      "[seed] fired via fallback +3001ms",
+    );
+  });
+
+  it("보류를 거쳤으면 대기 시간이 붙는다", () => {
+    expect(seedFireLog({ path: "ready", elapsedMs: 2203 }, 4500)).toContain("held 4500ms");
+  });
+
+  it("로그에 시드 본문이 들어갈 수 없다 — 인자가 경로·시간뿐", () => {
+    // 계약을 문자열로 고정: 어떤 입력에도 본문이 실릴 자리가 없다.
+    const line = seedFireLog({ path: "fallback", elapsedMs: 3000 });
+    expect(line).not.toMatch(/[가-힣]/); // 본문(한글 시드)이 새면 여기서 걸린다
+    expect(seedHoldLog().startsWith("[seed] held")).toBe(true);
+  });
+});
+
 describe("makeSeedScheduler", () => {
   const setup = () => {
     vi.useFakeTimers();
@@ -927,6 +1063,41 @@ describe("makeSeedScheduler", () => {
     s.signalReady(); // 취소 뒤의 신호도 무효
     vi.advanceTimersByTime(10_000);
     expect(fire).not.toHaveBeenCalled();
+    teardown();
+  });
+
+  it("경로 보고: 신호로 쐈으면 ready, 폴백으로 쐈으면 fallback", () => {
+    const a = setup();
+    a.s.signalReady();
+    vi.advanceTimersByTime(SEED_READY_SETTLE);
+    expect(a.fire.mock.calls[0][0].path).toBe("ready");
+    a.s.cancel();
+    teardown();
+
+    const b = setup();
+    vi.advanceTimersByTime(SEED_READY_DELAY);
+    expect(b.fire.mock.calls[0][0].path).toBe("fallback");
+    b.s.cancel();
+    teardown();
+  });
+
+  it("신호가 폴백 직전이면 경로도 fallback — **이긴 타이머**가 경로다", () => {
+    // 신호를 보긴 했지만 여유를 못 채우고 폴백이 이겼다. 로그가 ready라고
+    // 하면 드리프트 판독이 거꾸로 된다(감지는 됐는데 시점은 예전 그대로).
+    const { fire, s } = setup();
+    vi.advanceTimersByTime(SEED_READY_DELAY - 100);
+    s.signalReady();
+    vi.advanceTimersByTime(100);
+    expect(fire.mock.calls[0][0].path).toBe("fallback");
+    teardown();
+  });
+
+  it("경과 ms를 함께 보고한다 (로그용)", () => {
+    const { fire, s } = setup();
+    vi.advanceTimersByTime(1000);
+    s.signalReady();
+    vi.advanceTimersByTime(SEED_READY_SETTLE);
+    expect(fire.mock.calls[0][0].elapsedMs).toBe(1000 + SEED_READY_SETTLE);
     teardown();
   });
 

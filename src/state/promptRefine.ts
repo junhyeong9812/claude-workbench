@@ -146,6 +146,110 @@ export interface SeedScheduler {
   cancel(): void;
 }
 
+/** 시드를 쏜 것이 어느 쪽인가. */
+export type SeedFirePath =
+  /** PTY 준비 신호 + 여유 (정상). */
+  | "ready"
+  /** 신호를 못 본 채 {@link SEED_READY_DELAY} 도달 (폴백). */
+  | "fallback";
+
+/** 발사 한 번의 사실들 — 로그가 쓸 수 있는 전부다. */
+export interface SeedFireInfo {
+  path: SeedFirePath;
+  /** 예약 시작부터 발사까지 경과(ms). */
+  elapsedMs: number;
+}
+
+/**
+ * 발사 로그 한 줄.
+ *
+ * **인자가 {@link SeedFireInfo}뿐인 것이 이 함수의 요점이다** — 시드 본문을
+ * 넘길 방법 자체가 없어야 로그에 프롬프트가 새지 않는다(spec ②). 경로와 시간만
+ * 남긴다.
+ *
+ * 이 로그가 있는 이유는 버전 드리프트다: claude가 준비 신호 시퀀스를 바꾸면
+ * 감지는 조용히 실패하고 **전부 폴백**이 되는데, 기능은 (더 느릴 뿐) 계속
+ * 동작하므로 아무도 눈치채지 못한다. 경로가 로그에 찍히면 그 전환이 보인다.
+ */
+export function seedFireLog(info: SeedFireInfo, heldMs?: number): string {
+  const via = info.path === "ready" ? "ready-signal" : "fallback";
+  const held = heldMs === undefined ? "" : ` (held ${heldMs}ms — blocked 해소 대기)`;
+  return `[seed] fired via ${via} +${info.elapsedMs}ms${held}`;
+}
+
+/** 발사 직전 blocked라 보류했을 때의 한 줄 (본문 없음 — 위와 같은 이유). */
+export function seedHoldLog(): string {
+  return "[seed] held — 세션이 입력 대기(권한·trust 프롬프트) 상태다. 해소되면 자동 주입한다";
+}
+
+/** 발사 직전 게이트 — {@link makeSeedGate}의 조작 표면. */
+export interface SeedGate {
+  /** 예약기가 쐈다. 통과하면 지금 주입, blocked면 보류. */
+  fire(info: SeedFireInfo): void;
+  /** 언마운트 — 보류 중이면 구독을 끊고 영영 주입하지 않는다. */
+  cancel(): void;
+}
+
+/**
+ * **쓰기 직전** blocked 재확인 — [적용]·[보내기]와 같은 계약의 시드판(감사 G2).
+ *
+ * 필요한 이유는 claude TUI가 bracketed paste 모드를 켜지 않는다는 실측이다:
+ * 권한 승인이나 선택 메뉴(미신뢰 폴더의 trust 대화 포함)가 떠 있으면 우리가
+ * 보내는 바이트가 프롬프트가 아니라 **그 화면의 키 입력**으로 들어간다. 시드는
+ * 끝에 CR까지 붙이므로, 첫 글자가 메뉴 선택이 되고 CR이 그것을 확정한다 —
+ * 사용자가 승인한 적 없는 확정이다. 시드는 준비 신호 직후에 쏘는데 대화가 뜨는
+ * 시점도 바로 거기라, 이 창은 이론이 아니라 실경로다.
+ *
+ * **보류는 영구 잠금이 아니다**: 해소를 구독해 자동으로 주입하고, 그마저
+ * 어긋나도 "시드 재주입" 버튼이 남는다. 오판 방향은 한쪽으로 몰려 있다 —
+ * 잘못 보류하면 시드가 늦게 갈 뿐이지만, 잘못 쏘면 되돌릴 수 없는 확정이 된다.
+ *
+ * `blocked()`는 **구독 콜백 안에서도 불리므로 부수효과가 없어야 한다**(스토어를
+ * 다시 쓰면 재진입한다). 화면을 새로 스캔해 판정을 갱신하는 일은 호출부가
+ * `fire` 직전에 따로 한다.
+ */
+export function makeSeedGate(deps: {
+  /** 지금 막혀 있는가 (순수 조회 — 위 주석). */
+  blocked: () => boolean;
+  /** 통과 시 실제 주입. `heldMs`는 보류를 거쳤을 때만 온다. */
+  inject: (info: SeedFireInfo, heldMs?: number) => void;
+  /** blocked가 바뀔 수 있는 시점 구독 — 해제 함수를 돌려준다. */
+  subscribe: (onChange: () => void) => () => void;
+  /** 보류에 들어갔다 (로깅 훅). */
+  onHold?: () => void;
+  now?: () => number;
+}): SeedGate {
+  const now = deps.now ?? (() => Date.now());
+  let done = false;
+  let unsub: (() => void) | null = null;
+  const drop = () => {
+    unsub?.();
+    unsub = null;
+  };
+  return {
+    fire(info: SeedFireInfo) {
+      if (done || unsub !== null) return; // 1회성 (보류 중 재발사도 무시)
+      if (!deps.blocked()) {
+        done = true;
+        deps.inject(info);
+        return;
+      }
+      deps.onHold?.();
+      const heldAt = now();
+      unsub = deps.subscribe(() => {
+        if (done || deps.blocked()) return; // 아직 — 계속 보류
+        done = true;
+        drop();
+        deps.inject(info, now() - heldAt);
+      });
+    },
+    cancel() {
+      done = true;
+      drop();
+    },
+  };
+}
+
 /**
  * "준비 신호 + 여유" vs "폴백 지연" — **먼저 오는 쪽이 한 번만** 쏜다.
  *
@@ -158,26 +262,30 @@ export interface SeedScheduler {
  * 죽은 세션에 쓰는 일이 없어야 한다.
  */
 export function makeSeedScheduler(
-  fire: () => void,
+  fire: (info: SeedFireInfo) => void,
   opts: { fallbackMs?: number; settleMs?: number } = {},
 ): SeedScheduler {
   const fallbackMs = opts.fallbackMs ?? SEED_READY_DELAY;
   const settleMs = opts.settleMs ?? SEED_READY_SETTLE;
+  const startedAt = Date.now();
   let done = false;
   let settle: ReturnType<typeof setTimeout> | null = null;
-  const fallback = setTimeout(() => shoot(), fallbackMs);
-  function shoot() {
+  const fallback = setTimeout(() => shoot("fallback"), fallbackMs);
+  function shoot(path: SeedFirePath) {
     if (done) return;
     done = true;
     clearTimeout(fallback);
     if (settle !== null) clearTimeout(settle);
-    fire();
+    // 경로는 **이긴 타이머**가 정한다 — 신호를 봤는지가 아니다. 신호가 폴백
+    // 직전에 와서 여유를 못 채우면 실제로 쏜 것은 폴백이고, 로그도 그래야
+    // 드리프트 판독이 맞는다.
+    fire({ path, elapsedMs: Date.now() - startedAt });
   }
   return {
     signalReady() {
       // 이미 쐈거나 이미 신호를 받았으면 무시 — 신호는 한 번만 의미가 있다.
       if (done || settle !== null) return;
-      settle = setTimeout(() => shoot(), settleMs);
+      settle = setTimeout(() => shoot("ready"), settleMs);
     },
     cancel() {
       done = true;
