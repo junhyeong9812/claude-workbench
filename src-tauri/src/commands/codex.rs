@@ -12,6 +12,8 @@
 //! relay한다. 그 이상은 없다(타임라인 폴 스레드 없음·스냅샷 없음·ClaudeRuntime
 //! 등록 없음·hook `--settings` 없음). rollout 전사를 읽는 타임라인은 작업③.
 
+use std::path::Path;
+
 use core_lib::SessionManager;
 use tauri::{AppHandle, State};
 
@@ -51,6 +53,49 @@ fn build_codex_args(bin: &str, model: Option<&str>, effort: Option<&str>) -> Vec
     cmd
 }
 
+/// 자식 PTY에 줄 PATH — **해석된 codex의 bin 디렉토리를 맨 앞에** 둔다.
+///
+/// `find_codex`가 돌려주는 nvm 경로는 `codex.js`로 가는 심링크이고 그 shebang은
+/// `#!/usr/bin/env node`다. 즉 우리가 절대경로로 exec해도 실제 실행은 `node`를
+/// **자식의 PATH에서 다시 찾아** 이뤄진다. node가 nvm에만 있는 머신(= nvm 폴백이
+/// 필요한 바로 그 머신)에서 데스크톱 런처의 최소 PATH로는 그 조회가 실패하고
+/// 세션이 즉사한다 — 실측:
+///
+/// ```text
+/// $ env -i HOME=$HOME PATH=<빈dir> ~/.nvm/.../bin/codex --version
+///   /usr/bin/env: 'node': No such file or directory      EXIT=127
+/// $ env -i HOME=$HOME PATH=~/.nvm/.../v20.19.6/bin:<빈dir> … --version
+///   codex-cli 0.144.1                                    EXIT=0
+/// ```
+///
+/// 바이너리를 찾은 그 디렉토리에 `node`도 같이 있으므로(nvm 레이아웃) 한 칸
+/// 앞세우면 해소된다. 부수 이득: 우연히 존재하는 시스템 node가 아니라 **codex가
+/// 설치된 그 node**가 쓰인다.
+///
+/// PATH를 **덮지 않고 앞에 붙이는** 이유: 나머지 PATH는 codex가 띄우는 자식들
+/// (MCP 서버·훅·git)이 쓰는 것이라 잃으면 안 된다. PATH 위에 정식 설치된 codex를
+/// 찾은 경우엔 이미 PATH에 있던 디렉토리라 사실상 무변화다.
+fn child_path(bin: &Path, current: Option<&str>) -> Option<String> {
+    // 심링크를 따라가면 안 된다 — canonicalize는 `lib/node_modules/@openai/codex/
+    // bin`(node가 없는 곳)을 가리킨다. 필요한 건 심링크가 놓인 `.../v20/bin`이다.
+    let dir = bin.parent()?.to_string_lossy().to_string();
+    match current {
+        Some(p) if !p.is_empty() => {
+            // 이미 맨 앞이면 그대로 — 재스폰마다 같은 칸이 쌓이지 않게.
+            if std::env::split_paths(p)
+                .next()
+                .map(|f| f == Path::new(&dir))
+                .unwrap_or(false)
+            {
+                Some(p.to_string())
+            } else {
+                Some(format!("{dir}:{p}"))
+            }
+        }
+        _ => Some(dir),
+    }
+}
+
 /// codex TUI를 `cwd`에 뿌리내린 PTY로 띄우고 출력 relay를 시작한다. 반환은
 /// 세션 id — 프론트는 그 뒤로 일반 터미널과 **똑같이** 다룬다(`terminal_write`
 /// ·`terminal_resize`·`terminal_snapshot`·`terminal_close`). 그래서 닫기·창
@@ -73,8 +118,12 @@ pub fn codex_create(
 ) -> Result<u64, AppError> {
     let bin = core_lib::codex_cli::find_codex().ok_or_else(|| AppError::new(NOT_FOUND))?;
     let cmd = build_codex_args(&bin.to_string_lossy(), model.as_deref(), effort.as_deref());
+    // shim(`#!/usr/bin/env node`)이 node를 찾을 수 있게 — [`child_path`] 참조.
+    let envs: Vec<(String, String)> = child_path(&bin, std::env::var("PATH").ok().as_deref())
+        .map(|p| vec![("PATH".to_string(), p)])
+        .unwrap_or_default();
     let id = mgr
-        .create(Some(cmd), cwd, cols, rows)
+        .create_with_env(Some(cmd), cwd, cols, rows, envs)
         .map_err(AppError::new)?;
     // 구독 실패 시 고아 PTY를 남기지 않는다 (spawn_claude와 같은 방어선).
     let rx = match mgr.subscribe(id) {
@@ -90,9 +139,11 @@ pub fn codex_create(
 
 #[cfg(test)]
 mod tests {
-    use super::build_codex_args;
+    use super::{build_codex_args, child_path};
+    use std::path::Path;
 
     const BIN: &str = "/home/u/.nvm/versions/node/v20.19.6/bin/codex";
+    const BIN_DIR: &str = "/home/u/.nvm/versions/node/v20.19.6/bin";
 
     /// 미선택 경로 = 인자 없는 `codex` — `~/.codex/config.toml`의 model/
     /// model_reasoning_effort가 그대로 적용된다(실측 대조군: 배너 `gpt-5.6-sol high`).
@@ -149,5 +200,37 @@ mod tests {
     #[test]
     fn the_resolved_binary_path_is_argv0() {
         assert_eq!(build_codex_args(BIN, None, None)[0], BIN);
+    }
+
+    /// shim의 `#!/usr/bin/env node`가 node를 찾을 수 있어야 한다 — 바이너리를
+    /// 찾은 디렉토리(nvm 레이아웃에서 node가 같이 사는 곳)가 맨 앞에 온다.
+    #[test]
+    fn child_path_puts_the_binary_dir_first() {
+        let p = child_path(Path::new(BIN), Some("/usr/bin:/bin")).unwrap();
+        assert_eq!(p, format!("{BIN_DIR}:/usr/bin:/bin"));
+    }
+
+    /// 기존 PATH를 덮지 않는다 — codex가 띄우는 자식들(MCP·훅·git)이 그걸 쓴다.
+    #[test]
+    fn child_path_prepends_rather_than_replaces() {
+        let p = child_path(Path::new(BIN), Some("/usr/bin:/bin")).unwrap();
+        assert!(p.ends_with(":/usr/bin:/bin"), "기존 PATH가 뒤에 그대로 남아야 한다");
+    }
+
+    /// 이미 맨 앞이면 중복해서 쌓지 않는다(탭을 열고 닫기를 반복해도 PATH가
+    /// 자라지 않는다).
+    #[test]
+    fn child_path_is_idempotent() {
+        let once = child_path(Path::new(BIN), Some("/usr/bin")).unwrap();
+        let twice = child_path(Path::new(BIN), Some(&once)).unwrap();
+        assert_eq!(once, twice);
+    }
+
+    /// PATH가 없거나 비었으면 그 한 칸만 — 빈 문자열을 이어 붙여 `dir:`(빈 항목
+    /// = cwd 취급)를 만들지 않는다.
+    #[test]
+    fn child_path_without_an_existing_path() {
+        assert_eq!(child_path(Path::new(BIN), None).unwrap(), BIN_DIR);
+        assert_eq!(child_path(Path::new(BIN), Some("")).unwrap(), BIN_DIR);
     }
 }
