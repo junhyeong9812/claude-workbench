@@ -12,6 +12,8 @@ import {
   onAttentionEvent,
   PROMPT_SCAN_MAX_LINES,
   rollup,
+  isWriteBlocked,
+  statusOf,
   scanBottomForPrompt,
   shouldShowRollup,
   useClaudeStatus,
@@ -309,6 +311,74 @@ const SELECT_MENU = [
   "How should I structure P2?",
 ];
 
+/**
+ * 미신뢰 폴더의 trust 대화 — **실측 고정**(2026-08-07, claude 2.1.223).
+ *
+ * 새 /tmp 디렉토리에서 실 PTY로 띄운 화면을 xterm 버퍼에 넣고
+ * `translateToString(true)`로 뽑은 줄을 **그대로** 옮긴 것이다(bottom-first).
+ * 손으로 지어낸 모양이 아니라 실제로 렌더된 글자라, 시드 발사 게이트가 trust
+ * 대화까지 덮는다는 근거가 이 픽스처다 — 규칙을 손대다 이게 깨지면 미신뢰
+ * 폴더에서 시드가 trust 메뉴의 키 입력으로 들어간다.
+ *
+ * 같은 실측에서 함께 확인된 것: **미신뢰 폴더에서는 PTY 준비 신호(대체 화면
+ * 진입)가 아예 나오지 않는다** — trust 대화는 인라인으로 그려진다. 그래서 그
+ * 세션의 시드는 폴백 3000ms 경로를 타고, 화면은 1.0s에 이미 다 그려져 있어
+ * 발사 시각의 스캔이 이 대화를 확실히 본다(여유 ~2s).
+ */
+const TRUST_DIALOG = [
+  " Enter to confirm · Esc to cancel",
+  "   2. No, exit",
+  " ❯ 1. Yes, I trust this folder",
+  " Security guide",
+  " Claude Code'll be able to read, edit, and execute files here.",
+  " take a moment to review what's in this folder first.",
+  " own code, a well-known open source project, or work from your team). If not,",
+  " Quick safety check: Is this a project you created or one you trust? (Like your",
+  " /tmp/wb-trust-probe-23051",
+  " Accessing workspace:",
+];
+
+// --- 쓰기 게이트 판정: 원시 신호 합집합 (codex N2) --------------------------
+
+describe("isWriteBlocked", () => {
+  const entry = (over: Partial<SessionEntry> = {}): SessionEntry => ({
+    status: "idle",
+    unseen: false,
+    activity: "quiet",
+    questionBlocked: false,
+    screenBlocked: false,
+    seen: true,
+    seenDuringHold: false,
+    hookBacked: false,
+    hookBlocked: false,
+    ...over,
+  });
+
+  it("신호가 하나도 없으면 통과", () => {
+    expect(isWriteBlocked(entry())).toBe(false);
+  });
+
+  it("엔트리가 없으면 통과 — 신호가 없는 것이지 막힌 것이 아니다", () => {
+    expect(isWriteBlocked(undefined)).toBe(false);
+    expect(isWriteBlocked(null)).toBe(false);
+  });
+
+  it("세 신호 각각 단독으로 막는다", () => {
+    expect(isWriteBlocked(entry({ questionBlocked: true }))).toBe(true);
+    expect(isWriteBlocked(entry({ hookBlocked: true }))).toBe(true);
+    expect(isWriteBlocked(entry({ screenBlocked: true }))).toBe(true);
+  });
+
+  it("**hookBacked여도 화면 신호를 무시하지 않는다** — 표시 판정과 갈리는 지점", () => {
+    // 표시(statusOf)는 hook을 정본으로 삼아 이 조합을 "안 막힘"으로 읽는다.
+    // 쓰기 게이트가 그걸 그대로 쓰면, hook 해제가 화면 재도색보다 먼저 도착한
+    // 순간 대화가 아직 떠 있는데 게이트가 열린다(codex N2).
+    const e = entry({ hookBacked: true, hookBlocked: false, screenBlocked: true });
+    expect(isWriteBlocked(e)).toBe(true);
+    expect(statusOf(e)).toBe("idle"); // 표시는 반대로 읽는다 — 의도된 차이
+  });
+});
+
 describe("scanBottomForPrompt — rule positives", () => {
   it("E-pos1: permission dialog (Do you want to… + numbered Yes) → blocked", () => {
     expect(scanBottomForPrompt(PERMISSION_PROMPT)).toBe(true);
@@ -316,6 +386,12 @@ describe("scanBottomForPrompt — rule positives", () => {
 
   it("E-pos2: numbered select menu (❯ cursor + ≥2 options) → blocked", () => {
     expect(scanBottomForPrompt(SELECT_MENU)).toBe(true);
+  });
+
+  it("E-pos3: 미신뢰 폴더 trust 대화(실측 화면 그대로) → blocked", () => {
+    // 규칙 2(❯ 커서 + 숫자 옵션 ≥2)가 이미 덮는다 — 패턴 보강 없이 커버된다는
+    // 실확인 결과를 코드에 고정한다.
+    expect(scanBottomForPrompt(TRUST_DIALOG)).toBe(true);
   });
 
   it("E1: a prompt within the bottom ≤20 non-empty lines is detected", () => {
