@@ -12,6 +12,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { SESSION_DRAG_MIME, encodeSessionDrag } from "./sessionDropZone";
 import {
+  EMPTY_EXTERNAL,
   PICKER_GROUPS,
   adoptable,
   archBusyUpdate,
@@ -23,6 +24,7 @@ import {
   pickerRows,
   type ArchState,
   type ArchiveStatusRow,
+  type ExternalListing,
   type ExternalSessionRow,
   type RawSessionRow,
   type SessionPanelParams,
@@ -44,6 +46,11 @@ export interface SessionPickerController {
   rows: () => SessionSummary[];
   /** 터미널에서 연 세션(앱 스냅샷 없음) — 열린 것 제외 + 최신순. */
   externals: () => ExternalSessionRow[];
+  /** 사용자가 삭제해 숨긴 외부 세션 — 토글로 펼쳐 다시 열 수 있다. */
+  hiddenExternals: () => ExternalSessionRow[];
+  /** 숨긴 세션을 펼쳐 보고 있는가 (피커를 열 때마다 접힌 상태로 시작). */
+  showHidden: boolean;
+  toggleHidden: () => void;
   collapsed: Set<ArchState>;
   toggleGroup: (key: ArchState) => void;
   newName: string;
@@ -86,9 +93,12 @@ export function useSessionPicker(deps: {
   const [pickerCollapsed, setPickerCollapsed] = useState<Set<ArchState>>(new Set());
   // Which kind the open picker creates/reopens: ACP `claude` or A `claudeterm`.
   const [newName, setNewName] = useState("Claude 1");
-  // 터미널에서 연 세션(외부). 피커를 열 때마다 새로 조회한다 — live 판정은
-  // 지금 이 순간의 프로세스 상태라서 캐시하면 틀린 값을 보여준다.
-  const [external, setExternal] = useState<ExternalSessionRow[]>([]);
+  // 터미널에서 연 세션(외부) + 삭제로 숨긴 것들. 피커를 열 때마다 새로 조회한다
+  // — live 판정은 지금 이 순간의 프로세스 상태라서 캐시하면 틀린 값을 보여준다.
+  const [external, setExternal] = useState<ExternalListing>(EMPTY_EXTERNAL);
+  // 숨김 섹션은 접힌 채로 시작한다(peek). 삭제한 세션이 목록을 다시 채우지
+  // 않는 것이 이 기능의 요점이므로, 상태를 세션 간에 남기지 않는다.
+  const [showHidden, setShowHidden] = useState(false);
   // 피커 조회 세대. archReqRef와 **분리**한다: 아카이브 이벤트 리스너가
   // archReqRef를 올리므로 공유하면 이벤트 하나가 사용자의 피커 열기를 통째로
   // 취소해 버린다.
@@ -113,7 +123,7 @@ export function useSessionPicker(deps: {
     // 이 조회가 어느 프로젝트 것인지 고정 — 응답을 여기에 묶는다.
     const project = activeProject;
     let sessions: SessionSummary[] = [];
-    let extRows: ExternalSessionRow[] = [];
+    let extRows: ExternalListing = EMPTY_EXTERNAL;
     if (project) {
       const myArch = ++archReqRef.current;
       const [raw, statuses, inFlight, ext] = await Promise.all([
@@ -121,7 +131,9 @@ export function useSessionPicker(deps: {
         invoke<ArchiveStatusRow[]>("archive_status", { project }).catch(() => []),
         invoke<boolean>("archive_in_flight", { project }).catch(() => false),
         // 실패는 섹션 미표시 — 외부 세션은 부가 기능이라 피커 자체를 막지 않는다.
-        invoke<ExternalSessionRow[]>("claude_external_sessions", { project }).catch(() => []),
+        invoke<ExternalListing>("claude_external_sessions", { project }).catch(
+          () => EMPTY_EXTERNAL,
+        ),
       ]);
       switch (pickerLoadOutcome(loadReqRef.current, myReq, project, activeProjectRef.current)) {
         case "stale":
@@ -141,6 +153,7 @@ export function useSessionPicker(deps: {
       if (busy !== null) setArchBusy(busy);
     }
     setExternal(extRows);
+    setShowHidden(false);
     setNewName(`Claude ${sessions.length + openKindCount("claudeterm") + 1}`);
     setPicker(sessions); // open-session filtering happens at render
   };
@@ -190,13 +203,17 @@ export function useSessionPicker(deps: {
     return pickerRows(picker, open);
   };
 
-  const externals = (): ExternalSessionRow[] => {
-    if (picker == null) return [];
-    const open = openSessionIds(
+  /** 지금 패널에 열려 있는 세션 id — 외부 목록에서 제외한다. */
+  const openIds = () =>
+    openSessionIds(
       (getApi()?.panels ?? []).map((p) => p.params as SessionPanelParams | undefined),
     );
-    return externalRows(external, open);
-  };
+
+  const externals = (): ExternalSessionRow[] =>
+    picker == null ? [] : externalRows(external.sessions, openIds());
+
+  const hiddenExternals = (): ExternalSessionRow[] =>
+    picker == null ? [] : externalRows(external.hidden, openIds());
 
   const toggleGroup = (key: ArchState) =>
     setPickerCollapsed((prev) => {
@@ -213,6 +230,9 @@ export function useSessionPicker(deps: {
     archBusy,
     rows,
     externals,
+    hiddenExternals,
+    showHidden,
+    toggleHidden: () => setShowHidden((v) => !v),
     collapsed: pickerCollapsed,
     toggleGroup,
     newName,
@@ -363,68 +383,90 @@ export function SessionPicker({
         // 터미널에서 연 세션 — 전사는 있는데 앱 스냅샷이 없는 것들. 붙이면(adopt)
         // 스냅샷이 생겨 다음 조회부터 "저장된 세션"으로 넘어간다.
         const ext = ctl.externals();
-        if (ext.length === 0) return null;
+        // 삭제로 숨긴 것들 — 기본은 안 보이고, 토글로 펼쳐서 다시 열 수 있다.
+        const hidden = ctl.hiddenExternals();
+        if (ext.length === 0 && hidden.length === 0) return null;
+        const renderExtRow = (s: ExternalSessionRow, isHidden: boolean) => {
+          const badge = liveBadge(s);
+          const can = adoptable(s);
+          return (
+            <div
+              key={`ext:${s.uuid}`}
+              className={`claude-picker-row${isHidden ? " claude-picker-row-hidden" : ""}`}
+              // 이유 설명은 행에 건다 — 비활성 버튼은 마우스 이벤트를 받지
+              // 않아 tooltip이 안 뜨는 브라우저가 있고, 그러면 "왜 못 누르지"
+              // 를 알 길이 없어진다.
+              title={
+                badge
+                  ? badge.hint
+                  : `${s.cwd}\n클릭하면 이 세션을 이어서 엽니다${
+                      isHidden ? " (숨김이 풀립니다)" : ""
+                    }`
+              }
+            >
+              <button
+                className="claude-picker-item"
+                disabled={!can}
+                onClick={() => {
+                  if (!can) return;
+                  // 스폰 디렉토리는 전사의 원 cwd다(CLI가 거기서만 resume한다).
+                  // 앱이 보는 프로젝트 경로와 문자열이 다르면 — 같은 디렉토리를
+                  // 심링크 등으로 다르게 부르는 경우 — 한 번 확인받는다.
+                  if (
+                    activeProject &&
+                    s.cwd !== activeProject &&
+                    !window.confirm(
+                      `이 세션은 다음 디렉토리에서 시작됐습니다:\n${s.cwd}\n\n` +
+                        `현재 프로젝트(${activeProject})와 경로 표기가 다릅니다. ` +
+                        `원래 디렉토리에서 이어 열까요?`,
+                    )
+                  ) {
+                    return;
+                  }
+                  setPicker(null);
+                  addPanel("claudeterm", {
+                    loadSessionId: s.uuid,
+                    project: activeProject ?? s.cwd,
+                    spawnCwd: s.cwd,
+                    // 인수는 이 클릭 한 번뿐 — 패널이 세션을 열면서 지운다.
+                    adoptPending: true,
+                    title: s.title.slice(0, 24) || "외부 세션",
+                  });
+                }}
+              >
+                <span className="claude-picker-title">{s.title || "(제목 없음)"}</span>
+                <span className="claude-picker-meta">
+                  {fmtAgo(s.modified)}
+                  {badge ? <span className="claude-picker-badge"> · {badge.label}</span> : null}
+                  {isHidden ? <span className="claude-picker-badge"> · 숨김</span> : null}
+                </span>
+              </button>
+            </div>
+          );
+        };
         return (
           <>
-            <div
-              className="claude-picker-sep"
-              title="이 프로젝트에서 터미널로 직접 연 claude 세션입니다. 클릭하면 앱 탭으로 이어서 엽니다(--resume)."
-            >
-              외부 세션 ({ext.length})
-            </div>
-            {ext.map((s) => {
-              const badge = liveBadge(s);
-              const can = adoptable(s);
-              return (
-                <div
-                  key={`ext:${s.uuid}`}
-                  className="claude-picker-row"
-                  // 이유 설명은 행에 건다 — 비활성 버튼은 마우스 이벤트를 받지
-                  // 않아 tooltip이 안 뜨는 브라우저가 있고, 그러면 "왜 못 누르지"
-                  // 를 알 길이 없어진다.
-                  title={badge ? badge.hint : `${s.cwd}\n클릭하면 이 세션을 이어서 엽니다`}
-                >
-                  <button
-                    className="claude-picker-item"
-                    disabled={!can}
-                    onClick={() => {
-                      if (!can) return;
-                      // 스폰 디렉토리는 전사의 원 cwd다(CLI가 거기서만 resume한다).
-                      // 앱이 보는 프로젝트 경로와 문자열이 다르면 — 같은 디렉토리를
-                      // 심링크 등으로 다르게 부르는 경우 — 한 번 확인받는다.
-                      if (
-                        activeProject &&
-                        s.cwd !== activeProject &&
-                        !window.confirm(
-                          `이 세션은 다음 디렉토리에서 시작됐습니다:\n${s.cwd}\n\n` +
-                            `현재 프로젝트(${activeProject})와 경로 표기가 다릅니다. ` +
-                            `원래 디렉토리에서 이어 열까요?`,
-                        )
-                      ) {
-                        return;
-                      }
-                      setPicker(null);
-                      addPanel("claudeterm", {
-                        loadSessionId: s.uuid,
-                        project: activeProject ?? s.cwd,
-                        spawnCwd: s.cwd,
-                        // 인수는 이 클릭 한 번뿐 — 패널이 세션을 열면서 지운다.
-                        adoptPending: true,
-                        title: s.title.slice(0, 24) || "외부 세션",
-                      });
-                    }}
-                  >
-                    <span className="claude-picker-title">{s.title || "(제목 없음)"}</span>
-                    <span className="claude-picker-meta">
-                      {fmtAgo(s.modified)}
-                      {badge ? (
-                        <span className="claude-picker-badge"> · {badge.label}</span>
-                      ) : null}
-                    </span>
-                  </button>
-                </div>
-              );
-            })}
+            {ext.length > 0 && (
+              <div
+                className="claude-picker-sep"
+                title="이 프로젝트에서 터미널로 직접 연 claude 세션입니다. 클릭하면 앱 탭으로 이어서 엽니다(--resume)."
+              >
+                외부 세션 ({ext.length})
+              </div>
+            )}
+            {ext.map((s) => renderExtRow(s, false))}
+            {hidden.length > 0 && (
+              <button
+                className="claude-picker-group"
+                aria-expanded={ctl.showHidden}
+                title="삭제한 세션입니다 — 전사는 그대로 남아 있어서 여기서 다시 열 수 있습니다. 다시 열면 숨김이 풀립니다."
+                onClick={ctl.toggleHidden}
+              >
+                <span className="claude-picker-group-caret">{ctl.showHidden ? "▾" : "▸"}</span>
+                숨긴 세션 {hidden.length}개 {ctl.showHidden ? "접기" : "보기"}
+              </button>
+            )}
+            {ctl.showHidden && hidden.map((s) => renderExtRow(s, true))}
           </>
         );
       })()}

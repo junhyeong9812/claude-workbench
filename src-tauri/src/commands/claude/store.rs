@@ -105,19 +105,24 @@ pub fn claude_sessions(app: AppHandle, project: String) -> Vec<core_lib::snapsho
 /// removes it from this list on the next call. Nothing is persisted about the
 /// adoption itself (`core::external`).
 ///
+/// The one thing that *is* persisted is the user's dismissals: sessions deleted
+/// through [`claude_delete`] come back in the `hidden` bucket instead of the
+/// visible list (`core::hidden`), because deleting the snapshot is precisely
+/// what puts a session back into the difference.
+///
 /// Runs off the UI thread — it stats every transcript in the projects root and
 /// walks `/proc` for the liveness verdict (~0.2 s on a 340-transcript corpus).
 #[tauri::command]
 pub async fn claude_external_sessions(
     app: AppHandle,
     project: String,
-) -> Vec<core_lib::external::ExternalSession> {
+) -> core_lib::external::ExternalListing {
     tauri::async_runtime::spawn_blocking(move || {
         let (Ok(base), Some(projects_root)) =
             (app.path().app_data_dir(), core_lib::jsonl::claude_projects_root())
         else {
             eprintln!("claude_external_sessions: app data dir 또는 Claude projects root를 찾을 수 없어 목록을 비웁니다");
-            return Vec::new();
+            return core_lib::external::ExternalListing::default();
         };
         core_lib::external::list_external(
             &projects_root,
@@ -135,7 +140,7 @@ pub async fn claude_external_sessions(
         // An empty list is indistinguishable from "no external sessions" in the
         // UI, so a panicked/cancelled task must not vanish without a word.
         eprintln!("claude_external_sessions: 조회 태스크 실패 — 빈 목록으로 응답합니다 ({e})");
-        Vec::new()
+        core_lib::external::ExternalListing::default()
     })
 }
 
@@ -174,6 +179,18 @@ pub fn claude_rename(
 
 /// Delete a saved session's snapshot (the `삭제` action). The live session, if
 /// any, should be closed separately via `claude_close`.
+///
+/// The transcript is **not** touched — deleting a session has never meant
+/// deleting the CLI's own record of it, and it must not start meaning that now.
+/// But that leaves the session in the external-sessions difference (transcripts
+/// minus snapshots), so it would reappear in the picker one refresh after the
+/// user deleted it. The uuid is therefore recorded as dismissed
+/// (`core::hidden`); the picker's "숨긴 세션" toggle can still bring it back, and
+/// adopting it clears the dismissal.
+///
+/// Recording the dismissal is best-effort: the delete itself already succeeded,
+/// so failing the command afterwards would report a delete that did happen as an
+/// error. The cost of the failure is a row coming back, and it is logged.
 #[tauri::command]
 pub fn claude_delete(app: AppHandle, project: String, uuid: String) -> Result<(), AppError> {
     let base = app
@@ -181,6 +198,16 @@ pub fn claude_delete(app: AppHandle, project: String, uuid: String) -> Result<()
         .app_data_dir()
         .map_err(|_| AppError::new("Cannot resolve app data directory"))?;
     core_lib::snapshot::delete(&base, &project, &uuid)
-        .map_err(|e| AppError::new(io_message("Cannot delete session", &e)))
+        .map_err(|e| AppError::new(io_message("Cannot delete session", &e)))?;
+    // The transcripts root is passed so that, if this project's dismissal list is
+    // ever at its cap, tombstones (dismissals whose transcript is gone) are what
+    // gets evicted rather than a dismissal that is still doing its job.
+    let root = core_lib::jsonl::claude_projects_root();
+    if let Err(e) = core_lib::hidden::hide(&base, &project, &uuid, root.as_deref()) {
+        eprintln!(
+            "claude_delete: 숨김 목록 기록 실패 — 이 세션이 '외부 세션'으로 다시 보일 수 있습니다 ({e})"
+        );
+    }
+    Ok(())
 }
 

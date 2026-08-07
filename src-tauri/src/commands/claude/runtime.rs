@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex};
 
 use core_lib::SessionManager;
 use serde::Serialize;
-use tauri::{AppHandle, Emitter, State, Window};
+use tauri::{AppHandle, Emitter, Manager, State, Window};
 
 use crate::commands::{io_message, AppError};
 
@@ -220,7 +220,29 @@ pub struct ClaudeDetached {
 /// exists, and `spawn_claude` falls back to `--session-id` when it can't find
 /// the file — so letting a missing transcript through would quietly create a
 /// brand-new session wearing the id of the one the user clicked (audit B2).
-fn recheck_adoptable(uuid: &str, cwd: &str) -> Result<(), AppError> {
+///
+/// Two questions are asked here, and both must be answered **before** the spawn:
+///
+/// 1. *Is this still an adoptable external session of this project?*
+///    `core::external::candidate_mtime` re-derives it from the same candidate set
+///    the picker listed. This is checked **eagerly** — deliberately not folded
+///    into the liveness check. Threading it through the classifier's lazy mtime
+///    closure looked equivalent and was not: with no un-pinned `claude` running,
+///    the closure is never called, so a session that had meanwhile stopped being
+///    a candidate (the projects root became unreadable, a snapshot appeared, the
+///    transcript moved out of this project) sailed through as `Free` (audit M2).
+///    The picker's list path keeps the lazy form for a reason that does not apply
+///    here: there the mtime is already in the row, so asking costs nothing.
+/// 2. *Is anything else on it right now?* — the liveness signals, fed the mtime
+///    from (1).
+///
+/// Anything that cannot be established is a refusal, never a fallback value.
+fn recheck_adoptable(
+    app: &AppHandle,
+    project: &str,
+    uuid: &str,
+    cwd: &str,
+) -> Result<(), AppError> {
     let Some(root) = core_lib::jsonl::claude_projects_root() else {
         return Err(AppError::new("Claude 전사 디렉토리를 찾을 수 없어 세션을 열지 않았습니다."));
     };
@@ -236,6 +258,20 @@ fn recheck_adoptable(uuid: &str, cwd: &str) -> Result<(), AppError> {
             return Err(AppError::new(io_message("이 세션의 전사를 찾지 못했습니다", &e)))
         }
     };
+    // (1) Still a candidate? Eager — see the doc comment on why this must not
+    // ride along with the liveness check.
+    let base = app
+        .path()
+        .app_data_dir()
+        .map_err(|_| AppError::new("앱 데이터 경로를 찾을 수 없어 세션을 열지 않았습니다."))?;
+    let Some(modified) = core_lib::external::candidate_mtime(&root, &base, project, uuid) else {
+        return Err(AppError::new(
+            "이 세션은 지금 이 프로젝트의 '외부 세션'이 아닙니다 — 그 사이 앱이 이미 열었거나, \
+             전사가 옮겨졌거나, 전사 목록을 읽지 못했습니다. 목록을 다시 열어 확인하세요.",
+        ));
+    };
+
+    // (2) Anything on it right now?
     let jsonl = jsonl.canonicalize().unwrap_or(jsonl);
     let dir = std::fs::canonicalize(cwd).unwrap_or_else(|_| std::path::PathBuf::from(cwd));
     let targets = std::iter::once(jsonl.clone()).collect();
@@ -244,15 +280,26 @@ fn recheck_adoptable(uuid: &str, cwd: &str) -> Result<(), AppError> {
         &targets,
         std::process::id(),
     );
-    match probe.classify(uuid, &jsonl, &dir) {
-        core_lib::live::Liveness::Free => Ok(()),
-        core_lib::live::Liveness::Live => Err(AppError::new(
+    let verdict = probe.classify(uuid, &jsonl, &dir, || Some(modified));
+    use core_lib::live::{BlockReason, Liveness};
+    match (verdict.live, verdict.reason) {
+        (Liveness::Free, _) => Ok(()),
+        (Liveness::Live, _) => Err(AppError::new(
             "이 세션은 지금 다른 곳에서 열려 있습니다 — 그 창을 닫은 뒤 다시 시도하세요. \
              (같은 전사에 두 프로세스가 쓰면 세션이 깨집니다)",
         )),
-        core_lib::live::Liveness::Unknown => Err(AppError::new(
-            "이 세션이 열려 있는지 확인할 수 없어 열지 않았습니다 \
-             (같은 디렉토리에서 세션을 특정할 수 없는 claude가 돌고 있습니다).",
+        // The two Unknowns mean different things to the user: one says "this
+        // session, for now", the other says "nothing here, until that process
+        // goes away". Telling them apart is the whole reason the reason exists.
+        (Liveness::Unknown, Some(BlockReason::WrittenSinceStart)) => Err(AppError::new(
+            "이 세션이 열려 있는지 확인할 수 없어 열지 않았습니다 — 이 디렉토리에서 \
+             세션을 특정할 수 없는 claude가 돌고 있고, 이 전사는 그 claude가 시작된 뒤에 \
+             쓰였습니다. (그 전에 마지막으로 쓰인 세션은 그대로 열 수 있습니다)",
+        )),
+        (Liveness::Unknown, _) => Err(AppError::new(
+            "지금은 어떤 외부 세션도 열 수 없습니다 — 어디서 도는지 알 수 없는 프로세스가 \
+             있어(또는 실행 중인 claude의 시작 시각을 확인할 수 없어) 어느 세션이 물려 \
+             있는지 특정할 수 없습니다. 잠시 뒤 다시 시도하세요.",
         )),
     }
 }
@@ -294,6 +341,11 @@ pub fn claude_open_or_attach(
     // Mirror: attach to the running PTY if this uuid is live (T1/T2 — 전이는
     // ClaudeRuntime 순수 메서드, 승격 emit은 락 해제 후. P6-impl #1/#3/#5).
     match rt.attach_live(&project, uuid.as_deref(), &label, |id| mgr.exists(id)) {
+        // NOTE: this early return skips both the adopt recheck and the un-hide
+        // below, and should: attaching as a mirror means the session is already
+        // running **in this app**, so it is not an external transcript being
+        // taken over and cannot be a dismissed external row either. `adopt` on
+        // this branch is a leftover flag from the click, not a takeover.
         AttachLive::Attached { id, driver, rev, handoff } => {
             let role = if driver == label { "driver" } else { "mirror" };
             let opened = ClaudeOpened {
@@ -330,9 +382,10 @@ pub fn claude_open_or_attach(
     // side work above and immediately before the spawn, so nothing runs between
     // the check and the PTY (review #1, audit B2). The runtime lock is held
     // throughout. One /proc pass, measured at ~0.12 s.
-    if adopt.unwrap_or(false) {
+    let adopting = adopt.unwrap_or(false);
+    if adopting {
         if let Some(uuid) = uuid.as_deref() {
-            recheck_adoptable(uuid, &cwd)?;
+            recheck_adoptable(&app, &project, uuid, &cwd)?;
         }
     }
 
@@ -348,6 +401,17 @@ pub fn claude_open_or_attach(
         cols,
         rows,
     )?;
+    // Adopting a session the user had deleted spends the dismissal: they just
+    // reopened it, so it belongs in the normal list again (`core::hidden`).
+    // Only after the spawn actually succeeded — a refused adopt must leave the
+    // hidden list exactly as it was.
+    if adopting {
+        if let Ok(base) = app.path().app_data_dir() {
+            if let Err(e) = core_lib::hidden::unhide(&base, &project, &session_uuid) {
+                eprintln!("claude_open_or_attach: 숨김 해제 실패 — 이 세션은 숨김 목록에 남습니다 ({e})");
+            }
+        }
+    }
     rt.register(id, project, session_uuid.clone(), label.clone(), stop); // T3
     Ok(ClaudeOpened { id, session_uuid, role: "driver".into(), driver: label, rev: 0 })
 }
