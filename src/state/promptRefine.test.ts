@@ -12,9 +12,12 @@ import {
   REFINE_SUBMIT_CONFIRM_MS,
   SEED_READY_DELAY,
   SEED_READY_SETTLE,
+  clearPendingSeed,
   makeSeedGate,
   makeSeedScheduler,
   seedFireLog,
+  stashPendingSeed,
+  takePendingSeed,
   seedHoldLog,
   REFINE_SUBMIT_CR_DELAY,
   openPromptRefine,
@@ -857,6 +860,65 @@ describe("submitBytes — 본문 모양이 바이트를 정한다", () => {
 });
 
 // ---- 준비 신호 vs 폴백: 먼저 오는 쪽이 한 번만 -----------------------------
+
+// ---- 못 쏜 시드의 마운트 간 인계 (codex N3) --------------------------------
+
+describe("pendingSeed 보관함", () => {
+  const U = "sess-1";
+  const SEED = "이 커밋 리뷰하자";
+  // 모듈 상태라 케이스마다 정리한다.
+  const reset = () => {
+    clearPendingSeed(U);
+    clearPendingSeed("sess-2");
+  };
+
+  it("맡긴 시드를 다음 마운트가 가져간다", () => {
+    reset();
+    stashPendingSeed(U, SEED);
+    expect(takePendingSeed(U)).toBe(SEED);
+  });
+
+  it("읽기가 곧 소비 — 두 번째 마운트가 같은 시드를 또 쏘지 않는다", () => {
+    reset();
+    stashPendingSeed(U, SEED);
+    expect(takePendingSeed(U)).toBe(SEED);
+    expect(takePendingSeed(U)).toBeNull();
+  });
+
+  it("이어받은 마운트가 또 보류하면 다시 맡길 수 있다 (탭 왕복 반복)", () => {
+    reset();
+    stashPendingSeed(U, SEED);
+    const first = takePendingSeed(U);
+    stashPendingSeed(U, first!); // 언마운트 — 아직 못 쐈다
+    expect(takePendingSeed(U)).toBe(SEED);
+  });
+
+  it("세션마다 따로 — 남의 시드를 가져오지 않는다", () => {
+    reset();
+    stashPendingSeed(U, SEED);
+    expect(takePendingSeed("sess-2")).toBeNull();
+    expect(takePendingSeed(U)).toBe(SEED);
+  });
+
+  it("맡긴 적 없으면 null (일반적인 마운트는 아무 영향 없다)", () => {
+    reset();
+    expect(takePendingSeed(U)).toBeNull();
+  });
+
+  it("clear = 주입 성공·세션 종료 뒤엔 이어받을 것이 없다", () => {
+    reset();
+    stashPendingSeed(U, SEED);
+    clearPendingSeed(U);
+    expect(takePendingSeed(U)).toBeNull();
+  });
+
+  it("uuid가 없으면 조용히 무시 — 열리지 않은 세션에 맡길 곳은 없다", () => {
+    expect(() => stashPendingSeed(null, SEED)).not.toThrow();
+    expect(takePendingSeed(null)).toBeNull();
+    expect(takePendingSeed(undefined)).toBeNull();
+    expect(() => clearPendingSeed(undefined)).not.toThrow();
+  });
+});
 
 // ---- 발사 직전 blocked 게이트 (권한·trust 대화) ---------------------------
 

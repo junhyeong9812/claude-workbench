@@ -182,6 +182,49 @@ export function seedHoldLog(): string {
   return "[seed] held — 세션이 입력 대기(권한·trust 프롬프트) 상태다. 해소되면 자동 주입한다";
 }
 
+/**
+ * 아직 주입되지 않은 시드 — **세션 uuid에 묶인 메모리 보관함**.
+ *
+ * 시드 예약은 패널 마운트 안에 산다. 그런데 탭을 옮기면 패널이 언마운트되고
+ * (`onlyWhenVisible`), 예약은 취소된다 — 원래도 최대 3초의 소실 창이 있었지만
+ * blocked 보류가 그 창을 **무기한**으로 늘린다(codex N3): 권한 대화를 띄워 둔 채
+ * 다른 탭을 보다 돌아오면 시드는 흔적 없이 사라진다.
+ *
+ * **params(`updateParameters`)가 아니라 이 맵을 고른 이유**: params는 dockview
+ * 레이아웃과 함께 디스크에 저장된다. 보류 중인 시드를 params에 되살리면 그
+ * 시드가 레이아웃에 눌러앉아 **앱을 껐다 켠 뒤에도** 주입된다 — 리뷰/개발 시드는
+ * 그때 한 번 쓰라고 만든 1회성 프롬프트라, 며칠 뒤 세션을 복원하며 뒤늦게
+ * 실행되는 것은 기능이 아니라 사고다. 게다가 `paramsAfterOpen`이 seed를 소비하는
+ * 규칙과 되살리기가 서로를 밟는다(소비→복원→재소비의 순서를 맞춰야 한다).
+ * 메모리 맵은 그 두 문제가 아예 없다: 프로세스가 살아 있는 동안만 = 탭 왕복은
+ * 살아남고 앱 재시작은 살아남지 못한다 — 1회성 시드의 수명과 정확히 같다.
+ *
+ * 읽기는 **소비**다(take). 이어받은 마운트가 소유권을 가져가고, 그 마운트가 또
+ * 보류에 들어가면 다시 넣는다.
+ */
+const pendingSeeds = new Map<string, string>();
+
+/** 아직 못 쏜 시드를 맡긴다 (언마운트가 와도 다음 마운트가 잇도록). */
+export function stashPendingSeed(uuid: string | null | undefined, seed: string): void {
+  if (!uuid) return;
+  pendingSeeds.set(uuid, seed);
+}
+
+/** 맡긴 시드를 **가져간다**(꺼내면서 지운다). 없으면 null. */
+export function takePendingSeed(uuid: string | null | undefined): string | null {
+  if (!uuid) return null;
+  const seed = pendingSeeds.get(uuid);
+  if (seed === undefined) return null;
+  pendingSeeds.delete(uuid);
+  return seed;
+}
+
+/** 주입에 성공했거나 세션이 죽었다 — 더는 이어받을 것이 없다. */
+export function clearPendingSeed(uuid: string | null | undefined): void {
+  if (!uuid) return;
+  pendingSeeds.delete(uuid);
+}
+
 /** 발사 직전 게이트 — {@link makeSeedGate}의 조작 표면. */
 export interface SeedGate {
   /** 예약기가 쐈다. 통과하면 지금 주입, blocked면 보류. */
