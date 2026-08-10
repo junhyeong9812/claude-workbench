@@ -97,6 +97,17 @@ describe("활성 표면 + 요청버스 seam 라우팅 (P4')", () => {
     expect(g.projects.some((p) => p.path === "/b")).toBe(true); // 카탈로그 추가
   });
 
+  it("크로스윈도우 전환이 좌측을 우측과 같게 만들면 활성이 primary로 정규화", () => {
+    useAppStore.setState({ projects: [{ path: "/a", name: "a", project_types: [], tree_state: { expanded: [] } }, { path: "/b", name: "b", project_types: [], tree_state: { expanded: [] } }], activeProject: "/a" });
+    const s = useAppStore.getState();
+    s.setDualProject("/b");
+    s.setActiveSurface("secondary");
+    expect(useAppStore.getState().activeSurfaceId).toBe("secondary");
+    // 다른 창이 이 창의 좌측을 "/b"(=우측 표면)로 전환 → 우측 숨김 → primary 복귀.
+    useAppStore.getState().applyRemoteActive("/b");
+    expect(useAppStore.getState().activeSurfaceId).toBe("primary");
+  });
+
   it("addProject(기본)은 좌측 활성으로 연다(종전 동작)", async () => {
     useAppStore.setState({ projects: [{ path: "/a", name: "a", project_types: [], tree_state: { expanded: [] } }], activeProject: "/a" });
     useAppStore.getState().setDualProject(null);

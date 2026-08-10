@@ -975,7 +975,17 @@ export const useAppStore = create<AppState>((set, get) => ({
     setActiveSurfaceSeam(next); // imperative 발행 경로(요청버스 stamp)가 읽는 홀더
     if (get().activeSurfaceId !== next) set({ activeSurfaceId: next });
   },
-  applyRemoteActive: (path) => set({ activeProject: path }),
+  applyRemoteActive: (path) => {
+    set({ activeProject: path });
+    // 크로스윈도우 전환이 좌측을 우측 표면과 같은 프로젝트로 만들면 secondary가
+    // 숨겨진다 — 활성이 secondary였다면 primary로 되돌려 유령 라우팅(무음 유실)을
+    // 막는다(setDualProject와 동일 판정, P4').
+    if (get().activeSurfaceId === "secondary") {
+      const dual = secondaryProject(get().surfaceTree);
+      const visible = dual !== null && dual !== path && get().projects.some((p) => p.path === dual);
+      if (!visible) get().setActiveSurface("primary");
+    }
+  },
   initProjectSync: async () => {
     const self = getCurrentWindow().label;
     return await listen<{ activeProject: string | null; sourceWindow: string }>(
