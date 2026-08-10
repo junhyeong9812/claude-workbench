@@ -71,7 +71,10 @@ export function DevView({ project }: { project: string }) {
   useEffect(() => {
     if (!devIsFront(layerMode)) return; // integrated layer's request — leave it
     if (!editorOpenRequest) return;
-    const path = editorOpenRequest;
+    // 요청버스 표면 라우팅(P2): editorOpenRequest는 이제 {path, targetSurfaceId}.
+    // DevView는 primary 표면의 dev 레이어 단일 인스턴스라 표면 게이트 없이(항상
+    // primary 대상) path만 읽는다 — 표면별 dev 레이어는 P5 몫.
+    const path = editorOpenRequest.path;
     // Clear only AFTER the tab actually opens (side effect before clear, T1) so a
     // dropped request can't read as "consumed".
     setTabs((prev) => (prev.includes(path) ? prev : [path, ...prev]));
@@ -228,8 +231,8 @@ export function DevView({ project }: { project: string }) {
   // few frames in case content is still laying out. Skip the initial 0.
   const lastFocusHandledRef = useRef(0);
   useEffect(() => {
-    if (focusMainRequest === 0 || focusMainRequest === lastFocusHandledRef.current) return;
-    lastFocusHandledRef.current = focusMainRequest;
+    if (focusMainRequest.nonce === 0 || focusMainRequest.nonce === lastFocusHandledRef.current) return;
+    lastFocusHandledRef.current = focusMainRequest.nonce;
     if (!devIsFront(layerMode)) return; // integrated layer in front — MainArea focuses
     const wantEditor = active != null;
     let tries = 0;

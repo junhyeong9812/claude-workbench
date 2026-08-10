@@ -9,7 +9,7 @@ import { resolveCloseRequest } from "./sessionClose";
 import { CloseSessionModal } from "./CloseSessionModal";
 import { emit, listen } from "@tauri-apps/api/event";
 import { useAppStore } from "../state/store";
-import { useSurfaceProject } from "../state/surfaceContext";
+import { useSurfaceProject, useSurfaceId } from "../state/surfaceContext";
 import { useClaudeUi } from "../state/claudeUi";
 import { recallArea, forgetArea, type PanelArea } from "../state/panelFocus";
 import { isTransferring } from "../state/panelTransfer";
@@ -94,6 +94,12 @@ export function MainArea({
   // 방어 등)에 그대로 남는다(그건 전역 관심사 — P2/P3 몫).
   const isPrimary = !secondary;
   const surfaceProject = useSurfaceProject();
+  // 이 표면의 id — 요청버스 소비 게이트가 이 값과 요청의 `targetSurfaceId`가
+  // 일치할 때만 소비한다(P2). 지금은 발행이 항상 "primary"를 실어 주고 소비
+  // 표면도 primary 하나뿐이라, 종전 `isPrimary` 게이트와 결과가 동일(무동작).
+  // (구조적 isPrimary 게이트 — window 리스너·창 수명·closeRequest 백스톱·
+  // focusSession 조정자 — 는 요청버스 라우팅이 아니므로 그대로 둔다.)
+  const mySurfaceId = useSurfaceId();
   const surfaceKey = isPrimary ? "primary" : "secondary";
   const theme = useAppStore((s) => s.theme);
   const projects = useAppStore((s) => s.projects);
@@ -381,12 +387,12 @@ export function MainArea({
   // 않고 그대로 두어 DevView가 소비하게 한다: 유실≠소비. layerMode를 deps에 넣어
   // 같은 틱 모드 전환에도 재평가된다.)
   useEffect(() => {
-    if (!isPrimary) return; // 부 surface는 요청 버스 비소비 (spec §2)
     if (!integratedIsFront(layerMode)) return; // dev layer's request — leave it
     if (!editorOpenRequest) return;
+    if (editorOpenRequest.targetSurfaceId !== mySurfaceId) return; // 표면 라우팅(P2): 내 표면 것만
     const api = apiRef.current;
     if (!api) return; // dock not ready (mount/project switch) — keep the request
-    const path = editorOpenRequest;
+    const path = editorOpenRequest.path;
     // Clear only AFTER the side effect (activate/open) succeeds, so a throw leaves
     // the request in place to retry (side effect before clear, T1 / codex P2 E4).
     try {
@@ -407,12 +413,13 @@ export function MainArea({
   // (통합·개발 두 레이어가 동시 마운트되므로 앞 레이어인 통합 모드일 때만 소비한다 —
   // 개발 모드면 요청을 클리어하지 않고 남겨 두어 통합 복귀 시 소비된다: 유실≠소비.)
   useEffect(() => {
-    if (!isPrimary) return; // 부 surface는 요청 버스 비소비 (spec §2)
     if (!integratedIsFront(layerMode)) return; // dev layer in front — leave the request
     if (!diffRequest) return;
+    // 라우팅 키는 여기서 벗겨내 spec(DiffSpec)만 패널 params로 흘려보낸다(P2).
+    const { targetSurfaceId, ...spec } = diffRequest;
+    if (targetSurfaceId !== mySurfaceId) return; // 표면 라우팅(P2): 내 표면 것만
     const api = apiRef.current;
     if (!api) return;
-    const spec = diffRequest;
     requestDiff(null);
     // Scope the dedupe key by cwd: with multi-root, two repos can share a path or
     // commit hash, and a cwd-less key would reactivate the wrong repo's diff (codex P1).
@@ -440,9 +447,9 @@ export function MainArea({
   // (통합·개발 두 레이어가 동시 마운트되므로 앞 레이어인 통합 모드일 때만 소비한다 —
   // 개발 모드면 요청을 클리어하지 않고 남겨 두어 통합 복귀 시 소비된다: 유실≠소비.)
   useEffect(() => {
-    if (!isPrimary) return; // 부 surface는 요청 버스 비소비 (spec §2)
     if (!integratedIsFront(layerMode)) return; // dev layer in front — leave the request
     if (!claudeOpenRequest) return;
+    if (claudeOpenRequest.targetSurfaceId !== mySurfaceId) return; // 표면 라우팅(P2): 내 표면 것만
     const { project, seed, title: reqTitle, referencePanelId, model, effort } = claudeOpenRequest;
     // Only THIS project's mount may consume the request (MainArea is keyed by
     // activeProject): otherwise a not-yet-switched old mount would add the Claude
@@ -473,9 +480,9 @@ export function MainArea({
   // 이다 — codex에는 seed도 adopt도 loadSessionId도 없다(세션 uuid를 앱이 정할
   // 수 없고, 지속성은 이번 범위 밖).
   useEffect(() => {
-    if (!isPrimary) return;
     if (!integratedIsFront(layerMode)) return;
     if (!codexOpenRequest) return;
+    if (codexOpenRequest.targetSurfaceId !== mySurfaceId) return; // 표면 라우팅(P2): 내 표면 것만
     const { project, model, effort } = codexOpenRequest;
     if (project !== activeProject) return;
     const api = apiRef.current;
@@ -498,9 +505,9 @@ export function MainArea({
   // (통합·개발 두 레이어가 동시 마운트되므로 앞 레이어인 통합 모드일 때만 소비한다 —
   // 개발 모드면 요청을 클리어하지 않고 남겨 두어 통합 복귀 시 소비된다: 유실≠소비.)
   useEffect(() => {
-    if (!isPrimary) return; // 부 surface는 요청 버스 비소비 (spec §2)
     if (!integratedIsFront(layerMode)) return; // dev layer in front — leave the request
     if (!runRequest) return;
+    if (runRequest.targetSurfaceId !== mySurfaceId) return; // 표면 라우팅(P2): 내 표면 것만
     if (runRequest.project !== activeProject) return;
     const api = apiRef.current;
     if (!api) return; // dock not ready — keep the request; apiReady re-runs
@@ -517,9 +524,9 @@ export function MainArea({
   // 앞일 때만 소비한다 — 개발 레이어가 앞이면 DevView가, 스터디 모드면
   // StudySession이 자기 dock에 연다(요청은 남겨 둔다: 유실≠소비).
   useEffect(() => {
-    if (!isPrimary) return; // 부 surface는 요청 버스 비소비 (spec §2)
     if (!integratedIsFront(layerMode)) return;
     if (!terminalOpenRequest) return;
+    if (terminalOpenRequest.targetSurfaceId !== mySurfaceId) return; // 표면 라우팅(P2): 내 표면 것만
     const api = apiRef.current;
     if (!api) return; // dock not ready — keep the request; apiReady re-runs
     // 소비(clear)는 패널이 실제로 열린 뒤 — 실패하면 요청을 남겨 다음 발화에
@@ -636,11 +643,11 @@ export function MainArea({
   // input lands there. Skip the initial 0 so a fresh mount doesn't steal focus.
   const lastFocusHandledRef = useRef(0);
   useEffect(() => {
-    if (!isPrimary) return; // 부 surface는 포커스 요청 비소비
+    if (focusMainRequest.targetSurfaceId !== mySurfaceId) return; // 표면 라우팅(P2): 내 표면 것만
     // Claim each distinct request once; a layerMode-only re-fire (deps) must not
     // replay an already-handled focus. Skip the initial 0 (fresh-mount steal).
-    if (focusMainRequest === 0 || focusMainRequest === lastFocusHandledRef.current) return;
-    lastFocusHandledRef.current = focusMainRequest;
+    if (focusMainRequest.nonce === 0 || focusMainRequest.nonce === lastFocusHandledRef.current) return;
+    lastFocusHandledRef.current = focusMainRequest.nonce;
     // Only the FRONT (integrated) layer takes the focus; when the dev layer is in
     // front, DevView's own consumer handles it instead (symmetric routing).
     if (!integratedIsFront(layerMode)) return;
@@ -664,11 +671,11 @@ export function MainArea({
   // dev in front is a stale press: drop it — never silently flip the project's
   // persisted 통합/개발 mode from here (review A3).
   const termMenuRequest = useAppStore((s) => s.termMenuRequest);
-  const termMenuHandledRef = useRef(termMenuRequest);
+  const termMenuHandledRef = useRef(termMenuRequest.nonce);
   useEffect(() => {
-    if (!isPrimary) return;
-    if (termMenuRequest === termMenuHandledRef.current) return;
-    termMenuHandledRef.current = termMenuRequest;
+    if (termMenuRequest.targetSurfaceId !== mySurfaceId) return; // 표면 라우팅(P2)
+    if (termMenuRequest.nonce === termMenuHandledRef.current) return;
+    termMenuHandledRef.current = termMenuRequest.nonce;
     if (!integratedIsFront(layerMode)) return;
     setPicker(null);
     setTermMenu((v) => !v);
@@ -676,11 +683,11 @@ export function MainArea({
   }, [termMenuRequest]);
 
   const claudePickerRequest = useAppStore((s) => s.claudePickerRequest);
-  const claudePickerHandledRef = useRef(claudePickerRequest);
+  const claudePickerHandledRef = useRef(claudePickerRequest.nonce);
   useEffect(() => {
-    if (!isPrimary) return;
-    if (claudePickerRequest === claudePickerHandledRef.current) return;
-    claudePickerHandledRef.current = claudePickerRequest;
+    if (claudePickerRequest.targetSurfaceId !== mySurfaceId) return; // 표면 라우팅(P2)
+    if (claudePickerRequest.nonce === claudePickerHandledRef.current) return;
+    claudePickerHandledRef.current = claudePickerRequest.nonce;
     if (!integratedIsFront(layerMode)) return;
     setTermMenu(false);
     // Always (re)open — the pre-move button refetched sessions on every press
@@ -694,11 +701,11 @@ export function MainArea({
   // 버튼과 같은 bump 카운터 계약이고, 규칙(결정적 id·중복 방지)은 순수 모듈
   // state/projectMemo가 소유한다. 프로젝트가 없으면 저장 키가 없으므로 no-op.
   const memoRequest = useAppStore((s) => s.memoRequest);
-  const memoHandledRef = useRef(memoRequest);
+  const memoHandledRef = useRef(memoRequest.nonce);
   useEffect(() => {
-    if (!isPrimary) return;
-    if (memoRequest === memoHandledRef.current) return;
-    memoHandledRef.current = memoRequest;
+    if (memoRequest.targetSurfaceId !== mySurfaceId) return; // 표면 라우팅(P2)
+    if (memoRequest.nonce === memoHandledRef.current) return;
+    memoHandledRef.current = memoRequest.nonce;
     if (!integratedIsFront(layerMode)) return;
     const api = apiRef.current;
     if (!api || !activeProject) return;
@@ -709,11 +716,11 @@ export function MainArea({
   }, [memoRequest]);
 
   const detachPanelRequest = useAppStore((s) => s.detachPanelRequest);
-  const detachHandledRef = useRef(detachPanelRequest);
+  const detachHandledRef = useRef(detachPanelRequest.nonce);
   useEffect(() => {
-    if (!isPrimary) return;
-    if (detachPanelRequest === detachHandledRef.current) return;
-    detachHandledRef.current = detachPanelRequest;
+    if (detachPanelRequest.targetSurfaceId !== mySurfaceId) return; // 표면 라우팅(P2)
+    if (detachPanelRequest.nonce === detachHandledRef.current) return;
+    detachHandledRef.current = detachPanelRequest.nonce;
     // Only the front (integrated) dock detaches — the App button is disabled in
     // dev mode, so a request here while dev is front is a stale press: drop it.
     if (!integratedIsFront(layerMode)) return;
@@ -755,9 +762,9 @@ export function MainArea({
   const sessionResumeRequest = useAppStore((s) => s.sessionResumeRequest);
   const requestSessionResume = useAppStore((s) => s.requestSessionResume);
   useEffect(() => {
-    if (!isPrimary) return; // 부 surface는 resume 요청 비소비
     if (!integratedIsFront(layerMode)) return;
     if (!sessionResumeRequest) return;
+    if (sessionResumeRequest.targetSurfaceId !== mySurfaceId) return; // 표면 라우팅(P2): 내 표면 것만
     const api = apiRef.current;
     if (!api) return; // dock not ready — keep the request; apiReady re-runs
     const { uuid, project, title } = sessionResumeRequest;

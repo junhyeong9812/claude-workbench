@@ -97,7 +97,7 @@ describe("store-driven routing (T1/T4/T5)", () => {
     expect(mode).toBe("integrated");
     expect(integratedIsFront(mode)).toBe(true);
     expect(devIsFront(mode)).toBe(false);
-    expect(s.editorOpenRequest).toBe("/repo/proj/a.ts");
+    expect(s.editorOpenRequest?.path).toBe("/repo/proj/a.ts");
   });
 
   it("T4: in dev mode the integrated gate is closed, so it must not clear the request", () => {
@@ -109,7 +109,7 @@ describe("store-driven routing (T1/T4/T5)", () => {
     // so the request survives for the dev layer to consume.
     expect(integratedIsFront(mode)).toBe(false);
     expect(devIsFront(mode)).toBe(true);
-    expect(s.editorOpenRequest).toBe("/repo/proj/b.ts");
+    expect(s.editorOpenRequest?.path).toBe("/repo/proj/b.ts");
   });
 
   it("T5: setProjectMode(dev) then editorOpen routes to the dev layer", () => {
