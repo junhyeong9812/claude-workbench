@@ -83,6 +83,15 @@ describe("메모 툴바 — 저장하기 · 정리", () => {
     return cm!;
   };
 
+  /** 같은 root에 **다른 대상**으로 다시 렌더한다 (다른 메모로 옮겨 가기). */
+  const mountKey = async (key: string) => {
+    await act(async () => {
+      root.render(
+        <MemoEditor storeKey={key} read={read} write={write} projectRoot={ROOT} />,
+      );
+    });
+  };
+
   /** 라벨로 버튼을 찾는다 (클래스가 아니라 사용자가 보는 것으로). */
   const btn = (label: string): HTMLButtonElement => {
     const hit = [...host.querySelectorAll("button")].find((b) => b.textContent?.trim() === label);
@@ -263,6 +272,47 @@ describe("메모 툴바 — 저장하기 · 정리", () => {
     expect(host.querySelector(".memo-tidy-shrink")?.textContent).toContain("절단 가능성");
     // 경고일 뿐 막지는 않는다 — 판단은 미리보기를 보는 사람이 한다.
     expect(has("적용")).toBe(true);
+  });
+
+  it("정리 이후 편집했으면 적용하지 않고 다시 실행하라고 알린다", async () => {
+    invoke.mockResolvedValue("정리된 메모");
+    await mount();
+    await click("정리");
+    await click("정리 실행");
+    // 결과를 보는 사이 사용자가 이어서 쓴다.
+    const view = EditorView.findFromDOM(host.querySelector(".cm-content") as HTMLElement)!;
+    await act(async () => {
+      view.dispatch({ changes: { from: view.state.doc.length, insert: "\n방금 쓴 줄" } });
+    });
+    await click("적용");
+    expect(docText(), "방금 쓴 글이 사라지면 안 된다").toContain("방금 쓴 줄");
+    expect(host.querySelector(".memo-save-err")?.textContent).toContain("다시 실행");
+    expect(has("되돌리기"), "적용되지 않았으니 되돌릴 것도 없다").toBe(false);
+  });
+
+  it("대상이 바뀌면 진행 중이던 정리는 폐기된다 (세대·대상 판정)", async () => {
+    // 응답이 늦게 오는 요청을 띄운 채 다른 메모로 옮겨 간다.
+    let resolveSlow: (v: string) => void = () => {};
+    invoke.mockImplementationOnce(
+      () =>
+        new Promise<string>((res) => {
+          resolveSlow = res;
+        }),
+    );
+    await mount();
+    await click("정리");
+    await click("정리 실행");
+    expect(has("정리 중…"), "실행 중 표시").toBe(true);
+
+    await mountKey("/home/u/other");
+    // 늦은 응답이 도착한다 — 남의 메모의 결과가 이 화면에 뜨면 안 되고,
+    // busy도 남아 있으면 안 된다([정리 실행]이 영영 잠긴다).
+    await act(async () => {
+      resolveSlow("옛 메모의 정리 결과");
+    });
+    await click("정리");
+    expect(host.querySelector(".memo-tidy-preview")).toBeNull();
+    expect(has("정리 실행"), "다시 실행할 수 있어야 한다").toBe(true);
   });
 
   it("[버리기]는 결과만 버린다 (메모 불변)", async () => {

@@ -147,6 +147,9 @@ export function MemoEditor({
   // 에디터가 매 렌더 재생성되지 않게 한다).
   const cbRef = useRef({ read, write, onText, onHandle });
   cbRef.current = { read, write, onText, onHandle };
+  // 비동기 응답이 "지금도 같은 메모인가"를 물을 수 있게 하는 최신 대상.
+  const storeKeyRef = useRef(storeKey);
+  storeKeyRef.current = storeKey;
 
   // ---- 툴바([저장하기] · [메모 정리]) ----
   // 자동 저장 경로에는 손대지 않는다: 여기서 본문을 바꿀 때도 CodeMirror
@@ -170,6 +173,13 @@ export function MemoEditor({
   const [tidyBusy, setTidyBusy] = useState(false);
   const [tidyErr, setTidyErr] = useState<string | null>(null);
   const [tidyResult, setTidyResult] = useState<string | null>(null);
+  // 정리 요청의 **세대**. 요청은 수십 초가 걸리고 그 사이 사용자가 다른 메모로
+  // 옮겨 가거나 다시 실행할 수 있다 — 늦게 도착한 옛 응답이 지금 화면의
+  // 미리보기가 되면, 사용자는 자기가 보고 있는 것이 무엇의 결과인지 알 수 없다.
+  const tidyGenRef = useRef(0);
+  // 그 요청이 출발할 때의 본문. [적용] 시점에 본문이 달라져 있으면 결과는 이미
+  // 낡은 것이라 적용하지 않는다(그 사이의 편집을 통째로 지우게 된다).
+  const tidySourceRef = useRef<string | null>(null);
   // 적용 직전 본문 — **1회** 되돌리기의 전부(스택이 아니다). 값의 정본은 모듈
   // 맵(`projectMemo`의 undo)이고 여기 state는 버튼을 그리기 위한 사본이다:
   // 탭 전환으로 이 컴포넌트가 언마운트돼도 되돌릴 길이 남아 있어야 한다.
@@ -237,20 +247,41 @@ export function MemoEditor({
   };
 
   const runTidy = () => {
+    const gen = ++tidyGenRef.current;
+    const key = storeKey;
+    const source = latestRef.current;
+    tidySourceRef.current = source;
     setTidyBusy(true);
     setTidyErr(null);
     setTidyResult(null);
     saveTidyModel(tidyModel);
-    invoke<string>("memo_tidy", { text: latestRef.current, model: tidyModel || null })
-      .then(setTidyResult)
+    /** 이 응답이 아직 이 화면의 것인가 (세대·대상이 그대로인가). */
+    const current = () => tidyGenRef.current === gen && storeKeyRef.current === key;
+    invoke<string>("memo_tidy", { text: source, model: tidyModel || null })
+      .then((res) => {
+        if (!current()) return; // 낡은 응답 — 조용히 버린다
+        setTidyResult(res);
+      })
       // 실패는 무해하다 — 메모는 그대로고 사유만 남는다.
-      .catch((e) => setTidyErr(errText(e)))
-      .finally(() => setTidyBusy(false));
+      .catch((e) => {
+        if (!current()) return;
+        setTidyErr(errText(e));
+      })
+      .finally(() => {
+        if (current()) setTidyBusy(false);
+      });
   };
 
   const applyTidy = () => {
     if (tidyResult === null) return;
     const before = latestRef.current;
+    // 정리를 돌린 뒤 사용자가 이어서 썼다면 이 결과는 그 편집을 모른다 —
+    // 적용하면 방금 쓴 글이 통째로 사라진다. 다시 실행하게 한다.
+    if (tidySourceRef.current !== null && tidySourceRef.current !== before) {
+      setTidyErr("정리 이후 메모가 편집됐습니다 — 다시 실행하세요.");
+      setTidyResult(null);
+      return;
+    }
     if (!replaceDoc(tidyResult)) {
       setTidyErr("지금은 메모를 바꿀 수 없습니다.");
       return;
@@ -284,6 +315,11 @@ export function MemoEditor({
     setTidyOpen(false);
     setTidyErr(null);
     setTidyResult(null);
+    // 진행 중이던 요청은 이 메모의 것이 아니다 — 세대를 올려 응답을 무효화하고
+    // busy도 내린다(내리지 않으면 [정리 실행]이 영영 잠긴다).
+    tidyGenRef.current += 1;
+    tidySourceRef.current = null;
+    setTidyBusy(false);
     appliedRef.current = null;
     setUndoText(getUndo(storeKey));
   }, [storeKey]);
