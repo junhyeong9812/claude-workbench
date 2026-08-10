@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { errText } from "../utils/error";
 import { invoke } from "@tauri-apps/api/core";
 import { useAppStore } from "../state/store";
+import { useSurfaceProject } from "../state/surfaceContext";
 import { loadAgentOptions, spawnOptionFields } from "../state/agentOptions";
 import {
   groupWorktrees,
@@ -31,7 +32,8 @@ import { basename as baseName } from "../utils/path";
  * project, adds (path + branch), removes, and opens one as a project tab.
  */
 export function WorktreePanel() {
-  const cwd = useAppStore((s) => s.activeProject);
+  // 표면-로컬 프로젝트 (P1) — 활성 표면(primary)이 activeProject 반사라 무동작.
+  const cwd = useSurfaceProject();
   const addProject = useAppStore((s) => s.addProject);
   const requestClaudeOpen = useAppStore((s) => s.requestClaudeOpen);
 

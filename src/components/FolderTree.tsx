@@ -3,6 +3,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { WebviewWindow } from "@tauri-apps/api/webviewWindow";
 import { errText } from "../utils/error";
 import { useAppStore } from "../state/store";
+import { useSurfaceProject } from "../state/surfaceContext";
 import { expandedSetOf } from "../state/treeSelectors";
 import type { DirEntry } from "../types";
 import { TypeBadges } from "./TypeBadges";
@@ -126,11 +127,12 @@ function TreeNode({
 }
 
 /** Flattened visible nodes (display order), respecting which dirs are expanded —
- * the navigation model for ↑/↓. Read from the store directly (not a hook). */
-function visibleNodes(): DirEntry[] {
+ * the navigation model for ↑/↓. Read from the store directly (not a hook). The
+ * root is passed in (표면-로컬 프로젝트, P1) rather than read off the global
+ * activeProject, so keyboard nav walks *this surface's* tree. */
+function visibleNodes(root: string | null): DirEntry[] {
+  if (!root) return [];
   const s = useAppStore.getState();
-  const ap = s.activeProject;
-  if (!ap) return [];
   const expanded = expandedSetOf(s);
   const out: DirEntry[] = [];
   const walk = (entries: DirEntry[] | undefined) => {
@@ -139,14 +141,16 @@ function visibleNodes(): DirEntry[] {
       if (e.is_dir && expanded.has(e.path)) walk(s.childrenCache[e.path]);
     }
   };
-  walk(s.childrenCache[ap]);
+  walk(s.childrenCache[root]);
   return out;
 }
 
 export function FolderTree() {
-  const activeProject = useAppStore((s) => s.activeProject);
+  // 표면-로컬 프로젝트 (P1) — 활성 표면(primary)이 activeProject 반사라 무동작.
+  // 변수명 activeProject 유지 → 아래 root·loadChildren·드롭 파생이 전부 무변경.
+  const activeProject = useSurfaceProject();
   const rootChildren = useAppStore((s) =>
-    s.activeProject ? s.childrenCache[s.activeProject] : undefined,
+    activeProject ? s.childrenCache[activeProject] : undefined,
   );
   const loadChildren = useAppStore((s) => s.loadChildren);
   const toggleExpanded = useAppStore((s) => s.toggleExpanded);
@@ -227,7 +231,7 @@ export function FolderTree() {
   };
 
   const onKeyDown = (e: React.KeyboardEvent) => {
-    const nodes = visibleNodes();
+    const nodes = visibleNodes(activeProject);
     if (nodes.length === 0) return;
     const cursor = useAppStore.getState().treeCursor;
     const idx = nodes.findIndex((n) => n.path === cursor);
@@ -449,7 +453,7 @@ export function FolderTree() {
   // first node so there's a visible selection to navigate from.
   const onFocus = () => {
     if (useAppStore.getState().treeCursor == null) {
-      const nodes = visibleNodes();
+      const nodes = visibleNodes(activeProject);
       if (nodes.length > 0) setTreeCursor(nodes[0].path);
     }
   };

@@ -3,6 +3,7 @@ import { buildPathTree, type PathNode } from "../utils/pathTree";
 import { errText } from "../utils/error";
 import { invoke } from "@tauri-apps/api/core";
 import { useAppStore } from "../state/store";
+import { useSurfaceProject } from "../state/surfaceContext";
 import { computeGraph, GitGraphRow } from "./GitGraph";
 
 /** Mirrors core_lib::git serialized types. */
@@ -95,7 +96,9 @@ const buildTree = (changes: FileChange[]): TreeNode => buildPathTree(changes, (c
  * commit history with ref badges. Runs against `activeProject`'s cwd.
  */
 export function GitPanel() {
-  const activeProject = useAppStore((s) => s.activeProject);
+  // 표면-로컬 프로젝트 (P1) — 현재는 활성 표면(primary)이 activeProject를 반사하므로
+  // 값·동작 동일. 변수명 activeProject를 유지해 아래 cwd·git_roots 파생이 무변경.
+  const activeProject = useSurfaceProject();
   const requestDiff = useAppStore((s) => s.requestDiff);
   const requestEditorOpen = useAppStore((s) => s.requestEditorOpen);
   const openGitHistory = useAppStore((s) => s.openGitHistory);
