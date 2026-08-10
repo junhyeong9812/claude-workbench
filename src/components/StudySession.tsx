@@ -45,7 +45,11 @@ export function StudySession() {
         /* corrupt layout — fall through to seeding */
       }
     }
-    if (api.panels.length === 0 && cwd) {
+    // 재시드 판정은 "패널이 하나도 없나"가 아니라 **스터디 세션 패널이 없나**로
+    // 본다(DevView의 getPanel("dev-claude") 선례). 폴더 터미널 탭이 레이아웃에
+    // 남아 있으면 panels.length가 0이 아니어서, 세션을 닫은 뒤로는 영원히
+    // 재시드되지 않던 결함.
+    if (api.getPanel("study-claude") == null && cwd) {
       // Seed with the stable study session UUID so it resumes the same session
       // across restarts (create-or-resume in claude_start) even before any chat.
       const uuid = useAppStore.getState().ensureStudySessionUuid();
