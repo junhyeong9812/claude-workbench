@@ -192,6 +192,10 @@ pub fn write_file(path: String, content: String) -> Result<(), AppError> {
 /// already exists, so an existing file is never clobbered.
 ///
 /// 단일 경로 API — 구현은 [`create_files`]와 공유한다(생성 규칙 단일 출처).
+/// **현재 프론트 호출부는 없다**(트리 "새 파일"은 다중 생성 경로 하나로 통일):
+/// 삭제하지 않고 남기는 이유는 ① 단일 생성 계약(문구 포함)을 고정하는 테스트가
+/// 이 표면을 통해 돌고 ② 위임이라 구현 중복이 0이기 때문이다. 다시 갈라지면
+/// (자체 로직이 생기면) 그때는 지우는 게 맞다.
 #[tauri::command]
 pub fn create_file(path: String, root: String) -> Result<(), AppError> {
     create_files_impl(&[path], &root)
@@ -206,12 +210,68 @@ const MAX_CREATE_FILES: usize = 20;
 /// 충돌 정책: 하나라도 이미 존재하면 **아무것도 만들지 않고** 충돌 목록을 담은
 /// 오류를 돌려준다. 부분 생성은 "무엇이 만들어졌는지 모르는" 상태를 남기고,
 /// 사용자가 그걸 되돌리려면 트리에서 하나씩 지워야 한다 — 검사를 먼저 다 하는
-/// 비용이 훨씬 싸다. (검사 후 생성 사이의 경합은 `create_new`가 최후 방어선:
-/// 그 사이에 생긴 파일은 덮이지 않고 오류가 된다. 생성 도중의 I/O 실패는
-/// 되돌리지 않는다 — 조용히 삼키지 않고 오류로 드러낸다.)
+/// 비용이 훨씬 싸다.
+///
+/// 계약은 **관측 가능한 부분 생성 0**이다. 그래서 두 가지를 더 한다:
+///  - 중복·충돌 검사를 입력 문자열이 아니라 **정규화된 경로**(존재하는 최심
+///    조상을 canonicalize + 나머지 꼬리 — `effective_path`) 기준으로 한다.
+///    문자열 비교였을 때 `root/a.ts`와 `root/./a.ts`(또는 심링크 경유 별칭)는
+///    서로 다른 항목으로 통과해, 앞의 것을 만들고 뒤의 것에서 `create_new`가
+///    실패 = 정확히 막으려던 부분 생성이 됐다.
+///  - 검사를 통과한 뒤의 I/O 실패(권한·ENOSPC·부모가 파일이던 경우 등)에는
+///    **이번 호출이 만든 것만** 역순으로 지우고(파일 → 그때 새로 만든 빈 부모
+///    dir) 오류를 돌려준다. best-effort다: 되돌리기 자체가 실패해도(권한 등)
+///    원래 오류를 삼키지 않는다.
+///
+/// 남는 경합(수용): 검사와 생성 사이에 **다른 프로세스**가 같은 경로를 만들면
+/// `create_new`가 최후 방어선이라 덮어쓰지는 않고 오류가 된다. 부모 dir이 그
+/// 사이에 심링크로 바뀌는 TOCTOU도 같은 계정의 다른 프로세스만 가능하므로
+/// 이 앱의 위협 모델(#71 G4 — 같은 사용자 계정은 신뢰 경계 안) 밖으로 둔다.
 #[tauri::command]
 pub fn create_files(paths: Vec<String>, root: String) -> Result<(), AppError> {
     create_files_impl(&paths, &root)
+}
+
+/// 이번 호출이 만든 것 되돌리기 (best-effort — 실패는 무시하고 원 오류를 살린다).
+/// dir은 **깊은 것부터** 지운다(얕은 것을 먼저 지우려 하면 비어 있지 않아 실패).
+/// `remove_dir`(재귀 아님)만 쓰므로, 우리가 만들지 않은 내용이 그 사이에 들어온
+/// dir은 남는다 — 지우기보다 남기는 쪽이 안전하다.
+fn rollback_created(files: &[PathBuf], dirs: &[PathBuf]) {
+    for f in files.iter().rev() {
+        let _ = std::fs::remove_file(f);
+    }
+    let mut ds: Vec<&PathBuf> = dirs.iter().collect();
+    ds.sort_by_key(|d| std::cmp::Reverse(d.components().count()));
+    for d in ds {
+        let _ = std::fs::remove_dir(d);
+    }
+}
+
+/// `parent`부터 위로 올라가며 **아직 없는** 조상들(root 아래, 깊은 것부터).
+/// create_dir_all이 새로 만들게 될 목록 = 실패 시 되돌릴 목록.
+fn missing_ancestors(parent: &std::path::Path, root_c: &std::path::Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let mut cur = parent.to_path_buf();
+    while cur.starts_with(root_c) && cur != root_c && !cur.exists() {
+        out.push(cur.clone());
+        match cur.parent() {
+            Some(p) => cur = p.to_path_buf(),
+            None => break,
+        }
+    }
+    out
+}
+
+/// 오류 표시용 root 상대 경로 (밖이면 파일명 폴백) — 절대 경로를 그대로 노출하지
+/// 않으면서도 같은 이름이 여러 폴더에 있을 때 어느 것인지 구분된다.
+fn rel_to_root(p: &std::path::Path, root_c: &std::path::Path) -> String {
+    p.strip_prefix(root_c)
+        .map(|r| r.to_string_lossy().to_string())
+        .unwrap_or_else(|_| {
+            p.file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| p.to_string_lossy().to_string())
+        })
 }
 
 fn create_files_impl(paths: &[String], root: &str) -> Result<(), AppError> {
@@ -229,23 +289,27 @@ fn create_files_impl(paths: &[String], root: &str) -> Result<(), AppError> {
         reject_unsafe_path(p)?;
         ensure_within(p, root)?;
     }
-    // 2) 입력 자체의 중복도 부분 생성의 원인(두 번째가 no-clobber로 실패) — 먼저 막는다.
-    for (i, p) in paths.iter().enumerate() {
-        if paths[..i].contains(p) {
-            return Err(AppError::new("중복된 경로가 있습니다"));
+    let root_c = std::fs::canonicalize(root)
+        .map_err(|_| AppError::new("프로젝트 경로를 확인할 수 없습니다"))?;
+    // 2) 정규화 — 별칭(`./`·중복 슬래시·심링크 경유)이 같은 키로 접힌다.
+    let targets: Vec<PathBuf> = paths
+        .iter()
+        .map(|p| effective_path(p).ok_or_else(|| AppError::new("경로를 확인할 수 없습니다")))
+        .collect::<Result<_, _>>()?;
+    // 3) 입력 자체의 중복도 부분 생성의 원인(두 번째가 no-clobber로 실패) — 먼저 막는다.
+    for (i, t) in targets.iter().enumerate() {
+        if targets[..i].contains(t) {
+            return Err(AppError::new(format!(
+                "중복된 경로가 있습니다: {}",
+                rel_to_root(t, &root_c)
+            )));
         }
     }
-    // 3) 전수 충돌 검사. `symlink_metadata`(not `exists`)라 깨진 심링크도 점유로 본다.
-    let conflicts: Vec<String> = paths
+    // 4) 전수 충돌 검사. `symlink_metadata`(not `exists`)라 깨진 심링크도 점유로 본다.
+    let conflicts: Vec<String> = targets
         .iter()
-        .filter(|p| std::fs::symlink_metadata(std::path::Path::new(p)).is_ok())
-        .map(|p| {
-            std::path::Path::new(p)
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or(p)
-                .to_string()
-        })
+        .filter(|t| std::fs::symlink_metadata(t).is_ok())
+        .map(|t| rel_to_root(t, &root_c))
         .collect();
     if !conflicts.is_empty() {
         // 단일 생성의 문구는 그대로 유지(기존 트리 동작 회귀 0).
@@ -255,19 +319,25 @@ fn create_files_impl(paths: &[String], root: &str) -> Result<(), AppError> {
             format!("이미 존재하는 경로: {}", conflicts.join(", "))
         }));
     }
-    // 4) 생성.
-    for path in paths {
-        let p = std::path::Path::new(path);
-        if let Some(parent) = p.parent() {
-            std::fs::create_dir_all(parent)
-                .map_err(|e| AppError::new(io_message("Cannot create file", &e)))?;
+    // 5) 생성 — 실패하면 이번 호출이 만든 것만 되돌린다.
+    let mut made_files: Vec<PathBuf> = Vec::new();
+    let mut made_dirs: Vec<PathBuf> = Vec::new();
+    for t in &targets {
+        if let Some(parent) = t.parent() {
+            let missing = missing_ancestors(parent, &root_c);
+            if let Err(e) = std::fs::create_dir_all(parent) {
+                rollback_created(&made_files, &made_dirs);
+                return Err(AppError::new(io_message("Cannot create file", &e)));
+            }
+            made_dirs.extend(missing);
         }
-        std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(p)
-            .map(|_| ())
-            .map_err(|e| AppError::new(io_message("Cannot create file", &e)))?;
+        match std::fs::OpenOptions::new().write(true).create_new(true).open(t) {
+            Ok(_) => made_files.push(t.clone()),
+            Err(e) => {
+                rollback_created(&made_files, &made_dirs);
+                return Err(AppError::new(io_message("Cannot create file", &e)));
+            }
+        }
     }
     Ok(())
 }
@@ -635,14 +705,39 @@ mod tests {
         assert!(std::path::Path::new(&a).is_file());
         assert!(std::path::Path::new(&c).is_file());
 
-        // 충돌(a) + 신규(b) → b는 만들어지지 않는다. 오류 문구에 충돌 이름이 실린다.
-        let e = create_files(vec![a.clone(), b.clone()], root_s.clone()).unwrap_err();
+        // 신규(b) + 충돌(a) — **충돌 항목을 뒤에 둔다**: 검사를 다 하기 전에
+        // 만들기 시작하면 b가 생겨 버리므로, 이 순서라야 "전수 검사 후 생성"을
+        // 실제로 판별한다(앞에 두면 순차 구현도 통과).
+        let e = create_files(vec![b.clone(), a.clone()], root_s.clone()).unwrap_err();
         assert!(e.message.contains("a.ts"), "충돌 목록: {}", e.message);
         assert!(!std::path::Path::new(&b).exists(), "충돌 시 부분 생성 없음");
 
         // 중복 입력도 생성 전에 거부.
         assert!(create_files(vec![b.clone(), b.clone()], root_s.clone()).is_err());
         assert!(!std::path::Path::new(&b).exists());
+
+        // 별칭(`./`)은 문자열로는 다르지만 같은 파일 — 정규화 기준 중복이라
+        // 거부하고 아무것도 만들지 않는다(문자열 비교 시절엔 b가 만들어졌다).
+        let alias = format!("{root_s}/./b.ts");
+        let e = create_files(vec![b.clone(), alias.clone()], root_s.clone()).unwrap_err();
+        assert!(e.message.contains("중복"), "{}", e.message);
+        assert!(!std::path::Path::new(&b).exists(), "별칭 중복도 부분 생성 0");
+
+        // 별칭이 **기존 파일**을 가리키는 경우도 충돌로 잡힌다(a는 이미 있다).
+        let alias_a = format!("{root_s}/./a.ts");
+        let e = create_files(vec![b.clone(), alias_a], root_s.clone()).unwrap_err();
+        assert!(e.message.contains("a.ts"), "{}", e.message);
+        assert!(!std::path::Path::new(&b).exists());
+
+        // 심링크 경유 별칭 — `.` 정규화만으로는 접히지 않고 canonicalize라야
+        // 같은 키가 된다(정규화 기준 검사의 진짜 이유).
+        std::fs::create_dir_all(root.join("real")).unwrap();
+        std::os::unix::fs::symlink(root.join("real"), root.join("link")).unwrap();
+        let via_real = format!("{root_s}/real/x.ts");
+        let via_link = format!("{root_s}/link/x.ts");
+        let e = create_files(vec![via_real.clone(), via_link], root_s.clone()).unwrap_err();
+        assert!(e.message.contains("중복"), "{}", e.message);
+        assert!(!std::path::Path::new(&via_real).exists(), "심링크 별칭도 부분 생성 0");
 
         // 상한 초과 거부.
         let many: Vec<String> = (0..21).map(|i| format!("{root_s}/m{i}.ts")).collect();
@@ -659,6 +754,32 @@ mod tests {
 
         // 빈 목록.
         assert!(create_files(vec![], root_s).is_err());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // 검사를 통과한 뒤의 I/O 실패도 관측 가능한 부분 생성을 남기지 않는다:
+    // 두 번째 경로의 부모가 **첫 번째로 만든 파일**이라 create_new가 ENOTDIR로
+    // 실패한다 → 이번 호출이 만든 파일·dir이 전부 되돌아가야 한다.
+    #[test]
+    fn create_files_rolls_back_on_midway_io_failure() {
+        let (root, root_s) = temp_root("cfs_rb");
+        let file = format!("{root_s}/n1/n2/a.ts");
+        let under_file = format!("{root_s}/n1/n2/a.ts/x.ts"); // 부모가 파일 → 실패
+
+        let e = create_files(vec![file.clone(), under_file], root_s.clone()).unwrap_err();
+        assert!(!e.message.is_empty());
+        assert!(!std::path::Path::new(&file).exists(), "만든 파일 되돌림");
+        assert!(!root.join("n1/n2").exists(), "새로 만든 빈 부모 dir 되돌림");
+        assert!(!root.join("n1").exists(), "얕은 쪽까지 되돌림");
+        assert!(root.exists(), "루트는 건드리지 않는다");
+
+        // 이미 있던 dir은 우리가 만든 게 아니므로 남는다.
+        std::fs::create_dir_all(root.join("keep")).unwrap();
+        let f2 = format!("{root_s}/keep/b.ts");
+        let bad = format!("{root_s}/keep/b.ts/c.ts");
+        assert!(create_files(vec![f2.clone(), bad], root_s).is_err());
+        assert!(!std::path::Path::new(&f2).exists());
+        assert!(root.join("keep").is_dir(), "기존 dir 보존");
         let _ = std::fs::remove_dir_all(&root);
     }
 
