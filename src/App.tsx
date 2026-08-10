@@ -204,18 +204,20 @@ function AppMain() {
   const dualProject = useAppStore((s) => s.dualProject);
   const setDualProject = useAppStore((s) => s.setDualProject);
   // **렌더는 파생값으로 그린다** (리뷰 D1): 이펙트(커밋 후) 정리에만 맡기면
-  // setActive 직후 1프레임 동안 같은 프로젝트 dock 두 개가 공존한다. 파생값은
+  // setActive 직후 1프레임 동안 같은 프로젝트 dock 두 개가 공존한다. dualProject는
+  // 이제 표면 트리(store.surfaceTree)의 secondary 멤버십 미러이고, 파생값은
   // 동일 프로젝트·비멤버십(닫힘/hydration 전)을 렌더 시점에 즉시 숨긴다.
   const visibleDual = resolveVisibleDual(
     dualProject,
     activeProject,
     projects.map((p) => p.path),
   );
-  // 이펙트는 persist 정리만: ① 동일 프로젝트로 전환되면 dual 해제 ② 닫힌
-  // 프로젝트 정리(hydration 전 오판 방지로 목록이 채워진 뒤에만).
-  useEffect(() => {
-    if (dualProject && dualProject === activeProject) setDualProject(null);
-  }, [dualProject, activeProject, setDualProject]);
+  // P3': **동일-프로젝트 붕괴 이펙트 제거**. 예전엔 activeProject가 우측과 같아지면
+  // dual을 파괴(setDualProject(null))했지만, 이제 트리가 멤버십의 정본이라 겹침은
+  // 위 렌더 가드가 비파괴적으로 숨기기만 한다(active가 다시 갈라지면 우측 복원).
+  // 파괴적 붕괴 제거가 P4'(활성 표면 alias 전환)의 안전 전제다. 남는 이펙트는
+  // 진짜 멤버십 정리 하나뿐: 닫힌 프로젝트를 트리에서 제거(hydration 전 오판
+  // 방지로 목록이 채워진 뒤에만).
   useEffect(() => {
     if (dualProject && projects.length > 0 && !projects.some((p) => p.path === dualProject)) {
       setDualProject(null);
