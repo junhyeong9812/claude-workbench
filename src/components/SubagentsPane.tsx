@@ -1,30 +1,36 @@
 import { useState } from "react";
 import { AGENT_BADGE, KIND_LABEL, type TimelineItem } from "./TimelineView";
+import type { SubagentView } from "../hooks/useClaudeTimeline";
 
 /** Vertical stack of live subagent cards (Claude 패널의 "서브" 칼럼): every
  * agent of the session at once — 진행상황을 탭 전환 없이 나란히 본다. Each card
  * is the agent's item list (KIND rows, same styling as the timeline) with the
  * done/total progress rail; clicking a row opens it in the shared detail
- * viewer. Data is the timeline payload's `subagents` — 순수 렌더링, no extra
- * backend traffic. */
+ * viewer. Data is the timeline payload's `subagents`. 진행도·상태는 메타라 항상
+ * 있고, **완료 에이전트의 본문은 lazy**다 — 카드를 펼칠 때 `onExpand`가 조회한다
+ * (payload 절감 1단계). */
 export function SubagentsPane({
   subagents,
   selectedId,
   onSelect,
+  onExpand,
 }: {
-  /** [agentId, parentToolCallId|null, turn, items] — the timeline payload shape. */
-  subagents: [string, string | null, number, TimelineItem[]][];
+  subagents: SubagentView[];
   selectedId: string | null;
   onSelect: (item: TimelineItem) => void;
+  /** 완료 에이전트 본문 요청(펼침·재시도). */
+  onExpand?: (agentId: string, force?: boolean) => void;
 }) {
   // User fold overrides; without one, a finished agent starts collapsed (the
   // column is about live progress) — bounding the DOM on agent-heavy sessions.
   const [folds, setFolds] = useState<Map<string, boolean>>(new Map());
-  const toggle = (aid: string, current: boolean) =>
-    setFolds((prev) => new Map(prev).set(aid, !current));
+  const toggle = (a: SubagentView, current: boolean) => {
+    setFolds((prev) => new Map(prev).set(a.id, !current));
+    if (current && !a.loaded) onExpand?.(a.id); // 접힘→펼침 = 본문 요청
+  };
 
   // Newest spawn first — the agents being watched are almost always the latest.
-  const agents = [...subagents].sort((a, b) => b[2] - a[2]);
+  const agents = [...subagents].sort((a, b) => b.turn - a.turn);
 
   if (agents.length === 0) {
     return <div className="claudeterm-agents-empty">서브에이전트가 아직 없습니다.</div>;
@@ -32,16 +38,15 @@ export function SubagentsPane({
 
   return (
     <div className="claudeterm-agents-list">
-      {agents.map(([aid, , turn, its]) => {
-        const total = its.length;
-        const done = its.filter((it) => it.agent_status === "completed").length;
+      {agents.map((a) => {
+        // 카운트·진행 여부는 **메타**에서 — 본문이 lazy라 없어도 같은 값이다.
+        const { id: aid, turn, total, completed: done } = a;
         const pct = total > 0 ? Math.round((done / total) * 100) : 0;
-        const last = its[its.length - 1];
-        const running =
-          last?.agent_status === "in_progress" || last?.agent_status === "pending";
+        const running = a.lastStatus === "in_progress" || a.lastStatus === "pending";
         const fold = folds.get(aid) ?? !running; // finished agents start folded
         // Bound each card's DOM — a runaway agent can log thousands of items.
         const MAX_ROWS = 200;
+        const its = a.items;
         const rows = its.length > MAX_ROWS ? its.slice(-MAX_ROWS) : its;
         return (
           <div key={aid} className="claudeterm-agent-card">
@@ -50,7 +55,7 @@ export function SubagentsPane({
             </div>
             <div
               className="claudeterm-agent-card-head"
-              onClick={() => toggle(aid, fold)}
+              onClick={() => toggle(a, fold)}
               title={fold ? "펼치기" : "접기"}
             >
               <span className="timeline-date-caret">{fold ? "▸" : "▾"}</span>
@@ -60,6 +65,22 @@ export function SubagentsPane({
                 {done}/{total}
               </span>
             </div>
+            {/* 본문 lazy — 도착 전/실패를 명시(빈 카드로 보이면 안 된다).
+                조회 중이 아닌 미도착은 클릭 가능한 안내로 둔다(영영 오지 않는
+                "불러오는 중" 금지 — 타임라인 그룹과 같은 규칙). */}
+            {!fold && !a.loaded && (
+              <div
+                className="claudeterm-agents-empty"
+                onClick={a.loading ? undefined : () => onExpand?.(aid, true)}
+                title={a.loading ? undefined : "본문 불러오기"}
+              >
+                {a.loading
+                  ? "불러오는 중…"
+                  : a.failed
+                    ? "불러오지 못했습니다 — 클릭해 다시 시도"
+                    : "본문 불러오기 (클릭)"}
+              </div>
+            )}
             {!fold && its.length > MAX_ROWS && (
               <div className="claudeterm-agents-empty">…앞 {its.length - MAX_ROWS}개 생략</div>
             )}

@@ -29,7 +29,10 @@ export interface TimelinePeekParams {
 export function TimelinePeekPanel(props: IDockviewPanelProps<TimelinePeekParams>) {
   const uuid = props.params.uuid ?? null;
   const project = props.params.project ?? null;
-  const { items, turns, answers, dates, subagents, ended } = useClaudeTimeline({ uuid, project });
+  const { items, turns, answers, dates, subagents, requestSubagent, ended } = useClaudeTimeline({
+    uuid,
+    project,
+  });
   // peek는 읽기 전용 — 선택은 행 강조(스크롤 앵커)만 한다. 변경 상세 뷰어는 원
   // Claude 탭 소유(범위 절제: spec ④ "타임라인만 표시").
   const [selectedId, setSelectedId] = useState<string | null>(null);
@@ -88,6 +91,7 @@ export function TimelinePeekPanel(props: IDockviewPanelProps<TimelinePeekParams>
               answers={answers}
               dates={dates}
               subagents={subagents}
+              onExpandAgent={requestSubagent}
               selectedId={selectedId}
               selectedTurn={selectedTurn}
               selectedScope="live"

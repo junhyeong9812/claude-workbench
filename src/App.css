@@ -2882,6 +2882,15 @@ body {
 .timeline-item-sub {
   padding-left: 14px;
 }
+/* 완료 서브에이전트 본문 lazy 조회 중/실패 안내 — 그룹 행과 같은 들여쓰기로
+   앉혀 "빈 그룹"과 구분되게 한다. */
+.timeline-agent-lazy {
+  padding-left: 14px;
+  cursor: default;
+}
+.timeline-agent-lazy[title] {
+  cursor: pointer;
+}
 .claudeterm-term {
   flex: 1 1 0;
   min-height: 0;

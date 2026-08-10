@@ -135,6 +135,7 @@ pub fn run() {
             commands::claude::store::claude_sessions,
             commands::claude::store::claude_external_sessions,
             commands::claude::store::claude_item_detail,
+            commands::claude::store::claude_subagent_items,
             commands::claude::store::claude_session_snapshot,
             commands::memo::memo_read,
             commands::memo::memo_write,

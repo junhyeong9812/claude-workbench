@@ -87,6 +87,47 @@ pub async fn claude_item_detail(
     .map_err(|_| AppError::new("Detail lookup task failed"))?
 }
 
+/// 메모리 1단계 B: 완료 서브에이전트의 아이템 본문 — 펼칠 때만 조회한다.
+///
+/// 폴 payload는 완료 에이전트의 메타(진행도·상태)만 싣는다(`SubagentFrame`).
+/// 본문의 정본은 `<uuid>/subagents/agent-<id>.jsonl`이므로 여기서 그때그때
+/// 재파싱한다 — `claude_item_detail`과 같은 lazy 패턴이고, 절단도 같은 IPC
+/// 경계 규칙(`cap_content`)을 따른다.
+#[tauri::command]
+pub async fn claude_subagent_items(
+    project: String,
+    uuid: String,
+    agent_id: String,
+) -> Result<Vec<TimelineItem>, AppError> {
+    // uuid·agent_id 둘 다 경로 조각이 된다 — 커맨드 경계에서 형식을 못박는다
+    // (`claude_item_detail`과 동일한 방어선).
+    if !core_lib::snapshot::is_safe_uuid(&uuid) || !core_lib::snapshot::is_safe_uuid(&agent_id) {
+        return Err(AppError::new("Invalid session id"));
+    }
+    tauri::async_runtime::spawn_blocking(move || {
+        let root = core_lib::jsonl::claude_projects_root()
+            .ok_or_else(|| AppError::new("Cannot locate the Claude projects root"))?;
+        let jsonl = core_lib::jsonl::find_session_jsonl(&root, &uuid)
+            .map_err(|e| AppError::new(io_message("Locate transcript", &e)))?
+            .ok_or_else(|| AppError::new("Session transcript not found"))?;
+        // 폴 루프와 동일한 규칙: <jsonl stem>/subagents/agent-<id>.jsonl.
+        let path = jsonl
+            .with_extension("")
+            .join("subagents")
+            .join(format!("agent-{agent_id}.jsonl"));
+        if !path.is_file() {
+            return Err(AppError::new("Subagent transcript not found"));
+        }
+        let mut st = core_lib::jsonl::SessionTail::new(project, agent_id, path);
+        st.poll().map_err(|e| AppError::new(io_message("Read subagent transcript", &e)))?;
+        let mut items = st.timeline().items().to_vec();
+        super::timeline::cap_content(&mut items);
+        Ok(items)
+    })
+    .await
+    .map_err(|_| AppError::new("Subagent lookup task failed"))?
+}
+
 /// List the saved Claude (A) sessions for `project`, newest first (for the
 /// "+ Claude(A)" reopen picker).
 #[tauri::command]

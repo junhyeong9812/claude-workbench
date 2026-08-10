@@ -209,7 +209,8 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
     ctxModel,
     ctxTokens,
     applySnapshot,
-    setSubagents,
+    setSubagentFrames,
+    requestSubagent,
   } = useTimelineState((s, origin) => {
     // Derive the attention status from the same snapshot so a restart / reopen
     // restores the badge (invariant ⑥) — not just live events (S5). A
@@ -224,6 +225,12 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
         origin,
       });
     }
+  },
+  // 완료 서브에이전트 본문 lazy 조회 대상(펼침 시) — 상세 원문 조회
+  // (claude_item_detail)와 같은 세션 좌표를 쓴다.
+  {
+    project: props.params.project ?? useAppStore.getState().activeProject ?? null,
+    uuid: props.params.sessionUuid ?? props.params.loadSessionId ?? null,
   });
   // Width (px) of the detail viewer + timeline panes; drag splitters to resize.
   const [viewerWidth, setViewerWidth] = useState(480);
@@ -1108,7 +1115,7 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
         // (badge) from the same payload — "seen" = this panel is the active tab
         // AND its window is focused right now (S5 unified the derive path).
         applySnapshot(e.payload, "live");
-        setSubagents(e.payload.subagents ?? []);
+        setSubagentFrames(e.payload.subagents ?? []);
       });
       // Driver changes (P6): lock/unlock input by whether we hold the driver role.
       // `rev` is monotonic — drop stale events (review R7-4).
@@ -1446,7 +1453,7 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
   // tool_call_id → item 인덱스 (P0 F2, 순수 모듈 buildItemIndex + 특성테스트).
   // 전제: items/subagents는 payload 수신마다 새 배열로 교체된다(applySnapshot).
   const itemIndex = useMemo(
-    () => buildItemIndex(items, subagents.map(([, , , its]) => its)),
+    () => buildItemIndex(items, subagents.map((a) => a.items)),
     [items, subagents],
   );
   const selectedItem = selectedId ? (itemIndex.get(selectedId) ?? null) : null;
@@ -2014,12 +2021,11 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
                 onClick={() => setShowAgents((v) => !v)}
               >
                 🤖 서브 {(() => {
-                  const running = subagents.filter(([, , , its]) => {
-                    const last = its[its.length - 1];
-                    return (
-                      last?.agent_status === "in_progress" || last?.agent_status === "pending"
-                    );
-                  }).length;
+                  // 진행 여부는 메타(lastStatus) — 완료 에이전트는 본문이
+                  // payload에 없다(lazy).
+                  const running = subagents.filter(
+                    (a) => a.lastStatus === "in_progress" || a.lastStatus === "pending",
+                  ).length;
                   return running > 0 ? `${running}▶` : subagents.length;
                 })()}
               </button>
@@ -2415,6 +2421,7 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
             </div>
             <SubagentsPane
               subagents={subagents}
+              onExpand={requestSubagent}
               selectedId={selectedId}
               onSelect={(it) => {
                 setSelectedId(it.tool_call_id);
@@ -2472,6 +2479,7 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
             answers={answers}
             dates={dates}
             subagents={subagents}
+            onExpandAgent={requestSubagent}
             selectedId={selectedId}
             selectedTurn={selectedTurn}
             selectedScope={selectedTurnScope}
