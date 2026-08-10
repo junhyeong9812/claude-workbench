@@ -171,13 +171,18 @@ export function DevView({ project }: { project: string }) {
     const api = apiRef.current;
     if (!api) return; // dock 준비 전 — 요청 보존
     const { cwd, title } = terminalOpenRequest;
-    useAppStore.getState().requestTerminalOpen(null);
-    api.addPanel({
-      id: `terminal-dev-${crypto.randomUUID()}`, // 연타해도 id 충돌 없음
-      component: "terminal",
-      title,
-      params: { kind: "terminal", title, cwd },
-    });
+    // 소비는 패널이 열린 뒤 (실패 시 요청 보존 — MainArea와 같은 계약).
+    try {
+      api.addPanel({
+        id: `terminal-dev-${crypto.randomUUID()}`, // 연타해도 id 충돌 없음
+        component: "terminal",
+        title,
+        params: { kind: "terminal", title, cwd },
+      });
+      useAppStore.getState().requestTerminalOpen(null);
+    } catch (err) {
+      console.error("terminalOpen failed; keeping request", err);
+    }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [terminalOpenRequest, layerMode, dockReady]);
 

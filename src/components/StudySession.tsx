@@ -90,18 +90,24 @@ export function StudySession() {
   };
 
   // 폴더 터미널 요청 소비 (스터디 모드에서만 이 컴포넌트가 마운트된다).
+  // 소비(clear)는 **패널이 실제로 열린 뒤**다 — addPanel이 던지면 요청을 남겨
+  // 다음 발화에 다시 시도한다(부수효과 후 clear: 유실≠소비).
   useEffect(() => {
     if (!terminalOpenRequest) return;
     const api = apiRef.current;
     if (!api) return; // dock 준비 전 — 요청 보존
     const { cwd: dir, title } = terminalOpenRequest;
-    useAppStore.getState().requestTerminalOpen(null);
-    api.addPanel({
-      id: `terminal-study-${crypto.randomUUID()}`, // 연타해도 id 충돌 없음
-      component: "terminal",
-      title,
-      params: { kind: "terminal", title, cwd: dir },
-    });
+    try {
+      api.addPanel({
+        id: `terminal-study-${crypto.randomUUID()}`, // 연타해도 id 충돌 없음
+        component: "terminal",
+        title,
+        params: { kind: "terminal", title, cwd: dir },
+      });
+      useAppStore.getState().requestTerminalOpen(null);
+    } catch (err) {
+      console.error("terminalOpen failed; keeping request", err);
+    }
   }, [terminalOpenRequest, dockReady]);
 
   if (!cwd) {

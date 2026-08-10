@@ -517,8 +517,16 @@ export function MainArea({
     if (!terminalOpenRequest) return;
     const api = apiRef.current;
     if (!api) return; // dock not ready — keep the request; apiReady re-runs
-    requestTerminalOpen(null);
-    addPanel("terminal", { title: terminalOpenRequest.title, cwd: terminalOpenRequest.cwd });
+    // 소비(clear)는 패널이 실제로 열린 뒤 — 실패하면 요청을 남겨 다음 발화에
+    // 다시 시도한다(부수효과 후 clear, T1). 대기 중 새 요청이 오면 단일 슬롯이라
+    // 마지막 것이 이긴다: 폴더 터미널은 "지금 누른 그 폴더"를 여는 게 맞고,
+    // 앞선 요청이 아직 못 열렸다는 건 dock이 준비 전이었다는 뜻이라 수용한다.
+    try {
+      addPanel("terminal", { title: terminalOpenRequest.title, cwd: terminalOpenRequest.cwd });
+      requestTerminalOpen(null);
+    } catch (err) {
+      console.error("terminalOpen failed; keeping request", err);
+    }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [terminalOpenRequest, apiReady, layerMode]);
 
