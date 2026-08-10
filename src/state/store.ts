@@ -6,6 +6,13 @@ import type { ITheme } from "@xterm/xterm";
 import type { DirEntry, Project, ProjectType, SshConnection, WorkspaceState } from "../types";
 import { capTreeCache, computeTreeKeepSet, pruneTreeCache, sameEntries, underRoot } from "./treeSelectors";
 import { activeSurfaceId, type SurfaceId } from "./surfaceContext";
+import {
+  addSurface,
+  parseSurfaceTree,
+  removeSurface,
+  secondaryProject,
+  type SurfaceTree,
+} from "./surfaceTree";
 import { basename } from "../utils/path";
 
 /** Clamp a font size to the allowed range (also normalizes NaN). */
@@ -232,6 +239,36 @@ function persistPopoutGeometry(label: string, geo: PopoutGeo) {
   savePopoutGeometry(fresh);
 }
 
+/** Load the surface tree from localStorage, migrating the legacy `dualProject`
+ * string when the new `surfaceTree` key is absent (멀티프로젝트 P3'). Corrupt or
+ * missing = 기본(primary 단독) — parseSurfaceTree owns the recovery contract. */
+function loadSurfaceTree(): SurfaceTree {
+  let raw: unknown = null;
+  try {
+    const s = localStorage.getItem("surfaceTree");
+    if (s) raw = JSON.parse(s);
+  } catch {
+    /* corrupt JSON → parseSurfaceTree falls back to legacy/default */
+  }
+  return parseSurfaceTree(raw, localStorage.getItem("dualProject"));
+}
+
+/** Persist the surface tree atomically to localStorage AND keep the legacy
+ * `dualProject` key in sync so an OLDER app (which only reads `dualProject`)
+ * restores the right split without collapse — 다운그레이드 안전(이중 기록). Each
+ * setItem is its own atomic op; both readers stay independently consistent. */
+function persistSurfaceTree(tree: SurfaceTree) {
+  const secondary = secondaryProject(tree);
+  // Legacy key first: if only one write lands, the old reader is still correct.
+  if (secondary) localStorage.setItem("dualProject", secondary);
+  else localStorage.removeItem("dualProject");
+  try {
+    localStorage.setItem("surfaceTree", JSON.stringify(tree));
+  } catch {
+    /* quota — legacy key already carries the membership, so no data loss */
+  }
+}
+
 /** A request to open a diff in the main area (file change or a commit). */
 export interface DiffSpec {
   title: string;
@@ -404,7 +441,13 @@ interface AppState {
    * 전역 요청 버스는 주(좌) surface만 소비한다. localStorage 복원(project-
    * dual-surface). App이 activeProject와의 충돌·닫힌 프로젝트를 정리한다. */
   dualProject: string | null;
-  /** 우측 분할 열기/닫기(null) — persist. */
+  /** 표면 트리(멀티프로젝트 P3') — 우측 표면 멤버십의 **정본**. dualProject는
+   * 이 트리의 secondary 파생 미러다(소비처 호환). P3'은 primary + secondary
+   * 0~1개까지만 실사용하되 스키마는 N-way·상하 분할을 대비한다. persist =
+   * localStorage `surfaceTree` + 레거시 `dualProject` 이중 기록(다운그레이드 안전). */
+  surfaceTree: SurfaceTree;
+  /** 우측 분할 열기(path)/닫기(null) — 트리 addSurface/removeSurface로 매핑되고
+   * dualProject 미러를 갱신한 뒤 두 localStorage 키를 함께 저장. */
   setDualProject: (path: string | null) => void;
   /** Color theme (persisted to localStorage). Drives CSS vars + xterm palette. */
   theme: "dark" | "light";
@@ -693,6 +736,11 @@ function treeWriteAllowed(
   );
 }
 
+/** One-time migration/load of the surface tree at store construction (same
+ * timing as the old `dualProject` localStorage read). Shared so `surfaceTree`
+ * and its `dualProject` mirror start from the identical instance. */
+const SURFACE_TREE_INIT = loadSurfaceTree();
+
 export const useAppStore = create<AppState>((set, get) => ({
   projects: [],
   activeProject: null,
@@ -719,7 +767,8 @@ export const useAppStore = create<AppState>((set, get) => ({
   detachPanelRequest: { targetSurfaceId: activeSurfaceId(), nonce: 0 },
   memoRequest: { targetSurfaceId: activeSurfaceId(), nonce: 0 },
   sessionResumeRequest: null,
-  dualProject: localStorage.getItem("dualProject") || null,
+  surfaceTree: SURFACE_TREE_INIT,
+  dualProject: secondaryProject(SURFACE_TREE_INIT),
   theme: (localStorage.getItem("theme") as "dark" | "light") || "dark",
   fontSize: clampFontSize(Number(localStorage.getItem("fontSize")) || 13),
   termColors: loadTermColors(),
@@ -952,9 +1001,10 @@ export const useAppStore = create<AppState>((set, get) => ({
   requestMemo: () =>
     set((s) => ({ memoRequest: { targetSurfaceId: activeSurfaceId(), nonce: s.memoRequest.nonce + 1 } })),
   setDualProject: (path) => {
-    if (path) localStorage.setItem("dualProject", path);
-    else localStorage.removeItem("dualProject");
-    set({ dualProject: path });
+    // 트리가 멤버십 정본: 열기=addSurface(secondary 추가/교체), 닫기=removeSurface.
+    const tree = path ? addSurface(get().surfaceTree, path) : removeSurface(get().surfaceTree);
+    persistSurfaceTree(tree); // surfaceTree + 레거시 dualProject 이중 기록(원자·다운그레이드 안전)
+    set({ surfaceTree: tree, dualProject: secondaryProject(tree) });
   },
   requestSessionResume: (req) =>
     set((s) =>
