@@ -16,6 +16,7 @@ import { DevView } from "./components/DevView";
 import { FilePeekViewer } from "./components/FilePeekViewer";
 import { CommitFilesSidebar } from "./components/CommitFilesSidebar";
 import { CommitFileView } from "./components/CommitFileView";
+import { TermSettingsLayer } from "./components/TermSettingsButton";
 import { SearchPanel } from "./components/SearchPanel";
 import { RunMenu } from "./components/RunMenu";
 import { AgentOptionsPopover } from "./components/AgentOptionsPopover";
@@ -1067,6 +1068,9 @@ function AppMain() {
         </PanelGroup>
         </div>
       )}
+      {/* 설정 모달 레이어 — 창에 하나. 어느 탭의 ⚙에서 열든, 팝오버의 전역
+          링크에서 열든 여기서 그린다(트리거가 사라져도 모달이 살아남는다). */}
+      <TermSettingsLayer />
       {searchOpen && activeProject && (
         <SearchPanel
           root={activeProject}
