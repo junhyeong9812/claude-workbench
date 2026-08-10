@@ -79,11 +79,19 @@ export const DEFAULT_TIDY_MODEL = "sonnet";
 /** 마지막 선택을 기억하는 키 — agent별 키(`agentOptions:*`)와 같은 선례. */
 const TIDY_MODEL_KEY = "memoTidyModel";
 
-/** 기억된 정리 모델 (없거나 어휘 밖이면 기본값). */
+/**
+ * 기억된 정리 모델 (저장된 적이 없거나 어휘 밖이면 기본값).
+ *
+ * `""`(= CLI 기본)는 **어휘 안의 값**으로 친다 — 사용자가 그걸 고른 것도 선택이고,
+ * 매번 sonnet으로 되돌려 놓으면 기억이 아니라 강요다(`agentOptions`가 미지정을
+ * 1급 값으로 두는 것과 같은 판단).
+ */
 export function loadTidyModel(): string {
   try {
     const saved = localStorage.getItem(TIDY_MODEL_KEY);
-    return MODEL_CHOICES.some((m) => m === saved) ? saved! : DEFAULT_TIDY_MODEL;
+    if (saved === null) return DEFAULT_TIDY_MODEL;
+    if (saved === "") return "";
+    return MODEL_CHOICES.some((m) => m === saved) ? saved : DEFAULT_TIDY_MODEL;
   } catch {
     return DEFAULT_TIDY_MODEL; // 저장소가 막힌 환경 — 기본값으로 계속 동작한다
   }

@@ -27,7 +27,9 @@ import {
   type AutoSaver,
 } from "../state/projectMemo";
 
-/** 편집 잠금 확장 — 키 입력과 프로그램 편집을 둘 다 막는다. */
+/** 편집 잠금 확장 — **사용자 입력**을 두 축으로 막는다(편집 명령 + 브라우저의
+ * contenteditable). 프로그램이 직접 넣는 트랜잭션은 이걸로 막히지 않는다 —
+ * 그건 호출부가 스스로 거절해야 한다({@link MemoEditor}의 `replaceDoc`). */
 const readOnlyExts = (ro: boolean) =>
   ro ? [EditorState.readOnly.of(true), EditorView.editable.of(false)] : [];
 

@@ -78,4 +78,9 @@ describe("memoTools — 정리 모델 기억", () => {
     localStorage.setItem("memoTidyModel", "gpt-없는모델");
     expect(loadTidyModel()).toBe(DEFAULT_TIDY_MODEL);
   });
+
+  it('"CLI 기본"(미지정)도 선택이므로 기억한다', () => {
+    saveTidyModel("");
+    expect(loadTidyModel(), "매번 sonnet으로 되돌리면 기억이 아니라 강요다").toBe("");
+  });
 });

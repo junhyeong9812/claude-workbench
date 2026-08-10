@@ -1443,6 +1443,9 @@ body {
   flex: 0 0 auto;
   display: flex;
   align-items: center;
+  /* 툴바 버튼이 셋까지 붙는다 — 좁은 패널(정리 세션 3분할)에서 밀려 잘리는 대신
+     줄을 바꾼다. 헤더가 한 줄이라는 가정에 기댄 곳은 없다. */
+  flex-wrap: wrap;
   gap: 10px;
   padding: 4px 10px;
   font-size: 0.78em;
