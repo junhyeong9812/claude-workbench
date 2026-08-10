@@ -235,6 +235,12 @@ pub fn build_args(opts: &ClaudeOpts) -> Vec<String> {
     args
 }
 
+/// Hard cap on captured stdout. Output past this is **dropped silently** — the
+/// run still succeeds, it is just truncated. Public so callers whose result is
+/// user content (memo tidy) can treat "hit the cap" as an error instead of
+/// applying a document that ends mid-sentence.
+pub const CLAUDE_P_OUTPUT_CAP: usize = 256 * 1024;
+
 /// Run a one-shot `claude -p --output-format text` in `cwd`, feeding `prompt`
 /// on stdin and capturing stdout. Errors are plain user-safe strings (the
 /// command layer wraps them in its own error type).
@@ -244,7 +250,7 @@ pub fn run_claude_p(
     timeout: Duration,
     opts: &ClaudeOpts,
 ) -> Result<String, String> {
-    const CAP: usize = 256 * 1024;
+    const CAP: usize = CLAUDE_P_OUTPUT_CAP;
 
     let mut child = Command::new("claude")
         .args(build_args(opts))
