@@ -347,6 +347,14 @@ interface AppState {
   devReviewQueue: Array<{ id: string; project: string; prompt: string }>;
   /** Build/test runner: open a terminal panel that runs `cmd` (consumed by MainArea). */
   runRequest: { project: string; cmd: string; title: string } | null;
+  /** 트리 폴더 우클릭 "여기서 터미널 열기" → 그 폴더 cwd의 일반 터미널 탭.
+   *
+   * 소비자는 **화면 앞에 있는 dock 하나**다 — 통합=MainArea(주 surface)·개발=
+   * DevView·스터디=StudySession. 세 표면은 서로 배타적으로 마운트/전면이라
+   * (스터디 모드는 MainArea 자체가 언마운트, 개발/통합은 레이어 게이트) 요청
+   * 하나가 두 dock에 열리지 않는다. `nonce`는 같은 폴더를 연달아 열어도 효과가
+   * 다시 발화하게 한다. */
+  terminalOpenRequest: { cwd: string; title: string; nonce: number } | null;
   /** Bumped to ask MainArea to focus the active dockview panel (Ctrl+B from the
    * already-focused tree toggles focus back to the open tab). A counter so every
    * press re-fires even when the value would otherwise be unchanged. */
@@ -540,6 +548,8 @@ interface AppState {
   consumeDevReview: (id: string) => void;
   /** Request running a build/test command in a terminal (MainArea consumes). */
   requestRun: (req: { project: string; cmd: string; title: string } | null) => void;
+  /** 트리 "여기서 터미널 열기" 요청 (앞 dock이 소비); null이면 지운다. */
+  requestTerminalOpen: (req: { cwd: string; title: string } | null) => void;
   /** Ask MainArea to focus the active dockview panel (Ctrl+B tree→tab toggle). */
   requestFocusMain: () => void;
   /** Ask MainArea to activate the panel for `uuid` (attention roll-up cycle). */
@@ -682,6 +692,7 @@ export const useAppStore = create<AppState>((set, get) => ({
   claudeInjectAcks: [],
   devReviewQueue: [],
   runRequest: null,
+  terminalOpenRequest: null,
   focusMainRequest: 0,
   focusSessionRequest: null,
   termMenuRequest: 0,
@@ -893,6 +904,12 @@ export const useAppStore = create<AppState>((set, get) => ({
   consumeDevReview: (id) =>
     set((s) => ({ devReviewQueue: s.devReviewQueue.filter((r) => r.id !== id) })),
   requestRun: (req) => set({ runRequest: req }),
+  requestTerminalOpen: (req) =>
+    set((s) => ({
+      terminalOpenRequest: req
+        ? { ...req, nonce: (s.terminalOpenRequest?.nonce ?? 0) + 1 }
+        : null,
+    })),
   requestFocusMain: () => set((s) => ({ focusMainRequest: s.focusMainRequest + 1 })),
   requestFocusSession: (uuid) =>
     set((s) => ({

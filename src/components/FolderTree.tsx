@@ -15,6 +15,7 @@ import {
   parentDir,
   resolveDropDir,
 } from "./treeDnd";
+import { useTreeCrud } from "./treeCrud";
 
 /** 트리 행 DnD 핸들러 묶음 — TreeNode 재귀에 한 덩어리로 내려보낸다. */
 interface TreeDndHandlers {
@@ -25,21 +26,6 @@ interface TreeDndHandlers {
   onRowDrop: (entry: DirEntry | null, e: React.DragEvent) => void;
   onRowDragEnd: () => void;
 }
-
-/** Quick file-type picks for "새 파일" (fills the extension; the user can also
- * just type a full name like `Foo.java`). Our supported languages + markdown. */
-const FILE_EXTS: [string, string][] = [
-  ["Rust", "rs"],
-  ["Java", "java"],
-  ["Kotlin", "kt"],
-  ["Python", "py"],
-  ["TS", "ts"],
-  ["TSX", "tsx"],
-  ["JS", "js"],
-  ["HTML", "html"],
-  ["CSS", "css"],
-  ["MD", "md"],
-];
 
 /** A right-click action on a tree node (or the empty background → `entry=null`). */
 type ContextHandler = (entry: DirEntry | null, x: number, y: number) => void;
@@ -169,19 +155,14 @@ export function FolderTree() {
   const requestEditorOpen = useAppStore((s) => s.requestEditorOpen);
   const reloadActiveTree = useAppStore((s) => s.reloadActiveTree);
   const reloadDir = useAppStore((s) => s.reloadDir);
+  const requestTerminalOpen = useAppStore((s) => s.requestTerminalOpen);
 
-  // Right-click context menu (at cursor) + the create/rename/delete dialog.
-  const [menu, setMenu] = useState<{ dir: string; node: DirEntry | null; x: number; y: number } | null>(
-    null,
-  );
+  // 우클릭 CRUD(메뉴·입력/삭제 다이얼로그)는 공용 훅 소유 — 스터디·개발 트리와
+  // 같은 코드다. 여기 남는 다이얼로그는 트리 DnD 고유의 덮어쓰기 확인 하나뿐.
   const [dialog, setDialog] = useState<
-    | { kind: "newfile" | "newfolder"; dir: string }
-    | { kind: "rename"; node: DirEntry }
-    | { kind: "delete"; node: DirEntry }
     | { kind: "dnd-overwrite"; from: string; to: string; destDir: string; srcParent: string; copy: boolean }
     | null
   >(null);
-  const [name, setName] = useState("");
   const [opErr, setOpErr] = useState<string | null>(null);
   // DnD 드롭 후보 하이라이트: 행 경로, "" = 빈 영역(루트), null = 드래그 없음.
   const [dndHover, setDndHover] = useState<string | null>(null);
@@ -193,92 +174,30 @@ export function FolderTree() {
   // 드롭 존 창 생성 중 가드 (post-fix P5 — check-then-create race).
   const dropZoneOpeningRef = useRef(false);
 
-  // Parent dir of an absolute path; "/" for a root-level entry (so reloadDir
-  // never gets "" → the process cwd). treeDnd.parentDir와 문자단위 동일이라
-  // 그쪽(테스트 보유)을 단일 출처로 (P4).
-  const dirname = parentDir;
-
-  // Clean a typed relative path: drop empty/`.`/`..` segments. "" if invalid, so
-  // `.` / `/` / `...` don't slip through as a no-op create.
-  const normalizeRel = (s: string): string => {
-    const segs = s.split("/").map((x) => x.trim()).filter(Boolean);
-    if (segs.length === 0 || segs.some((x) => x === "." || x === "..")) return "";
-    return segs.join("/");
-  };
-
-  // dir to create *into*: a folder uses itself; a file uses its parent dir; the
-  // empty background uses the project root.
-  const dirOf = (node: DirEntry | null): string => {
-    if (!node) return activeProject ?? "";
-    return node.is_dir ? node.path : dirname(node.path);
-  };
-
-  const onContext: ContextHandler = (node, x, y) => {
-    setMenu({ dir: dirOf(node), node, x, y });
-  };
-
   const ensureExpanded = (dir: string) => {
     if (dir !== activeProject && !isExpanded(dir)) toggleExpanded(dir);
   };
 
-  // Run a filesystem op, refresh the affected dir, surface errors in the dialog.
-  // Returns true only on success, so callers can chain (e.g. open the new file)
-  // without firing on failure.
-  const runOp = async (
-    fn: () => Promise<void>,
-    reloadTarget: string,
-    afterExpand?: string,
-  ): Promise<boolean> => {
-    setOpErr(null);
-    try {
-      await fn();
-      await reloadDir(reloadTarget);
-      if (afterExpand) ensureExpanded(afterExpand);
-      setDialog(null);
-      setName("");
-      return true;
-    } catch (e) {
-      setOpErr(errText(e, "작업 실패"));
-      return false;
-    }
-  };
+  // 우클릭 CRUD 공용 훅 — 이 트리 고유의 것만 호스트로 넘긴다: containment 루트
+  // (= 프로젝트 루트), 새 파일 생성 후 에디터 열기, 폴더 터미널, 드롭 존 항목.
+  const crud = useTreeCrud({
+    root: activeProject ?? null,
+    reloadDir,
+    expandDir: ensureExpanded,
+    // 다중 생성(brace)이면 첫 파일만 연다 — 탭 20개가 한꺼번에 열리지 않도록.
+    onCreated: (paths) => requestEditorOpen(paths[0]),
+    onOpenTerminal: (dir) => requestTerminalOpen({ cwd: dir, title: baseName(dir) }),
+    extraItems: (_node, dir) => [
+      {
+        label: "파일 가져오기 (드롭 존)",
+        title: "OS 파일매니저에서 파일을 끌어다 넣는 보조 창을 엽니다 (이 폴더로 복사)",
+        onClick: () => openDropZone(dir),
+      },
+    ],
+  });
 
-  const submitDialog = () => {
-    if (!dialog || !activeProject) return;
-    const root = activeProject;
-    const trimmed = name.trim();
-    if (dialog.kind === "newfile") {
-      // `sub/Foo.java` makes the subdir too. Reject empty path segments.
-      const rel = normalizeRel(trimmed);
-      if (!rel) {
-        setOpErr("올바른 파일명을 입력하세요");
-        return;
-      }
-      const path = `${dialog.dir}/${rel}`;
-      void runOp(() => invoke("create_file", { path, root }), dialog.dir, dialog.dir).then((ok) => {
-        if (ok) requestEditorOpen(path); // open the fresh file in the editor
-      });
-    } else if (dialog.kind === "newfolder") {
-      // `.` (Java package style) or `/` → nested dirs. Reject empty segments so
-      // `.` / `/` / `...` don't silently no-op on an existing dir.
-      const rel = normalizeRel(trimmed.replace(/\./g, "/"));
-      if (!rel) {
-        setOpErr("올바른 폴더명을 입력하세요");
-        return;
-      }
-      void runOp(() => invoke("create_dir", { path: `${dialog.dir}/${rel}`, root }), dialog.dir, dialog.dir);
-    } else if (dialog.kind === "rename") {
-      const rel = normalizeRel(trimmed);
-      if (!rel) {
-        setOpErr("올바른 이름을 입력하세요");
-        return;
-      }
-      const parent = dirname(dialog.node.path);
-      void runOp(
-        () => invoke("rename_path", { from: dialog.node.path, to: `${parent}/${rel}`, root }),
-        parent,
-      );
-    }
+  const onContext: ContextHandler = (node, x, y) => {
+    crud.openMenu(node, x, y);
   };
 
   useEffect(() => {
@@ -483,7 +402,6 @@ export function FolderTree() {
    * 대상 폴더별 고정 label — 같은 폴더로 다시 열면 기존 창을 포커스(진행 중
    * 결과 표시 보존, 리뷰 D8), 다른 폴더면 별도 창. */
   const openDropZone = (dest: string) => {
-    setMenu(null);
     if (!activeProject) return;
     if (dropZoneOpeningRef.current) return; // 연타 create race 방지 (post-fix P5)
     dropZoneOpeningRef.current = true;
@@ -536,13 +454,6 @@ export function FolderTree() {
     }
   };
 
-  const openDialog = (d: NonNullable<typeof dialog>, initial = "") => {
-    setMenu(null);
-    setOpErr(null);
-    setName(initial);
-    setDialog(d);
-  };
-
   return (
     <div
       className={`tree${dndHover === "" ? " tree-drop-root" : ""}`}
@@ -566,144 +477,38 @@ export function FolderTree() {
         <TreeNode key={entry.path} entry={entry} depth={0} onContext={onContext} dnd={dnd} />
       ))}
 
-      {menu && (
-        <>
-          <div className="tree-menu-backdrop" onClick={() => setMenu(null)} onContextMenu={(e) => { e.preventDefault(); setMenu(null); }} />
-          <div className="tree-menu" style={{ left: menu.x, top: menu.y }}>
-            <button className="tree-menu-item" onClick={() => openDialog({ kind: "newfile", dir: menu.dir })}>
-              새 파일
-            </button>
-            <button className="tree-menu-item" onClick={() => openDialog({ kind: "newfolder", dir: menu.dir })}>
-              새 폴더
-            </button>
-            <button
-              className="tree-menu-item"
-              title="OS 파일매니저에서 파일을 끌어다 넣는 보조 창을 엽니다 (이 폴더로 복사)"
-              onClick={() => openDropZone(menu.dir)}
-            >
-              파일 가져오기 (드롭 존)
-            </button>
-            {menu.node && (
-              <>
-                <div className="tree-menu-sep" />
-                <button
-                  className="tree-menu-item"
-                  onClick={() => openDialog({ kind: "rename", node: menu.node! }, menu.node!.name)}
-                >
-                  이름 변경
-                </button>
-                <button
-                  className="tree-menu-item tree-menu-danger"
-                  onClick={() => { setDialog({ kind: "delete", node: menu.node! }); setMenu(null); setOpErr(null); }}
-                >
-                  삭제
-                </button>
-              </>
-            )}
-          </div>
-        </>
-      )}
+      {crud.ui}
 
       {dialog && (
         <div className="tree-dialog-backdrop" onClick={() => setDialog(null)}>
           <div className="tree-dialog" onClick={(e) => e.stopPropagation()}>
-            {dialog.kind === "dnd-overwrite" ? (
-              <>
-                <div className="tree-dialog-head">덮어쓰기 확인</div>
-                <div className="tree-dialog-msg">
-                  대상 폴더에 <code>{baseName(dialog.to)}</code> 이(가) 이미 있습니다.
-                  <br />
-                  기존 항목을 삭제하고 {dialog.copy ? "복사" : "이동"}할까요?
-                </div>
-                {opErr && <div className="tree-dialog-err">{opErr}</div>}
-                <div className="tree-dialog-foot">
-                  <button onClick={() => setDialog(null)}>취소</button>
-                  <button
-                    className="tree-menu-danger"
-                    disabled={dndBusy}
-                    onClick={() =>
-                      void doDnd(
-                        dialog.from,
-                        dialog.to,
-                        dialog.destDir,
-                        dialog.srcParent,
-                        dialog.copy,
-                        true,
-                        true,
-                      )
-                    }
-                  >
-                    {dndBusy ? "처리 중…" : "덮어쓰기"}
-                  </button>
-                </div>
-              </>
-            ) : dialog.kind === "delete" ? (
-              <>
-                <div className="tree-dialog-head">삭제 확인</div>
-                <div className="tree-dialog-msg">
-                  <code>{dialog.node.name}</code> 을(를) 삭제할까요?
-                  {dialog.node.is_dir && " (폴더 내용 전부)"}
-                </div>
-                {opErr && <div className="tree-dialog-err">{opErr}</div>}
-                <div className="tree-dialog-foot">
-                  <button onClick={() => setDialog(null)}>취소</button>
-                  <button
-                    className="tree-menu-danger"
-                    onClick={() =>
-                      void runOp(
-                        () => invoke("delete_path", { path: dialog.node.path, root: activeProject }),
-                        dirname(dialog.node.path),
-                      )
-                    }
-                  >
-                    삭제
-                  </button>
-                </div>
-              </>
-            ) : (
-              <>
-                <div className="tree-dialog-head">
-                  {dialog.kind === "newfile" ? "새 파일" : dialog.kind === "newfolder" ? "새 폴더" : "이름 변경"}
-                </div>
-                {dialog.kind === "newfolder" && (
-                  <div className="tree-dialog-hint">. 또는 / 로 중첩 폴더 (예: com.example.foo)</div>
-                )}
-                <input
-                  className="tree-dialog-input"
-                  autoFocus
-                  value={name}
-                  placeholder={dialog.kind === "newfile" ? "파일명 (예: Foo.java)" : "이름"}
-                  onChange={(e) => setName(e.target.value)}
-                  onKeyDown={(e) => {
-                    if (e.key === "Enter") { e.preventDefault(); submitDialog(); }
-                    if (e.key === "Escape") { e.preventDefault(); setDialog(null); }
-                  }}
-                />
-                {dialog.kind === "newfile" && (
-                  <div className="tree-dialog-exts">
-                    {FILE_EXTS.map(([label, ext]) => (
-                      <button
-                        key={ext}
-                        className="tree-ext-btn"
-                        onClick={() =>
-                          setName((n) => {
-                            const base = n.includes(".") ? n.slice(0, n.lastIndexOf(".")) : n;
-                            return `${base || "Untitled"}.${ext}`;
-                          })
-                        }
-                      >
-                        {label}
-                      </button>
-                    ))}
-                  </div>
-                )}
-                {opErr && <div className="tree-dialog-err">{opErr}</div>}
-                <div className="tree-dialog-foot">
-                  <button onClick={() => setDialog(null)}>취소</button>
-                  <button onClick={submitDialog}>확인</button>
-                </div>
-              </>
-            )}
+            <div className="tree-dialog-head">덮어쓰기 확인</div>
+            <div className="tree-dialog-msg">
+              대상 폴더에 <code>{baseName(dialog.to)}</code> 이(가) 이미 있습니다.
+              <br />
+              기존 항목을 삭제하고 {dialog.copy ? "복사" : "이동"}할까요?
+            </div>
+            {opErr && <div className="tree-dialog-err">{opErr}</div>}
+            <div className="tree-dialog-foot">
+              <button onClick={() => setDialog(null)}>취소</button>
+              <button
+                className="tree-menu-danger"
+                disabled={dndBusy}
+                onClick={() =>
+                  void doDnd(
+                    dialog.from,
+                    dialog.to,
+                    dialog.destDir,
+                    dialog.srcParent,
+                    dialog.copy,
+                    true,
+                    true,
+                  )
+                }
+              >
+                {dndBusy ? "처리 중…" : "덮어쓰기"}
+              </button>
+            </div>
           </div>
         </div>
       )}

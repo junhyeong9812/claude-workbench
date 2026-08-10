@@ -1,12 +1,14 @@
-import { useRef } from "react";
+import { useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { DockviewReact, type DockviewApi, type DockviewReadyEvent } from "dockview-react";
 import "dockview-react/dist/styles/dockview.css";
 import { ClaudeTermPanel } from "./ClaudeTermPanel";
+import { TerminalPanel } from "./TerminalPanel";
 import { useAppStore } from "../state/store";
 import { loadAgentOptions, spawnOptionFields } from "../state/agentOptions";
 
-const components = { claudeterm: ClaudeTermPanel };
+// 스터디 세션 + (트리 "여기서 터미널 열기"로 열리는) 일반 터미널 탭.
+const components = { claudeterm: ClaudeTermPanel, terminal: TerminalPanel };
 
 /**
  * The bottom pane of the study view (P3): a single pinned Claude session +
@@ -23,6 +25,10 @@ export function StudySession() {
   const layout = useAppStore((s) => s.studySessionLayout);
   const setLayout = useAppStore((s) => s.setStudySessionLayout);
   const apiRef = useRef<DockviewApi | null>(null);
+  // 트리 "여기서 터미널 열기" — 스터디 모드에서는 MainArea가 언마운트라 이
+  // dock이 유일한 소비자다. dockReady는 마운트 직후 도착한 요청을 재발화시킨다.
+  const terminalOpenRequest = useAppStore((s) => s.terminalOpenRequest);
+  const [dockReady, setDockReady] = useState(0);
   // Read layout once at onReady (avoid re-seeding on every render).
   const layoutRef = useRef(layout);
   layoutRef.current = layout;
@@ -30,6 +36,7 @@ export function StudySession() {
   const onReady = (event: DockviewReadyEvent) => {
     const api = event.api;
     apiRef.current = api;
+    setDockReady((n) => n + 1);
 
     if (layoutRef.current != null) {
       try {
@@ -38,7 +45,11 @@ export function StudySession() {
         /* corrupt layout — fall through to seeding */
       }
     }
-    if (api.panels.length === 0 && cwd) {
+    // 재시드 판정은 "패널이 하나도 없나"가 아니라 **스터디 세션 패널이 없나**로
+    // 본다(DevView의 getPanel("dev-claude") 선례). 폴더 터미널 탭이 레이아웃에
+    // 남아 있으면 panels.length가 0이 아니어서, 세션을 닫은 뒤로는 영원히
+    // 재시드되지 않던 결함.
+    if (api.getPanel("study-claude") == null && cwd) {
       // Seed with the stable study session UUID so it resumes the same session
       // across restarts (create-or-resume in claude_start) even before any chat.
       const uuid = useAppStore.getState().ensureStudySessionUuid();
@@ -61,14 +72,43 @@ export function StudySession() {
 
     // Explicit close of the study session → stop its PTY + clear layout so the
     // next entry re-seeds a fresh one (study always has exactly one session).
+    // 폴더 터미널 탭은 그 계약 밖이다 — 자기 PTY만 닫고 레이아웃은 건드리지
+    // 않는다(터미널 하나 닫았다고 스터디 세션 레이아웃을 버리면 안 된다).
     api.onDidRemovePanel((panel) => {
-      const p = panel.params as { sessionId?: number } | undefined;
+      const p = panel.params as { kind?: string; sessionId?: number } | undefined;
+      if (p?.kind === "terminal") {
+        if (typeof p.sessionId === "number") {
+          invoke("terminal_close", { id: p.sessionId }).catch(() => {});
+        }
+        return;
+      }
       if (typeof p?.sessionId === "number") {
         invoke("claude_close", { id: p.sessionId }).catch(() => {});
       }
       setLayout(null);
     });
   };
+
+  // 폴더 터미널 요청 소비 (스터디 모드에서만 이 컴포넌트가 마운트된다).
+  // 소비(clear)는 **패널이 실제로 열린 뒤**다 — addPanel이 던지면 요청을 남겨
+  // 다음 발화에 다시 시도한다(부수효과 후 clear: 유실≠소비).
+  useEffect(() => {
+    if (!terminalOpenRequest) return;
+    const api = apiRef.current;
+    if (!api) return; // dock 준비 전 — 요청 보존
+    const { cwd: dir, title } = terminalOpenRequest;
+    try {
+      api.addPanel({
+        id: `terminal-study-${crypto.randomUUID()}`, // 연타해도 id 충돌 없음
+        component: "terminal",
+        title,
+        params: { kind: "terminal", title, cwd: dir },
+      });
+      useAppStore.getState().requestTerminalOpen(null);
+    } catch (err) {
+      console.error("terminalOpen failed; keeping request", err);
+    }
+  }, [terminalOpenRequest, dockReady]);
 
   if (!cwd) {
     return <div className="study-ph study-ph-term">좌/우 폴더를 선택하면 스터디 세션이 열립니다.</div>;
