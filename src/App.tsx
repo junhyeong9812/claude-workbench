@@ -16,7 +16,7 @@ import { DevView } from "./components/DevView";
 import { FilePeekViewer } from "./components/FilePeekViewer";
 import { CommitFilesSidebar } from "./components/CommitFilesSidebar";
 import { CommitFileView } from "./components/CommitFileView";
-import { TermSettingsLayer } from "./components/TermSettingsButton";
+import { TermSettingsButton, TermSettingsLayer } from "./components/TermSettingsButton";
 import { SearchPanel } from "./components/SearchPanel";
 import { RunMenu } from "./components/RunMenu";
 import { AgentOptionsPopover } from "./components/AgentOptionsPopover";
@@ -841,6 +841,18 @@ function AppMain() {
                     +
                   </button>
                 </div>
+              </div>
+              {/* 전역 진입 1개 (리뷰 V3). 주 진입점은 각 터미널·claude 탭의 ⚙
+                  이지만, 탭이 하나도 없는 상태(개발 모드·빈 레이아웃)에서는
+                  같은 모달 안에 있는 **세션 알림 설정**에 닿을 길이 사라진다.
+                  같은 모달을 열 뿐이라 색상까지 전역에서 열리는 건 무해하다. */}
+              <div className="appearance-row">
+                <span className="appearance-label">터미널·알림</span>
+                <TermSettingsButton
+                  className="toolbar-btn"
+                  label="설정 열기…"
+                  title="터미널 색상 · 세션 알림 — 터미널 탭 안의 ⚙과 같은 설정입니다"
+                />
               </div>
             </div>
           )}
