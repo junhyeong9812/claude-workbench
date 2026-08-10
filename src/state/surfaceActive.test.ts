@@ -22,6 +22,7 @@ import { activeSurfaceId } from "./surfaceContext";
 describe("활성 표면 + 요청버스 seam 라우팅 (P4')", () => {
   beforeEach(() => {
     localStorage.clear();
+    useAppStore.setState({ projects: [], activeProject: null });
     const s = useAppStore.getState();
     s.setDualProject(null);
     s.setActiveSurface("primary");
@@ -40,6 +41,8 @@ describe("활성 표면 + 요청버스 seam 라우팅 (P4')", () => {
   });
 
   it("우측 표면이 있으면 활성 전환 → seam·상태·요청버스 stamp가 secondary", () => {
+    // 가시성 술어(G4)는 우측이 **열린 탭**이고 좌측과 다를 것을 요구.
+    useAppStore.setState({ projects: [{ path: "/a", name: "a", project_types: [], tree_state: { expanded: [] } }, { path: "/b", name: "b", project_types: [], tree_state: { expanded: [] } }], activeProject: "/a" });
     const s = useAppStore.getState();
     s.setDualProject("/b"); // 우측 표면 생성
     s.setActiveSurface("secondary");
@@ -53,6 +56,7 @@ describe("활성 표면 + 요청버스 seam 라우팅 (P4')", () => {
   });
 
   it("우측 표면을 닫으면(setDualProject null) 활성이 primary로 되돌아온다", () => {
+    useAppStore.setState({ projects: [{ path: "/a", name: "a", project_types: [], tree_state: { expanded: [] } }, { path: "/b", name: "b", project_types: [], tree_state: { expanded: [] } }], activeProject: "/a" });
     const s = useAppStore.getState();
     s.setDualProject("/b");
     s.setActiveSurface("secondary");
@@ -113,5 +117,66 @@ describe("활성 표면 + 요청버스 seam 라우팅 (P4')", () => {
     useAppStore.getState().setDualProject(null);
     await useAppStore.getState().addProject("/c");
     expect(useAppStore.getState().activeProject).toBe("/c");
+  });
+
+  // ── 듀얼 리뷰 findings ──────────────────────────────────────────────
+  it("[G1] primary를 닫아 재인덱스로 좌측이 우측과 같아지면 활성이 primary로 정규화", () => {
+    useAppStore.setState({ projects: [{ path: "/a", name: "a", project_types: [], tree_state: { expanded: [] } }, { path: "/b", name: "b", project_types: [], tree_state: { expanded: [] } }], activeProject: "/a" });
+    const s = useAppStore.getState();
+    s.setDualProject("/b");
+    s.setActiveSurface("secondary");
+    expect(useAppStore.getState().activeSurfaceId).toBe("secondary");
+    // /a(primary) 닫음 → projects=[/b], activeProject=/b(재인덱스) → 우측 /b가
+    // 좌측과 겹쳐 숨김 → 활성 정규화.
+    useAppStore.getState().closeProject("/a");
+    expect(useAppStore.getState().activeProject).toBe("/b");
+    expect(useAppStore.getState().activeSurfaceId).toBe("primary");
+  });
+
+  it("[G2] 슬롯 재분류 — picker-UI는 항상 primary, panel-destination은 활성 표면", () => {
+    useAppStore.setState({ projects: [{ path: "/a", name: "a", project_types: [], tree_state: { expanded: [] } }, { path: "/b", name: "b", project_types: [], tree_state: { expanded: [] } }], activeProject: "/a" });
+    const s = useAppStore.getState();
+    s.setDualProject("/b");
+    s.setActiveSurface("secondary");
+    expect(useAppStore.getState().activeSurfaceId).toBe("secondary");
+    const g = useAppStore.getState();
+    // picker-UI-open → 항상 primary(팝오버/포커스가 primary 크롬에만 렌더).
+    g.requestTermMenu();
+    g.requestClaudePicker();
+    g.requestFocusMain();
+    expect(useAppStore.getState().termMenuRequest.targetSurfaceId).toBe("primary");
+    expect(useAppStore.getState().claudePickerRequest.targetSurfaceId).toBe("primary");
+    expect(useAppStore.getState().focusMainRequest.targetSurfaceId).toBe("primary");
+    // panel-destination → 활성 표면(secondary).
+    g.requestClaudeOpen({ project: "/b" });
+    g.requestCodexOpen({ project: "/b" });
+    g.requestRun({ project: "/b", cmd: "x", title: "t" });
+    g.requestTerminalOpen({ cwd: "/b", title: "t" });
+    g.requestEditorOpen("/b/f.ts");
+    g.requestDiff({ title: "d", cwd: "/b", path: "a" });
+    g.requestSessionResume({ uuid: "u", project: "/b", title: "t" });
+    g.requestMemo();
+    g.requestDetachPanel();
+    const h = useAppStore.getState();
+    expect(h.claudeOpenRequest?.targetSurfaceId).toBe("secondary");
+    expect(h.codexOpenRequest?.targetSurfaceId).toBe("secondary");
+    expect(h.runRequest?.targetSurfaceId).toBe("secondary");
+    expect(h.terminalOpenRequest?.targetSurfaceId).toBe("secondary");
+    expect(h.editorOpenRequest?.targetSurfaceId).toBe("secondary");
+    expect(h.diffRequest?.targetSurfaceId).toBe("secondary");
+    expect(h.sessionResumeRequest?.targetSurfaceId).toBe("secondary");
+    expect(h.memoRequest.targetSurfaceId).toBe("secondary");
+    expect(h.detachPanelRequest.targetSurfaceId).toBe("secondary");
+  });
+
+  it("[G3] 주 표면이 dev로 진입하면 활성이 primary로 정규화(오버레이가 dual 가림)", () => {
+    useAppStore.setState({ projects: [{ path: "/a", name: "a", project_types: [], tree_state: { expanded: [] } }, { path: "/b", name: "b", project_types: [], tree_state: { expanded: [] } }], activeProject: "/a", projectModes: {} });
+    const s = useAppStore.getState();
+    s.setDualProject("/b");
+    s.setActiveSurface("secondary");
+    expect(useAppStore.getState().activeSurfaceId).toBe("secondary");
+    // 좌측(activeProject="/a")이 dev 진입 → DevView 오버레이가 dual 전체를 가림.
+    useAppStore.getState().setProjectMode("/a", "dev");
+    expect(useAppStore.getState().activeSurfaceId).toBe("primary");
   });
 });
