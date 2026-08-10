@@ -1516,7 +1516,7 @@ body {
   cursor: default;
 }
 
-/* ---- 메모 툴바 ([저장하기]) ---- */
+/* ---- 메모 툴바 ([저장하기] · [정리] · [되돌리기]) ---- */
 /* 헤더의 버튼은 상태 줄 오른쪽에 붙는다 — `.memo-path`가 남은 폭을 먹으므로
    버튼들은 줄어들지 않게 flex 0. */
 .memo-tool {
@@ -1539,7 +1539,9 @@ body {
   color: var(--fg-dim);
   border-bottom: 1px solid var(--border, #333);
 }
-.memo-save {
+.memo-save,
+.memo-tidy-bar,
+.memo-tidy-foot {
   flex: 0 0 auto;
   display: flex;
   align-items: center;
@@ -1576,6 +1578,28 @@ body {
   flex: 0 1 auto;
   color: color-mix(in srgb, var(--st-warn) 80%, var(--fg));
 }
+/* 정리 미리보기 — 적용 전에는 **읽기 전용 텍스트**다. 메모 본문을 밀어내지
+   않도록 자기 높이 상한 안에서 스크롤한다. */
+.memo-tidy {
+  flex: 0 1 auto;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  max-height: 55%;
+}
+.memo-tidy-preview {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow: auto;
+  padding: 8px 10px;
+  font-family: var(--mono, monospace);
+  font-size: 0.82em;
+  white-space: pre-wrap;
+  color: var(--fg, #cdd6f4);
+  background: color-mix(in srgb, var(--accent-bright) 6%, transparent);
+  border-bottom: 1px solid var(--border, #333);
+}
+
 /* ---- Git panel (G1) ---- */
 .git-panel {
   display: flex;

@@ -1,13 +1,20 @@
 /**
- * 메모 툴바의 **되돌릴 수 없는 순간**을 실증한다.
+ * 메모 툴바의 **되돌릴 수 없는 두 순간**을 실증한다.
  *
- * [저장하기]는 프로젝트 안의 진짜 파일을 쓴다. 그래서 여기서 보는 건 "무엇을
- * 백엔드에 넘겼는가"와 **기존 파일이 확인 없이 덮이지 않는가**다(백엔드가
- * `exists`로 되돌려주는 확인 턱이 UI에 실제로 뜨는가).
+ * ① [저장하기] — 프로젝트 안의 진짜 파일을 쓴다. 그래서 여기서 보는 건 "무엇을
+ *   백엔드에 넘겼는가"와 **기존 파일이 확인 없이 덮이지 않는가**다(백엔드가
+ *   `exists`로 되돌려주는 확인 턱이 UI에 실제로 뜨는가).
+ * ② [정리] — AI 결과로 사용자의 글을 통째로 갈아 끼운다. 미리보기 전에는 한 글자도
+ *   바뀌지 않아야 하고, 적용 뒤에는 직전 본문으로 1회 되돌아갈 수 있어야 한다.
+ *   실패는 무해해야 한다(메모 불변 + 사유).
+ *
+ * 자동 저장(#72 유실 0)은 이 파일의 대상이 아니지만 **회귀는 여기서도 드러난다**:
+ * 적용/되돌리기가 CodeMirror 트랜잭션을 타므로 `write`가 그 본문으로 나가야 한다.
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
+import { EditorView } from "codemirror";
 
 const invoke = vi.hoisted(() => vi.fn());
 vi.mock("@tauri-apps/api/core", () => ({ invoke }));
@@ -28,7 +35,7 @@ Range.prototype.getBoundingClientRect = () => new DOMRect();
 
 const ROOT = "/home/u/repo";
 
-describe("메모 툴바 — 저장하기", () => {
+describe("메모 툴바 — 저장하기 · 정리", () => {
   let host: HTMLDivElement;
   let root: Root;
   const writes: string[] = [];
@@ -96,12 +103,15 @@ describe("메모 툴바 — 저장하기", () => {
       input.dispatchEvent(new Event("input", { bubbles: true }));
     });
   };
+  const docText = () =>
+    EditorView.findFromDOM(host.querySelector(".cm-content") as HTMLElement)!.state.doc.toString();
   const exportCalls = () =>
     invoke.mock.calls.filter((c) => c[0] === "memo_export").map((c) => c[1] as Record<string, unknown>);
 
   it("저장 대상 루트가 없으면 [저장하기]를 아예 내지 않는다", async () => {
     await mount(null);
     expect(has("저장하기")).toBe(false);
+    expect(has("정리"), "정리는 루트와 무관하다").toBe(true);
   });
 
   it("기본 제안 경로로 프로젝트 안에 저장한다", async () => {
@@ -151,5 +161,60 @@ describe("메모 툴바 — 저장하기", () => {
     await click("저장");
     expect(host.querySelector(".memo-save"), "폼은 열린 채").toBeTruthy();
     expect(host.querySelector(".memo-save-err")?.textContent).toContain("권한이 없습니다");
+  });
+
+  it("정리는 미리보기까지만 — 적용 전에는 메모가 한 글자도 안 바뀐다", async () => {
+    invoke.mockResolvedValue("정리된 메모");
+    await mount();
+    await click("정리");
+    await click("정리 실행");
+    // 기본 모델은 sonnet(공통 목록).
+    expect(invoke).toHaveBeenCalledWith("memo_tidy", { text: "원래 메모", model: "sonnet" });
+    expect(host.querySelector(".memo-tidy-preview")?.textContent).toBe("정리된 메모");
+    expect(docText(), "미리보기는 메모를 건드리지 않는다").toBe("원래 메모");
+    expect(writes, "저장도 나가지 않는다").toEqual([]);
+  });
+
+  it("[적용]은 메모를 교체하고, [되돌리기]는 직전 본문으로 1회 되돌린다", async () => {
+    invoke.mockResolvedValue("정리된 메모");
+    await mount();
+    await click("정리");
+    await click("정리 실행");
+    await click("적용");
+    expect(docText()).toBe("정리된 메모");
+    expect(host.querySelector(".memo-tidy-preview"), "적용하면 미리보기는 닫힌다").toBeNull();
+    // 교체는 평범한 편집과 같은 길을 탄다 — 자동 저장이 그 본문으로 나간다.
+    await act(async () => {
+      (host.querySelector(".cm-content") as HTMLElement).dispatchEvent(
+        new FocusEvent("blur", { bubbles: true }),
+      );
+    });
+    expect(writes).toEqual(["정리된 메모"]);
+
+    await click("되돌리기");
+    expect(docText()).toBe("원래 메모");
+    // **1회**다 — 되돌린 뒤에는 버튼이 사라진다.
+    expect(has("되돌리기")).toBe(false);
+  });
+
+  it("[버리기]는 결과만 버린다 (메모 불변)", async () => {
+    invoke.mockResolvedValue("정리된 메모");
+    await mount();
+    await click("정리");
+    await click("정리 실행");
+    await click("버리기");
+    expect(host.querySelector(".memo-tidy-preview")).toBeNull();
+    expect(docText()).toBe("원래 메모");
+    expect(has("되돌리기"), "적용한 적이 없으니 되돌릴 것도 없다").toBe(false);
+  });
+
+  it("정리 실패는 무해하다 — 메모 불변 + 사유", async () => {
+    invoke.mockRejectedValue({ message: "claude 를 실행할 수 없습니다" });
+    await mount();
+    await click("정리");
+    await click("정리 실행");
+    expect(host.querySelector(".memo-save-err")?.textContent).toContain("claude");
+    expect(docText()).toBe("원래 메모");
+    expect(host.querySelector(".memo-tidy-preview")).toBeNull();
   });
 });

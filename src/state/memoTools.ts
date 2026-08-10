@@ -1,10 +1,13 @@
 /**
- * 메모 툴바([저장하기])의 **순수 규칙** — 저장 경로 어휘.
+ * 메모 툴바([저장하기] · [메모 정리])의 **순수 규칙** — 경로 어휘와 모델 기억.
  *
- * UI(`MemoEditor`)에서 떼어 둔 이유는 이 판정이 조용히 틀리면 손해가 크기
- * 때문이다: 경로 정규화가 헐거우면 프로젝트 밖에 파일이 생긴다(백엔드
- * `memo_export`의 봉쇄가 마지막 방어선이지, 여기가 첫 번째다).
+ * UI(`MemoEditor`)에서 떼어 둔 이유는 여기 있는 두 판정이 조용히 틀리면 손해가
+ * 크기 때문이다: 경로 정규화가 헐거우면 프로젝트 밖에 파일이 생기고(백엔드
+ * `memo_export`의 봉쇄가 마지막 방어선이지, 여기가 첫 번째다), 모델 기억이
+ * 어휘를 안 지키면 정리 실행이 CLI 즉사로 끝난다.
  */
+
+import { MODEL_CHOICES } from "./agentOptions";
 
 /** `YYYY-MM-DD` — **로컬 달력** 기준(사용자가 보는 오늘). */
 export function isoDate(now: Date = new Date()): string {
@@ -44,4 +47,35 @@ export function normalizeMemoRel(input: string): RelPathCheck {
   if (parts.length === 0) return { ok: false, reason: "저장할 파일 이름이 없습니다." };
   if (raw.endsWith("/")) return { ok: false, reason: "폴더가 아니라 파일 경로를 적으세요." };
   return { ok: true, rel: parts.join("/") };
+}
+
+/**
+ * 정리에 쓸 모델의 기본값 — **sonnet**.
+ *
+ * 세션 옵션(`agentOptions`)의 `""`(미지정)과 다른 선택이다: 저기는 사용자가 쓰던
+ * CLI 기본을 존중해야 하는 대화 세션이고, 여기는 한 번 돌고 끝나는 정리 작업이라
+ * 비용·속도가 예측 가능한 쪽이 낫다.
+ */
+export const DEFAULT_TIDY_MODEL = "sonnet";
+
+/** 마지막 선택을 기억하는 키 — agent별 키(`agentOptions:*`)와 같은 선례. */
+const TIDY_MODEL_KEY = "memoTidyModel";
+
+/** 기억된 정리 모델 (없거나 어휘 밖이면 기본값). */
+export function loadTidyModel(): string {
+  try {
+    const saved = localStorage.getItem(TIDY_MODEL_KEY);
+    return MODEL_CHOICES.some((m) => m === saved) ? saved! : DEFAULT_TIDY_MODEL;
+  } catch {
+    return DEFAULT_TIDY_MODEL; // 저장소가 막힌 환경 — 기본값으로 계속 동작한다
+  }
+}
+
+/** 고른 모델을 기억한다 (실패는 무시 — 기억은 편의지 계약이 아니다). */
+export function saveTidyModel(model: string): void {
+  try {
+    localStorage.setItem(TIDY_MODEL_KEY, model);
+  } catch {
+    /* 저장 실패는 무해 */
+  }
 }

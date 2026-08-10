@@ -1,13 +1,21 @@
 /**
- * 메모 툴바의 순수 규칙 — 저장 경로 정규화.
+ * 메모 툴바의 순수 규칙 — 저장 경로 정규화와 정리 모델 기억.
  *
- * load-bearing이다: 여기서 통과시킨 문자열이 그대로 프로젝트 루트에
+ * 경로 쪽이 load-bearing이다: 여기서 통과시킨 문자열이 그대로 프로젝트 루트에
  * 붙는다. 백엔드 `memo_export`가 canonical 봉쇄로 한 번 더 막지만, **두 겹이
  * 다 열려야 사고가 나는 구조**를 유지하려면 이쪽 목록도 테스트로 고정해야 한다.
  */
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it } from "vitest";
 
-import { defaultMemoPath, isoDate, normalizeMemoRel } from "./memoTools";
+import {
+  DEFAULT_TIDY_MODEL,
+  defaultMemoPath,
+  isoDate,
+  loadTidyModel,
+  normalizeMemoRel,
+  saveTidyModel,
+} from "./memoTools";
+import { MODEL_CHOICES } from "./agentOptions";
 
 describe("memoTools — 저장 경로", () => {
   it("기본 제안은 오늘 날짜의 docs/memo-YYYY-MM-DD.md (로컬 달력)", () => {
@@ -36,5 +44,22 @@ describe("memoTools — 저장 경로", () => {
   it("폴더 경로·순수 점은 파일이 아니라고 말해 준다", () => {
     expect(normalizeMemoRel("docs/")).toMatchObject({ ok: false });
     expect(normalizeMemoRel(".")).toMatchObject({ ok: false });
+  });
+});
+
+describe("memoTools — 정리 모델 기억", () => {
+  afterEach(() => localStorage.clear());
+
+  it("기본은 sonnet이고 공통 목록의 값이다", () => {
+    expect(DEFAULT_TIDY_MODEL).toBe("sonnet");
+    expect(MODEL_CHOICES).toContain(DEFAULT_TIDY_MODEL);
+    expect(loadTidyModel()).toBe("sonnet");
+  });
+
+  it("고른 값을 기억하되, 어휘 밖 값은 기본으로 떨어뜨린다", () => {
+    saveTidyModel("fable");
+    expect(loadTidyModel()).toBe("fable");
+    localStorage.setItem("memoTidyModel", "gpt-없는모델");
+    expect(loadTidyModel()).toBe(DEFAULT_TIDY_MODEL);
   });
 });

@@ -4,9 +4,15 @@ import { EditorView, basicSetup } from "codemirror";
 import { EditorState, Compartment } from "@codemirror/state";
 import { langFor } from "./cmLang";
 import { cmThemeExt } from "./cmTheme";
+import { ModelSelect } from "./AgentOptionFields";
 import { errText } from "../utils/error";
 import { useAppStore } from "../state/store";
-import { defaultMemoPath, normalizeMemoRel } from "../state/memoTools";
+import {
+  defaultMemoPath,
+  loadTidyModel,
+  normalizeMemoRel,
+  saveTidyModel,
+} from "../state/memoTools";
 import {
   MEMO_SAVE_DELAY,
   clearStash,
@@ -138,9 +144,10 @@ export function MemoEditor({
   const cbRef = useRef({ read, write, onText, onHandle });
   cbRef.current = { read, write, onText, onHandle };
 
-  // ---- 툴바([저장하기]) ----
-  // 자동 저장 경로에는 손대지 않는다 — 내보내기는 **별도 커맨드**(`memo_export`)로
-  // 나가고, 앱 데이터의 메모 파일과 그 낙관적 잠금에는 손대지 않는다.
+  // ---- 툴바([저장하기] · [메모 정리]) ----
+  // 자동 저장 경로에는 손대지 않는다: 여기서 본문을 바꿀 때도 CodeMirror
+  // 트랜잭션으로 넣어 **평범한 편집과 같은 길**(updateListener → saver.schedule)을
+  // 타게 한다. 툴바가 따로 디스크에 쓰면 유실 방어선이 둘로 갈린다.
   const [saveOpen, setSaveOpen] = useState(false);
   const [savePath, setSavePath] = useState("");
   const [saveBusy, setSaveBusy] = useState(false);
@@ -148,6 +155,23 @@ export function MemoEditor({
   // 덮어쓰기 확인 턱 — 값이 있으면 "이미 있다"는 답을 받은 상대 경로다.
   const [overwriteRel, setOverwriteRel] = useState<string | null>(null);
   const [note, setNote] = useState<string | null>(null);
+  const [tidyOpen, setTidyOpen] = useState(false);
+  const [tidyModel, setTidyModel] = useState(() => loadTidyModel());
+  const [tidyBusy, setTidyBusy] = useState(false);
+  const [tidyErr, setTidyErr] = useState<string | null>(null);
+  const [tidyResult, setTidyResult] = useState<string | null>(null);
+  // 적용 직전 본문 — **1회** 되돌리기의 전부(스택이 아니다).
+  const [undoText, setUndoText] = useState<string | null>(null);
+
+  /** 본문을 통째로 갈아 끼운다 (정리 [적용]·[되돌리기]). 잠금 중에는 트랜잭션이
+   * 무시되므로 시도하지 않는다. */
+  const replaceDoc = (next: string): boolean => {
+    const view = viewRef.current;
+    if (!view || readOnly) return false;
+    view.dispatch({ changes: { from: 0, to: view.state.doc.length, insert: next } });
+    return true;
+  };
+
   /** 저장 요청 1회. `overwrite`가 false인데 파일이 있으면 아무것도 쓰지 않고
    * 확인 턱으로 돌아온다. */
   const runExport = (rel: string, overwrite: boolean) => {
@@ -183,13 +207,49 @@ export function MemoEditor({
     runExport(check.rel, false);
   };
 
-  // 대상이 바뀌면 툴바 상태도 그 메모의 것이 아니다 — 열려 있던 폼과 안내를
-  // 버린다(다른 메모의 경로가 이 메모의 저장 폼에 남는 사고 방지).
+  const runTidy = () => {
+    setTidyBusy(true);
+    setTidyErr(null);
+    setTidyResult(null);
+    saveTidyModel(tidyModel);
+    invoke<string>("memo_tidy", { text: latestRef.current, model: tidyModel || null })
+      .then(setTidyResult)
+      // 실패는 무해하다 — 메모는 그대로고 사유만 남는다.
+      .catch((e) => setTidyErr(errText(e)))
+      .finally(() => setTidyBusy(false));
+  };
+
+  const applyTidy = () => {
+    if (tidyResult === null) return;
+    const before = latestRef.current;
+    if (!replaceDoc(tidyResult)) {
+      setTidyErr("지금은 메모를 바꿀 수 없습니다.");
+      return;
+    }
+    setUndoText(before);
+    setTidyResult(null);
+    setTidyOpen(false);
+    setNote("정리 결과를 적용했습니다 — [되돌리기]로 직전 본문으로 돌아갑니다");
+  };
+
+  const undoTidy = () => {
+    if (undoText === null) return;
+    if (!replaceDoc(undoText)) return;
+    setUndoText(null);
+    setNote("직전 본문으로 되돌렸습니다");
+  };
+
+  // 대상이 바뀌면 툴바 상태도 그 메모의 것이 아니다 — 되돌리기 버퍼까지 버린다
+  // (다른 메모의 본문을 이 메모에 붓는 사고 방지).
   useEffect(() => {
     setSaveOpen(false);
     setSaveErr(null);
     setOverwriteRel(null);
     setNote(null);
+    setTidyOpen(false);
+    setTidyErr(null);
+    setTidyResult(null);
+    setUndoText(null);
   }, [storeKey]);
 
   // Switch the CodeMirror theme live when the app theme changes (EditorPanel 선례).
@@ -354,6 +414,26 @@ export function MemoEditor({
             저장하기
           </button>
         )}
+        <button
+          className="memo-tool"
+          title="AI가 메모의 구조·중복만 정리합니다 (내용은 그대로 · 적용 전에 미리 봅니다)"
+          onClick={() => {
+            setTidyErr(null);
+            setNote(null);
+            setTidyOpen((v) => !v);
+          }}
+        >
+          정리
+        </button>
+        {undoText !== null && (
+          <button
+            className="memo-tool"
+            title="정리 적용 직전의 본문으로 돌아갑니다 (1회)"
+            onClick={undoTidy}
+          >
+            되돌리기
+          </button>
+        )}
         {actions}
       </div>
       {note && <div className="memo-note">{note}</div>}
@@ -398,6 +478,40 @@ export function MemoEditor({
             취소
           </button>
           {saveErr && <span className="memo-save-err">{saveErr}</span>}
+        </div>
+      )}
+      {tidyOpen && (
+        <div className="memo-tidy">
+          <div className="memo-tidy-bar">
+            <span>모델</span>
+            <ModelSelect
+              value={tidyModel}
+              defaultLabel="CLI 기본"
+              ariaLabel="정리에 쓸 모델"
+              onChange={setTidyModel}
+            />
+            <button className="memo-retry" disabled={tidyBusy} onClick={runTidy}>
+              {tidyBusy ? "정리 중…" : "정리 실행"}
+            </button>
+            <button className="memo-retry" onClick={() => setTidyOpen(false)}>
+              닫기
+            </button>
+            {tidyErr && <span className="memo-save-err">정리 실패: {tidyErr}</span>}
+          </div>
+          {tidyResult !== null && (
+            <>
+              <div className="memo-tidy-preview">{tidyResult}</div>
+              <div className="memo-tidy-foot">
+                <span className="memo-save-warn">미리보기 — 적용해야 메모가 바뀝니다</span>
+                <button className="memo-retry" disabled={!!readOnly} onClick={applyTidy}>
+                  적용
+                </button>
+                <button className="memo-retry" onClick={() => setTidyResult(null)}>
+                  버리기
+                </button>
+              </div>
+            </>
+          )}
         </div>
       )}
       {conflict && (
