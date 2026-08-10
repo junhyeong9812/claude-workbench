@@ -172,6 +172,11 @@ pub fn memo_export(
     }
     if overwrite {
         // 사용자가 이미 "덮어써라"라고 답한 경로 — 원자 교체로 쓴다(부분 파일 없음).
+        //
+        // 확인 이후 쓰기 전까지 대상이 바뀌는 것(누가 지우고 심링크를 걸어 두는 것,
+        // 상위 디렉토리가 심링크가 되는 것)은 막지 않는다. 확인 턱은 **관측**이지
+        // 원자적 보장이 아니고, 그 공격은 이미 같은 계정 권한을 가진 로컬
+        // 프로세스만 할 수 있다 — #71 G4와 같은 위협 모델에서 수용한다.
         crate::commands::files::atomic_write(&full, &text)?;
         return Ok(MemoExportResult::Saved { path: full_s });
     }
@@ -180,21 +185,18 @@ pub fn memo_export(
     // `create_new`는 그 원자적 primitive이고, 끊어진 심링크·기존 심링크에도
     // `AlreadyExists`로 실패한다 — `exists()`가 놓치는 경로까지 "이미 있다"로 본다.
     //
-    // 여기서 원자 교체(temp+rename)를 못 쓰는 이유는 rename이 **항상 덮기**이기
-    // 때문이다. 새 파일 한 개에 한해 "부분 쓰기 가능성"보다 "확인 없는 덮어쓰기
-    // 불가"를 택한다.
-    //
-    // 상위 디렉토리가 그 사이 심링크로 바뀌는 TOCTOU는 남는다 — 로컬 사용자 권한이
-    // 이미 있는 공격자만 가능한 경로라 위협 모델에서 수용한다(#71 G4와 동일).
+    // 다만 `create_new`로 **본문까지** 쓰면 원자성을 잃는다(쓰기 중 실패 = 부분
+    // 파일이 최종 경로에 남는다). 그래서 두 단계로 나눈다: create_new는 **자리
+    // 예약**(빈 파일)으로만 쓰고, 본문은 기존 원자 교체(temp+rename)로 얹는다 —
+    // 방금 우리가 예약한 파일 위의 교체라 남의 파일을 덮을 여지가 없다. 예약 뒤
+    // 어느 단계든 실패하면 예약을 지워 빈 파일도 남기지 않는다.
     match std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
         .open(&full)
     {
-        Ok(mut f) => {
-            use std::io::Write;
-            f.write_all(text.as_bytes())
-                .map_err(|e| AppError::new(crate::commands::io_message("Cannot save memo", &e)))?;
+        Ok(_reserved) => {
+            fill_reserved(&full, || crate::commands::files::atomic_write(&full, &text))?;
             Ok(MemoExportResult::Saved { path: full_s })
         }
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
@@ -205,6 +207,21 @@ pub fn memo_export(
             &e,
         ))),
     }
+}
+
+/// 예약해 둔 자리를 채운다 — **실패하면 예약을 지운다**.
+///
+/// 예약(빈 파일)이 남으면 사용자에겐 "저장에 실패했다는데 파일은 생겼다"가 되고,
+/// 다음 시도는 그 빈 파일 때문에 확인 턱에 걸린다. 실패의 흔적이 다음 시도를
+/// 방해해선 안 된다.
+fn fill_reserved(
+    full: &std::path::Path,
+    write: impl FnOnce() -> Result<(), AppError>,
+) -> Result<(), AppError> {
+    write().map_err(|e| {
+        let _ = std::fs::remove_file(full);
+        e
+    })
 }
 
 /// 메모를 AI에게 **정리시키고 결과 본문만** 돌려준다 (메모 툴바 [메모 정리]).
@@ -420,6 +437,42 @@ mod tests {
         let out = memo_export(root_s, "m.md".into(), "새 본문".into(), true).unwrap();
         assert!(matches!(out, MemoExportResult::Saved { .. }));
         assert_eq!(std::fs::read_to_string(root.join("m.md")).unwrap(), "새 본문");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 쓰기가 실패하면 **최종 경로에 아무것도 남지 않는다** — 예약(빈 파일)도
+    /// 지운다. 남으면 "실패했다는데 파일은 생겼다"가 되고, 다음 시도는 그 빈
+    /// 파일 때문에 확인 턱에 걸린다.
+    #[test]
+    fn a_failed_write_leaves_no_partial_file() {
+        let (root, _root_s) = temp_root("partial");
+        let target = root.join("m.md");
+        // 예약 — 확인 전 저장 경로가 하는 것과 같다.
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&target)
+            .expect("예약");
+        assert!(target.exists(), "예약이 자리를 잡았다");
+
+        let r = fill_reserved(&target, || Err(AppError::new("디스크 오류")));
+        assert!(r.is_err());
+        assert!(
+            std::fs::symlink_metadata(&target).is_err(),
+            "부분 파일도 빈 예약도 남으면 안 된다"
+        );
+
+        // 성공 경로는 그대로 남는다(정상 저장의 대조군).
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&target)
+            .expect("예약");
+        fill_reserved(&target, || {
+            crate::commands::files::atomic_write(&target, "본문")
+        })
+        .expect("저장");
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "본문");
         let _ = std::fs::remove_dir_all(&root);
     }
 
