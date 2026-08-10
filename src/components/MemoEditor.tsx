@@ -344,6 +344,12 @@ export function MemoEditor({
     let cancelled = false;
     setErr(null);
     setConflict(false);
+    // 에디터를 **다시 만드는 모든 경로**에서 툴바를 내린다. storeKey 변경뿐
+    // 아니라 [재시도]·[새로고침](reloads)도 여기로 오는데, 그때 이전 본문이
+    // latestRef에 남아 있으면 새 본문이 도착하기 전의 [저장하기]가 **낡은 글**을
+    // 파일로 찍어 낸다. 값도 함께 비워 그 창을 없앤다.
+    setLoaded(false);
+    latestRef.current = "";
 
     // 저장 실패는 조용히 넘기지 않는다 — 자동 저장은 사용자가 결과를 볼 수 있는
     // 유일한 자리가 상태 줄뿐이다(명시 저장 버튼이 없다). 그리고 **실패는 반드시

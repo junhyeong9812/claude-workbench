@@ -144,6 +144,32 @@ describe("메모 툴바 — 저장하기 · 정리", () => {
     expect(has("정리")).toBe(false);
   });
 
+  it("[새로고침]으로 다시 읽는 동안에도 툴바가 낡은 본문을 들고 있지 않다", async () => {
+    // 읽기 실패 → [재시도] 경로로 에디터를 다시 만든다. 그 사이 툴바가 보이면
+    // 직전 본문(또는 빈 문자열)이 파일로 나갈 수 있다.
+    let fail = true;
+    await act(async () => {
+      root.render(
+        <MemoEditor
+          storeKey="/home/u/repo"
+          read={async () => {
+            if (fail) throw new Error("일시적 오류");
+            return { text: disk, hash: "h0" };
+          }}
+          write={write}
+          projectRoot={ROOT}
+        />,
+      );
+    });
+    expect(has("저장하기")).toBe(false);
+    fail = false;
+    await act(async () => {
+      btn("재시도").click();
+    });
+    expect(host.querySelector(".cm-content")?.textContent).toContain("원래 메모");
+    expect(has("저장하기"), "다시 선 뒤에는 툴바가 돌아온다").toBe(true);
+  });
+
   it("기본 제안 경로로 프로젝트 안에 저장한다", async () => {
     invoke.mockResolvedValue({ status: "saved", path: `${ROOT}/docs/x.md` });
     await mount();
