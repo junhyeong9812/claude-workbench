@@ -166,17 +166,45 @@ pub fn memo_export(
     if full.is_dir() {
         return Err(AppError::new("같은 이름의 폴더가 이미 있습니다."));
     }
-    // `symlink_metadata` — 끊어진 심링크도 "이미 있다"로 본다(`exists()`는 false를
-    // 주고 조용히 지나간다).
-    if std::fs::symlink_metadata(&full).is_ok() && !overwrite {
-        return Ok(MemoExportResult::Exists { path: full_s });
-    }
     if let Some(parent) = full.parent() {
         std::fs::create_dir_all(parent)
             .map_err(|e| AppError::new(crate::commands::io_message("Cannot save memo", &e)))?;
     }
-    crate::commands::files::atomic_write(&full, &text)?;
-    Ok(MemoExportResult::Saved { path: full_s })
+    if overwrite {
+        // 사용자가 이미 "덮어써라"라고 답한 경로 — 원자 교체로 쓴다(부분 파일 없음).
+        crate::commands::files::atomic_write(&full, &text)?;
+        return Ok(MemoExportResult::Saved { path: full_s });
+    }
+    // 확인 전 저장은 **존재 검사와 생성이 한 번에** 일어나야 한다. 검사 뒤 쓰기로
+    // 나누면 그 사이에 생긴 파일을 확인 없이 덮는다(`create_file`과 같은 판단).
+    // `create_new`는 그 원자적 primitive이고, 끊어진 심링크·기존 심링크에도
+    // `AlreadyExists`로 실패한다 — `exists()`가 놓치는 경로까지 "이미 있다"로 본다.
+    //
+    // 여기서 원자 교체(temp+rename)를 못 쓰는 이유는 rename이 **항상 덮기**이기
+    // 때문이다. 새 파일 한 개에 한해 "부분 쓰기 가능성"보다 "확인 없는 덮어쓰기
+    // 불가"를 택한다.
+    //
+    // 상위 디렉토리가 그 사이 심링크로 바뀌는 TOCTOU는 남는다 — 로컬 사용자 권한이
+    // 이미 있는 공격자만 가능한 경로라 위협 모델에서 수용한다(#71 G4와 동일).
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&full)
+    {
+        Ok(mut f) => {
+            use std::io::Write;
+            f.write_all(text.as_bytes())
+                .map_err(|e| AppError::new(crate::commands::io_message("Cannot save memo", &e)))?;
+            Ok(MemoExportResult::Saved { path: full_s })
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            Ok(MemoExportResult::Exists { path: full_s })
+        }
+        Err(e) => Err(AppError::new(crate::commands::io_message(
+            "Cannot save memo",
+            &e,
+        ))),
+    }
 }
 
 /// 메모를 AI에게 **정리시키고 결과 본문만** 돌려준다 (메모 툴바 [메모 정리]).
@@ -360,6 +388,18 @@ mod tests {
         let out = memo_export(root_s, "m.md".into(), "새 본문".into(), true).unwrap();
         assert!(matches!(out, MemoExportResult::Saved { .. }));
         assert_eq!(std::fs::read_to_string(root.join("m.md")).unwrap(), "새 본문");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 끊어진 심링크도 "이미 있다"다 — `exists()`가 false를 주는 경로라
+    /// 확인 없이 덮이면 링크 대상이 조용히 만들어진다.
+    #[test]
+    fn export_treats_a_dangling_symlink_as_existing() {
+        let (root, root_s) = temp_root("dangling");
+        std::os::unix::fs::symlink(root.join("nowhere.md"), root.join("link.md")).unwrap();
+        let out = memo_export(root_s, "link.md".into(), "본문".into(), false).unwrap();
+        assert!(matches!(out, MemoExportResult::Exists { .. }));
+        assert!(!root.join("nowhere.md").exists(), "링크 대상이 생기면 안 된다");
         let _ = std::fs::remove_dir_all(&root);
     }
 
