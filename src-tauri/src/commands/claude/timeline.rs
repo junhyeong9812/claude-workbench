@@ -243,84 +243,6 @@ fn payload_frames(sub_raw: &[Frame<'_>], parents: Vec<Option<String>>) -> Vec<Su
         .collect()
 }
 
-/// emit 최소 간격 게이트 — 순수 (메모리 1단계 C). 폴 주기(150ms)는 그대로 두고
-/// **전송만** 디바운스한다. 반환 = (이번 틱에 emit할까, 다음 틱으로 넘길 pending).
-///
-/// **trailing edge 보장**: 변화가 있었다는 사실(`pending`)은 실제로 보낼 때까지
-/// 지워지지 않는다. 스트리밍이 멎어 더 이상 변화가 없어도 폴은 계속 돌므로,
-/// 마지막 상태는 간격이 지난 첫 틱(≤150ms 뒤)에 반드시 착지한다 — 화면이 낡은
-/// 채 남지 않는다. payload는 emit 시점의 tail에서 새로 조립되므로 언제나 최신이다
-/// (합쳐진 중간 상태를 보내지 않는다).
-pub(super) fn emit_gate(
-    changed: bool,
-    pending: bool,
-    since_last_emit: Duration,
-    min_interval: Duration,
-) -> (bool, bool) {
-    let pending = pending || changed;
-    if pending && since_last_emit >= min_interval {
-        (true, false)
-    } else {
-        (false, pending)
-    }
-}
-
-/// payload 조립 + `claude-timeline` emit — 폴 루프의 정상 틱과 종료 flush(AA1)가
-/// **같은 경로**를 쓰도록 추출. items·turns·answers 등을 t에서 새로 복사하고,
-/// 서브에이전트 프레임을 발견 순서로 조립해(활성=본문 인라인, 완료=메타만) 보낸다.
-#[allow(clippy::too_many_arguments)]
-fn assemble_and_emit(
-    app: &AppHandle,
-    id: u64,
-    t: &core_lib::jsonl::SessionTail,
-    subagents: &HashMap<String, core_lib::jsonl::SessionTail>,
-    subagent_turn: &HashMap<String, u64>,
-    active_sig: &HashMap<String, FileSig>,
-    sub_order: &[String],
-    sub_done: &HashMap<String, DoneSub>,
-    mention_memo: &mut HashMap<(String, String, String), (u32, bool)>,
-) {
-    let items = t.timeline().items();
-    let items_v = items.to_vec();
-    let turns_v: Vec<(u64, String)> = t.turns().iter().map(|(k, v)| (*k, v.clone())).collect();
-    let answers_v: Vec<(u64, String)> = t.answers().iter().map(|(k, v)| (*k, v.clone())).collect();
-    let dates_v: Vec<(u64, String)> = t.dates().iter().map(|(k, v)| (*k, v.clone())).collect();
-    let tokens_v: Vec<(u64, TokenUsage)> = t.tokens().iter().map(|(k, v)| (*k, *v)).collect();
-    let model_v: Option<String> = t.model().map(str::to_string);
-    let last_usage_v: Option<TokenUsage> = t.last_usage();
-    // P0 B2: 발견 순서로 활성+완료 프레임 조립(특성테스트 ordered_frames_*)
-    // — 완료 프레임 보존 + active(재파싱 완료) 우선 + 결정적 순서.
-    let active_map: HashMap<String, (u64, &[TimelineItem])> = subagents
-        .iter()
-        .map(|(aid, st)| (aid.clone(), (*subagent_turn.get(aid).unwrap_or(&0), st.timeline().items())))
-        .collect();
-    let sub_raw = ordered_frames(sub_order, &active_map, active_sig, sub_done);
-    // 부모 추론은 **절단 전** 원문으로(멘션이 CAP 밖에 있을 수 있다 — P1 절단은
-    // 그 뒤 표시용 클론에만 적용). first-match를 매 변경 틱 재계산하되 아이템별
-    // contains 판정만 revision 키로 메모(naive와 완전 동치, 비용만 국한).
-    let parents: Vec<Option<String>> = sub_raw
-        .iter()
-        .map(|f| subagent_parent_memo(&f.aid, &items_v, &sub_raw, mention_memo))
-        .collect();
-    let mut items_p = items_v;
-    cap_content(&mut items_p);
-    let subagents_v = payload_frames(&sub_raw, parents);
-    let _ = app.emit(
-        "claude-timeline",
-        ClaudeTimelinePayload {
-            id,
-            items: items_p,
-            turns: turns_v,
-            answers: answers_v,
-            dates: dates_v,
-            tokens: tokens_v,
-            model: model_v,
-            last_usage: last_usage_v,
-            subagents: subagents_v,
-        },
-    );
-}
-
 #[cfg_attr(not(test), allow(dead_code))] // 특성테스트의 naive 기준 구현(메모판과 동치 검증용)
 pub(super) fn subagent_parent(
     aid: &str,
@@ -440,17 +362,6 @@ pub(super) fn run_timeline_poll(
     let mut snap_dirty = false;
     let mut last_save = std::time::Instant::now()
         .checked_sub(SAVE_DEBOUNCE)
-        .unwrap_or_else(std::time::Instant::now);
-    // 메모리 1단계 C: emit 최소 간격. 폴은 150ms 그대로 두고 전송만 디바운스한다
-    // — 답변 스트리밍 중에는 fingerprint가 매 틱 바뀌어 최대 6.7 emit/s가 나갔다
-    // (실측 payload 24.8MB × 6.7/s ≈ 166MB/s의 직렬화·IPC·JS 파싱). 400ms면
-    // 전송이 ≤2.5/s로 떨어지면서(−63%) 체감 지연은 반 초 미만이다. 스냅샷
-    // debounce(:292)와 같은 패턴이되, 저장(2s)보다 훨씬 짧게 잡아 화면 최신성을
-    // 지킨다. 마지막 상태는 trailing edge로 반드시 착지한다(emit_gate).
-    const EMIT_MIN_INTERVAL: Duration = Duration::from_millis(400);
-    let mut emit_pending = false;
-    let mut last_emit = std::time::Instant::now()
-        .checked_sub(EMIT_MIN_INTERVAL)
         .unwrap_or_else(std::time::Instant::now);
     // Cheap fingerprint of the last emitted state (incl. subagent item count). A
     // prompt- or answer-only record advances turns/answers without touching any
@@ -694,38 +605,67 @@ pub(super) fn run_timeline_poll(
             model_fp,
             sub_gen, // N2: 재활성 세대 — 재구축으로 rev 합이 같아도 emit 보장
         );
-        // 변화 감지와 전송을 분리한다(메모리 1단계 C). 변화는 매 틱 그대로
-        // 판정해 스냅샷 dirty를 즉시 세우고(저장 debounce는 자기 주기를 유지),
-        // emit만 최소 간격 게이트를 통과할 때 나간다. pending은 실제 전송
-        // 전까지 유지되므로 마지막 상태가 반드시 전달된다(trailing edge).
-        let changed = fp != last_fp;
-        if changed {
-            last_fp = fp;
-            // 저장은 emit 게이트와 무관하게 마킹 — 디바운스된 전송이 스냅샷
-            // 저장까지 늦추면 안 된다. Persisting keeps the session
-            // listable/reopenable across restarts (D-1).
-            snap_dirty = true;
+        // 폴백(2026-08-10, 정지 규칙 3라운드): emit은 **폴 틱마다 즉시**(fp 변화
+        // 시) — 착수 전 base(810bbc3)의 검증된 경로. 400ms 디바운스(emit_gate·
+        // 자연종료 flush·existed 기반 flush)는 emit 순서 표면에서 silent staleness가
+        // 반복 재발(역순 closed→timeline 미반영·자연종료 flush의 활성 서브 증분
+        // 미poll)해 통째로 걷어냈다. 즉시 emit이면 held-back pending·trailing·flush
+        // 개념 자체가 없어 순서 해저드가 구조적으로 소멸한다(closed→timeline 역순
+        // 불가·활성 서브 증분 매 틱 반영). payload 절감(아래 lazy·CONTENT_CAP)은
+        // 디바운스와 독립이라 유지 — 트래픽 base 167MB/s → ~33MB/s(-80%).
+        if fp == last_fp {
+            continue; // nothing changed this tick
         }
-        let (do_emit, pending) = emit_gate(changed, emit_pending, last_emit.elapsed(), EMIT_MIN_INTERVAL);
-        emit_pending = pending;
-        if !do_emit {
-            continue;
-        }
-        last_emit = std::time::Instant::now();
+        last_fp = fp;
 
-        assemble_and_emit(
-            &app,
-            id,
-            t,
-            &subagents,
-            &subagent_turn,
-            &active_sig,
-            &sub_order,
-            &sub_done,
-            &mut mention_memo,
+        let items_v = items.to_vec();
+        let turns_v: Vec<(u64, String)> = t.turns().iter().map(|(k, v)| (*k, v.clone())).collect();
+        let answers_v: Vec<(u64, String)> =
+            t.answers().iter().map(|(k, v)| (*k, v.clone())).collect();
+        let dates_v: Vec<(u64, String)> = t.dates().iter().map(|(k, v)| (*k, v.clone())).collect();
+        let tokens_v: Vec<(u64, TokenUsage)> = t.tokens().iter().map(|(k, v)| (*k, *v)).collect();
+        let model_v: Option<String> = t.model().map(str::to_string);
+        let last_usage_v: Option<TokenUsage> = t.last_usage();
+        // P0 B2: 발견 순서로 활성+완료 프레임 조립(특성테스트 ordered_frames_*)
+        // — 완료 프레임 보존 + active(재파싱 완료) 우선 + 결정적 순서.
+        let active_map: HashMap<String, (u64, &[TimelineItem])> = subagents
+            .iter()
+            .map(|(aid, st)| {
+                (aid.clone(), (*subagent_turn.get(aid).unwrap_or(&0), st.timeline().items()))
+            })
+            .collect();
+        let sub_raw = ordered_frames(&sub_order, &active_map, &active_sig, &sub_done);
+        // 부모 추론은 **절단 전** 원문으로(멘션이 CAP 밖에 있을 수 있다 — P1 절단은
+        // 그 뒤 표시용 클론에만 적용). first-match를 매 변경 틱 재계산하되 아이템별
+        // contains 판정만 revision 키로 메모(naive와 완전 동치, 비용만 국한).
+        let parents: Vec<Option<String>> = sub_raw
+            .iter()
+            .map(|f| subagent_parent_memo(&f.aid, &items_v, &sub_raw, &mut mention_memo))
+            .collect();
+        // 메모리 1단계 B(유지): 활성 프레임만 items 절단·인라인, 완료 프레임은
+        // 메타(+파일 서명)만 — 본문은 프론트가 펼칠 때 claude_subagent_items로 조회.
+        let mut items_p = items_v;
+        cap_content(&mut items_p);
+        let subagents_v = payload_frames(&sub_raw, parents);
+
+        let _ = app.emit(
+            "claude-timeline",
+            ClaudeTimelinePayload {
+                id,
+                items: items_p,
+                turns: turns_v,
+                answers: answers_v,
+                dates: dates_v,
+                tokens: tokens_v,
+                model: model_v,
+                last_usage: last_usage_v,
+                subagents: subagents_v,
+            },
         );
-        // 저장 자체는 위(틱 진입부) debounce 플러시가 수행하고, dirty 마킹은
-        // 변화 감지 시점(emit 게이트 앞)에서 이미 끝났다.
+        // 저장 자체는 위(틱 진입부) debounce 플러시가 수행한다 — 여기서는
+        // dirty 마킹만. Persisting keeps the session listable/reopenable across
+        // restarts (D-1) without the append duplication.
+        snap_dirty = true;
 
         if stop.load(Ordering::Relaxed) {
             break; // closed during poll/emit — don't persist after close (F4)
@@ -740,32 +680,8 @@ pub(super) fn run_timeline_poll(
             existed = rt.remove_session(id).is_some(); // T7 (전이표 순수 메서드)
         }
     }
-    // AA1/BB1(듀얼 리뷰 codex): **자연 종료(existed=true)면 emit_pending과 무관하게**
-    // 마지막 poll 1회 후 최종 상태를 emit한다 — 직전 emit 후 400ms 창 안의 미발화
-    // 변화든, 종료 직전 아직 poll하지 못한 바이트든 모두 최종 화면에 반영된다
-    // (게이트가 도입한 라이브 회귀를 근본에서 닫는 단순 규칙: "자연 종료 = 최종
-    // poll+emit"). 정상 순서로는 이 timeline이 아래 `claude-session-closed`보다
-    // 먼저 도착하지만, **순서가 뒤집혀도 프론트가 종결 우선(idempotent)이라**
-    // 이미 닫힌 세션이 다시 열리지 않는다(BB2 — useClaudeTimeline). 즉 순서 안전은
-    // 프론트가 흡수하고 여기선 "최종 상태를 반드시 한 번 보낸다"만 책임진다.
-    // 재emit은 idempotent replace라 무변화여도 무해. active_sig는 빈 맵 — 남은
-    // 활성 프레임은 본문 인라인, 완료 프레임은 DoneSub.sig를 쓴다.
+    // Notify any mirror windows that the session ended (review P6-impl #2).
     if existed {
-        if let Some(t) = tail.as_mut() {
-            let _ = t.poll();
-            assemble_and_emit(
-                &app,
-                id,
-                t,
-                &subagents,
-                &subagent_turn,
-                &HashMap::new(),
-                &sub_order,
-                &sub_done,
-                &mut mention_memo,
-            );
-        }
-        // Notify any mirror windows that the session ended (review P6-impl #2).
         let _ = app.emit("claude-session-closed", id);
     }
 }
@@ -919,53 +835,6 @@ mod tests {
         assert!(its[0].content_text.as_deref().unwrap().len() <= CONTENT_CAP);
         assert_eq!(live_items[0].content_text.as_deref().unwrap().len(), long.len(), "원본 불변");
         assert_eq!(out[0].total, 1);
-    }
-
-    // 메모리 1단계 C — emit 최소 간격 게이트. 핵심 계약은 **trailing edge**:
-    // 변화 후 더 이상 변화가 없어도 마지막 상태가 반드시 나간다.
-    #[test]
-    fn emit_gate_throttles_but_always_lands_the_last_state() {
-        const MIN: Duration = Duration::from_millis(400);
-        let ms = Duration::from_millis;
-        // 변화 없음 + pending 없음 → 아무것도 안 보낸다(간격이 지났어도).
-        assert_eq!(emit_gate(false, false, ms(10_000), MIN), (false, false));
-        // 변화 직후 간격 미달 → 보류(pending 유지 — 여기서 잃으면 화면이 낡는다).
-        assert_eq!(emit_gate(true, false, ms(0), MIN), (false, true));
-        assert_eq!(emit_gate(true, true, ms(399), MIN), (false, true));
-        // **변화가 멎어도** 간격이 지난 첫 틱에 보류분이 나간다(trailing edge).
-        assert_eq!(emit_gate(false, true, ms(400), MIN), (true, false));
-        // 간격이 지난 뒤의 변화는 그 틱에 바로 나간다(디바운스 = 지연이 아니라 상한).
-        assert_eq!(emit_gate(true, false, ms(1_000), MIN), (true, false));
-    }
-
-    /// 게이트를 150ms 폴 루프에 태운 시뮬레이션 — 스트리밍 중 전송이 줄고,
-    /// 스트리밍이 끝난 뒤 **마지막 변화가 빠짐없이** 전달되는지 고정한다.
-    #[test]
-    fn emit_gate_over_a_poll_loop_drops_rate_and_keeps_final_tick() {
-        const MIN: Duration = Duration::from_millis(400);
-        const TICK: u64 = 150;
-        let mut pending = false;
-        let mut since = MIN; // 첫 틱은 자격 있음
-        let mut emits = 0;
-        let mut last_emitted_tick = None;
-        // 0..20틱(3초) 중 앞 10틱만 매 틱 변화(스트리밍), 이후 무변화.
-        for tick in 0..20u64 {
-            let changed = tick < 10;
-            let (go, p) = emit_gate(changed, pending, since, MIN);
-            pending = p;
-            if go {
-                emits += 1;
-                last_emitted_tick = Some(tick);
-                since = Duration::ZERO;
-            } else {
-                since += Duration::from_millis(TICK);
-            }
-        }
-        // 게이트 없으면 10회(변화 틱마다). 게이트로 4회.
-        assert_eq!(emits, 4, "스트리밍 10틱이 4회 전송으로 합쳐진다");
-        // 마지막 변화(틱 9) 이후의 전송이 존재 = 최종 상태 착지.
-        assert!(last_emitted_tick.unwrap() >= 9, "마지막 변화 뒤 전송이 없으면 화면이 낡는다");
-        assert!(!pending, "보류가 남은 채 끝나면 안 된다");
     }
 
     // P0 B1(재수정) — 메모 스캔이 naive와 완전 동치인지 + revision bump 반영.
