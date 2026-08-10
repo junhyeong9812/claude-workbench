@@ -38,6 +38,7 @@ export function MemoPanel(props: IDockviewPanelProps<MemoParams>) {
         <MemoEditor
           storeKey={project}
           subtitle={project}
+          projectRoot={project}
           read={(key) => invoke<MemoDoc>("memo_read", { project: key })}
           write={(key, text, baseHash) =>
             invoke<MemoSaveResult>("memo_write", { project: key, text, baseHash })

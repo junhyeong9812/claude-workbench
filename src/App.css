@@ -1444,6 +1444,9 @@ body {
   flex: 0 0 auto;
   display: flex;
   align-items: center;
+  /* 툴바 버튼이 셋까지 붙는다 — 좁은 패널(정리 세션 3분할)에서 밀려 잘리는 대신
+     줄을 바꾼다. 헤더가 한 줄이라는 가정에 기댄 곳은 없다. */
+  flex-wrap: wrap;
   gap: 10px;
   padding: 4px 10px;
   font-size: 0.78em;
@@ -1511,6 +1514,103 @@ body {
   border: 1px solid color-mix(in srgb, var(--accent-bright) 40%, transparent);
   border-radius: 4px;
   cursor: pointer;
+}
+.memo-retry:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+/* ---- 메모 툴바 ([저장하기] · [정리] · [되돌리기]) ---- */
+/* 헤더의 버튼은 상태 줄 오른쪽에 붙는다 — `.memo-path`가 남은 폭을 먹으므로
+   버튼들은 줄어들지 않게 flex 0. */
+.memo-tool {
+  flex: 0 0 auto;
+  padding: 1px 8px;
+  font-size: 0.95em;
+  color: var(--fg, #cdd6f4);
+  background: rgba(127, 127, 127, 0.14);
+  border: 1px solid var(--border, #333);
+  border-radius: 4px;
+  cursor: pointer;
+}
+.memo-tool:hover {
+  background: color-mix(in srgb, var(--accent-bright) 18%, transparent);
+}
+.memo-note {
+  flex: 0 0 auto;
+  padding: 4px 10px;
+  font-size: 0.78em;
+  color: var(--fg-dim);
+  border-bottom: 1px solid var(--border, #333);
+}
+.memo-save,
+.memo-tidy-bar,
+.memo-tidy-foot {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 5px 10px;
+  font-size: 0.78em;
+  color: var(--fg-dim);
+  background: rgba(127, 127, 127, 0.06);
+  border-bottom: 1px solid var(--border, #333);
+}
+.memo-save-root {
+  flex: 0 0 auto;
+  opacity: 0.7;
+}
+.memo-save-path {
+  flex: 1 1 auto;
+  min-width: 0;
+  padding: 2px 6px;
+  font-family: inherit;
+  font-size: 1em;
+  color: var(--fg, #cdd6f4);
+  background: var(--bg);
+  border: 1px solid var(--border, #333);
+  border-radius: 4px;
+}
+.memo-save-err {
+  flex: 0 1 auto;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--st-danger);
+}
+/* 절단 경고 — "적용하지 마라"가 아니라 "보고 판단하라"는 신호(danger 아님). */
+.memo-tidy-shrink {
+  flex: 0 1 auto;
+  padding: 0 6px;
+  color: var(--fg, #cdd6f4);
+  background: color-mix(in srgb, var(--st-warn) 22%, transparent);
+  border: 1px solid color-mix(in srgb, var(--st-warn) 45%, transparent);
+  border-radius: 999px;
+}
+.memo-save-warn {
+  flex: 0 1 auto;
+  color: color-mix(in srgb, var(--st-warn) 80%, var(--fg));
+}
+/* 정리 미리보기 — 적용 전에는 **읽기 전용 텍스트**다. 메모 본문을 밀어내지
+   않도록 자기 높이 상한 안에서 스크롤한다. */
+.memo-tidy {
+  flex: 0 1 auto;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  max-height: 55%;
+}
+.memo-tidy-preview {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow: auto;
+  padding: 8px 10px;
+  font-family: var(--mono, monospace);
+  font-size: 0.82em;
+  white-space: pre-wrap;
+  color: var(--fg, #cdd6f4);
+  background: color-mix(in srgb, var(--accent-bright) 6%, transparent);
+  border-bottom: 1px solid var(--border, #333);
 }
 
 /* ---- Git panel (G1) ---- */

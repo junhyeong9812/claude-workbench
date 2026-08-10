@@ -123,7 +123,7 @@ fn reject_unsafe_path(path: &str) -> Result<(), AppError> {
 /// canonicalized (resolving symlinks); for a not-yet-created `path` we check its
 /// deepest existing ancestor, so a new nested file still gets validated against
 /// its real on-disk location.
-fn ensure_within(path: &str, root: &str) -> Result<(), AppError> {
+pub(crate) fn ensure_within(path: &str, root: &str) -> Result<(), AppError> {
     // 봉쇄 알고리즘은 core::pathguard 단일 출처(P4) — 문구만 도메인 소유.
     use core_lib::pathguard::ContainErr;
     core_lib::pathguard::contained_prospective(std::path::Path::new(root), path).map_err(|e| {
@@ -165,6 +165,13 @@ pub fn write_file(path: String, content: String) -> Result<(), AppError> {
     if p.is_dir() {
         return Err(AppError::new("Cannot write: path is a directory"));
     }
+    atomic_write(p, &content)
+}
+
+/// The temp-then-rename body of [`write_file`], reusable by other writers (메모
+/// 내보내기). Kept as one function so **every** app-side file write inherits the
+/// same durability contract — a half-written file is never observable.
+pub(crate) fn atomic_write(p: &std::path::Path, content: &str) -> Result<(), AppError> {
     // Resolve to the real file (follow symlinks); fall back to the given path if
     // it doesn't exist yet (new file).
     let target = std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());

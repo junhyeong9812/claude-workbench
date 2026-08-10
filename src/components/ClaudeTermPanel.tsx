@@ -2525,6 +2525,9 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
             <MemoEditor
               storeKey={refineMemoKey}
               subtitle="이 정리 세션의 초안 — 닫을 때 아카이브에 함께 남습니다"
+              // 저장 기준은 **원본 프로젝트**다 — `params.project`는 격리
+              // 스크래치(/tmp)라 거기 저장하면 다음 정리에 사라진다.
+              projectRoot={refineSourceProject ?? undefined}
               read={(key) => invoke<MemoDoc>("refine_memo_read", { key })}
               write={(key, text, baseHash) =>
                 invoke<MemoSaveResult>("refine_memo_write", { key, text, baseHash })

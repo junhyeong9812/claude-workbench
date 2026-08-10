@@ -138,6 +138,8 @@ pub fn run() {
             commands::claude::store::claude_session_snapshot,
             commands::memo::memo_read,
             commands::memo::memo_write,
+            commands::memo::memo_export,
+            commands::memo::memo_tidy,
             commands::refine::prompt_refine_workdir,
             commands::refine::refine_memo_delete,
             commands::refine::refine_memo_read,
