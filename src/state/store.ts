@@ -14,6 +14,7 @@ import {
   type SurfaceTree,
 } from "./surfaceTree";
 import { resolveVisibleDual } from "./dualSurface";
+import { resolveLayerMode } from "./layerRouting";
 import { basename } from "../utils/path";
 
 /** Clamp a font size to the allowed range (also normalizes NaN). */
@@ -260,15 +261,23 @@ function persistSurfaceTree(tree: SurfaceTree) {
 }
 
 /** 우측(secondary) 표면이 실제로 렌더되는가 — **활성 표면 정규화의 단일 술어**
- * (G4, 리뷰). `resolveVisibleDual`과 **동일 판정**(멤버십·좌우 동일 겹침 숨김·
- * 닫힘)을 재사용해, 활성이 secondary인데 우측이 안 보이면(요청버스가 언마운트된
- * 표면으로 라우팅되어 무음 유실) 정규화의 근거가 된다. 트리 존재만 보던 예전
- * has2nd(겹침 숨김 통과 가능)를 대체한다. */
+ * (G4 + codex 최종확인 H1). 두 축을 AND한다:
+ *   ① **멤버십·겹침·닫힘**: `resolveVisibleDual`과 동일 판정(우측 프로젝트가 열린
+ *      탭이고 좌측과 다른가).
+ *   ② **dual 레이어 가시**: 주 프로젝트가 dev 모드면 DevView 오버레이가 dual-row
+ *      **전체**를 가린다(App: layerMode=activeProject 구동 → main-layer-back). 이땐
+ *      어떤 표면도 실제로 안 보이므로 secondary도 false.
+ * 이로써 dev 축이 술어에 통합되어, 단일 진입점 reconcileActiveSurface가 dev **진입**
+ * (setProjectMode)뿐 아니라 **이미 dev인 프로젝트로 primary가 바뀌는**
+ * (applyRemoteActive·closeProject 재인덱스) 경로까지 균일하게 정규화한다 — 숨은
+ * dock으로의 무음 유실 갭이 자동으로 닫힌다. */
 function secondaryIsVisible(s: {
   surfaceTree: SurfaceTree;
   activeProject: string | null;
   projects: Project[];
+  projectModes: Record<string, "integrated" | "dev">;
 }): boolean {
+  if (resolveLayerMode(s.projectModes, s.activeProject) === "dev") return false;
   return (
     resolveVisibleDual(
       secondaryProject(s.surfaceTree),
@@ -897,6 +906,8 @@ export const useAppStore = create<AppState>((set, get) => ({
         set({ activeProject: path });
         get().persist();
         broadcastActiveProject(path);
+        get().reconcileActiveSurface(); // 이미-열린 프로젝트로 재포커스(예: worktree)가
+        // dev/겹침이면 활성 정규화(H1 균일 — 숨은 dock 무음 유실 차단).
       }
       return;
     }
@@ -924,7 +935,10 @@ export const useAppStore = create<AppState>((set, get) => ({
     }));
     get().persist();
     if (toSecondary) get().setDualProject(path);
-    else broadcastActiveProject(path);
+    else {
+      broadcastActiveProject(path);
+      get().reconcileActiveSurface(); // 균일 불변식: activeProject 쓰기는 정규화 동반
+    }
   },
 
   closeProject: (path) => {
@@ -991,6 +1005,7 @@ export const useAppStore = create<AppState>((set, get) => ({
     set({ activeProject: path });
     get().persist();
     broadcastActiveProject(path);
+    get().reconcileActiveSurface(); // 새 activeProject가 dev/겹침이면 활성 정규화(H1 균일)
   },
   setActiveSurface: (id) => {
     // 우측 표면이 **뚜렷이 보이지 않으면**(없음·좌우 겹침 숨김·닫힘) secondary를
@@ -1124,11 +1139,11 @@ export const useAppStore = create<AppState>((set, get) => ({
     else delete next[project]; // "integrated" is the default — keep the map sparse
     localStorage.setItem("projectModes", JSON.stringify(next));
     set({ projectModes: next });
-    // G3(리뷰): 주 표면(activeProject)이 dev로 진입하면 DevView 오버레이가 dual
-    // 전체를 가린다(App layerMode=activeProject 구동). resolveVisibleDual은 오버레이를
-    // 모르므로 reconcile로는 안 잡힌다 — secondary 활성이면 숨은 dock으로 Run/터미널/
-    // resume가 라우팅돼 무음 유실된다. dev 진입 시 활성을 primary로 강제 정규화.
-    if (mode === "dev" && project === get().activeProject) get().setActiveSurface("primary");
+    // G3→H1(codex 최종확인): dev 축이 secondaryIsVisible 술어에 통합됐으므로,
+    // dev 진입도 단일 진입점 reconcileActiveSurface가 균일하게 처리한다(예전
+    // setActiveSurface("primary") 특수 경로 제거 — 단일 술어가 정본). 주 프로젝트가
+    // dev면 술어가 false → 활성=secondary는 primary로 정규화(오버레이가 dual 가림).
+    get().reconcileActiveSurface();
   },
   ensureDevUuid: (project) => {
     const cur = get().devUuids[project];

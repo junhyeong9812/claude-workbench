@@ -22,7 +22,7 @@ import { activeSurfaceId } from "./surfaceContext";
 describe("활성 표면 + 요청버스 seam 라우팅 (P4')", () => {
   beforeEach(() => {
     localStorage.clear();
-    useAppStore.setState({ projects: [], activeProject: null });
+    useAppStore.setState({ projects: [], activeProject: null, projectModes: {} });
     const s = useAppStore.getState();
     s.setDualProject(null);
     s.setActiveSurface("primary");
@@ -184,6 +184,31 @@ describe("활성 표면 + 요청버스 seam 라우팅 (P4')", () => {
     expect(useAppStore.getState().activeSurfaceId).toBe("secondary");
     // 좌측(activeProject="/a")이 dev 진입 → DevView 오버레이가 dual 전체를 가림.
     useAppStore.getState().setProjectMode("/a", "dev");
+    expect(useAppStore.getState().activeSurfaceId).toBe("primary");
+  });
+
+  it("[H1a] applyRemoteActive로 좌측이 이미-dev인 프로젝트로 바뀌면 활성 정규화", () => {
+    // 술어에 dev 축이 통합돼, dev 진입 특수경로 없이도 단일 reconcile이 닫는다.
+    useAppStore.setState({ projects: [{ path: "/a", name: "a", project_types: [], tree_state: { expanded: [] } }, { path: "/b", name: "b", project_types: [], tree_state: { expanded: [] } }, { path: "/c", name: "c", project_types: [], tree_state: { expanded: [] } }], activeProject: "/a", projectModes: { "/c": "dev" } });
+    const s = useAppStore.getState();
+    s.setDualProject("/b");
+    s.setActiveSurface("secondary");
+    expect(useAppStore.getState().activeSurfaceId).toBe("secondary");
+    // 다른 창이 좌측을 이미-dev인 /c로 전환 → dev 오버레이가 dual 가림 → 정규화.
+    useAppStore.getState().applyRemoteActive("/c");
+    expect(useAppStore.getState().activeProject).toBe("/c");
+    expect(useAppStore.getState().activeSurfaceId).toBe("primary");
+  });
+
+  it("[H1b] closeProject 재인덱스가 dev 프로젝트를 primary로 만들면 활성 정규화", () => {
+    // 순서 [/a, /c(dev), /b] — /a 닫으면 projects[0]=/c(dev)가 새 activeProject.
+    useAppStore.setState({ projects: [{ path: "/a", name: "a", project_types: [], tree_state: { expanded: [] } }, { path: "/c", name: "c", project_types: [], tree_state: { expanded: [] } }, { path: "/b", name: "b", project_types: [], tree_state: { expanded: [] } }], activeProject: "/a", projectModes: { "/c": "dev" } });
+    const s = useAppStore.getState();
+    s.setDualProject("/b");
+    s.setActiveSurface("secondary");
+    expect(useAppStore.getState().activeSurfaceId).toBe("secondary");
+    useAppStore.getState().closeProject("/a");
+    expect(useAppStore.getState().activeProject).toBe("/c"); // 재인덱스 → dev
     expect(useAppStore.getState().activeSurfaceId).toBe("primary");
   });
 });
