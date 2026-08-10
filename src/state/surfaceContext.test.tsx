@@ -5,7 +5,7 @@
  * surfaceId를 주입하는가, (b) 훅이 그 값을 정확히 되돌려주는가, (c) 프로바이더
  * 밖에서 훅을 호출하면(개발 오용) 명확히 실패하는가.
  */
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { act, Component, type ReactNode } from "react";
 import { createRoot, type Root } from "react-dom/client";
 
@@ -113,13 +113,20 @@ describe("SurfaceContext", () => {
       useSurface();
       return null;
     }
-    act(() => {
-      root.render(
-        <Boundary>
-          <OrphanProbe />
-        </Boundary>,
-      );
-    });
+    // React는 에러 경계가 잡은 예외도 stderr에 다시 찍는다 — 이 테스트에서만
+    // 억제해 CI 로그 오염을 막는다(예외 자체는 아래 단언이 검증).
+    const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      act(() => {
+        root.render(
+          <Boundary>
+            <OrphanProbe />
+          </Boundary>,
+        );
+      });
+    } finally {
+      errSpy.mockRestore();
+    }
     expect(thrown).toBeInstanceOf(Error);
     expect(String((thrown as Error).message)).toContain("SurfaceProvider");
   });
