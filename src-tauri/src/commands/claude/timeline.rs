@@ -48,7 +48,15 @@ struct ClaudeTimelinePayload {
 /// P1: 표시 계층 content_text 상한 — payload·스냅샷에서만 절단(원본 JSONL·
 /// 아카이브는 전문 유지). 절단 아이템은 `content_truncated`로 표시되고
 /// 뷰어가 `claude_item_detail`로 원문을 lazy 조회한다.
-pub(super) const CONTENT_CAP: usize = 32 * 1024;
+///
+/// 메모리 1단계(2026-08-10): 32KB는 실측상 사실상 무효였다 — 1,591개 중 상한을
+/// 넘는 아이템이 59개뿐이라 payload는 24.8MB 그대로였다. 문제는 "거대 아이템"이
+/// 아니라 "평균 3KB × 1,591개"이므로 상한을 4KB로 내려 평균 아이템에 실효화한다
+/// (메인 5.63MB → 5.24MB, 절단 아이템 59→73개). 2KB는 추가 0.22MB를 얻는 대신
+/// 절단 아이템이 148개로 두 배가 되어(그만큼 원문 조회 왕복이 늘어난다) 4KB를
+/// 택했다. 절단본은 `content_truncated` + `claude_item_detail` 원문 조회가
+/// 이미 덮고 있어 표시 손실은 없다.
+pub(super) const CONTENT_CAP: usize = 4 * 1024;
 
 /// UTF-8 경계 보존 절단 — 순수 (P1 특성테스트 대상).
 pub(super) fn cap_content(items: &mut [TimelineItem]) {
