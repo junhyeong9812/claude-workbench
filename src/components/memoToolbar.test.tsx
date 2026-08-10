@@ -253,6 +253,18 @@ describe("메모 툴바 — 저장하기 · 정리", () => {
     expect(docText()).toContain("이어서 쓴 줄");
   });
 
+  it("결과가 원문 대비 급감하면 미리보기에 절단 경고가 붙는다", async () => {
+    // 원문은 길고 결과는 한 줄 — 정리가 아니라 절단(또는 지시 탈취)의 모양이다.
+    invoke.mockResolvedValue("한 줄");
+    disk = "긴 메모 본문입니다. ".repeat(20);
+    await mount();
+    await click("정리");
+    await click("정리 실행");
+    expect(host.querySelector(".memo-tidy-shrink")?.textContent).toContain("절단 가능성");
+    // 경고일 뿐 막지는 않는다 — 판단은 미리보기를 보는 사람이 한다.
+    expect(has("적용")).toBe(true);
+  });
+
   it("[버리기]는 결과만 버린다 (메모 불변)", async () => {
     invoke.mockResolvedValue("정리된 메모");
     await mount();

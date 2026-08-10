@@ -94,7 +94,12 @@ pub fn create_run_scratch_dir() -> Result<std::path::PathBuf, String> {
 /// Unpredictable suffix — the kernel's UUID source (the same one session ids come
 /// from), with pid+nanos as a fallback so a missing `/proc` degrades to "unique"
 /// rather than failing.
-fn random_suffix() -> String {
+///
+/// Public because a second caller needs the same property for a different reason:
+/// the memo-tidy prompt builds a **nonce delimiter** around user text, and that
+/// only bounds prompt injection if the tag the model is told to respect cannot be
+/// guessed and written by the text itself.
+pub fn random_suffix() -> String {
     if let Ok(s) = std::fs::read_to_string("/proc/sys/kernel/random/uuid") {
         let hex: String = s.chars().filter(|c| c.is_ascii_hexdigit()).take(16).collect();
         if hex.len() == 16 {

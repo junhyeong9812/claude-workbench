@@ -1574,6 +1574,15 @@ body {
   white-space: nowrap;
   color: var(--st-danger);
 }
+/* 절단 경고 — "적용하지 마라"가 아니라 "보고 판단하라"는 신호(danger 아님). */
+.memo-tidy-shrink {
+  flex: 0 1 auto;
+  padding: 0 6px;
+  color: var(--fg, #cdd6f4);
+  background: color-mix(in srgb, var(--st-warn) 22%, transparent);
+  border: 1px solid color-mix(in srgb, var(--st-warn) 45%, transparent);
+  border-radius: 999px;
+}
 .memo-save-warn {
   flex: 0 1 auto;
   color: color-mix(in srgb, var(--st-warn) 80%, var(--fg));

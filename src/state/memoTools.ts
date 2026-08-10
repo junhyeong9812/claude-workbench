@@ -20,6 +20,24 @@ export function defaultMemoPath(now: Date = new Date()): string {
   return `docs/memo-${isoDate(now)}.md`;
 }
 
+/**
+ * 정리 결과가 원문 대비 이 비율 아래로 줄면 **경고**한다.
+ *
+ * 정리는 "구조·중복만" 손보는 작업이라 분량이 절반 아래로 떨어지는 것은 정리가
+ * 아니라 **절단**의 모양이다(모델이 지시를 놓쳤거나, 구분자를 넘어선 텍스트가
+ * 지시로 읽혔거나, 출력이 상한에 걸렸거나). 자동으로 막지는 않는다 — 실제로
+ * 중복만 가득한 메모는 정직하게 반 이하로 줄 수 있고, 판단은 미리보기를 보는
+ * 사람이 한다. 대신 그 판단을 **하게** 만든다.
+ */
+export const TIDY_SHRINK_WARN = 0.5;
+
+/** 결과가 원문 대비 급감했는가 (미리보기 경고 배지). */
+export function tidyShrank(before: string, after: string): boolean {
+  const b = before.trim().length;
+  if (b === 0) return false;
+  return after.trim().length < b * TIDY_SHRINK_WARN;
+}
+
 export type RelPathCheck = { ok: true; rel: string } | { ok: false; reason: string };
 
 /**

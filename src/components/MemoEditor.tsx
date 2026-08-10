@@ -12,6 +12,7 @@ import {
   loadTidyModel,
   normalizeMemoRel,
   saveTidyModel,
+  tidyShrank,
 } from "../state/memoTools";
 import {
   MEMO_SAVE_DELAY,
@@ -544,7 +545,13 @@ export function MemoEditor({
             <>
               <div className="memo-tidy-preview">{tidyResult}</div>
               <div className="memo-tidy-foot">
-                <span className="memo-save-warn">미리보기 — 적용해야 메모가 바뀝니다</span>
+                {tidyShrank(latestRef.current, tidyResult) ? (
+                  <span className="memo-tidy-shrink">
+                    내용이 크게 줄었습니다 — 절단 가능성. 적용 전에 확인하세요
+                  </span>
+                ) : (
+                  <span className="memo-save-warn">미리보기 — 적용해야 메모가 바뀝니다</span>
+                )}
                 <button className="memo-retry" disabled={!!readOnly} onClick={applyTidy}>
                   적용
                 </button>

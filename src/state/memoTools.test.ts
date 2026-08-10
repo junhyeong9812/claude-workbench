@@ -14,6 +14,7 @@ import {
   loadTidyModel,
   normalizeMemoRel,
   saveTidyModel,
+  tidyShrank,
 } from "./memoTools";
 import { MODEL_CHOICES } from "./agentOptions";
 
@@ -44,6 +45,21 @@ describe("memoTools — 저장 경로", () => {
   it("폴더 경로·순수 점은 파일이 아니라고 말해 준다", () => {
     expect(normalizeMemoRel("docs/")).toMatchObject({ ok: false });
     expect(normalizeMemoRel(".")).toMatchObject({ ok: false });
+  });
+});
+
+describe("memoTools — 절단 경고", () => {
+  it("절반 아래로 줄면 경고한다 (절단의 모양)", () => {
+    const before = "a".repeat(100);
+    expect(tidyShrank(before, "a".repeat(40))).toBe(true);
+    expect(tidyShrank(before, "a".repeat(80))).toBe(false);
+    // 경계값은 경고하지 않는다 — 정직한 중복 제거가 딱 절반일 수 있다.
+    expect(tidyShrank(before, "a".repeat(50))).toBe(false);
+  });
+
+  it("빈 원문은 경고 대상이 아니다 (0으로 나누지 않는다)", () => {
+    expect(tidyShrank("", "")).toBe(false);
+    expect(tidyShrank("   ", "무엇이든")).toBe(false);
   });
 });
 
