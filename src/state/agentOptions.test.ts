@@ -172,8 +172,8 @@ describe("spawnOptionFields — 미지정은 키째 사라진다", () => {
     expect(spawnOptionFields({ model: "opus", effort: "" })).toEqual({ model: "opus" });
     expect(spawnOptionFields({ model: "", effort: "max" })).toEqual({ effort: "max" });
     expect(spawnOptionFields({ model: MODEL_CHOICES[0], effort: EFFORT_CHOICES[0] })).toEqual({
-      model: "opus",
-      effort: "max",
+      model: MODEL_CHOICES[0],
+      effort: EFFORT_CHOICES[0],
     });
   });
 });
