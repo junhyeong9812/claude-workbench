@@ -7,6 +7,7 @@ import {
 import "dockview-react/dist/styles/dockview.css";
 import { resolveCloseRequest } from "./sessionClose";
 import { CloseSessionModal } from "./CloseSessionModal";
+import { TermSettingsLayer } from "./TermSettingsButton";
 import { emit, listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { useAppStore } from "../state/store";
@@ -307,6 +308,10 @@ export function PopoutWorkbench() {
         defaultTabComponent={AppTab}
         onReady={onReady}
       />
+
+      {/* 이 창에도 터미널·claude 탭이 산다 — 모달 소유권은 창(번들 인스턴스)마다
+          따로이므로 레이어도 창마다 하나씩 놓는다. */}
+      <TermSettingsLayer />
 
       {closeRequest && (
         <CloseSessionModal

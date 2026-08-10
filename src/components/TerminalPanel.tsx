@@ -7,6 +7,7 @@ import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import "@xterm/xterm/css/xterm.css";
 import { useAppStore } from "../state/store";
 import { xtermTheme } from "./xtermTheme";
+import { TermSettingsButton } from "./TermSettingsButton";
 import type { TerminalOutputEvent, SnapshotResult } from "../types";
 import { decodePtyData, ptyEventName, pushPendingCapped } from "./pty";
 import { errText } from "../utils/error";
@@ -393,5 +394,14 @@ export function TerminalPanel(props: IDockviewPanelProps<TerminalParams>) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  return <div className="terminal-host" ref={hostRef} />;
+  // 색상 설정 진입점은 **호스트 안에 얹는다**(별도 툴바 줄을 만들지 않는다 —
+  // 모든 터미널 탭에서 세로 공간을 상시로 먹는다). xterm은 `term.open(host)`에서
+  // 자기 엘리먼트를 append만 하므로 이 버튼과 형제로 공존하고, 절대 위치라
+  // FitAddon이 재는 호스트 크기에도 영향이 없다. 일반 터미널·SSH·codex(래퍼가
+  // 이 패널을 그대로 쓴다) 세 종류가 이 한 곳을 공유한다.
+  return (
+    <div className="terminal-host" ref={hostRef}>
+      <TermSettingsButton className="terminal-gear" />
+    </div>
+  );
 }

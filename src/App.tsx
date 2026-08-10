@@ -16,7 +16,7 @@ import { DevView } from "./components/DevView";
 import { FilePeekViewer } from "./components/FilePeekViewer";
 import { CommitFilesSidebar } from "./components/CommitFilesSidebar";
 import { CommitFileView } from "./components/CommitFileView";
-import { TerminalSettings } from "./components/TerminalSettings";
+import { TermSettingsButton, TermSettingsLayer } from "./components/TermSettingsButton";
 import { SearchPanel } from "./components/SearchPanel";
 import { RunMenu } from "./components/RunMenu";
 import { AgentOptionsPopover } from "./components/AgentOptionsPopover";
@@ -343,7 +343,6 @@ function AppMain() {
   sidebarViewRef.current = sidebarView;
   const pickHalfTab = (half: SidebarHalf, tab: SidebarTab) =>
     setSidebarView((v) => applyTabPick(v, half, tab));
-  const [termSettingsOpen, setTermSettingsOpen] = useState(false);
   const theme = useAppStore((s) => s.theme);
   const setTheme = useAppStore((s) => s.setTheme);
   const fontSize = useAppStore((s) => s.fontSize);
@@ -576,7 +575,10 @@ function AppMain() {
     if (activeProject) setProjectMode(activeProject, v === "dev" ? "dev" : "integrated");
   };
 
-  // 외관 팝오버 (테마+터미널색+글자크기 통합) — outside-click closes it.
+  // 테마 팝오버 (테마 + 글자 크기) — outside-click closes it. 터미널 색상은
+  // T3에서 터미널 탭 안의 ⚙(TermSettingsButton)로 옮겼다. 내부 식별자는
+  // `appearance*` 그대로 둔다 — CSS 클래스(.appearance-*)와 짝이고, 라벨만
+  // 바뀐 것에 파일 전체 rename을 얹으면 diff가 이유 없이 넓어진다.
   const [appearanceOpen, setAppearanceOpen] = useState(false);
   const appearanceRef = useRef<HTMLDivElement>(null);
   const appearanceBtnRef = useRef<HTMLButtonElement>(null);
@@ -763,18 +765,18 @@ function AppMain() {
           <button
             ref={appearanceBtnRef}
             className={`toolbar-btn${appearanceOpen ? " toolbar-btn-on" : ""}`}
-            title="외관 설정 — 테마 · 글자 크기 · 터미널 색상"
+            title="테마 설정 — 테마 · 글자 크기"
             aria-haspopup="dialog"
             aria-expanded={appearanceOpen}
             onClick={() => setAppearanceOpen((v) => !v)}
           >
-            <span className="toolbar-ico">◐</span> 외관
+            <span className="toolbar-ico">◐</span> 테마
           </button>
           {appearanceOpen && (
             <div
               className="appearance-pop"
               role="dialog"
-              aria-label="외관 설정"
+              aria-label="테마 설정"
               tabIndex={-1}
               ref={appearancePopRef}
             >
@@ -840,17 +842,17 @@ function AppMain() {
                   </button>
                 </div>
               </div>
+              {/* 전역 진입 1개 (리뷰 V3). 주 진입점은 각 터미널·claude 탭의 ⚙
+                  이지만, 탭이 하나도 없는 상태(개발 모드·빈 레이아웃)에서는
+                  같은 모달 안에 있는 **세션 알림 설정**에 닿을 길이 사라진다.
+                  같은 모달을 열 뿐이라 색상까지 전역에서 열리는 건 무해하다. */}
               <div className="appearance-row">
-                <span className="appearance-label">터미널 색상</span>
-                <button
+                <span className="appearance-label">터미널·알림</span>
+                <TermSettingsButton
                   className="toolbar-btn"
-                  onClick={() => {
-                    setAppearanceOpen(false);
-                    setTermSettingsOpen(true);
-                  }}
-                >
-                  설정 열기…
-                </button>
+                  label="설정 열기…"
+                  title="터미널 색상 · 세션 알림 — 터미널 탭 안의 ⚙과 같은 설정입니다"
+                />
               </div>
             </div>
           )}
@@ -1078,7 +1080,9 @@ function AppMain() {
         </PanelGroup>
         </div>
       )}
-      {termSettingsOpen && <TerminalSettings onClose={() => setTermSettingsOpen(false)} />}
+      {/* 설정 모달 레이어 — 창에 하나. 어느 탭의 ⚙에서 열든, 팝오버의 전역
+          링크에서 열든 여기서 그린다(트리거가 사라져도 모달이 살아남는다). */}
+      <TermSettingsLayer />
       {searchOpen && activeProject && (
         <SearchPanel
           root={activeProject}
