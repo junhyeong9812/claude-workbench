@@ -44,6 +44,7 @@ import { initClaudeStatusGlobal } from "./state/claudeStatusGlobal";
 import { initNotify } from "./state/notify";
 import { resolveLayerMode, devLayerMounted, shouldFlipToIntegrated } from "./state/layerRouting";
 import { resolveVisibleDual } from "./state/dualSurface";
+import { SurfaceProvider } from "./state/surfaceContext";
 import {
   applyActivityPick,
   applyTabPick,
@@ -1005,7 +1006,11 @@ function AppMain() {
                 않도록 조건부는 우측 쌍에만 둔다. */}
             <PanelGroup direction="horizontal" autoSaveId="dual-surface" className="dual-row">
               <Panel id="dual-primary" order={1} minSize={25}>
-                <MainArea />
+                {/* P0 무동작 인프라: 주 표면 서브트리에 자기 프로젝트를 주입한다
+                    (값은 현행 그대로 — MainArea는 여전히 activeProject 직독). */}
+                <SurfaceProvider surfaceId="primary" project={activeProject}>
+                  <MainArea />
+                </SurfaceProvider>
               </Panel>
               {visibleDual && (
                 <>
@@ -1031,7 +1036,12 @@ function AppMain() {
                       <div className="dual-secondary-body">
                         {/* 내부 DockviewReact가 surfaceProject로 키잉되어
                             프로젝트 교체 시 dock만 리마운트된다(외부 key 불요 — D11). */}
-                        <MainArea project={visibleDual} secondary />
+                        {/* P0 무동작 인프라: 부 표면 서브트리에 우측 분할이
+                            표시 중인 프로젝트(visibleDual)를 주입한다 — MainArea가
+                            받는 project prop과 동일 값(반사만, 소비 변경 0). */}
+                        <SurfaceProvider surfaceId="secondary" project={visibleDual}>
+                          <MainArea project={visibleDual} secondary />
+                        </SurfaceProvider>
                       </div>
                     </div>
                   </Panel>
