@@ -21,7 +21,7 @@ const PREFIXES = new Set([
   "activity", "agent", "app", "appearance", "archive", "badge", "cfs", "claude", "claudeterm",
   "cm", "codexterm", "commit", "ctx", "dev", "diff", "dock", "drop", "dropzone", "dual", "editor", "font",
   "git", "graph", "main", "memo", "modal", "pane", "panes", "peek", "placeholder", "resize",
-  "run", "search", "seg", "sidebar", "ssh", "study", "tab", "tabbar", "terminal",
+  "run", "search", "seg", "sidebar", "ssh", "study", "surface", "tab", "tabbar", "terminal",
   "timeline", "tl", "toolbar", "tree", "ts", "workspace", "worktree",
 ]);
 

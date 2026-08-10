@@ -5,7 +5,7 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 import type { ITheme } from "@xterm/xterm";
 import type { DirEntry, Project, ProjectType, SshConnection, WorkspaceState } from "../types";
 import { capTreeCache, computeTreeKeepSet, pruneTreeCache, sameEntries, underRoot } from "./treeSelectors";
-import { activeSurfaceId, type SurfaceId } from "./surfaceContext";
+import { activeSurfaceId, setActiveSurfaceSeam, type SurfaceId } from "./surfaceContext";
 import {
   addSurface,
   parseSurfaceTree,
@@ -283,6 +283,14 @@ export interface DiffSpec {
 interface AppState {
   projects: Project[];
   activeProject: string | null;
+  /**
+   * 활성 표면(멀티프로젝트 P4') — 마지막으로 클릭/상호작용한 표면. 툴바·전역
+   * 단축키·요청버스·조정 소비자(사이드바·헤더·검색)가 이 표면을 따른다. 우측
+   * 표면이 없으면 항상 "primary". `activeProject`는 **primary/left 앵커로 유지**
+   * (persist·크로스윈도우 sync·dev 레이어·resolveVisibleDual 비교축) — 활성
+   * 표면의 프로젝트는 파생값 `activeSurfaceProject`(App)로 노출하고, 요청버스는
+   * `activeSurfaceId()` seam으로 라우팅한다. */
+  activeSurfaceId: SurfaceId;
   /** dirPath -> its immediate children (transient cache). */
   childrenCache: Record<string, DirEntry[]>;
   /** dirPath -> in-flight read_dir guard. */
@@ -522,6 +530,10 @@ interface AppState {
   /** Make a project active (swaps the visible tree) + broadcast to other
    * windows so every window shares the same project (multiwindow). */
   setActive: (path: string) => void;
+  /** 활성 표면 전환(P4' 포커스 모델) — 표면 클릭/상호작용 시 호출. 우측 표면이
+   * 없으면 "primary"로 정규화한다. React 상태와 `activeSurfaceId()` seam 홀더를
+   * 함께 갱신해 요청버스 라우팅과 화면(사이드바·시각 피드백)이 정합한다. */
+  setActiveSurface: (id: SurfaceId) => void;
   /** Apply a project switch broadcast from ANOTHER window — sets state only, no
    * persist/re-emit (the originating window already did both; review R0-3). */
   applyRemoteActive: (path: string | null) => void;
@@ -734,6 +746,7 @@ const SURFACE_TREE_INIT = loadSurfaceTree();
 export const useAppStore = create<AppState>((set, get) => ({
   projects: [],
   activeProject: null,
+  activeSurfaceId: "primary",
   childrenCache: {},
   loadingDirs: {},
   treeCursor: null,
@@ -909,7 +922,11 @@ export const useAppStore = create<AppState>((set, get) => ({
       };
     });
     // 우측 표면이 닫혔으면 legacy 키(디스크 정본)도 즉시 정리 — 잔존 방지.
-    if (clearedSurface) persistSurfaceTree(get().surfaceTree);
+    // 그 표면이 활성이었다면 활성도 primary로 되돌린다(P4' 유령 활성 방지).
+    if (clearedSurface) {
+      persistSurfaceTree(get().surfaceTree);
+      if (get().activeSurfaceId === "secondary") get().setActiveSurface("primary");
+    }
     get().persist();
     // If closing the active project moved focus elsewhere, sync other windows
     // so they swap too (review R1-9).
@@ -938,6 +955,13 @@ export const useAppStore = create<AppState>((set, get) => ({
     set({ activeProject: path });
     get().persist();
     broadcastActiveProject(path);
+  },
+  setActiveSurface: (id) => {
+    // 우측 표면이 없으면 secondary를 활성으로 둘 수 없다 — primary로 정규화.
+    const has2nd = secondaryProject(get().surfaceTree) !== null;
+    const next: SurfaceId = id === "secondary" && has2nd ? "secondary" : "primary";
+    setActiveSurfaceSeam(next); // imperative 발행 경로(요청버스 stamp)가 읽는 홀더
+    if (get().activeSurfaceId !== next) set({ activeSurfaceId: next });
   },
   applyRemoteActive: (path) => set({ activeProject: path }),
   initProjectSync: async () => {
@@ -1012,7 +1036,13 @@ export const useAppStore = create<AppState>((set, get) => ({
     // 트리가 멤버십 정본: 열기=addSurface(secondary 추가/교체), 닫기=removeSurface.
     const tree = path ? addSurface(get().surfaceTree, path) : removeSurface(get().surfaceTree);
     persistSurfaceTree(tree); // legacy dualProject 단일 키만 기록(FB — 원자·다운그레이드 자명)
-    set({ surfaceTree: tree, dualProject: secondaryProject(tree) });
+    const dualProject = secondaryProject(tree);
+    set({ surfaceTree: tree, dualProject });
+    // 우측 표면이 사라졌는데 활성이 secondary였다면 primary로 되돌린다(P4' —
+    // 유령 활성 표면 방지: 이후 요청버스가 존재하지 않는 표면을 겨냥하지 않게).
+    if (dualProject === null && get().activeSurfaceId === "secondary") {
+      get().setActiveSurface("primary");
+    }
   },
   requestSessionResume: (req) =>
     set((s) =>

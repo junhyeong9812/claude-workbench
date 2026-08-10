@@ -189,6 +189,11 @@ function AppMain() {
   const init = useAppStore((s) => s.init);
   const initProjectSync = useAppStore((s) => s.initProjectSync);
   const activeProject = useAppStore((s) => s.activeProject);
+  // 활성 표면(P4' 포커스 모델) — 마지막 클릭한 표면. 툴바·검색·사이드바·요청버스가
+  // 이 표면을 따른다. activeProject는 primary/left 앵커로 유지하고, 활성 표면의
+  // 프로젝트는 아래 activeSurfaceProject 파생값으로 노출한다.
+  const activeSurfaceId = useAppStore((s) => s.activeSurfaceId);
+  const setActiveSurface = useAppStore((s) => s.setActiveSurface);
   const peekFile = useAppStore((s) => s.peekFile);
   const peekLine = useAppStore((s) => s.peekLine);
   const setPeekFile = useAppStore((s) => s.setPeekFile);
@@ -1010,17 +1015,34 @@ function AppMain() {
                 않도록 조건부는 우측 쌍에만 둔다. */}
             <PanelGroup direction="horizontal" autoSaveId="dual-surface" className="dual-row">
               <Panel id="dual-primary" order={1} minSize={25}>
-                {/* P0 무동작 인프라: 주 표면 서브트리에 자기 프로젝트를 주입한다
-                    (값은 현행 그대로 — MainArea는 여전히 activeProject 직독). */}
-                <SurfaceProvider surfaceId="primary" project={activeProject}>
-                  <MainArea />
-                </SurfaceProvider>
+                {/* 주 표면 컨테이너: pointerdown-capture로 이 표면의 **모든**
+                    상호작용을 잡아 활성 표면을 primary로 전환한다(P4' 포커스
+                    모델 — "마지막 클릭=활성", 스모크에서 dockview 이벤트보다
+                    견고하다고 확정). SurfaceProvider는 primary가 소유한 프로젝트
+                    (=activeProject 앵커, 활성 표면과 무관하게 안정)를 주입한다. */}
+                <div
+                  className={`surface-frame${
+                    visibleDual && activeSurfaceId === "primary" ? " surface-active" : ""
+                  }`}
+                  onPointerDownCapture={() => setActiveSurface("primary")}
+                >
+                  <SurfaceProvider surfaceId="primary" project={activeProject}>
+                    <MainArea />
+                  </SurfaceProvider>
+                </div>
               </Panel>
               {visibleDual && (
                 <>
                   <PanelResizeHandle className="resize-handle" />
                   <Panel id="dual-secondary" order={2} minSize={20} defaultSize={40}>
-                    <div className="dual-secondary">
+                    {/* 부 표면 컨테이너: 같은 pointerdown-capture로 활성 표면을
+                        secondary로 전환한다(P4'). 활성일 때 surface-active 강조. */}
+                    <div
+                      className={`dual-secondary${
+                        activeSurfaceId === "secondary" ? " surface-active" : ""
+                      }`}
+                      onPointerDownCapture={() => setActiveSurface("secondary")}
+                    >
                       <div
                         className="dual-secondary-head"
                         title={`${visibleDual}\n수동 dock — 툴바 버튼·단축키·요청은 좌측(주) 작업 영역 기준입니다`}

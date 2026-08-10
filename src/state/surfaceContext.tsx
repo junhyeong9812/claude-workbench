@@ -64,14 +64,27 @@ export function useSurfaceId(): SurfaceId {
 /**
  * 현재 "활성 표면"의 id — 요청버스 발행(§P2)이 라우팅 키로 실어 보내는 값.
  *
- * 멀티프로젝트 P2 단계에서는 활성 표면 개념이 아직 없고 소비자가 primary 하나뿐
- * 이라 **상수 "primary"** 를 돌려준다 → 어느 발행이든 primary로 라우팅되어
- * 완전 무동작이다. 이 함수가 요청버스 표면 라우팅의 **유일한 seam**이다:
- * P4'(활성 표면·포커스 모델)가 이 한 함수를 "지금 포커스된 표면 id를 읽어
- * 돌려주도록" 교체하면, 각 요청 발행이 자동으로 활성 표면을 겨냥하고 그 표면의
- * MainArea만 소비하게 된다(소비부는 이미 `req.targetSurfaceId === useSurfaceId()`
- * 로 게이트되어 있으므로 소비부 재작업 없이 라우팅이 살아난다).
+ * **멀티프로젝트 P4'(활성 표면·포커스 모델)**: 이 함수가 요청버스 표면 라우팅의
+ * **유일한 seam**이다. 마지막으로 클릭/상호작용한 표면 id를 돌려주므로, 각 요청
+ * 발행이 자동으로 활성 표면을 겨냥하고 그 표면의 MainArea만 소비한다(소비부는
+ * 이미 `req.targetSurfaceId === useSurfaceId()`로 게이트되어 있어 소비부 재작업
+ * 없이 라우팅이 살아난다).
+ *
+ * 값은 **모듈 지역 홀더**로 들고, store의 `setActiveSurface`가 상태 갱신과 함께
+ * `setActiveSurfaceSeam`으로 이 홀더를 동기화한다. 이 배선(홀더 ↔ store) 덕에
+ * surfaceContext가 store를 import하지 않아 순환 의존이 없다. 발행부(store
+ * 세터)는 발행 **시점**에 이 함수를 imperative하게 읽어 stamp하므로 React
+ * 구독이 아니라 최신 활성 표면을 정확히 싣는다. 기본값은 "primary"(우측 표면
+ * 없음·초기 로드).
  */
+let activeSurfaceHolder: SurfaceId = "primary";
+
 export function activeSurfaceId(): SurfaceId {
-  return "primary";
+  return activeSurfaceHolder;
+}
+
+/** 활성 표면 seam 홀더를 갱신한다(**store의 setActiveSurface 전용**). React 상태와
+ * 별개로 imperative 발행 경로가 읽는 최신값 — 둘은 setActiveSurface가 함께 쓴다. */
+export function setActiveSurfaceSeam(id: SurfaceId): void {
+  activeSurfaceHolder = id;
 }
