@@ -939,12 +939,13 @@ function AppMain() {
           onExpand={() => setCollapsed(false)}
           className="pane-left"
         >
-          {/* P1: 사이드바 클러스터를 표면 컨텍스트로 감싼다. 사이드바는 dual-row
-              밖 단일 인스턴스라 P0 배선(MainArea만 감쌈)에 포함되지 않았다 —
-              활성 표면(현재는 primary)의 프로젝트를 주입해 FolderTree·GitPanel·
-              WorktreePanel·GraphPanel이 useSurfaceProject()를 읽게 한다. 값은
-              activeProject 반사라 완전 무동작(P5에서 표면별 사이드바로 실체화). */}
-          <SurfaceProvider surfaceId="primary" project={activeProject}>
+          {/* 사이드바 클러스터를 표면 컨텍스트로 감싼다(P1 배선). **P4'**: 위치는
+              아직 단일(dual-row 밖 1개)이지만 **활성 표면**을 반영한다 — 활성 표면
+              전환 시 FolderTree·GitPanel·WorktreePanel·GraphPanel이 그 표면의
+              프로젝트로 내용 전환된다(useSurfaceProject/useSurfaceId 경유). 활성
+              표면의 프로젝트/ id를 주입하되 위치·인스턴스는 그대로(표면별 사이드바
+              인스턴스는 P5). */}
+          <SurfaceProvider surfaceId={activeSurfaceId} project={activeSurfaceProject}>
           <div className="sidebar-content">
             {/* PanelGroup은 분할 여부와 무관하게 **상시** 렌더 — ⊟ 토글이 위쪽
                 본문(keyed "body")의 identity를 보존해 GitPanel 커밋 메시지 등
