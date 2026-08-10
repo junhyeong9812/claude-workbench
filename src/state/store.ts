@@ -239,34 +239,23 @@ function persistPopoutGeometry(label: string, geo: PopoutGeo) {
   savePopoutGeometry(fresh);
 }
 
-/** Load the surface tree from localStorage, migrating the legacy `dualProject`
- * string when the new `surfaceTree` key is absent (멀티프로젝트 P3'). Corrupt or
- * missing = 기본(primary 단독) — parseSurfaceTree owns the recovery contract. */
+/** Load the surface tree from localStorage (멀티프로젝트 P3'). FB(리뷰): the disk
+ * source of truth is the **single legacy `dualProject` key** — we never read a
+ * `surfaceTree` blob (그건 P6로 이연), so the two-key divergence class cannot
+ * exist. parseSurfaceTree(null, legacy) builds the in-memory tree; corrupt or
+ * missing legacy = 기본(primary 단독) via the recovery contract. */
 function loadSurfaceTree(): SurfaceTree {
-  let raw: unknown = null;
-  try {
-    const s = localStorage.getItem("surfaceTree");
-    if (s) raw = JSON.parse(s);
-  } catch {
-    /* corrupt JSON → parseSurfaceTree falls back to legacy/default */
-  }
-  return parseSurfaceTree(raw, localStorage.getItem("dualProject"));
+  return parseSurfaceTree(null, localStorage.getItem("dualProject"));
 }
 
-/** Persist the surface tree atomically to localStorage AND keep the legacy
- * `dualProject` key in sync so an OLDER app (which only reads `dualProject`)
- * restores the right split without collapse — 다운그레이드 안전(이중 기록). Each
- * setItem is its own atomic op; both readers stay independently consistent. */
+/** Persist the surface tree to the **single legacy `dualProject` key** (FB, 리뷰).
+ * P3'의 트리는 0~1 secondary라 legacy 문자열과 동형이므로 이 한 키가 저장 정보를
+ * 전부 담는다 — 원자적(한 키·한 setItem)이고 다운그레이드가 자명하다(구버전 앱이
+ * 읽는 유일 키). 방향·N-way를 담는 트리 persist는 P6로 이연. */
 function persistSurfaceTree(tree: SurfaceTree) {
   const secondary = secondaryProject(tree);
-  // Legacy key first: if only one write lands, the old reader is still correct.
   if (secondary) localStorage.setItem("dualProject", secondary);
   else localStorage.removeItem("dualProject");
-  try {
-    localStorage.setItem("surfaceTree", JSON.stringify(tree));
-  } catch {
-    /* quota — legacy key already carries the membership, so no data loss */
-  }
 }
 
 /** A request to open a diff in the main area (file change or a commit). */
@@ -841,6 +830,14 @@ export const useAppStore = create<AppState>((set, get) => ({
       );
       set({ projects: refreshed });
       get().persist();
+
+      // FD(리뷰): 복원된 open_projects에 우측 표면 프로젝트가 없으면(예전 세션에서
+      // 닫혔거나 workspace.json과 legacy 키가 어긋난 경우) 여기서 정리한다 —
+      // hydration 완료 후 1회, App 이펙트 의존 없이 트리·미러·키를 정합화한다.
+      const secondary = secondaryProject(get().surfaceTree);
+      if (secondary && !refreshed.some((p) => p.path === secondary)) {
+        get().setDualProject(null);
+      }
     } catch (err) {
       // load_state is infallible on the Rust side, but guard anyway.
       console.error("load_state failed", err);
@@ -882,6 +879,11 @@ export const useAppStore = create<AppState>((set, get) => ({
 
   closeProject: (path) => {
     const before = get().activeProject;
+    // FD(리뷰): 닫는 프로젝트가 우측 표면이면 **이 갱신 안에서** 트리·미러를 함께
+    // 제거한다. 예전엔 App 이펙트(projects.length>0 가드)가 정리했는데, 마지막
+    // 프로젝트를 닫아 목록이 비면 그 가드가 정리를 막아 닫은 경로가 트리·미러·
+    // 키에 잔존했다. store 액션이 정본이 되어 effect 의존을 없앤다.
+    const clearedSurface = secondaryProject(get().surfaceTree) === path;
     set((s) => {
       const projects = s.projects.filter((p) => p.path !== path);
       let activeProject = s.activeProject;
@@ -895,13 +897,18 @@ export const useAppStore = create<AppState>((set, get) => ({
       // 새 캐시를 덮는(감사 B3) 경로 차단. 재오픈은 cache-miss → 새로 읽음.
       treeCacheEpoch++;
       const keep = [...projects.map((p) => p.path), s.studyFolders.left, s.studyFolders.right];
+      const surfaceTree = clearedSurface ? removeSurface(s.surfaceTree) : s.surfaceTree;
       return {
         projects,
         activeProject,
+        surfaceTree,
+        dualProject: secondaryProject(surfaceTree),
         childrenCache: pruneTreeCache(s.childrenCache, path, keep),
         loadingDirs: pruneTreeCache(s.loadingDirs, path, keep),
       };
     });
+    // 우측 표면이 닫혔으면 legacy 키(디스크 정본)도 즉시 정리 — 잔존 방지.
+    if (clearedSurface) persistSurfaceTree(get().surfaceTree);
     get().persist();
     // If closing the active project moved focus elsewhere, sync other windows
     // so they swap too (review R1-9).

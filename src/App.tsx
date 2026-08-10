@@ -212,17 +212,12 @@ function AppMain() {
     activeProject,
     projects.map((p) => p.path),
   );
-  // P3': **동일-프로젝트 붕괴 이펙트 제거**. 예전엔 activeProject가 우측과 같아지면
-  // dual을 파괴(setDualProject(null))했지만, 이제 트리가 멤버십의 정본이라 겹침은
-  // 위 렌더 가드가 비파괴적으로 숨기기만 한다(active가 다시 갈라지면 우측 복원).
-  // 파괴적 붕괴 제거가 P4'(활성 표면 alias 전환)의 안전 전제다. 남는 이펙트는
-  // 진짜 멤버십 정리 하나뿐: 닫힌 프로젝트를 트리에서 제거(hydration 전 오판
-  // 방지로 목록이 채워진 뒤에만).
-  useEffect(() => {
-    if (dualProject && projects.length > 0 && !projects.some((p) => p.path === dualProject)) {
-      setDualProject(null);
-    }
-  }, [dualProject, projects, setDualProject]);
+  // P3'(리뷰): dual 정리 이펙트 **전부 제거**. 멤버십은 이제 store가 정본으로
+  // 관리한다 — ① 동일-프로젝트 겹침은 위 렌더 가드가 비파괴적으로 숨기고(트리
+  // 멤버십 보존 → P4' alias 전환 안전), ② 닫힌 프로젝트 정리는 closeProject의
+  // zustand 갱신 안(마지막 프로젝트 close 포함)과 init() hydration 후 1회
+  // 정합화가 담당한다(예전 projects.length>0 이펙트가 마지막 프로젝트 close 시
+  // 정리를 건너뛰어 잔존시키던 FD 버그 제거).
   // 작업 영역에 드롭된 OS 파일들의 메모리 뷰 (workarea-drop-view — 완전 읽기
   // 전용, 디스크에 아무것도 쓰지 않음). 첫 파일 활성 + 탭 전환.
   const [droppedPeek, setDroppedPeek] = useState<{
