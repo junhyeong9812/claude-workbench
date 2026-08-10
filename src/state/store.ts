@@ -517,8 +517,11 @@ interface AppState {
    * metadata. Returns false (keeping the connection) if the keychain delete
    * fails, so the secret can't be silently orphaned. */
   deleteConnection: (id: string) => Promise<boolean>;
-  /** Open a folder as a new project tab (or focus it if already open). */
-  addProject: (path: string) => Promise<void>;
+  /** Open a folder as a new project tab (or focus it if already open).
+   * `opts.surface==="secondary"`(P4' 활성 표면 열기)면 primary 앵커를 건드리지
+   * 않고 우측 표면에 싣는다(카탈로그엔 추가). 기본(생략/primary)은 종전대로 좌측
+   * 활성으로 연다. */
+  addProject: (path: string, opts?: { surface?: SurfaceId }) => Promise<void>;
   /** Close a project tab. */
   closeProject: (path: string) => void;
   /** Move `fromPath`'s tab to just before/after `toPath` and persist. */
@@ -858,12 +861,19 @@ export const useAppStore = create<AppState>((set, get) => ({
     }
   },
 
-  addProject: async (path) => {
-    // Already open -> just focus it.
+  addProject: async (path, opts) => {
+    // P4' 활성 표면 열기: secondary면 primary 앵커·크로스윈도우 sync를 건드리지
+    // 않고 우측 표면(setDualProject)에만 싣는다. 좌측 프로젝트 전환 없음.
+    const toSecondary = opts?.surface === "secondary";
+    // Already open -> just focus it (활성 표면 기준).
     if (get().projects.some((p) => p.path === path)) {
-      set({ activeProject: path });
-      get().persist();
-      broadcastActiveProject(path);
+      if (toSecondary) {
+        get().setDualProject(path);
+      } else {
+        set({ activeProject: path });
+        get().persist();
+        broadcastActiveProject(path);
+      }
       return;
     }
 
@@ -885,10 +895,12 @@ export const useAppStore = create<AppState>((set, get) => ({
 
     set((s) => ({
       projects: [...s.projects, project],
-      activeProject: path,
+      // secondary 열기는 좌측 활성을 유지한다(우측에만 실림).
+      ...(toSecondary ? {} : { activeProject: path }),
     }));
     get().persist();
-    broadcastActiveProject(path);
+    if (toSecondary) get().setDualProject(path);
+    else broadcastActiveProject(path);
   },
 
   closeProject: (path) => {
@@ -1038,9 +1050,15 @@ export const useAppStore = create<AppState>((set, get) => ({
     persistSurfaceTree(tree); // legacy dualProject 단일 키만 기록(FB — 원자·다운그레이드 자명)
     const dualProject = secondaryProject(tree);
     set({ surfaceTree: tree, dualProject });
-    // 우측 표면이 사라졌는데 활성이 secondary였다면 primary로 되돌린다(P4' —
-    // 유령 활성 표면 방지: 이후 요청버스가 존재하지 않는 표면을 겨냥하지 않게).
-    if (dualProject === null && get().activeSurfaceId === "secondary") {
+    // 우측 표면이 **뚜렷하게 보이지 않으면**(닫힘=null · 좌측과 동일 프로젝트라
+    // resolveVisibleDual이 숨김 · 아직 열린 탭 아님) 활성이 secondary였어도
+    // primary로 되돌린다(P4' 유령 활성 방지 — 렌더 안 되는 표면으로 요청버스가
+    // 라우팅되어 조용히 유실되는 것을 차단, resolveVisibleDual과 동일 판정).
+    const secondaryVisible =
+      dualProject !== null &&
+      dualProject !== get().activeProject &&
+      get().projects.some((p) => p.path === dualProject);
+    if (!secondaryVisible && get().activeSurfaceId === "secondary") {
       get().setActiveSurface("primary");
     }
   },

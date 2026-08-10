@@ -95,10 +95,12 @@ export function MainArea({
   const isPrimary = !secondary;
   const surfaceProject = useSurfaceProject();
   // 이 표면의 id — 요청버스 소비 게이트가 이 값과 요청의 `targetSurfaceId`가
-  // 일치할 때만 소비한다(P2). 지금은 발행이 항상 "primary"를 실어 주고 소비
-  // 표면도 primary 하나뿐이라, 종전 `isPrimary` 게이트와 결과가 동일(무동작).
-  // (구조적 isPrimary 게이트 — window 리스너·창 수명·closeRequest 백스톱·
-  // focusSession 조정자 — 는 요청버스 라우팅이 아니므로 그대로 둔다.)
+  // 일치할 때만 소비한다(P2 라우팅). **P4'**: 활성 표면 seam이 켜져 부 표면도
+  // 자기로 라우팅된 요청을 소비한다(spec §2 불변식 완화: "활성 표면이 조작
+  // 소유"). 프로젝트 매칭은 전역 activeProject가 아니라 surfaceProject(표면-로컬)
+  // 로 한다 — 아래 각 소비 이펙트 참조. 단 **구조적 isPrimary 게이트**(창당 1개
+  // window 리스너·창 수명·closeRequest 백스톱·focusSession 조정자·창 분리 드래그)
+  // 는 라우팅이 아니라 "창당 단일 소유"라 그대로 주 표면에 둔다.
   const mySurfaceId = useSurfaceId();
   const surfaceKey = isPrimary ? "primary" : "secondary";
   const theme = useAppStore((s) => s.theme);
@@ -106,7 +108,11 @@ export function MainArea({
   const projectModes = useAppStore((s) => s.projectModes);
   // MainArea is now always mounted (behind the dev layer when in dev mode), so
   // it must only consume main-area requests while it is the front layer.
-  const layerMode = resolveLayerMode(projectModes, activeProject);
+  // 레이어(통합/개발)는 **표면-로컬**이다(P4'): 주 표면은 자기 프로젝트
+  // (surfaceProject===activeProject)의 모드로, 부 표면은 dev 레이어 오버레이가
+  // 없으므로 항상 "integrated"로 둔다 — 이로써 주가 dev 모드여도 부는 자기로
+  // 라우팅된 요청을 정상 소비한다(전역 activeProject 모드에 묶이지 않음).
+  const layerMode = isPrimary ? resolveLayerMode(projectModes, surfaceProject) : "integrated";
   const editorOpenRequest = useAppStore((s) => s.editorOpenRequest);
   const requestEditorOpen = useAppStore((s) => s.requestEditorOpen);
   const diffRequest = useAppStore((s) => s.diffRequest);
@@ -451,11 +457,12 @@ export function MainArea({
     if (!claudeOpenRequest) return;
     if (claudeOpenRequest.targetSurfaceId !== mySurfaceId) return; // 표면 라우팅(P2): 내 표면 것만
     const { project, seed, title: reqTitle, referencePanelId, model, effort } = claudeOpenRequest;
-    // Only THIS project's mount may consume the request (MainArea is keyed by
-    // activeProject): otherwise a not-yet-switched old mount would add the Claude
-    // panel to the wrong project's dock (codex P1). Keep the request until the
-    // worktree's mount is active.
-    if (project !== activeProject) return;
+    // Only THIS surface's current project may consume the request (the dock is
+    // keyed by surfaceProject): otherwise a not-yet-switched old mount would add
+    // the Claude panel to the wrong project's dock (codex P1). 표면-로컬 비교
+    // (P4' — surfaceProject): 활성=secondary로 라우팅된 요청은 부 표면(자기
+    // 프로젝트)만 받고 주 표면은 건너뛴다. 주에선 surfaceProject===activeProject.
+    if (project !== surfaceProject) return;
     const api = apiRef.current;
     if (!api) return; // dock not ready (project-switch remount) — keep the request; apiReady re-runs this
     requestClaudeOpen(null); // consume only once we can actually act
@@ -472,7 +479,7 @@ export function MainArea({
         : {}),
     });
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [claudeOpenRequest, apiReady, activeProject, layerMode]);
+  }, [claudeOpenRequest, apiReady, surfaceProject, layerMode]);
 
   // 새 codex 세션 요청 소비 (툴바 옵션 팝오버). claude 쪽과 같은 keep-until-
   // actionable 규칙을 따르되(부 surface 비소비 · 앞 레이어일 때만 · 이 프로젝트의
@@ -484,7 +491,7 @@ export function MainArea({
     if (!codexOpenRequest) return;
     if (codexOpenRequest.targetSurfaceId !== mySurfaceId) return; // 표면 라우팅(P2): 내 표면 것만
     const { project, model, effort } = codexOpenRequest;
-    if (project !== activeProject) return;
+    if (project !== surfaceProject) return; // 표면-로컬 비교(P4')
     const api = apiRef.current;
     if (!api) return;
     requestCodexOpen(null);
@@ -495,7 +502,7 @@ export function MainArea({
       ...(effort ? { effort } : {}),
     });
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [codexOpenRequest, apiReady, activeProject, layerMode]);
+  }, [codexOpenRequest, apiReady, surfaceProject, layerMode]);
 
   // (개발 세션 ✓확인/🧪 소비는 DevView로 이관됨 — 통합 dock 안에 "개발 세션"
   // 부분 패널을 끼워 넣던 옛 경로는 제거. 이제 EditorPanel이 dev 레이어를 전면
@@ -508,7 +515,7 @@ export function MainArea({
     if (!integratedIsFront(layerMode)) return; // dev layer in front — leave the request
     if (!runRequest) return;
     if (runRequest.targetSurfaceId !== mySurfaceId) return; // 표면 라우팅(P2): 내 표면 것만
-    if (runRequest.project !== activeProject) return;
+    if (runRequest.project !== surfaceProject) return; // 표면-로컬 비교(P4')
     const api = apiRef.current;
     if (!api) return; // dock not ready — keep the request; apiReady re-runs
     requestRun(null);
@@ -518,7 +525,7 @@ export function MainArea({
       cwd: runRequest.project,
     });
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [runRequest, apiReady, activeProject, layerMode]);
+  }, [runRequest, apiReady, surfaceProject, layerMode]);
 
   // 트리 "여기서 터미널 열기": 그 폴더를 cwd로 하는 일반 터미널 탭. 통합 레이어가
   // 앞일 때만 소비한다 — 개발 레이어가 앞이면 DevView가, 스터디 모드면
@@ -708,10 +715,10 @@ export function MainArea({
     memoHandledRef.current = memoRequest.nonce;
     if (!integratedIsFront(layerMode)) return;
     const api = apiRef.current;
-    if (!api || !activeProject) return;
+    if (!api || !surfaceProject) return; // 표면-로컬 메모(P4')
     setTermMenu(false);
     setPicker(null);
-    openProjectMemo(api, activeProject);
+    openProjectMemo(api, surfaceProject);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [memoRequest]);
 

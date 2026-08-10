@@ -217,6 +217,12 @@ function AppMain() {
     activeProject,
     projects.map((p) => p.path),
   );
+  // 활성 표면의 프로젝트(P4' alias) — 조정 소비자(사이드바·헤더·새 세션·검색)가
+  // 읽는다. 활성=secondary이고 우측 표면이 실제 보일 때만 그 프로젝트, 그 외에는
+  // primary 앵커(activeProject). visibleDual이 null(닫힘/hydration 전/동일 겹침)
+  // 이면 primary로 폴백 — 유령 프로젝트를 가리키지 않는다.
+  const activeSurfaceProject =
+    activeSurfaceId === "secondary" && visibleDual ? visibleDual : activeProject;
   // P3'(리뷰): dual 정리 이펙트 **전부 제거**. 멤버십은 이제 store가 정본으로
   // 관리한다 — ① 동일-프로젝트 겹침은 위 렌더 가드가 비파괴적으로 숨기고(트리
   // 멤버십 보존 → P4' alias 전환 안전), ② 닫힌 프로젝트 정리는 closeProject의
@@ -711,13 +717,16 @@ function AppMain() {
                   float
                   triggerRef={agentOptsBtnRef}
                   disabledReason={
-                    activeProject ? undefined : "프로젝트를 연 뒤 세션을 시작할 수 있습니다"
+                    activeSurfaceProject ? undefined : "프로젝트를 연 뒤 세션을 시작할 수 있습니다"
                   }
                   onClose={() => setAgentOptsOpen(false)}
                   onStart={(agent, opts) => {
                     setAgentOptsOpen(false);
-                    if (!activeProject) return;
-                    const req = { project: activeProject, ...spawnOptionFields(opts) };
+                    // 새 세션은 **활성 표면**의 프로젝트로 연다(P4') — 요청버스
+                    // seam이 targetSurfaceId를 활성 표면으로 stamp하고, req.project
+                    // 가 그 표면의 surfaceProject와 일치해야 소비된다.
+                    if (!activeSurfaceProject) return;
+                    const req = { project: activeSurfaceProject, ...spawnOptionFields(opts) };
                     if (agent === "codex") requestCodexOpen(req);
                     else requestClaudeOpen(req);
                   }}
@@ -741,18 +750,18 @@ function AppMain() {
               title={
                 layerMode === "dev"
                   ? "메모는 통합 모드에서 사용할 수 있습니다"
-                  : !activeProject
+                  : !activeSurfaceProject
                     ? "메모는 프로젝트를 연 뒤 사용할 수 있습니다"
                     : "이 프로젝트의 메모장 열기 (자동 저장 · 프로젝트당 1개)"
               }
-              disabled={layerMode === "dev" || !activeProject}
+              disabled={layerMode === "dev" || !activeSurfaceProject}
               onClick={() => requestMemo()}
             >
               <span className="toolbar-ico">▤</span> 메모
             </button>
           </div>
         )}
-        <RunMenu />
+        <RunMenu project={activeSurfaceProject} />
         <div
           className="appearance-menu"
           ref={appearanceRef}
@@ -862,7 +871,8 @@ function AppMain() {
         </div>
         <ToolbarRollup />
         <span className="toolbar-title">
-          {activeProject ?? "claude-workbench"}
+          {/* 헤더는 활성 표면의 프로젝트를 가리킨다(P4'). */}
+          {activeSurfaceProject ?? "claude-workbench"}
         </span>
       </div>
       {mode === "study" ? (
@@ -1121,9 +1131,9 @@ function AppMain() {
       {/* 설정 모달 레이어 — 창에 하나. 어느 탭의 ⚙에서 열든, 팝오버의 전역
           링크에서 열든 여기서 그린다(트리거가 사라져도 모달이 살아남는다). */}
       <TermSettingsLayer />
-      {searchOpen && activeProject && (
+      {searchOpen && activeSurfaceProject && (
         <SearchPanel
-          root={activeProject}
+          root={activeSurfaceProject}
           onClose={() => setSearchOpen(false)}
           onOpen={(path, line) => {
             setPeekFile(path, line);

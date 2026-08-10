@@ -9,7 +9,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn(() => Promise.resolve()) }));
 vi.mock("@tauri-apps/api/event", () => ({
-  emit: vi.fn(),
+  emit: vi.fn(() => Promise.resolve()),
   listen: vi.fn(() => Promise.resolve(() => {})),
 }));
 vi.mock("@tauri-apps/api/window", () => ({
@@ -74,5 +74,33 @@ describe("활성 표면 + 요청버스 seam 라우팅 (P4')", () => {
     useAppStore.getState().closeProject("/b");
     expect(useAppStore.getState().activeSurfaceId).toBe("primary");
     expect(activeSurfaceId()).toBe("primary");
+  });
+
+  it("우측을 좌측과 같은 프로젝트로 바꾸면(숨김 겹침) 활성이 primary로 정규화", () => {
+    useAppStore.setState({ projects: [{ path: "/a", name: "a", project_types: [], tree_state: { expanded: [] } }, { path: "/b", name: "b", project_types: [], tree_state: { expanded: [] } }], activeProject: "/a" });
+    const s = useAppStore.getState();
+    s.setDualProject("/b");
+    s.setActiveSurface("secondary");
+    expect(useAppStore.getState().activeSurfaceId).toBe("secondary");
+    // 우측을 좌측(activeProject="/a")과 동일하게 → resolveVisibleDual이 숨김 →
+    // 유령 활성 방지로 primary 복귀.
+    useAppStore.getState().setDualProject("/a");
+    expect(useAppStore.getState().activeSurfaceId).toBe("primary");
+  });
+
+  it("addProject(surface:'secondary')는 좌측 앵커를 유지하고 우측 표면에 싣는다", async () => {
+    useAppStore.setState({ projects: [{ path: "/a", name: "a", project_types: [], tree_state: { expanded: [] } }], activeProject: "/a" });
+    await useAppStore.getState().addProject("/b", { surface: "secondary" });
+    const g = useAppStore.getState();
+    expect(g.activeProject).toBe("/a"); // 좌측 앵커 유지
+    expect(g.dualProject).toBe("/b"); // 우측 표면에 실림
+    expect(g.projects.some((p) => p.path === "/b")).toBe(true); // 카탈로그 추가
+  });
+
+  it("addProject(기본)은 좌측 활성으로 연다(종전 동작)", async () => {
+    useAppStore.setState({ projects: [{ path: "/a", name: "a", project_types: [], tree_state: { expanded: [] } }], activeProject: "/a" });
+    useAppStore.getState().setDualProject(null);
+    await useAppStore.getState().addProject("/c");
+    expect(useAppStore.getState().activeProject).toBe("/c");
   });
 });
