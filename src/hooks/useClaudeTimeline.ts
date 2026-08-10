@@ -67,18 +67,21 @@ export interface SubagentFrame {
   completed: number;
   /** 마지막 아이템 상태 — 본문 없이도 "진행 중" 표시가 동일하다. */
   last_status: string | null;
-  /** 본문 캐시 무효화 키(revision 합) — 재활성→재완료 시 값이 달라진다. */
-  rev: number;
+  /** 본문 캐시 무효화 키 = 백엔드 파일 서명 문자열(AA2). 완료 에이전트가
+   * 재활성→재구축→재완료로 transcript가 바뀌면 서명이 달라져 낡은 lazy 본문을
+   * 버린다. revision 합은 재구축 시 리셋돼 같은 합·다른 내용을 낼 수 있었다.
+   * 활성 프레임(items 인라인)은 서명이 필요 없어 null. */
+  sig: string | null;
   /** 활성 프레임의 본문. 완료 프레임은 null = "펼칠 때 조회하라". */
   items: TimelineItem[] | null;
 }
 
-/** lazy 본문 캐시의 한 칸. `rev`는 그 본문이 어느 프레임 버전의 것인지 —
- * 프레임의 rev가 달라지면(재활성 후 재완료) stale이므로 버린다. */
+/** lazy 본문 캐시의 한 칸. `sig`는 그 본문이 어느 프레임 버전의 것인지 —
+ * 프레임의 sig(파일 서명)가 달라지면(재활성 후 재완료) stale이므로 버린다. */
 export type LazyAgentEntry =
-  | { state: "loading"; rev: number }
-  | { state: "ready"; rev: number; items: TimelineItem[] }
-  | { state: "error"; rev: number };
+  | { state: "loading"; sig: string | null }
+  | { state: "ready"; sig: string | null; items: TimelineItem[] }
+  | { state: "error"; sig: string | null };
 
 /** 뷰가 실제로 그리는 서브에이전트 — 프레임(메타) + 본문 도착 상태. */
 export interface SubagentView {
@@ -118,7 +121,9 @@ export function mergeSubagents(
       return { ...meta, items: f.items, loaded: true, loading: false, failed: false };
     }
     const e = cache.get(f.id);
-    const fresh = e && e.rev === f.rev ? e : undefined;
+    // AA2: 파일 서명이 일치하는 캐시만 fresh — 재활성→재완료로 서명이 바뀐
+    // 프레임의 낡은 본문은 없는 것으로 친다(낡은 표시 금지).
+    const fresh = e && e.sig === f.sig ? e : undefined;
     return {
       ...meta,
       items: fresh?.state === "ready" ? fresh.items : [],
@@ -149,24 +154,39 @@ export function adoptInlineBodies(
   let next: Map<string, LazyAgentEntry> | null = null;
   for (const f of frames) {
     if (f.items == null) continue;
+    // 활성 프레임의 서명은 이번 틱의 파일 서명(백엔드 active_sig) — 완료 안정
+    // 구간엔 값이 고정이라, 활성일 때 승계해 둔 본문이 완료 전이(items=null,
+    // 같은 서명) 후에도 fresh로 인정된다(전이 시 깜빡임 없음).
     const cur = cache.get(f.id);
-    // rev는 items가 바뀔 때만 달라진다(revision 합) — 같은 rev면 같은 본문.
-    if (cur && cur.state === "ready" && cur.rev === f.rev) continue;
+    if (cur && cur.state === "ready" && cur.sig === f.sig) continue;
     next ??= new Map(cache);
-    next.set(f.id, { state: "ready", rev: f.rev, items: f.items });
+    next.set(f.id, { state: "ready", sig: f.sig, items: f.items });
   }
   return next ?? cache;
 }
 
+/** lazy 조회 응답을 캐시에 반영해도 되나 (순수 — AA3 CAS). 늦게 도착한 응답이
+ * 그 사이 발주된 더 새 요청(승계·재조회)이나 세션 전환을 덮으면 미도착 회귀가
+ * 생긴다. `myReq`가 이 에이전트의 최신 요청이고 세션 uuid도 발주 때와 같을 때만
+ * 반영한다. */
+export function lazyResponseIsCurrent(
+  latestReq: number | undefined,
+  myReq: number,
+  currentUuid: string | null,
+  myUuid: string | null,
+): boolean {
+  return latestReq === myReq && currentUuid === myUuid;
+}
+
 /** 이 프레임의 본문을 지금 조회해야 하나 (순수). 활성 프레임(본문 인라인)은
- * 불필요, 같은 rev의 캐시가 이미 있으면 불필요(실패 sentinel 포함 — 재시도는
+ * 불필요, 같은 서명의 캐시가 이미 있으면 불필요(실패 sentinel 포함 — 재시도는
  * `force`로만, 실패 재조회 폭주 방지). */
 export function needsSubagentFetch(
   frame: SubagentFrame | undefined,
   entry: LazyAgentEntry | undefined,
 ): boolean {
   if (!frame || frame.items != null) return false;
-  return !entry || entry.rev !== frame.rev;
+  return !entry || entry.sig !== frame.sig;
 }
 
 /** The part of a payload `applySnapshot` reads — a live event or the stored
@@ -270,6 +290,13 @@ export function useTimelineState(
     });
   }, []);
 
+  // AA3: lazy 조회 CAS — 요청마다 단조 토큰을 발급하고 에이전트별 최신 토큰을
+  // 기록한다. 응답 resolve/reject 시 (같은 세션 · 여전히 최신 요청)일 때만 캐시에
+  // 반영한다. 늦게 도착한 rev7 응답이 그 사이 승계된 rev8/새 조회를 덮어
+  // "미도착"으로 되돌리는 경로를 막는다.
+  const reqSeqRef = useRef(0);
+  const reqOfRef = useRef<Map<string, number>>(new Map());
+
   /** payload의 프레임 반영 + 인라인 본문을 캐시로 승계(완료 전이 시 표시 유지). */
   const setSubagentFrames = useCallback((frames: SubagentFrame[]) => {
     setFrames(frames);
@@ -301,22 +328,39 @@ export function useTimelineState(
       if (!frame) return;
       if (!force && !needsSubagentFetch(frame, entry)) return;
       if (force && frame.items != null) return; // 활성 프레임은 조회 대상이 아니다
-      const rev = frame.rev;
+      const sig = frame.sig;
       const src = sourceRef.current;
+      // AA3: 이 요청을 식별 — 토큰 + 발주 시점 세션 uuid. 응답 반영 전 둘 다
+      // 여전히 유효한지 확인한다(늦은 응답이 새 요청/세션 전환을 덮지 않게).
+      const myReq = ++reqSeqRef.current;
+      reqOfRef.current.set(agentId, myReq);
+      const myUuid = src?.uuid ?? null;
+      const commit = (e: LazyAgentEntry) => {
+        if (
+          !lazyResponseIsCurrent(
+            reqOfRef.current.get(agentId),
+            myReq,
+            sourceRef.current?.uuid ?? null,
+            myUuid,
+          )
+        )
+          return; // 더 새 요청이 앞질렀거나 세션이 바뀌었다 — 늦은 응답 폐기
+        putLazy(agentId, e);
+      };
       if (!src?.project || !src?.uuid) {
         // 조회 좌표를 모르면 본문은 영영 못 온다 — "불러오는 중"으로 매달아
         // 두지 말고 실패로 표시한다(무음 금지).
-        putLazy(agentId, { state: "error", rev });
+        commit({ state: "error", sig });
         return;
       }
-      putLazy(agentId, { state: "loading", rev });
+      commit({ state: "loading", sig });
       invoke<TimelineItem[]>("claude_subagent_items", {
         project: src.project,
         uuid: src.uuid,
         agentId,
       })
-        .then((its) => putLazy(agentId, { state: "ready", rev, items: its ?? [] }))
-        .catch(() => putLazy(agentId, { state: "error", rev }));
+        .then((its) => commit({ state: "ready", sig, items: its ?? [] }))
+        .catch(() => commit({ state: "error", sig }));
     },
     [putLazy],
   );

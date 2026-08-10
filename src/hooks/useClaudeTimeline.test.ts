@@ -8,6 +8,7 @@ vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn(async () => null) }));
 import {
   adoptInlineBodies,
   ctxOccupancy,
+  lazyResponseIsCurrent,
   ctxWindow,
   mergeSubagents,
   needsSubagentFetch,
@@ -81,7 +82,7 @@ const frame = (f: Partial<SubagentFrame>): SubagentFrame => ({
   total: 12,
   completed: 11,
   last_status: "completed",
-  rev: 7,
+  sig: "s7",
   items: null,
   ...f,
 });
@@ -101,21 +102,22 @@ describe("mergeSubagents — 프레임(메타) + lazy 본문 캐시 → 뷰 모�
     expect([v.total, v.completed, v.lastStatus]).toEqual([12, 11, "completed"]);
   });
 
-  it("같은 rev의 캐시가 있으면 본문이 붙는다 / 진행·실패 상태가 드러난다", () => {
+  it("같은 서명의 캐시가 있으면 본문이 붙는다 / 진행·실패 상태가 드러난다", () => {
     const its = [it0("y")];
-    const ready = new Map<string, LazyAgentEntry>([["a1", { state: "ready", rev: 7, items: its }]]);
+    const ready = new Map<string, LazyAgentEntry>([["a1", { state: "ready", sig: "s7", items: its }]]);
     expect(mergeSubagents([frame({})], ready)[0]).toMatchObject({ items: its, loaded: true });
-    const loading = new Map<string, LazyAgentEntry>([["a1", { state: "loading", rev: 7 }]]);
+    const loading = new Map<string, LazyAgentEntry>([["a1", { state: "loading", sig: "s7" }]]);
     expect(mergeSubagents([frame({})], loading)[0]).toMatchObject({ loading: true, loaded: false });
-    const err = new Map<string, LazyAgentEntry>([["a1", { state: "error", rev: 7 }]]);
+    const err = new Map<string, LazyAgentEntry>([["a1", { state: "error", sig: "s7" }]]);
     expect(mergeSubagents([frame({})], err)[0]).toMatchObject({ failed: true, loaded: false });
   });
 
-  it("rev가 어긋난 캐시는 무시한다 — 재활성→재완료한 에이전트의 낡은 본문 표시 금지", () => {
+  it("서명이 어긋난 캐시는 무시한다 (AA2) — 재활성→재완료로 파일 서명이 바뀐 낡은 본문 표시 금지", () => {
+    // 같은 rev 합이라도 파일 서명(sig)이 다르면 stale — revision 리셋 충돌 방어.
     const stale = new Map<string, LazyAgentEntry>([
-      ["a1", { state: "ready", rev: 6, items: [it0("old")] }],
+      ["a1", { state: "ready", sig: "s6", items: [it0("old")] }],
     ]);
-    const [v] = mergeSubagents([frame({ rev: 7 })], stale);
+    const [v] = mergeSubagents([frame({ sig: "s7" })], stale);
     expect(v.items).toEqual([]);
     expect(v.loaded).toBe(false);
   });
@@ -125,15 +127,15 @@ describe("needsSubagentFetch — 언제 조회하나", () => {
   it("활성 프레임(본문 인라인)은 조회하지 않는다", () => {
     expect(needsSubagentFetch(frame({ items: [it0("x")] }), undefined)).toBe(false);
   });
-  it("캐시 없음 → 조회 / 같은 rev 캐시(진행·완료·실패) → 재조회 안 함", () => {
+  it("캐시 없음 → 조회 / 같은 서명 캐시(진행·완료·실패) → 재조회 안 함", () => {
     expect(needsSubagentFetch(frame({}), undefined)).toBe(true);
-    expect(needsSubagentFetch(frame({}), { state: "loading", rev: 7 })).toBe(false);
-    expect(needsSubagentFetch(frame({}), { state: "ready", rev: 7, items: [] })).toBe(false);
+    expect(needsSubagentFetch(frame({}), { state: "loading", sig: "s7" })).toBe(false);
+    expect(needsSubagentFetch(frame({}), { state: "ready", sig: "s7", items: [] })).toBe(false);
     // 실패는 자동 재시도하지 않는다(폭주 방지) — 뷰의 "다시 시도"가 force로 뚫는다.
-    expect(needsSubagentFetch(frame({}), { state: "error", rev: 7 })).toBe(false);
+    expect(needsSubagentFetch(frame({}), { state: "error", sig: "s7" })).toBe(false);
   });
-  it("rev가 달라진 프레임은 다시 조회한다", () => {
-    expect(needsSubagentFetch(frame({ rev: 8 }), { state: "ready", rev: 7, items: [] })).toBe(true);
+  it("서명이 달라진 프레임은 다시 조회한다", () => {
+    expect(needsSubagentFetch(frame({ sig: "s8" }), { state: "ready", sig: "s7", items: [] })).toBe(true);
   });
   it("프레임이 없으면 no-op", () => {
     expect(needsSubagentFetch(undefined, undefined)).toBe(false);
@@ -141,13 +143,14 @@ describe("needsSubagentFetch — 언제 조회하나", () => {
 });
 
 describe("adoptInlineBodies — 활성 본문 승계(완료 전이 시 화면이 비지 않게)", () => {
-  it("활성 프레임의 본문을 캐시에 넣고, 완료 전이 후에도 같은 rev로 살아남는다", () => {
+  it("활성 프레임의 본문을 캐시에 넣고, 완료 전이 후에도 같은 서명으로 살아남는다", () => {
     const its = [it0("x")];
-    const live = frame({ items: its, rev: 9 });
+    // 활성 프레임의 서명 = 이번 틱 파일 서명(완료 안정 구간엔 완료 서명과 동일).
+    const live = frame({ items: its, sig: "f9" });
     const cache = adoptInlineBodies([live], new Map());
-    expect(cache.get("a1")).toEqual({ state: "ready", rev: 9, items: its });
-    // 다음 emit에서 같은 에이전트가 완료 프레임(본문 없음)으로 와도 표시 유지.
-    const [v] = mergeSubagents([frame({ items: null, rev: 9 })], cache);
+    expect(cache.get("a1")).toEqual({ state: "ready", sig: "f9", items: its });
+    // 다음 emit에서 같은 에이전트가 완료 프레임(본문 없음·같은 서명)으로 와도 표시 유지.
+    const [v] = mergeSubagents([frame({ items: null, sig: "f9" })], cache);
     expect(v.items).toBe(its);
     expect(v.loaded).toBe(true);
   });
@@ -156,13 +159,30 @@ describe("adoptInlineBodies — 활성 본문 승계(완료 전이 시 화면이
     const empty = new Map<string, LazyAgentEntry>();
     expect(adoptInlineBodies([frame({ items: null })], empty)).toBe(empty);
     const its = [it0("x")];
-    const c1 = adoptInlineBodies([frame({ items: its, rev: 9 })], empty);
-    // 같은 rev의 재수신은 캐시를 건드리지 않는다(불필요한 재렌더 방지).
-    expect(adoptInlineBodies([frame({ items: its, rev: 9 })], c1)).toBe(c1);
-    // rev가 오르면(본문 변경) 새 본문으로 교체.
+    const c1 = adoptInlineBodies([frame({ items: its, sig: "f9" })], empty);
+    // 같은 서명의 재수신은 캐시를 건드리지 않는다(불필요한 재렌더 방지).
+    expect(adoptInlineBodies([frame({ items: its, sig: "f9" })], c1)).toBe(c1);
+    // 서명이 바뀌면(본문 변경) 새 본문으로 교체.
     const its2 = [it0("x"), it0("y")];
-    const c2 = adoptInlineBodies([frame({ items: its2, rev: 10 })], c1);
+    const c2 = adoptInlineBodies([frame({ items: its2, sig: "f10" })], c1);
     expect(c2).not.toBe(c1);
-    expect(c2.get("a1")).toEqual({ state: "ready", rev: 10, items: its2 });
+    expect(c2.get("a1")).toEqual({ state: "ready", sig: "f10", items: its2 });
+  });
+});
+
+describe("lazyResponseIsCurrent — AA3 CAS (늦은 응답이 새 요청/세션을 덮지 않게)", () => {
+  it("최신 요청 + 같은 세션이면 반영한다", () => {
+    expect(lazyResponseIsCurrent(5, 5, "u1", "u1")).toBe(true);
+  });
+  it("그 사이 더 새 요청(승계·재조회)이 발주됐으면 폐기", () => {
+    // myReq=5로 나간 rev7 응답이 늦게 도착했는데, 이미 req=6이 발주됨.
+    expect(lazyResponseIsCurrent(6, 5, "u1", "u1")).toBe(false);
+  });
+  it("세션이 전환됐으면 폐기 — 다른 세션의 캐시를 오염시키지 않는다", () => {
+    expect(lazyResponseIsCurrent(5, 5, "u2", "u1")).toBe(false);
+    expect(lazyResponseIsCurrent(5, 5, null, "u1")).toBe(false);
+  });
+  it("이 에이전트로 발주된 요청 기록이 없으면(세션 리셋 등) 폐기", () => {
+    expect(lazyResponseIsCurrent(undefined, 5, "u1", "u1")).toBe(false);
   });
 });
