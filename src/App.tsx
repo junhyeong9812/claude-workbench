@@ -16,7 +16,6 @@ import { DevView } from "./components/DevView";
 import { FilePeekViewer } from "./components/FilePeekViewer";
 import { CommitFilesSidebar } from "./components/CommitFilesSidebar";
 import { CommitFileView } from "./components/CommitFileView";
-import { TerminalSettings } from "./components/TerminalSettings";
 import { SearchPanel } from "./components/SearchPanel";
 import { RunMenu } from "./components/RunMenu";
 import { AgentOptionsPopover } from "./components/AgentOptionsPopover";
@@ -343,7 +342,6 @@ function AppMain() {
   sidebarViewRef.current = sidebarView;
   const pickHalfTab = (half: SidebarHalf, tab: SidebarTab) =>
     setSidebarView((v) => applyTabPick(v, half, tab));
-  const [termSettingsOpen, setTermSettingsOpen] = useState(false);
   const theme = useAppStore((s) => s.theme);
   const setTheme = useAppStore((s) => s.setTheme);
   const fontSize = useAppStore((s) => s.fontSize);
@@ -576,7 +574,10 @@ function AppMain() {
     if (activeProject) setProjectMode(activeProject, v === "dev" ? "dev" : "integrated");
   };
 
-  // 외관 팝오버 (테마+터미널색+글자크기 통합) — outside-click closes it.
+  // 테마 팝오버 (테마 + 글자 크기) — outside-click closes it. 터미널 색상은
+  // T3에서 터미널 탭 안의 ⚙(TermSettingsButton)로 옮겼다. 내부 식별자는
+  // `appearance*` 그대로 둔다 — CSS 클래스(.appearance-*)와 짝이고, 라벨만
+  // 바뀐 것에 파일 전체 rename을 얹으면 diff가 이유 없이 넓어진다.
   const [appearanceOpen, setAppearanceOpen] = useState(false);
   const appearanceRef = useRef<HTMLDivElement>(null);
   const appearanceBtnRef = useRef<HTMLButtonElement>(null);
@@ -763,18 +764,18 @@ function AppMain() {
           <button
             ref={appearanceBtnRef}
             className={`toolbar-btn${appearanceOpen ? " toolbar-btn-on" : ""}`}
-            title="외관 설정 — 테마 · 글자 크기 · 터미널 색상"
+            title="테마 설정 — 테마 · 글자 크기"
             aria-haspopup="dialog"
             aria-expanded={appearanceOpen}
             onClick={() => setAppearanceOpen((v) => !v)}
           >
-            <span className="toolbar-ico">◐</span> 외관
+            <span className="toolbar-ico">◐</span> 테마
           </button>
           {appearanceOpen && (
             <div
               className="appearance-pop"
               role="dialog"
-              aria-label="외관 설정"
+              aria-label="테마 설정"
               tabIndex={-1}
               ref={appearancePopRef}
             >
@@ -839,18 +840,6 @@ function AppMain() {
                     +
                   </button>
                 </div>
-              </div>
-              <div className="appearance-row">
-                <span className="appearance-label">터미널 색상</span>
-                <button
-                  className="toolbar-btn"
-                  onClick={() => {
-                    setAppearanceOpen(false);
-                    setTermSettingsOpen(true);
-                  }}
-                >
-                  설정 열기…
-                </button>
               </div>
             </div>
           )}
@@ -1078,7 +1067,6 @@ function AppMain() {
         </PanelGroup>
         </div>
       )}
-      {termSettingsOpen && <TerminalSettings onClose={() => setTermSettingsOpen(false)} />}
       {searchOpen && activeProject && (
         <SearchPanel
           root={activeProject}

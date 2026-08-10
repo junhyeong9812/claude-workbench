@@ -240,7 +240,7 @@ body {
   border-color: var(--border);
 }
 
-/* Active/engaged toolbar toggle (e.g. the 외관 팝오버 열림). */
+/* Active/engaged toolbar toggle (e.g. the 테마 팝오버 열림). */
 .toolbar-btn-on {
   color: var(--accent-bright);
   border-color: var(--accent-bright);
@@ -399,7 +399,8 @@ body {
   color: var(--fg-dim);
 }
 
-/* 외관 팝오버 (테마 · 글자 크기 · 터미널 색상). */
+/* 테마 팝오버 (테마 · 글자 크기 — 터미널 색상은 터미널 탭의 ⚙로 옮겼다).
+   클래스 이름은 .appearance-*로 둔다(라벨만 바뀌었다). */
 .appearance-menu {
   position: relative;
 }
