@@ -1056,12 +1056,18 @@ function AppMain() {
                     >
                       <div
                         className="dual-secondary-head"
-                        title={`${visibleDual}\n수동 dock — 툴바 버튼·단축키·요청은 좌측(주) 작업 영역 기준입니다`}
+                        title={`${visibleDual}\n${
+                          activeSurfaceId === "secondary"
+                            ? "활성 표면 — 툴바·단축키·요청·사이드바가 이 프로젝트를 가리킵니다"
+                            : "클릭하면 이 표면이 활성이 되어 툴바·단축키·요청·사이드바가 이 프로젝트로 전환됩니다"
+                        }`}
                       >
                         <span className="dual-secondary-name">
                           {projects.find((p) => p.path === visibleDual)?.name ?? visibleDual}
                         </span>
-                        <span className="dual-secondary-hint">보조</span>
+                        <span className="dual-secondary-hint">
+                          {activeSurfaceId === "secondary" ? "활성" : "보조"}
+                        </span>
                         <button
                           className="dual-secondary-close"
                           title="우측 분할 닫기"
