@@ -135,14 +135,15 @@ fn ensure_within(path: &str, root: &str) -> Result<(), AppError> {
     })
 }
 
+/// Delete a file/dir under `root`.
+///
+/// `root`는 **필수**다 — 예전엔 `Option`이라 스터디 트리처럼 생략하는 호출부가
+/// containment 없이 삭제를 돌릴 수 있었다. 호출부가 전부 루트를 넘기게 된 지금은
+/// 타입으로 강제해, "루트를 안 넘기면 검사도 없다"는 경로 자체를 없앤다.
 #[tauri::command]
-pub fn delete_path(path: String, root: Option<String>) -> Result<(), AppError> {
+pub fn delete_path(path: String, root: String) -> Result<(), AppError> {
     reject_unsafe_path(&path)?;
-    // The file-tree caller pins deletes to the project root; legacy callers
-    // (study tree) omit it and keep the prior behavior.
-    if let Some(r) = root.as_deref() {
-        ensure_within(&path, r)?;
-    }
+    ensure_within(&path, &root)?;
     let p = std::path::Path::new(&path);
     let md = std::fs::symlink_metadata(p).map_err(|e| AppError::new(io_message("Cannot delete", &e)))?;
     if md.is_dir() {
