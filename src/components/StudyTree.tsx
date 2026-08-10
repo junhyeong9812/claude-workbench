@@ -1,12 +1,10 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
-import { errText } from "../utils/error";
-import { invoke } from "@tauri-apps/api/core";
 import { useAppStore } from "../state/store";
 import { useShallow } from "zustand/react/shallow";
 import type { DirEntry } from "../types";
-import { ContextMenu, copyText, type MenuItem } from "./ContextMenu";
-
-const dirname = (p: string): string => p.split(/[\\/]/).slice(0, -1).join("/") || "/";
+import { copyText } from "./ContextMenu";
+import { useTreeCrud } from "./treeCrud";
+import { basename } from "../utils/path";
 
 interface VisNode {
   entry: DirEntry;
@@ -65,7 +63,6 @@ export function StudyTree({
     return m;
   }, [visibleDirs, childrenSlices]);
   const [cursor, setCursor] = useState<string | null>(null);
-  const [menu, setMenu] = useState<{ x: number; y: number; entry: DirEntry } | null>(null);
   // Re-read the root + every expanded dir from disk (reflects external add/delete).
   const expandedRef = useRef(expandedArr);
   expandedRef.current = expandedArr;
@@ -177,48 +174,20 @@ export function StudyTree({
     else onActivate(entry.path);
   };
 
-  const menuItems = (entry: DirEntry): MenuItem[] => {
-    const targetDir = entry.is_dir ? entry.path : dirname(entry.path);
-    return [
-      { label: "경로 복사", onClick: () => void copyText(entry.path) },
-      {
-        label: "새 파일",
-        onClick: async () => {
-          const name = window.prompt(`새 파일 이름 (${targetDir})`);
-          if (!name || !name.trim()) return;
-          const clean = name.trim();
-          // Keep new files inside the folder — no separators / parent escapes (codex SF-1).
-          if (/[\\/]/.test(clean) || clean.split("/").includes("..") || clean.includes("..")) {
-            alert("파일 이름에 경로 구분자(/ \\)나 ..는 쓸 수 없습니다.");
-            return;
-          }
-          const np = `${targetDir}/${clean}`;
-          try {
-            await invoke("write_file", { path: np, content: "" });
-            if (entry.is_dir) expand(entry.path);
-            await reloadDir(targetDir);
-            onActivate(np);
-          } catch (err) {
-            alert(`파일 생성 실패: ${errText(err)}`);
-          }
-        },
-      },
-      {
-        label: "삭제",
-        danger: true,
-        onClick: async () => {
-          if (!window.confirm(`${entry.path}\n삭제할까요?${entry.is_dir ? " (폴더 전체)" : ""}`)) return;
-          try {
-            await invoke("delete_path", { path: entry.path });
-            closeStudyTabsUnder(entry.path); // prune now-dead tabs
-            await reloadDir(dirname(entry.path));
-          } catch (err) {
-            alert(`삭제 실패: ${errText(err)}`);
-          }
-        },
-      },
-    ];
-  };
+  // 우클릭 CRUD는 파일 탭 트리와 **같은 훅**을 쓴다 (새 파일·새 폴더·이름 변경·
+  // 삭제 + brace 다중 생성). containment 루트는 이 트리의 root — 스터디 반대쪽
+  // 폴더로 나가는 경로는 백엔드 ensure_within이 거부한다.
+  const crud = useTreeCrud({
+    root,
+    reloadDir,
+    expandDir: expand,
+    // 다중 생성이면 첫 파일만 연다 (탭 폭증 방지).
+    onCreated: (paths) => onActivate(paths[0]),
+    onDeleted: (path) => closeStudyTabsUnder(path), // prune now-dead tabs
+    onOpenTerminal: (dir) => useAppStore.getState().requestTerminalOpen({ cwd: dir, title: basename(dir) }),
+    extraItems: (node) =>
+      node ? [{ label: "경로 복사", onClick: () => void copyText(node.path) }] : [],
+  });
 
   return (
     <>
@@ -243,7 +212,7 @@ export function StudyTree({
             onContextMenu={(e) => {
               e.preventDefault();
               setCursor(entry.path);
-              setMenu({ x: e.clientX, y: e.clientY, entry });
+              crud.openMenu(entry, e.clientX, e.clientY);
             }}
           >
             {entry.is_dir && <span className="study-tree-caret">{expanded.has(entry.path) ? "▾" : "▸"}</span>}
@@ -251,9 +220,7 @@ export function StudyTree({
           </div>
         ))}
       </div>
-      {menu && (
-        <ContextMenu x={menu.x} y={menu.y} items={menuItems(menu.entry)} onClose={() => setMenu(null)} />
-      )}
+      {crud.ui}
     </>
   );
 }
