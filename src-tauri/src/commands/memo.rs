@@ -107,3 +107,156 @@ pub fn memo_write(
         }
     }
 }
+
+/// `memo_export`의 결과. "이미 있다"는 **오류가 아니라 정상 결과**다 — 프론트가
+/// 덮어쓰기 확인 턱을 띄우고 사용자의 답을 받아 다시 부르는 흐름이라, 실패로
+/// 올리면 "저장 실패"와 구분되지 않는다(`memo_write`의 conflict와 같은 판단).
+#[derive(Serialize)]
+#[serde(tag = "status", rename_all = "camelCase")]
+pub enum MemoExportResult {
+    /// 저장 완료 — 실제로 쓴 절대 경로.
+    Saved { path: String },
+    /// 대상이 이미 있고 `overwrite`가 false였다 — 아무것도 쓰지 않았다.
+    Exists { path: String },
+}
+
+/// 메모 본문을 **프로젝트 안의 파일**로 내보낸다 (메모 툴바 [저장하기]).
+///
+/// 자동 저장(`memo_write`)과는 목적이 다르다: 저쪽은 앱 데이터의 작업용 문서고,
+/// 이쪽은 사용자가 고른 경로로 **한 번 찍어 내는** 사본이다. 그래서 낙관적 잠금이
+/// 없고(base 해시가 없다), 대신 확인 턱이 있다.
+///
+/// 봉쇄는 트리 CRUD와 같은 단일 출처(`files::ensure_within`)다 — 상대 경로를
+/// 프로젝트 루트에 붙인 뒤 canonical 기준으로 루트 안인지 본다. `..`·절대 경로는
+/// 붙이기 전에 거절한다: 그래야 "왜 거부됐는지"가 사용자에게 그 말로 보인다.
+/// 상위 디렉토리는 자동 생성한다(`docs/memo-….md`가 첫 파일일 수 있다).
+#[tauri::command]
+pub fn memo_export(
+    root: String,
+    rel: String,
+    text: String,
+    overwrite: bool,
+) -> Result<MemoExportResult, AppError> {
+    if root.trim().is_empty() {
+        return Err(AppError::new("메모를 저장할 프로젝트가 지정되지 않았습니다."));
+    }
+    let rel = rel.trim();
+    if rel.is_empty() {
+        return Err(AppError::new("저장할 경로를 입력하세요."));
+    }
+    let rel_path = std::path::Path::new(rel);
+    if rel_path.is_absolute() {
+        return Err(AppError::new(
+            "프로젝트 루트 기준 상대 경로만 사용할 수 있습니다.",
+        ));
+    }
+    if rel_path
+        .components()
+        .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        return Err(AppError::new("'..' 가 포함된 경로는 허용되지 않습니다"));
+    }
+    let full = std::path::Path::new(&root).join(rel_path);
+    let full_s = full
+        .to_str()
+        .ok_or_else(|| AppError::new("경로를 읽을 수 없습니다"))?
+        .to_string();
+    crate::commands::files::ensure_within(&full_s, &root)?;
+    // 디렉토리를 파일로 덮어쓰는 사고는 확인 턱으로도 풀 수 없다 — 바로 거절.
+    if full.is_dir() {
+        return Err(AppError::new("같은 이름의 폴더가 이미 있습니다."));
+    }
+    // `symlink_metadata` — 끊어진 심링크도 "이미 있다"로 본다(`exists()`는 false를
+    // 주고 조용히 지나간다).
+    if std::fs::symlink_metadata(&full).is_ok() && !overwrite {
+        return Ok(MemoExportResult::Exists { path: full_s });
+    }
+    if let Some(parent) = full.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| AppError::new(crate::commands::io_message("Cannot save memo", &e)))?;
+    }
+    crate::commands::files::atomic_write(&full, &text)?;
+    Ok(MemoExportResult::Saved { path: full_s })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_root(tag: &str) -> (std::path::PathBuf, String) {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static N: AtomicU64 = AtomicU64::new(0);
+        let d = std::env::temp_dir().join(format!(
+            "mt_memoexp_{tag}_{}_{}",
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&d).unwrap();
+        let root = std::fs::canonicalize(&d).unwrap();
+        let s = root.to_string_lossy().to_string();
+        (root, s)
+    }
+
+    /// 기본 제안 경로처럼 **아직 없는 폴더 안**으로도 저장된다.
+    #[test]
+    fn export_creates_parent_dirs_and_writes() {
+        let (root, root_s) = temp_root("mk");
+        let out = memo_export(root_s, "docs/memo-2026-08-10.md".into(), "본문".into(), false)
+            .expect("저장되어야 한다");
+        match out {
+            MemoExportResult::Saved { path } => {
+                assert_eq!(path, root.join("docs/memo-2026-08-10.md").to_string_lossy());
+            }
+            MemoExportResult::Exists { .. } => panic!("새 파일인데 exists가 나왔다"),
+        }
+        assert_eq!(
+            std::fs::read_to_string(root.join("docs/memo-2026-08-10.md")).unwrap(),
+            "본문"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 기존 파일은 **확인 없이는 절대** 덮이지 않는다 — `exists`를 돌려주고
+    /// 디스크는 그대로. `overwrite: true`로 다시 부르면 그때 덮는다.
+    #[test]
+    fn export_needs_confirmation_to_overwrite() {
+        let (root, root_s) = temp_root("ow");
+        std::fs::write(root.join("m.md"), "원본").unwrap();
+        let out = memo_export(root_s.clone(), "m.md".into(), "새 본문".into(), false).unwrap();
+        assert!(matches!(out, MemoExportResult::Exists { .. }));
+        assert_eq!(std::fs::read_to_string(root.join("m.md")).unwrap(), "원본");
+
+        let out = memo_export(root_s, "m.md".into(), "새 본문".into(), true).unwrap();
+        assert!(matches!(out, MemoExportResult::Saved { .. }));
+        assert_eq!(std::fs::read_to_string(root.join("m.md")).unwrap(), "새 본문");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 프로젝트 밖으로는 어떤 형태로도 못 나간다 — `..`·절대 경로·심링크 탈출.
+    #[test]
+    fn export_is_confined_to_the_project() {
+        let (root, root_s) = temp_root("out");
+        let outside = temp_root("outside").0;
+        std::fs::write(outside.join("victim.md"), "남의 파일").unwrap();
+
+        for rel in [
+            "../victim.md",
+            "docs/../../victim.md",
+            "/etc/mt_should_not_exist",
+            "",
+            "   ",
+        ] {
+            let r = memo_export(root_s.clone(), rel.into(), "덮어쓰기".into(), true);
+            assert!(r.is_err(), "{rel:?} 가 통과했다");
+        }
+        // 심링크로 밖을 가리켜도 canonical 기준 판정이 잡는다.
+        std::os::unix::fs::symlink(&outside, root.join("link")).unwrap();
+        assert!(memo_export(root_s, "link/victim.md".into(), "덮어쓰기".into(), true).is_err());
+        assert_eq!(
+            std::fs::read_to_string(outside.join("victim.md")).unwrap(),
+            "남의 파일"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&outside);
+    }
+}

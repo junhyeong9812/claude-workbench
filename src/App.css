@@ -1511,7 +1511,71 @@ body {
   border-radius: 4px;
   cursor: pointer;
 }
+.memo-retry:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
 
+/* ---- 메모 툴바 ([저장하기]) ---- */
+/* 헤더의 버튼은 상태 줄 오른쪽에 붙는다 — `.memo-path`가 남은 폭을 먹으므로
+   버튼들은 줄어들지 않게 flex 0. */
+.memo-tool {
+  flex: 0 0 auto;
+  padding: 1px 8px;
+  font-size: 0.95em;
+  color: var(--fg, #cdd6f4);
+  background: rgba(127, 127, 127, 0.14);
+  border: 1px solid var(--border, #333);
+  border-radius: 4px;
+  cursor: pointer;
+}
+.memo-tool:hover {
+  background: color-mix(in srgb, var(--accent-bright) 18%, transparent);
+}
+.memo-note {
+  flex: 0 0 auto;
+  padding: 4px 10px;
+  font-size: 0.78em;
+  color: var(--fg-dim);
+  border-bottom: 1px solid var(--border, #333);
+}
+.memo-save {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 5px 10px;
+  font-size: 0.78em;
+  color: var(--fg-dim);
+  background: rgba(127, 127, 127, 0.06);
+  border-bottom: 1px solid var(--border, #333);
+}
+.memo-save-root {
+  flex: 0 0 auto;
+  opacity: 0.7;
+}
+.memo-save-path {
+  flex: 1 1 auto;
+  min-width: 0;
+  padding: 2px 6px;
+  font-family: inherit;
+  font-size: 1em;
+  color: var(--fg, #cdd6f4);
+  background: var(--bg);
+  border: 1px solid var(--border, #333);
+  border-radius: 4px;
+}
+.memo-save-err {
+  flex: 0 1 auto;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--st-danger);
+}
+.memo-save-warn {
+  flex: 0 1 auto;
+  color: color-mix(in srgb, var(--st-warn) 80%, var(--fg));
+}
 /* ---- Git panel (G1) ---- */
 .git-panel {
   display: flex;

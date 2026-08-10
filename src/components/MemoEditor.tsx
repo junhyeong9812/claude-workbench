@@ -1,10 +1,12 @@
 import { useEffect, useRef, useState, type ReactNode } from "react";
+import { invoke } from "@tauri-apps/api/core";
 import { EditorView, basicSetup } from "codemirror";
 import { EditorState, Compartment } from "@codemirror/state";
 import { langFor } from "./cmLang";
 import { cmThemeExt } from "./cmTheme";
 import { errText } from "../utils/error";
 import { useAppStore } from "../state/store";
+import { defaultMemoPath, normalizeMemoRel } from "../state/memoTools";
 import {
   MEMO_SAVE_DELAY,
   clearStash,
@@ -50,7 +52,15 @@ export interface MemoEditorProps {
   readOnly?: boolean;
   /** 잠긴 이유 — 헤더에 그대로 보여 준다(왜 안 써지는지 모르는 것이 최악). */
   readOnlyNote?: string;
+  /** [저장하기]의 기준 디렉토리 (프로젝트 루트의 절대 경로). 주지 않으면 그
+   * 버튼을 아예 내지 않는다 — 어디에 저장되는지 모르는 저장 버튼은 위험하다. */
+  projectRoot?: string;
 }
+
+/** `memo_export`의 결과 — "이미 있다"는 오류가 아니라 확인 턱이 필요한 정상 결과. */
+export type MemoExportResult =
+  | { status: "saved"; path: string }
+  | { status: "exists"; path: string };
 
 /** 부모가 잡을 수 있는 저장 손잡이. */
 export interface MemoHandle {
@@ -95,6 +105,7 @@ export function MemoEditor({
   onHandle,
   readOnly,
   readOnlyNote,
+  projectRoot,
 }: MemoEditorProps) {
   const hostRef = useRef<HTMLDivElement | null>(null);
   const viewRef = useRef<EditorView | null>(null);
@@ -126,6 +137,60 @@ export function MemoEditor({
   // 에디터가 매 렌더 재생성되지 않게 한다).
   const cbRef = useRef({ read, write, onText, onHandle });
   cbRef.current = { read, write, onText, onHandle };
+
+  // ---- 툴바([저장하기]) ----
+  // 자동 저장 경로에는 손대지 않는다 — 내보내기는 **별도 커맨드**(`memo_export`)로
+  // 나가고, 앱 데이터의 메모 파일과 그 낙관적 잠금에는 손대지 않는다.
+  const [saveOpen, setSaveOpen] = useState(false);
+  const [savePath, setSavePath] = useState("");
+  const [saveBusy, setSaveBusy] = useState(false);
+  const [saveErr, setSaveErr] = useState<string | null>(null);
+  // 덮어쓰기 확인 턱 — 값이 있으면 "이미 있다"는 답을 받은 상대 경로다.
+  const [overwriteRel, setOverwriteRel] = useState<string | null>(null);
+  const [note, setNote] = useState<string | null>(null);
+  /** 저장 요청 1회. `overwrite`가 false인데 파일이 있으면 아무것도 쓰지 않고
+   * 확인 턱으로 돌아온다. */
+  const runExport = (rel: string, overwrite: boolean) => {
+    if (!projectRoot) return;
+    setSaveBusy(true);
+    setSaveErr(null);
+    invoke<MemoExportResult>("memo_export", {
+      root: projectRoot,
+      rel,
+      text: latestRef.current,
+      overwrite,
+    })
+      .then((res) => {
+        if (res.status === "exists") {
+          setOverwriteRel(rel);
+          return;
+        }
+        setOverwriteRel(null);
+        setSaveOpen(false);
+        setNote(`저장됨 → ${rel}`);
+      })
+      .catch((e) => setSaveErr(errText(e)))
+      .finally(() => setSaveBusy(false));
+  };
+
+  const submitSave = () => {
+    const check = normalizeMemoRel(savePath);
+    if (!check.ok) {
+      setSaveErr(check.reason);
+      setOverwriteRel(null);
+      return;
+    }
+    runExport(check.rel, false);
+  };
+
+  // 대상이 바뀌면 툴바 상태도 그 메모의 것이 아니다 — 열려 있던 폼과 안내를
+  // 버린다(다른 메모의 경로가 이 메모의 저장 폼에 남는 사고 방지).
+  useEffect(() => {
+    setSaveOpen(false);
+    setSaveErr(null);
+    setOverwriteRel(null);
+    setNote(null);
+  }, [storeKey]);
 
   // Switch the CodeMirror theme live when the app theme changes (EditorPanel 선례).
   const theme = useAppStore((s) => s.theme);
@@ -274,8 +339,67 @@ export function MemoEditor({
         {subtitle && <span className="memo-path">{subtitle}</span>}
         {readOnly && readOnlyNote && <span className="memo-locked">{readOnlyNote}</span>}
         <span className="memo-status">{status}</span>
+        {projectRoot && (
+          <button
+            className="memo-tool"
+            title="메모를 프로젝트 안의 파일로 저장합니다"
+            onClick={() => {
+              setSaveErr(null);
+              setOverwriteRel(null);
+              setNote(null);
+              if (!saveOpen) setSavePath(defaultMemoPath());
+              setSaveOpen((v) => !v);
+            }}
+          >
+            저장하기
+          </button>
+        )}
         {actions}
       </div>
+      {note && <div className="memo-note">{note}</div>}
+      {saveOpen && (
+        <div className="memo-save">
+          <span className="memo-save-root" title={projectRoot}>
+            프로젝트 루트 기준
+          </span>
+          <input
+            className="memo-save-path"
+            value={savePath}
+            spellCheck={false}
+            autoFocus
+            aria-label="저장할 상대 경로"
+            onChange={(e) => {
+              setSavePath(e.target.value);
+              setSaveErr(null);
+              setOverwriteRel(null);
+            }}
+            onKeyDown={(e) => {
+              if (e.key === "Enter" && !saveBusy && overwriteRel === null) submitSave();
+              if (e.key === "Escape") setSaveOpen(false);
+            }}
+          />
+          {overwriteRel === null ? (
+            <button className="memo-retry" disabled={saveBusy} onClick={submitSave}>
+              {saveBusy ? "저장 중…" : "저장"}
+            </button>
+          ) : (
+            <>
+              <span className="memo-save-warn">이미 있는 파일입니다</span>
+              <button
+                className="memo-retry"
+                disabled={saveBusy}
+                onClick={() => runExport(overwriteRel, true)}
+              >
+                덮어쓰기
+              </button>
+            </>
+          )}
+          <button className="memo-retry" onClick={() => setSaveOpen(false)}>
+            취소
+          </button>
+          {saveErr && <span className="memo-save-err">{saveErr}</span>}
+        </div>
+      )}
       {conflict && (
         <div className="memo-conflict">
           <span>이 메모가 다른 창에서 수정됐습니다. 지금 편집분은 아직 저장되지 않았습니다.</span>
