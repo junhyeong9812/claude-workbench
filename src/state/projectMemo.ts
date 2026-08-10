@@ -215,6 +215,41 @@ export function clearStash(project: string): void {
 /** 테스트 격리용 — 보관함을 비운다. */
 export function resetStash(): void {
   stash.clear();
+  undo.clear();
+}
+
+// ---- 정리 [적용]의 되돌리기 버퍼 (리뷰 W1) ---------------------------------
+
+/**
+ * AI 정리를 [적용]하기 **직전의 본문**. 키는 `undo:<storeKey>`.
+ *
+ * 컴포넌트 state가 아니라 모듈 맵인 이유는 stash와 같다 — dockview는 비활성 탭의
+ * 패널을 언마운트하므로, state에 들고 있으면 **탭을 한 번 전환하는 순간 되돌릴
+ * 길이 사라진다**. 정리 적용은 사용자의 글을 통째로 갈아 끼운 직후라 그 창이 가장
+ * 좁아서는 안 되는 자리다.
+ *
+ * 창 수명을 넘지 않는 것은 의도다(앱 재시작 = 소멸): 되돌리기는 방금 한 조작에
+ * 대한 취소지, 어제 적용한 정리까지 되돌리는 히스토리가 아니다.
+ *
+ * **만료**도 같은 이유로 필요하다 — 적용 후 사용자가 계속 쓴 뒤에 [되돌리기]가
+ * 눌리면 옛 본문이 그 작업을 통째로 지운다. 그래서 호출부는 적용 이후 **첫 일반
+ * 편집**에서 이 버퍼를 버린다.
+ */
+const undo = new Map<string, string>();
+
+const undoKey = (storeKey: string): string => `undo:${storeKey}`;
+
+export function setUndo(storeKey: string, text: string): void {
+  undo.set(undoKey(storeKey), text);
+}
+
+/** 보관된 직전 본문 (없으면 null — 되돌릴 것이 없다). */
+export function getUndo(storeKey: string): string | null {
+  return undo.get(undoKey(storeKey)) ?? null;
+}
+
+export function clearUndo(storeKey: string): void {
+  undo.delete(undoKey(storeKey));
 }
 
 // ---- 창 종료 시 일괄 flush (리뷰 P1) ---------------------------------------

@@ -40,7 +40,9 @@ describe("메모 툴바 — 저장하기 · 정리", () => {
   let root: Root;
   const writes: string[] = [];
 
-  const read = async (): Promise<MemoDoc> => ({ text: "원래 메모", hash: "h0" });
+  // 디스크의 현재 본문 — 재마운트가 "탭을 다시 열었다"를 흉내 낼 수 있게 가변.
+  let disk = "원래 메모";
+  const read = async (): Promise<MemoDoc> => ({ text: disk, hash: "h0" });
   const write = async (_k: string, text: string): Promise<MemoSaveResult> => {
     writes.push(text);
     return { status: "saved", hash: "h1" };
@@ -50,6 +52,7 @@ describe("메모 툴바 — 저장하기 · 정리", () => {
     resetStash();
     localStorage.clear();
     writes.length = 0;
+    disk = "원래 메모";
     vi.stubGlobal("ResizeObserver", NoopResizeObserver);
     host = document.createElement("div");
     document.body.appendChild(host);
@@ -213,6 +216,41 @@ describe("메모 툴바 — 저장하기 · 정리", () => {
     expect(docText()).toBe("원래 메모");
     // **1회**다 — 되돌린 뒤에는 버튼이 사라진다.
     expect(has("되돌리기")).toBe(false);
+  });
+
+  it("되돌리기는 탭을 전환했다 돌아와도 살아 있다 (언마운트 생존)", async () => {
+    invoke.mockResolvedValue("정리된 메모");
+    await mount();
+    await click("정리");
+    await click("정리 실행");
+    await click("적용");
+
+    // dockview 탭 전환 = 언마운트. 다시 열면 디스크엔 적용된 본문이 있다.
+    disk = "정리된 메모";
+    await act(async () => root.unmount());
+    root = createRoot(host);
+    await mount();
+    expect(docText()).toBe("정리된 메모");
+    expect(has("되돌리기"), "되돌릴 길이 탭 전환으로 사라지면 안 된다").toBe(true);
+    await click("되돌리기");
+    expect(docText()).toBe("원래 메모");
+  });
+
+  it("적용 뒤 **첫 일반 편집**에서 되돌리기가 만료된다", async () => {
+    invoke.mockResolvedValue("정리된 메모");
+    await mount();
+    await click("정리");
+    await click("정리 실행");
+    await click("적용");
+    expect(has("되돌리기")).toBe(true);
+
+    // 사용자가 이어서 쓴다 — 이 시점의 옛 본문은 그 작업을 통째로 지우는 값이다.
+    const view = EditorView.findFromDOM(host.querySelector(".cm-content") as HTMLElement)!;
+    await act(async () => {
+      view.dispatch({ changes: { from: view.state.doc.length, insert: "\n이어서 쓴 줄" } });
+    });
+    expect(has("되돌리기"), "만료돼야 한다").toBe(false);
+    expect(docText()).toContain("이어서 쓴 줄");
   });
 
   it("[버리기]는 결과만 버린다 (메모 불변)", async () => {

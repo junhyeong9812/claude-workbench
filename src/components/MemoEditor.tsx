@@ -16,8 +16,11 @@ import {
 import {
   MEMO_SAVE_DELAY,
   clearStash,
+  clearUndo,
+  getUndo,
   makeAutoSaver,
   registerMemoSaver,
+  setUndo,
   stashMemo,
   takeStash,
   type AutoSaver,
@@ -166,11 +169,30 @@ export function MemoEditor({
   const [tidyBusy, setTidyBusy] = useState(false);
   const [tidyErr, setTidyErr] = useState<string | null>(null);
   const [tidyResult, setTidyResult] = useState<string | null>(null);
-  // 적용 직전 본문 — **1회** 되돌리기의 전부(스택이 아니다).
-  const [undoText, setUndoText] = useState<string | null>(null);
+  // 적용 직전 본문 — **1회** 되돌리기의 전부(스택이 아니다). 값의 정본은 모듈
+  // 맵(`projectMemo`의 undo)이고 여기 state는 버튼을 그리기 위한 사본이다:
+  // 탭 전환으로 이 컴포넌트가 언마운트돼도 되돌릴 길이 남아 있어야 한다.
+  const [undoText, setUndoText] = useState<string | null>(() => getUndo(storeKey));
+  // [적용]이 넣은 본문. 이후 문서가 이 값과 달라지는 순간이 "일반 편집 시작"이고,
+  // 그때 되돌리기를 만료시킨다 — 옛 본문이 그 뒤의 작업을 통째로 지우지 않게.
+  const appliedRef = useRef<string | null>(null);
+  // updateListener는 에디터를 만들 때 한 번만 묶인다 — 최신 만료 로직을 재생성
+  // 없이 부르기 위한 상자.
+  const expireUndoRef = useRef<(next: string) => void>(() => {});
+  expireUndoRef.current = (next: string) => {
+    if (undoText === null) return;
+    if (appliedRef.current !== null && next === appliedRef.current) return; // 적용 그 자체
+    clearUndo(storeKey);
+    appliedRef.current = null;
+    setUndoText(null);
+  };
 
-  /** 본문을 통째로 갈아 끼운다 (정리 [적용]·[되돌리기]). 잠금 중에는 트랜잭션이
-   * 무시되므로 시도하지 않는다. */
+  /** 본문을 통째로 갈아 끼운다 (정리 [적용]·[되돌리기]).
+   *
+   * 잠금 중에는 **우리가** 거절한다 — CodeMirror의 `readOnly`는 편집 명령과
+   * contenteditable 입력을 막을 뿐, 프로그램이 직접 넣는 트랜잭션은 그대로
+   * 적용된다. 닫는 중(아카이브 동봉 대기)에 본문이 바뀌면 동봉된 것과 화면이
+   * 어긋나므로 여기서 막는다. */
   const replaceDoc = (next: string): boolean => {
     const view = viewRef.current;
     if (!view || readOnly) return false;
@@ -232,21 +254,26 @@ export function MemoEditor({
       setTidyErr("지금은 메모를 바꿀 수 없습니다.");
       return;
     }
+    setUndo(storeKey, before);
+    appliedRef.current = tidyResult;
     setUndoText(before);
     setTidyResult(null);
     setTidyOpen(false);
-    setNote("정리 결과를 적용했습니다 — [되돌리기]로 직전 본문으로 돌아갑니다");
+    setNote("정리 결과를 적용했습니다 — 다음 편집을 시작하기 전까지 [되돌리기]할 수 있습니다");
   };
 
   const undoTidy = () => {
     if (undoText === null) return;
     if (!replaceDoc(undoText)) return;
+    clearUndo(storeKey);
+    appliedRef.current = null;
     setUndoText(null);
     setNote("직전 본문으로 되돌렸습니다");
   };
 
-  // 대상이 바뀌면 툴바 상태도 그 메모의 것이 아니다 — 되돌리기 버퍼까지 버린다
-  // (다른 메모의 본문을 이 메모에 붓는 사고 방지).
+  // 대상이 바뀌면 툴바 상태도 그 메모의 것이 아니다. 되돌리기만은 **버리지 않고
+  // 그 메모의 버퍼를 다시 읽는다** — 버퍼는 storeKey별로 살아 있고, 다른 메모의
+  // 본문이 이 메모에 부어지는 사고는 키가 갈려 있어 일어나지 않는다.
   useEffect(() => {
     setLoaded(false);
     setSaveOpen(false);
@@ -256,7 +283,8 @@ export function MemoEditor({
     setTidyOpen(false);
     setTidyErr(null);
     setTidyResult(null);
-    setUndoText(null);
+    appliedRef.current = null;
+    setUndoText(getUndo(storeKey));
   }, [storeKey]);
 
   // Switch the CodeMirror theme live when the app theme changes (EditorPanel 선례).
@@ -359,6 +387,9 @@ export function MemoEditor({
                   saver.schedule(next);
                   setDirty(true);
                   setStatus("편집 중…");
+                  // 적용 뒤 첫 일반 편집 = 되돌리기 만료 (그 뒤의 작업을 옛
+                  // 본문이 통째로 지우지 않게).
+                  expireUndoRef.current(next);
                 }
               }),
             ],
@@ -439,7 +470,7 @@ export function MemoEditor({
         {undoText !== null && (
           <button
             className="memo-tool"
-            title="정리 적용 직전의 본문으로 돌아갑니다 (1회)"
+            title="정리 적용 직전의 본문으로 돌아갑니다 — 1회, 다음 편집을 시작하면 사라집니다 (앱을 다시 켜도 사라집니다)"
             onClick={undoTidy}
           >
             되돌리기
