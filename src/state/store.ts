@@ -427,16 +427,17 @@ interface AppState {
    * gate and clears with null). Already-open session → activate that panel. */
   sessionResumeRequest: { uuid: string; project: string; title: string; nonce: number; targetSurfaceId: SurfaceId } | null;
   /** 우측 분할 surface에 열린 프로젝트 경로 (null=닫힘). 수동적 dock —
-   * 전역 요청 버스는 주(좌) surface만 소비한다. localStorage 복원(project-
-   * dual-surface). App이 activeProject와의 충돌·닫힌 프로젝트를 정리한다. */
+   * 전역 요청 버스는 주(좌) surface만 소비한다. surfaceTree의 secondary 파생
+   * 미러(소비처 호환). 닫힌 프로젝트 정리는 store(closeProject·init)가 정본. */
   dualProject: string | null;
   /** 표면 트리(멀티프로젝트 P3') — 우측 표면 멤버십의 **정본**. dualProject는
    * 이 트리의 secondary 파생 미러다(소비처 호환). P3'은 primary + secondary
-   * 0~1개까지만 실사용하되 스키마는 N-way·상하 분할을 대비한다. persist =
-   * localStorage `surfaceTree` + 레거시 `dualProject` 이중 기록(다운그레이드 안전). */
+   * 0~1개까지만 실사용하되 스키마는 N-way·상하 분할을 대비한다. persist = P3'
+   * 트리는 legacy 문자열과 동형이라 **디스크는 legacy `dualProject` 단일 키만**
+   * 기록한다(FB — 분기 원천 제거·다운그레이드 자명). 트리는 메모리 정본. */
   surfaceTree: SurfaceTree;
   /** 우측 분할 열기(path)/닫기(null) — 트리 addSurface/removeSurface로 매핑되고
-   * dualProject 미러를 갱신한 뒤 두 localStorage 키를 함께 저장. */
+   * dualProject 미러를 갱신한 뒤 legacy `dualProject` 단일 키로 저장. */
   setDualProject: (path: string | null) => void;
   /** Color theme (persisted to localStorage). Drives CSS vars + xterm palette. */
   theme: "dark" | "light";
@@ -1010,7 +1011,7 @@ export const useAppStore = create<AppState>((set, get) => ({
   setDualProject: (path) => {
     // 트리가 멤버십 정본: 열기=addSurface(secondary 추가/교체), 닫기=removeSurface.
     const tree = path ? addSurface(get().surfaceTree, path) : removeSurface(get().surfaceTree);
-    persistSurfaceTree(tree); // surfaceTree + 레거시 dualProject 이중 기록(원자·다운그레이드 안전)
+    persistSurfaceTree(tree); // legacy dualProject 단일 키만 기록(FB — 원자·다운그레이드 자명)
     set({ surfaceTree: tree, dualProject: secondaryProject(tree) });
   },
   requestSessionResume: (req) =>

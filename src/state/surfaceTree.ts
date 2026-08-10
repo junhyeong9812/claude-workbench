@@ -200,12 +200,18 @@ function extractSecondaryLoose(raw: unknown): string | null {
  * **예외 경계**(FA): 어떤 throw(깊이/노드 예산·순환·이상치)든 여기서 잡아 손상
  * 취급 → 레거시/기본으로 낙하한다. 앱 시작이 이 함수로 절대 크래시하지 않는다.
  *
+ * **rawTree 우선·배타(FC2)**: rawTree가 present면 그것 하나로만 해석한다 — 유효
+ * 하면 채택, 아니면(손상·예산 초과·미래 추출 실패) **즉시 기본**이고 legacy로
+ * 떨어지지 않는다("손상=기본" 계약, 임의 부활 차단). legacy 마이그레이션은
+ * rawTree가 **null/부재일 때만** 적용한다.
+ *
  * 우선순위:
- *  1. `rawTree`가 구조+의미 유효한 트리 → 정규화해 그대로(version 무관).
- *  2. `rawTree`의 version이 **현재보다 높을 때만** secondary 최선 추출(미래 대비).
- *     현재/무버전 손상은 즉시 기본 — 임의 부활 차단(FC).
- *  3. 신 트리 없음/손상 → 레거시 `dualProject` 문자열로 구성(구→신 마이그레이션).
- *  4. 그 무엇도 아니면 → 기본(primary 단독).
+ *  1. `rawTree` present:
+ *     a. 구조+의미 유효 → 정규화해 그대로(version 무관).
+ *     b. version이 **현재보다 높을 때만** secondary 최선 추출(미래 대비).
+ *     c. 그 외(현재/무버전 손상·throw) → 기본(primary 단독) — legacy 무시.
+ *  2. `rawTree` 부재(null) → 레거시 `dualProject` 문자열로 구성(구→신 마이그레이션).
+ *  3. 레거시도 없으면 → 기본.
  *
  * @param rawTree 트리 JSON을 파싱한 값(또는 null). P3'은 디스크에서 트리 블롭을
  *   읽지 않으므로(FB — 단일 legacy 키 persist) 실사용은 null이지만, 스키마의
@@ -213,22 +219,27 @@ function extractSecondaryLoose(raw: unknown): string | null {
  * @param legacyDual localStorage `"dualProject"` 문자열(구·현 표현) 또는 null.
  */
 export function parseSurfaceTree(rawTree: unknown, legacyDual: string | null): SurfaceTree {
-  try {
-    if (rawTree && typeof rawTree === "object") {
-      const t = rawTree as Record<string, unknown>;
-      const version = typeof t.version === "number" ? t.version : null;
-      if (version !== null && isValidTree(t.root)) {
-        return { version, root: t.root as SurfaceNode };
+  if (rawTree !== null && rawTree !== undefined) {
+    // present → rawTree 하나로만 해석. 손상이면 기본(legacy 부활 금지).
+    try {
+      if (typeof rawTree === "object") {
+        const t = rawTree as Record<string, unknown>;
+        const version = typeof t.version === "number" ? t.version : null;
+        if (version !== null && isValidTree(t.root)) {
+          return { version, root: t.root as SurfaceNode };
+        }
+        // 미래(더 높은 version) 스키마만 secondary 최선 추출.
+        if (version !== null && version > SURFACE_TREE_VERSION) {
+          const loose = extractSecondaryLoose(rawTree);
+          if (loose) return treeWithSecondary(loose);
+        }
       }
-      // 손상 또는 미래 스키마: **미래 버전일 때만** secondary 최선 추출.
-      if (version !== null && version > SURFACE_TREE_VERSION) {
-        const loose = extractSecondaryLoose(rawTree);
-        if (loose) return treeWithSecondary(loose);
-      }
+    } catch {
+      // 예산 초과·순환 등 어떤 throw든 손상 취급.
     }
-  } catch {
-    // 예산 초과·순환 등 어떤 throw든 손상 취급 → 아래 레거시/기본.
+    return emptyTree(); // present-but-corrupt → 기본(legacy 마이그레이션 금지)
   }
+  // rawTree 부재(null) → 레거시 문자열로 구→신 마이그레이션.
   if (typeof legacyDual === "string" && legacyDual) return treeWithSecondary(legacyDual);
   return emptyTree();
 }

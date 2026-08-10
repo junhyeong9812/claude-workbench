@@ -88,8 +88,10 @@ describe("parseSurfaceTree — 손상/이상치 = 기본 복원(로드 실패 �
       expect(parseSurfaceTree(bad, null)).toEqual(emptyTree());
     }
   });
-  it("손상 트리 + 레거시 있음 → 레거시로 복구(무손실)", () => {
-    expect(secondaryProject(parseSurfaceTree({ version: 1 }, "/legacy"))).toBe("/legacy");
+  it("present-but-corrupt 트리 + 레거시 있음 → **기본**(legacy 부활 아님 — FC2)", () => {
+    // rawTree가 present면 그것 하나로만 해석. 현재 버전 손상은 legacy로 떨어지지
+    // 않고 즉시 기본이다("손상=기본" 계약).
+    expect(parseSurfaceTree({ version: 1 }, "/legacy")).toEqual(emptyTree());
   });
 });
 
@@ -153,6 +155,17 @@ describe("FC(리뷰): 손상 트리가 임의 secondary를 부활시키지 못�
       expect(parseSurfaceTree(bad, null)).toEqual(emptyTree());
     }
   });
+
+  it("FC2: 현재 버전 손상 rawTree + legacy 존재 → 기본(둘 다 부활 안 함)", () => {
+    // rawTree의 metadata에 secondary가 숨어 있고 legacy도 있지만, present-but-
+    // corrupt(현재 버전)이므로 loose 추출도 legacy 마이그레이션도 하지 않는다.
+    const fixture = {
+      version: 1,
+      root: { kind: "bogus" },
+      metadata: { kind: "leaf", surfaceId: "secondary", projectKey: "/resurrected" },
+    };
+    expect(parseSurfaceTree(fixture, "/legacy")).toEqual(emptyTree());
+  });
 });
 
 describe("FA(리뷰): 깊은 트리·순환에서 크래시하지 않고 기본 복원", () => {
@@ -165,8 +178,9 @@ describe("FA(리뷰): 깊은 트리·순환에서 크래시하지 않고 기본 
     const deep = { version: 1, root: node };
     expect(() => parseSurfaceTree(deep, null)).not.toThrow();
     expect(parseSurfaceTree(deep, null)).toEqual(emptyTree());
-    // 레거시가 있으면 크래시 대신 레거시로 복구.
-    expect(secondaryProject(parseSurfaceTree(deep, "/safe"))).toBe("/safe");
+    // present-but-corrupt이므로 legacy가 있어도 기본(FC2) — 크래시 없음이 핵심.
+    expect(() => parseSurfaceTree(deep, "/safe")).not.toThrow();
+    expect(parseSurfaceTree(deep, "/safe")).toEqual(emptyTree());
   });
 
   it("순환 참조 → throw 없이 기본", () => {
