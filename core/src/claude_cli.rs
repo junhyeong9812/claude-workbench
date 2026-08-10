@@ -235,21 +235,63 @@ pub fn build_args(opts: &ClaudeOpts) -> Vec<String> {
     args
 }
 
-/// Hard cap on captured stdout. Output past this is **dropped silently** — the
-/// run still succeeds, it is just truncated. Public so callers whose result is
-/// user content (memo tidy) can treat "hit the cap" as an error instead of
-/// applying a document that ends mid-sentence.
+/// Hard cap on captured stdout. Output past this is dropped — the run still
+/// succeeds, it is just truncated.
 pub const CLAUDE_P_OUTPUT_CAP: usize = 256 * 1024;
+
+/// One finished `claude -p` run: what it printed, and **whether we dropped
+/// anything on the floor**.
+///
+/// The flag exists because truncation cannot be recovered from the text: the
+/// captured bytes are a valid string of *some* length, and comparing that length
+/// to the cap is not the same question (trailing whitespace at the cap boundary
+/// is trimmed away, so a truncated run can measure shorter than the cap). Only
+/// the reader knows, so the reader reports it.
+pub struct ClaudeRun {
+    pub text: String,
+    /// Output exceeded [`CLAUDE_P_OUTPUT_CAP`] and the tail was discarded.
+    pub truncated: bool,
+}
+
+/// Append `chunk` to `buf` up to `cap`, returning **whether bytes were dropped**.
+///
+/// Split out of the reader thread so the one thing that must not be wrong here
+/// can be tested without spawning a process: "we hit the cap" has to be reported
+/// by the code that drops the bytes, because no later inspection of `buf` can
+/// tell (a run that fills the cap exactly is not truncated, and one that
+/// overflows by a byte may still *measure* short after trimming).
+fn take_capped(buf: &mut Vec<u8>, chunk: &[u8], cap: usize) -> bool {
+    if buf.len() >= cap {
+        return !chunk.is_empty();
+    }
+    let take = chunk.len().min(cap - buf.len());
+    buf.extend_from_slice(&chunk[..take]);
+    take < chunk.len()
+}
 
 /// Run a one-shot `claude -p --output-format text` in `cwd`, feeding `prompt`
 /// on stdin and capturing stdout. Errors are plain user-safe strings (the
 /// command layer wraps them in its own error type).
+///
+/// Truncation is invisible here — callers whose result is *user content* should
+/// use [`run_claude_p_run`] and refuse a truncated result instead of applying a
+/// document that ends mid-sentence.
 pub fn run_claude_p(
     cwd: &str,
     prompt: &str,
     timeout: Duration,
     opts: &ClaudeOpts,
 ) -> Result<String, String> {
+    run_claude_p_run(cwd, prompt, timeout, opts).map(|r| r.text)
+}
+
+/// [`run_claude_p`] with the truncation flag kept (see [`ClaudeRun`]).
+pub fn run_claude_p_run(
+    cwd: &str,
+    prompt: &str,
+    timeout: Duration,
+    opts: &ClaudeOpts,
+) -> Result<ClaudeRun, String> {
     const CAP: usize = CLAUDE_P_OUTPUT_CAP;
 
     let mut child = Command::new("claude")
@@ -275,21 +317,21 @@ pub fn run_claude_p(
     // channel so we collect with a *timeout* — never an unbounded `join`, which
     // could hang if a descendant of `claude` keeps the pipe open past the
     // child's own exit.
-    let (otx, orx) = std::sync::mpsc::channel::<Vec<u8>>();
+    // The reader reports `(bytes, truncated)` — truncation is only observable
+    // here, at the moment bytes are dropped.
+    let (otx, orx) = std::sync::mpsc::channel::<(Vec<u8>, bool)>();
     if let Some(mut so) = child.stdout.take() {
         thread::spawn(move || {
             let mut buf = Vec::new();
+            let mut truncated = false;
             let mut chunk = [0u8; 8192];
             while let Ok(n) = so.read(&mut chunk) {
                 if n == 0 {
                     break;
                 }
-                if buf.len() < CAP {
-                    let take = n.min(CAP - buf.len());
-                    buf.extend_from_slice(&chunk[..take]);
-                }
+                truncated |= take_capped(&mut buf, &chunk[..n], CAP);
             }
-            let _ = otx.send(buf);
+            let _ = otx.send((buf, truncated));
         });
     }
     // Drain stderr to a sink (so a full stderr pipe can't block the child) and
@@ -326,12 +368,12 @@ pub fn run_claude_p(
         Some(st) if st.success() => {
             // Collect stdout with a bounded wait (the drain thread finishes as
             // the pipe closed on exit) — never block indefinitely.
-            let stdout = orx.recv_timeout(Duration::from_secs(3)).unwrap_or_default();
+            let (stdout, truncated) = orx.recv_timeout(Duration::from_secs(3)).unwrap_or_default();
             let text = String::from_utf8_lossy(&stdout).trim().to_string();
             if text.is_empty() {
                 Err("Claude returned empty output".to_string())
             } else {
-                Ok(text)
+                Ok(ClaudeRun { text, truncated })
             }
         }
         Some(_) => Err("Claude exited with an error".to_string()),
@@ -342,6 +384,30 @@ pub fn run_claude_p(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 절단은 **버리는 쪽이 알린다** — 나중에 길이를 재서 알 수 있는 값이 아니다.
+    #[test]
+    fn take_capped_reports_dropped_bytes() {
+        // 상한을 정확히 채운 것은 절단이 아니다.
+        let mut buf = Vec::new();
+        assert!(!take_capped(&mut buf, b"abcde", 5));
+        assert_eq!(buf, b"abcde");
+        // 한 바이트만 넘쳐도 절단이다.
+        let mut buf = Vec::new();
+        assert!(take_capped(&mut buf, b"abcdef", 5));
+        assert_eq!(buf, b"abcde");
+        // 이미 가득 찬 뒤의 청크도 절단(버퍼는 안 늘어난다).
+        assert!(take_capped(&mut buf, b"g", 5));
+        assert_eq!(buf, b"abcde");
+        // 빈 청크는 아무것도 버리지 않는다.
+        assert!(!take_capped(&mut buf, b"", 5));
+
+        // 상한 경계가 공백이면 trim 뒤 길이는 상한보다 **짧다** — 길이 비교로
+        // 절단을 판정하던 방식이 통과시키던 바로 그 경우.
+        let mut buf = Vec::new();
+        assert!(take_capped(&mut buf, b"abc  \n more", 5));
+        assert_eq!(String::from_utf8_lossy(&buf).trim().len(), 3);
+    }
 
     /// 격리의 두 방어선은 **리터럴 `/tmp`** 위에 쓰여 있다. 경로가 그 리터럴을
     /// 벗어나는 순간 정리 세션 전사가 조용히 아카이브 후보가 되므로, 경로와

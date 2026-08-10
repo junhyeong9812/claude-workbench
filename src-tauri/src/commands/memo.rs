@@ -246,7 +246,7 @@ pub async fn memo_tidy(text: String, model: Option<String>) -> Result<String, Ap
             effort: None,
             add_dirs: Vec::new(),
         };
-        let out = core_lib::claude_cli::run_claude_p(
+        let out = core_lib::claude_cli::run_claude_p_run(
             &cwd.to_string_lossy(),
             &tidy_prompt(&text, &nonce),
             std::time::Duration::from_secs(180),
@@ -255,16 +255,17 @@ pub async fn memo_tidy(text: String, model: Option<String>) -> Result<String, Ap
         .map_err(AppError::new);
         let _ = std::fs::remove_dir_all(&cwd);
         let raw = out?;
-        // 상한에 닿았다 = **조용히 잘린 출력**이다. run_claude_p는 그것을 성공으로
-        // 돌려주지만, 여기서는 그 결과가 사용자의 문서를 통째로 대체할 후보라
-        // 정상 결과로 다루면 안 된다(문장 중간에서 끊긴 메모를 적용시키는 길).
-        if raw.len() >= core_lib::claude_cli::CLAUDE_P_OUTPUT_CAP {
+        // 잘렸다 = **조용히 버려진 꼬리**가 있다. 그 결과가 사용자의 문서를 통째로
+        // 대체할 후보라 정상 결과로 다루면 안 된다(문장 중간에서 끊긴 메모를
+        // 적용시키는 길). 판정은 길이 비교가 아니라 읽는 쪽이 준 플래그다 —
+        // 상한 경계의 공백이 trim으로 지워지면 길이는 상한보다 짧아진다.
+        if raw.truncated {
             return Err(AppError::new(format!(
                 "정리 결과가 상한({}KB)에 걸려 잘렸습니다 — 적용하지 않습니다. 메모를 나눠서 정리하세요.",
                 core_lib::claude_cli::CLAUDE_P_OUTPUT_CAP / 1024
             )));
         }
-        let tidied = strip_code_fence(raw.trim());
+        let tidied = strip_code_fence(raw.text.trim());
         if tidied.is_empty() {
             return Err(AppError::new("정리 결과가 비어 있습니다 — 메모는 그대로 둡니다."));
         }
