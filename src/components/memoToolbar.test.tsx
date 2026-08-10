@@ -271,6 +271,22 @@ describe("메모 툴바 — 저장하기 · 정리", () => {
     expect(docText()).toBe("원래 메모");
   });
 
+  it("적용 결과가 그 사이 바뀌었으면 되돌리기를 버린다 (남의 수정 보호)", async () => {
+    invoke.mockResolvedValue("정리된 메모");
+    await mount();
+    await click("정리");
+    await click("정리 실행");
+    await click("적용");
+
+    // 탭을 닫은 사이 다른 창(또는 외부 편집)이 문서를 바꿨다.
+    disk = "다른 창이 고친 본문";
+    await act(async () => root.unmount());
+    root = createRoot(host);
+    await mount();
+    expect(docText()).toBe("다른 창이 고친 본문");
+    expect(has("되돌리기"), "옛 본문으로 남의 수정을 덮을 길이 있으면 안 된다").toBe(false);
+  });
+
   it("적용 뒤 **첫 일반 편집**에서 되돌리기가 만료된다", async () => {
     invoke.mockResolvedValue("정리된 메모");
     await mount();

@@ -235,16 +235,29 @@ export function resetStash(): void {
  * 눌리면 옛 본문이 그 작업을 통째로 지운다. 그래서 호출부는 적용 이후 **첫 일반
  * 편집**에서 이 버퍼를 버린다.
  */
-const undo = new Map<string, string>();
+const undo = new Map<string, UndoEntry>();
+
+/**
+ * 되돌리기 한 칸 — 직전 본문과 **그때 적용한 본문**.
+ *
+ * `applied`를 함께 들고 있는 것이 요점이다: 되살아난 버퍼를 쓰기 전에 "지금
+ * 화면의 본문이 정말 그 적용의 결과인가"를 물어야 한다. 그 사이 다른 창이나
+ * 디스크가 문서를 바꿨다면 `before`는 더 이상 "직전"이 아니라 **남의 수정을
+ * 통째로 지우는 값**이다.
+ */
+export interface UndoEntry {
+  before: string;
+  applied: string;
+}
 
 const undoKey = (storeKey: string): string => `undo:${storeKey}`;
 
-export function setUndo(storeKey: string, text: string): void {
-  undo.set(undoKey(storeKey), text);
+export function setUndo(storeKey: string, before: string, applied: string): void {
+  undo.set(undoKey(storeKey), { before, applied });
 }
 
-/** 보관된 직전 본문 (없으면 null — 되돌릴 것이 없다). */
-export function getUndo(storeKey: string): string | null {
+/** 보관된 한 칸 (없으면 null — 되돌릴 것이 없다). */
+export function getUndo(storeKey: string): UndoEntry | null {
   return undo.get(undoKey(storeKey)) ?? null;
 }
 

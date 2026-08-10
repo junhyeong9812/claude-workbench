@@ -185,7 +185,9 @@ export function MemoEditor({
   // 적용 직전 본문 — **1회** 되돌리기의 전부(스택이 아니다). 값의 정본은 모듈
   // 맵(`projectMemo`의 undo)이고 여기 state는 버튼을 그리기 위한 사본이다:
   // 탭 전환으로 이 컴포넌트가 언마운트돼도 되돌릴 길이 남아 있어야 한다.
-  const [undoText, setUndoText] = useState<string | null>(() => getUndo(storeKey));
+  // 마운트 시점에는 아직 본문을 모른다 — 되살아난 버퍼가 **이 화면의 것인지**는
+  // 읽기가 끝난 뒤에야 판정할 수 있다(아래 로드 경로).
+  const [undoText, setUndoText] = useState<string | null>(null);
   // [적용]이 넣은 본문. 이후 문서가 이 값과 달라지는 순간이 "일반 편집 시작"이고,
   // 그때 되돌리기를 만료시킨다 — 옛 본문이 그 뒤의 작업을 통째로 지우지 않게.
   const appliedRef = useRef<string | null>(null);
@@ -288,7 +290,7 @@ export function MemoEditor({
       setTidyErr("지금은 메모를 바꿀 수 없습니다.");
       return;
     }
-    setUndo(storeKey, before);
+    setUndo(storeKey, before, tidyResult);
     appliedRef.current = tidyResult;
     setUndoText(before);
     setTidyResult(null);
@@ -323,7 +325,7 @@ export function MemoEditor({
     tidySourceRef.current = null;
     setTidyBusy(false);
     appliedRef.current = null;
-    setUndoText(getUndo(storeKey));
+    setUndoText(null);
   }, [storeKey]);
 
   // Switch the CodeMirror theme live when the app theme changes (EditorPanel 선례).
@@ -443,6 +445,17 @@ export function MemoEditor({
         viewRef.current.focus();
         // 본문이 손에 들어온 뒤에야 툴바를 낸다 (아래 `loaded` 참조).
         setLoaded(true);
+        // 되돌리기 버퍼는 **적용 결과가 그대로 남아 있을 때만** 유효하다. 그 사이
+        // 다른 창이나 디스크가 문서를 바꿨다면(자동 저장은 낙관적 잠금이라 그런
+        // 일이 정상적으로 일어난다) 옛 본문은 되돌리기가 아니라 남의 수정을
+        // 통째로 지우는 값이다 — 그럴 땐 버퍼를 버린다.
+        const saved = getUndo(storeKey);
+        if (saved && saved.applied === text) {
+          appliedRef.current = saved.applied;
+          setUndoText(saved.before);
+        } else if (saved) {
+          clearUndo(storeKey);
+        }
         if (recovered) {
           // 되살린 편집은 아직 디스크에 없다 — 곧바로 저장 큐에 올린다.
           saver.schedule(text);
