@@ -1,4 +1,4 @@
-import { useState, type ReactNode } from "react";
+import { useEffect, useState, type ReactNode } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { errText } from "../utils/error";
 import { parentDir } from "./treeDnd";
@@ -54,6 +54,14 @@ const FILE_EXTS: [string, string][] = [
   ["MD", "md"],
 ];
 
+/** 확인 다이얼로그용 루트 상대 경로 — 같은 이름이 여러 폴더에 있을 때 "어느
+ * 것을 지우는지"가 이름만으로는 안 보인다(옛 스터디 confirm은 절대 경로를 다
+ * 보여 줬다). 루트 밖/불명이면 원 경로 그대로. */
+export function relToRoot(path: string, root: string | null): string {
+  if (root && path.startsWith(root + "/")) return path.slice(root.length + 1);
+  return path;
+}
+
 export interface TreeCrudHost {
   /** containment 루트 = 이 트리의 루트 (스터디는 그 쪽 폴더). null이면 메뉴가 열리지 않는다. */
   root: string | null;
@@ -100,6 +108,18 @@ export function useTreeCrud(host: TreeCrudHost): TreeCrud {
     setMenu({ node, dir: dirOf(node), x, y });
   };
 
+  // 메뉴는 Esc로도 닫힌다 — 옛 스터디 메뉴(ContextMenu)의 동작이고, 백드롭
+  // 클릭만 남기면 키보드만 쓰는 흐름에서 메뉴를 못 닫는다. (다이얼로그의 Esc는
+  // 입력 필드가 직접 처리한다.)
+  useEffect(() => {
+    if (!menu) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") setMenu(null);
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [menu]);
+
   const openDialog = (d: CrudDialogState, initial = "") => {
     setMenu(null);
     setOpErr(null);
@@ -126,6 +146,14 @@ export function useTreeCrud(host: TreeCrudHost): TreeCrud {
       return true;
     } catch (e) {
       setOpErr(errText(e, "작업 실패"));
+      // 실패에도 한 번 다시 읽는다: "실패"가 곧 "디스크가 그대로"는 아니다
+      // (다중 생성의 부분 실패는 백엔드가 되돌리지만, 외부에서 이미 만들어진
+      // 파일 때문에 실패한 경우엔 그 파일이 화면에 없다). 갱신 실패는 무시.
+      try {
+        await host.reloadDir(reloadTarget);
+      } catch {
+        /* 갱신 실패는 원래 오류를 덮지 않는다 */
+      }
       return false;
     }
   };
@@ -182,7 +210,12 @@ export function useTreeCrud(host: TreeCrudHost): TreeCrud {
         ...(host.onOpenTerminal
           ? [
               {
-                label: "여기서 터미널 열기",
+                // 파일 행에서 여는 터미널의 cwd는 그 파일의 **상위 폴더**다 —
+                // "여기서"가 파일을 가리키는 것처럼 읽히지 않게 문구를 가른다.
+                label:
+                  menu.node && !menu.node.is_dir
+                    ? "상위 폴더에서 터미널 열기"
+                    : "여기서 터미널 열기",
                 title: `${menu.dir} 에서 터미널 탭을 엽니다`,
                 onClick: () => host.onOpenTerminal!(menu.dir),
               },
@@ -250,7 +283,7 @@ export function useTreeCrud(host: TreeCrudHost): TreeCrud {
               <>
                 <div className="tree-dialog-head">삭제 확인</div>
                 <div className="tree-dialog-msg">
-                  <code>{dialog.node.name}</code> 을(를) 삭제할까요?
+                  <code>{relToRoot(dialog.node.path, host.root)}</code> 을(를) 삭제할까요?
                   {dialog.node.is_dir && " (폴더 내용 전부)"}
                 </div>
                 {opErr && <div className="tree-dialog-err">{opErr}</div>}
