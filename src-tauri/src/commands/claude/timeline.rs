@@ -158,6 +158,28 @@ pub(super) fn subagent_parent(
         .map(|it| it.tool_call_id.clone())
 }
 
+/// emit 최소 간격 게이트 — 순수 (메모리 1단계 C). 폴 주기(150ms)는 그대로 두고
+/// **전송만** 디바운스한다. 반환 = (이번 틱에 emit할까, 다음 틱으로 넘길 pending).
+///
+/// **trailing edge 보장**: 변화가 있었다는 사실(`pending`)은 실제로 보낼 때까지
+/// 지워지지 않는다. 스트리밍이 멎어 더 이상 변화가 없어도 폴은 계속 돌므로,
+/// 마지막 상태는 간격이 지난 첫 틱(≤150ms 뒤)에 반드시 착지한다 — 화면이 낡은
+/// 채 남지 않는다. payload는 emit 시점의 tail에서 새로 조립되므로 언제나 최신이다
+/// (합쳐진 중간 상태를 보내지 않는다).
+pub(super) fn emit_gate(
+    changed: bool,
+    pending: bool,
+    since_last_emit: Duration,
+    min_interval: Duration,
+) -> (bool, bool) {
+    let pending = pending || changed;
+    if pending && since_last_emit >= min_interval {
+        (true, false)
+    } else {
+        (false, pending)
+    }
+}
+
 /// P0 B1(리뷰 재수정 — Some-동결 캐시는 "늦게 채워진 상위 후보로의 부모
 /// 교체"라는 원본 동작을 잃는다): first-match를 **매 변경 틱 그대로 재계산**
 /// 하되, 아이템별 `contains(aid)` 판정만 `(revision)` 키로 메모한다.
@@ -259,6 +281,17 @@ pub(super) fn run_timeline_poll(
     let mut snap_dirty = false;
     let mut last_save = std::time::Instant::now()
         .checked_sub(SAVE_DEBOUNCE)
+        .unwrap_or_else(std::time::Instant::now);
+    // 메모리 1단계 C: emit 최소 간격. 폴은 150ms 그대로 두고 전송만 디바운스한다
+    // — 답변 스트리밍 중에는 fingerprint가 매 틱 바뀌어 최대 6.7 emit/s가 나갔다
+    // (실측 payload 24.8MB × 6.7/s ≈ 166MB/s의 직렬화·IPC·JS 파싱). 400ms면
+    // 전송이 ≤2.5/s로 떨어지면서(−63%) 체감 지연은 반 초 미만이다. 스냅샷
+    // debounce(:292)와 같은 패턴이되, 저장(2s)보다 훨씬 짧게 잡아 화면 최신성을
+    // 지킨다. 마지막 상태는 trailing edge로 반드시 착지한다(emit_gate).
+    const EMIT_MIN_INTERVAL: Duration = Duration::from_millis(400);
+    let mut emit_pending = false;
+    let mut last_emit = std::time::Instant::now()
+        .checked_sub(EMIT_MIN_INTERVAL)
         .unwrap_or_else(std::time::Instant::now);
     // Cheap fingerprint of the last emitted state (incl. subagent item count). A
     // prompt- or answer-only record advances turns/answers without touching any
@@ -496,10 +529,24 @@ pub(super) fn run_timeline_poll(
             model_fp,
             sub_gen, // N2: 재활성 세대 — 재구축으로 rev 합이 같아도 emit 보장
         );
-        if fp == last_fp {
-            continue; // nothing changed this tick
+        // 변화 감지와 전송을 분리한다(메모리 1단계 C). 변화는 매 틱 그대로
+        // 판정해 스냅샷 dirty를 즉시 세우고(저장 debounce는 자기 주기를 유지),
+        // emit만 최소 간격 게이트를 통과할 때 나간다. pending은 실제 전송
+        // 전까지 유지되므로 마지막 상태가 반드시 전달된다(trailing edge).
+        let changed = fp != last_fp;
+        if changed {
+            last_fp = fp;
+            // 저장은 emit 게이트와 무관하게 마킹 — 디바운스된 전송이 스냅샷
+            // 저장까지 늦추면 안 된다. Persisting keeps the session
+            // listable/reopenable across restarts (D-1).
+            snap_dirty = true;
         }
-        last_fp = fp;
+        let (do_emit, pending) = emit_gate(changed, emit_pending, last_emit.elapsed(), EMIT_MIN_INTERVAL);
+        emit_pending = pending;
+        if !do_emit {
+            continue;
+        }
+        last_emit = std::time::Instant::now();
 
         let items_v = items.to_vec();
         let turns_v: Vec<(u64, String)> = t.turns().iter().map(|(k, v)| (*k, v.clone())).collect();
@@ -560,10 +607,8 @@ pub(super) fn run_timeline_poll(
                 subagents: subagents_v,
             },
         );
-        // 저장 자체는 위(틱 진입부) debounce 플러시가 수행한다 — 여기서는
-        // dirty 마킹만. Persisting keeps the session listable/reopenable across
-        // restarts (D-1) without the append duplication.
-        snap_dirty = true;
+        // 저장 자체는 위(틱 진입부) debounce 플러시가 수행하고, dirty 마킹은
+        // 변화 감지 시점(emit 게이트 앞)에서 이미 끝났다.
 
         if stop.load(Ordering::Relaxed) {
             break; // closed during poll/emit — don't persist after close (F4)
@@ -678,6 +723,53 @@ mod tests {
         let out = ordered_frames(&order, active, &d);
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].2[0].tool_call_id, "new-1"); // 재파싱된 active 우선
+    }
+
+    // 메모리 1단계 C — emit 최소 간격 게이트. 핵심 계약은 **trailing edge**:
+    // 변화 후 더 이상 변화가 없어도 마지막 상태가 반드시 나간다.
+    #[test]
+    fn emit_gate_throttles_but_always_lands_the_last_state() {
+        const MIN: Duration = Duration::from_millis(400);
+        let ms = Duration::from_millis;
+        // 변화 없음 + pending 없음 → 아무것도 안 보낸다(간격이 지났어도).
+        assert_eq!(emit_gate(false, false, ms(10_000), MIN), (false, false));
+        // 변화 직후 간격 미달 → 보류(pending 유지 — 여기서 잃으면 화면이 낡는다).
+        assert_eq!(emit_gate(true, false, ms(0), MIN), (false, true));
+        assert_eq!(emit_gate(true, true, ms(399), MIN), (false, true));
+        // **변화가 멎어도** 간격이 지난 첫 틱에 보류분이 나간다(trailing edge).
+        assert_eq!(emit_gate(false, true, ms(400), MIN), (true, false));
+        // 간격이 지난 뒤의 변화는 그 틱에 바로 나간다(디바운스 = 지연이 아니라 상한).
+        assert_eq!(emit_gate(true, false, ms(1_000), MIN), (true, false));
+    }
+
+    /// 게이트를 150ms 폴 루프에 태운 시뮬레이션 — 스트리밍 중 전송이 줄고,
+    /// 스트리밍이 끝난 뒤 **마지막 변화가 빠짐없이** 전달되는지 고정한다.
+    #[test]
+    fn emit_gate_over_a_poll_loop_drops_rate_and_keeps_final_tick() {
+        const MIN: Duration = Duration::from_millis(400);
+        const TICK: u64 = 150;
+        let mut pending = false;
+        let mut since = MIN; // 첫 틱은 자격 있음
+        let mut emits = 0;
+        let mut last_emitted_tick = None;
+        // 0..20틱(3초) 중 앞 10틱만 매 틱 변화(스트리밍), 이후 무변화.
+        for tick in 0..20u64 {
+            let changed = tick < 10;
+            let (go, p) = emit_gate(changed, pending, since, MIN);
+            pending = p;
+            if go {
+                emits += 1;
+                last_emitted_tick = Some(tick);
+                since = Duration::ZERO;
+            } else {
+                since += Duration::from_millis(TICK);
+            }
+        }
+        // 게이트 없으면 10회(변화 틱마다). 게이트로 4회.
+        assert_eq!(emits, 4, "스트리밍 10틱이 4회 전송으로 합쳐진다");
+        // 마지막 변화(틱 9) 이후의 전송이 존재 = 최종 상태 착지.
+        assert!(last_emitted_tick.unwrap() >= 9, "마지막 변화 뒤 전송이 없으면 화면이 낡는다");
+        assert!(!pending, "보류가 남은 채 끝나면 안 된다");
     }
 
     // P0 B1(재수정) — 메모 스캔이 naive와 완전 동치인지 + revision bump 반영.
