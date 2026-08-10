@@ -233,34 +233,70 @@ pub fn create_files(paths: Vec<String>, root: String) -> Result<(), AppError> {
     create_files_impl(&paths, &root)
 }
 
-/// 이번 호출이 만든 것 되돌리기 (best-effort — 실패는 무시하고 원 오류를 살린다).
-/// dir은 **깊은 것부터** 지운다(얕은 것을 먼저 지우려 하면 비어 있지 않아 실패).
-/// `remove_dir`(재귀 아님)만 쓰므로, 우리가 만들지 않은 내용이 그 사이에 들어온
-/// dir은 남는다 — 지우기보다 남기는 쪽이 안전하다.
-fn rollback_created(files: &[PathBuf], dirs: &[PathBuf]) {
+/// 이번 호출이 만든 것 되돌리기 (best-effort). dir은 **깊은 것부터** 지운다
+/// (얕은 것을 먼저 지우려 하면 비어 있지 않아 실패). `remove_dir`(재귀 아님)만
+/// 쓰므로, 그 사이에 남의 내용이 들어온 dir은 남는다 — 지우기보다 남기는 쪽이
+/// 안전하다.
+///
+/// 반환 = **정리하지 못하고 남은 것들**의 root 상대 경로. 삼키기만 하면 사용자
+/// 화면에는 "실패"라고 떴는데 디스크에는 파일이 남아 있는 상태가 무음이 된다 —
+/// 호출부가 이 목록을 원 오류 뒤에 덧붙여 가시화한다.
+fn rollback_created(files: &[PathBuf], dirs: &[PathBuf], root_c: &std::path::Path) -> Vec<String> {
+    let mut left = Vec::new();
     for f in files.iter().rev() {
-        let _ = std::fs::remove_file(f);
+        if std::fs::remove_file(f).is_err() && std::fs::symlink_metadata(f).is_ok() {
+            left.push(rel_to_root(f, root_c));
+        }
     }
     let mut ds: Vec<&PathBuf> = dirs.iter().collect();
     ds.sort_by_key(|d| std::cmp::Reverse(d.components().count()));
     for d in ds {
-        let _ = std::fs::remove_dir(d);
+        if std::fs::remove_dir(d).is_err() && d.exists() {
+            left.push(rel_to_root(d, root_c));
+        }
+    }
+    left
+}
+
+/// 원 오류 + 정리 못 한 잔존물 표시 (잔존이 없으면 원 오류 그대로).
+fn create_error(msg: String, leftovers: Vec<String>) -> AppError {
+    if leftovers.is_empty() {
+        AppError::new(msg)
+    } else {
+        AppError::new(format!("{msg} (일부 항목 정리 실패: {})", leftovers.join(", ")))
     }
 }
 
-/// `parent`부터 위로 올라가며 **아직 없는** 조상들(root 아래, 깊은 것부터).
-/// create_dir_all이 새로 만들게 될 목록 = 실패 시 되돌릴 목록.
-fn missing_ancestors(parent: &std::path::Path, root_c: &std::path::Path) -> Vec<PathBuf> {
-    let mut out = Vec::new();
-    let mut cur = parent.to_path_buf();
-    while cur.starts_with(root_c) && cur != root_c && !cur.exists() {
-        out.push(cur.clone());
-        match cur.parent() {
-            Some(p) => cur = p.to_path_buf(),
-            None => break,
+/// `root_c` 아래의 `parent`까지 조상을 **바깥→안 순서로 하나씩** 만들고, 이번
+/// 호출이 실제로 만든 것만 `made`에 기록한다.
+///
+/// `create_dir_all` + "미리 계산한 미존재 목록"이 아닌 이유(감사 Y1): 계산과
+/// 생성 사이의 창에서 **다른 호출**(같은 앱의 다른 트리/패널도 만든다)이 같은
+/// dir을 만들면, 우리는 그것을 우리 소유로 오기록해 롤백 때 남의 dir을 지운다.
+/// 반대로 create_dir_all이 중간까지만 만들고 실패하면 그 잔해는 아예 기록되지
+/// 않아 롤백에서 빠진다. 한 레벨씩 만들면 창이 사라진다 — 성공 = 우리 것(기록),
+/// `AlreadyExists` = 남의 것(미기록), 그 밖의 오류 = 그 시점까지의 기록분으로
+/// 롤백. (경로에 파일이 끼어 있으면 그 레벨은 AlreadyExists로 지나가고, 바로
+/// 다음 레벨 또는 파일 생성이 NotADirectory로 실패해 결국 오류로 드러난다.)
+fn ensure_dirs(
+    parent: &std::path::Path,
+    root_c: &std::path::Path,
+    made: &mut Vec<PathBuf>,
+) -> std::io::Result<()> {
+    let Ok(rel) = parent.strip_prefix(root_c) else {
+        // 루트 밖(있을 수 없음 — 봉쇄 통과분만 온다)이면 기록 없이 통짜 생성.
+        return std::fs::create_dir_all(parent);
+    };
+    let mut cur = root_c.to_path_buf();
+    for seg in rel.components() {
+        cur.push(seg);
+        match std::fs::create_dir(&cur) {
+            Ok(()) => made.push(cur.clone()),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {} // 남의 것 — 기록하지 않는다
+            Err(e) => return Err(e),
         }
     }
-    out
+    Ok(())
 }
 
 /// 오류 표시용 root 상대 경로 (밖이면 파일명 폴백) — 절대 경로를 그대로 노출하지
@@ -325,18 +361,16 @@ fn create_files_impl(paths: &[String], root: &str) -> Result<(), AppError> {
     let mut made_dirs: Vec<PathBuf> = Vec::new();
     for t in &targets {
         if let Some(parent) = t.parent() {
-            let missing = missing_ancestors(parent, &root_c);
-            if let Err(e) = std::fs::create_dir_all(parent) {
-                rollback_created(&made_files, &made_dirs);
-                return Err(AppError::new(io_message("Cannot create file", &e)));
+            if let Err(e) = ensure_dirs(parent, &root_c, &mut made_dirs) {
+                let left = rollback_created(&made_files, &made_dirs, &root_c);
+                return Err(create_error(io_message("Cannot create file", &e), left));
             }
-            made_dirs.extend(missing);
         }
         match std::fs::OpenOptions::new().write(true).create_new(true).open(t) {
             Ok(_) => made_files.push(t.clone()),
             Err(e) => {
-                rollback_created(&made_files, &made_dirs);
-                return Err(AppError::new(io_message("Cannot create file", &e)));
+                let left = rollback_created(&made_files, &made_dirs, &root_c);
+                return Err(create_error(io_message("Cannot create file", &e), left));
             }
         }
     }
@@ -782,6 +816,104 @@ mod tests {
         assert!(!std::path::Path::new(&f2).exists());
         assert!(root.join("keep").is_dir(), "기존 dir 보존");
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // dir 소유권(감사 Y1): 이번 호출이 **직접 만든** 레벨만 되돌린다. 한 레벨씩
+    // create_dir 하므로 "미리 계산 → create_dir_all" 사이의 창(다른 호출이 그
+    // 사이에 만든 dir을 우리 것으로 오기록)이 없다.
+    #[test]
+    fn create_files_rollback_keeps_foreign_dirs() {
+        let (root, root_s) = temp_root("cfs_own");
+        // 남의 것(사전 존재) — 깊이 2단계.
+        std::fs::create_dir_all(root.join("pre/kept")).unwrap();
+        let f = format!("{root_s}/pre/kept/mine/deep/a.ts");
+        let bad = format!("{root_s}/pre/kept/mine/deep/a.ts/x.ts"); // 부모가 파일 → 실패
+        assert!(create_files(vec![f.clone(), bad], root_s.clone()).is_err());
+        assert!(!std::path::Path::new(&f).exists(), "만든 파일 되돌림");
+        assert!(!root.join("pre/kept/mine").exists(), "이번 호출이 만든 레벨만 정리");
+        assert!(root.join("pre/kept").is_dir(), "사전 존재 dir 보존");
+        assert!(root.join("pre").is_dir(), "사전 존재 상위 dir 보존");
+
+        // 사전 존재 dir이 **중간 레벨 실패**를 일으켜도(쓰기 권한 없음) 그 dir은
+        // 남고, 그 아래로는 아무것도 안 생긴다. root로 도는 환경에서는 권한이
+        // 무시되므로 실제로 막히는지 먼저 확인하고 건너뛴다.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let ro = root.join("ro");
+            std::fs::create_dir(&ro).unwrap();
+            std::fs::set_permissions(&ro, std::fs::Permissions::from_mode(0o555)).unwrap();
+            let probe = ro.join(".probe");
+            let writable = std::fs::File::create(&probe).is_ok();
+            let _ = std::fs::remove_file(&probe);
+            if !writable {
+                let blocked = format!("{root_s}/ro/sub/b.ts");
+                assert!(create_files(vec![blocked], root_s).is_err());
+                assert!(ro.is_dir(), "권한 실패에도 남의 dir 보존");
+                assert!(!ro.join("sub").exists());
+            }
+            std::fs::set_permissions(&ro, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // 경쟁 재현(감사 Y1): "다른 호출이 그 사이에 만들어 둔 레벨"의 **결과 상태**는
+    // = 그 레벨이 이미 존재하는 상태다. 그 상태에서 ensure_dirs를 돌려 우리가
+    // 만든 레벨만 기록되는지 직접 본다. 옛 구현은 소유권을 생성 **전** 스냅샷
+    // (missing_ancestors)으로 정했기 때문에 이 레벨을 우리 것으로 기록했고,
+    // 실패 시 남의 dir을 지웠다.
+    #[test]
+    fn ensure_dirs_records_only_what_it_creates() {
+        let (root, _root_s) = temp_root("cfs_ed");
+        std::fs::create_dir_all(root.join("a/b")).unwrap(); // 남의 것
+        let mut made: Vec<PathBuf> = Vec::new();
+        ensure_dirs(&root.join("a/b/c/d"), &root, &mut made).unwrap();
+        assert_eq!(
+            made,
+            vec![root.join("a/b/c"), root.join("a/b/c/d")],
+            "우리가 실제로 만든 레벨만 기록"
+        );
+        assert!(root.join("a/b/c/d").is_dir());
+
+        // 전 구간이 이미 있으면 기록은 비어 있다(= 롤백이 남의 것을 안 건드린다).
+        let mut made2: Vec<PathBuf> = Vec::new();
+        ensure_dirs(&root.join("a/b"), &root, &mut made2).unwrap();
+        assert!(made2.is_empty());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // dir 체인 **중간 실패**의 잔해도 기록되어 되돌아간다(감사 Y1의 나머지 절반).
+    // 옛 구현은 소유권을 create_dir_all **성공 후에만** 기록해서, 통짜 생성이
+    // 앞 레벨만 만들고 실패하면 그 잔해가 아예 롤백 목록에 없었다.
+    // 재현: 마지막 세그먼트를 파일명 길이 상한(255)보다 길게 → 앞 레벨(deep1)은
+    // 만들어지고 그 다음이 ENAMETOOLONG으로 실패한다.
+    #[test]
+    fn create_files_rolls_back_partial_dir_chain() {
+        let (root, root_s) = temp_root("cfs_chain");
+        let too_long = "z".repeat(300);
+        let target = format!("{root_s}/deep1/{too_long}/f.ts");
+        let e = create_files(vec![target], root_s).unwrap_err();
+        assert!(!e.message.is_empty());
+        assert!(
+            !root.join("deep1").exists(),
+            "체인 중간까지 만들어진 dir도 되돌린다 (옛 구현은 여기서 잔해가 남았다)"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // 되돌리기 실패는 삼키되 **보이게** 한다 (감사 Y2) — 잔존 목록이 원 오류
+    // 뒤에 붙는다. (실제 remove 실패는 외부 개입 없이 재현할 수 없어, 가시화
+    // 계약 자체를 조립 지점에서 검증한다.)
+    #[test]
+    fn create_error_surfaces_leftovers() {
+        let clean = create_error("Cannot create file: I/O error".into(), vec![]);
+        assert_eq!(clean.message, "Cannot create file: I/O error");
+        let dirty = create_error(
+            "Cannot create file: I/O error".into(),
+            vec!["sub/a.ts".into(), "sub".into()],
+        );
+        assert!(dirty.message.starts_with("Cannot create file: I/O error"));
+        assert!(dirty.message.contains("일부 항목 정리 실패: sub/a.ts, sub"), "{}", dirty.message);
     }
 
     fn temp_root(tag: &str) -> (std::path::PathBuf, String) {
