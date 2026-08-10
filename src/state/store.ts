@@ -1032,17 +1032,21 @@ export const useAppStore = create<AppState>((set, get) => ({
   openGitHistoryFile: (root, commit, path) =>
     set({ gitHistoryFile: { root, commit, path } }),
   closeGitHistoryFile: () => set({ gitHistoryFile: null }),
-  // 요청버스 라우팅(P2 seam + P4' 슬롯 재분류 — 리뷰 G2). 발행부가 targetSurfaceId를
-  // stamp하는데, 슬롯은 **두 부류**다:
-  //  · **panel-destination**(연 패널이 활성 dock에 들어가야 하는 것 — editorOpen·
-  //    diff·claudeOpen·codexOpen·run·terminalOpen·memo·detach·sessionResume)은
-  //    **활성 표면**(`activeSurfaceId()`)을 따른다.
-  //  · **picker-UI-open**(팝오버/포커스가 **primary 크롬**에만 렌더되는 것 —
-  //    termMenu·claudePicker·focusMain)은 **항상 primary**를 타깃한다. 소비부 UI가
-  //    `isPrimary` 게이트(MainArea `.main-menus`)라 secondary로 라우팅되면 nonce만
-  //    소비되고 아무것도 안 뜨는 무음 유실이 됐다. 피커는 primary에 뜨고, 거기서
-  //    고른 세션은 panel-destination(sessionResume/claudeOpen)이라 활성 표면 dock에
-  //    열린다(표면별 툴바 완결은 P5).
+  // 요청버스 라우팅(P2 seam + P4' 슬롯 재분류 — 리뷰 G2 + codex 감사 폴백). 발행부가
+  // targetSurfaceId를 stamp하는데, 슬롯은 **두 부류**다:
+  //  · **panel-destination**(연 패널이 dock에 들어가는 것 — editorOpen·diff·
+  //    claudeOpen·codexOpen·run·terminalOpen·memo·detach·sessionResume)은 **활성
+  //    표면**(`activeSurfaceId()`)을 따른다. 소비부가 팝오버 없이 그 표면 dock에
+  //    패널을 열어 항상 보인다 → 활성=secondary면 secondary dock에 열림(무음 유실 0).
+  //  · **picker-UI-open**(팝오버/포커스가 **primary 크롬**에만 렌더 — termMenu·
+  //    claudePicker·focusMain)은 **항상 primary**를 타깃한다. 소비부 UI가 isPrimary
+  //    게이트(MainArea `.main-menus`)라 secondary로 라우팅하면 nonce만 소비되고
+  //    아무것도 안 뜨는 무음 유실이 된다. 그래서 primary에 띄운다 — 그리고 피커는
+  //    자기(primary) 표면-로컬 프로젝트·dock으로 조회·오픈하므로 **고른 세션도
+  //    primary dock에 열린다**(항상 보이는 dock → 무음 유실 0). "활성 표면에 툴바
+  //    피커로 열기"는 primary-렌더 피커가 secondary dock을 조작하는 크로스-표면
+  //    배관(surface-local 피커 설계 3번째 되짜기)이라 정지 규칙에 따라 **표면별
+  //    툴바를 세우는 P5로 이연**한다. P4'의 절대 기준 = 무음 유실 0(양쪽 충족).
   requestEditorOpen: (path) =>
     set({ editorOpenRequest: path === null ? null : { path, targetSurfaceId: activeSurfaceId() } }),
   requestDiff: (spec) =>

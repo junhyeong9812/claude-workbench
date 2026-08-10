@@ -141,10 +141,21 @@ export function MainArea({
   // "+ Claude" 저장 세션 피커 — 상태·조회·표시는 SessionPicker 소유 (P5 F-b).
   // 여는 트리거(툴바 요청 버스)와 드롭 취소는 여기 남아 setPicker/openPicker만
   // 부른다.
+  //
+  // **P4' 슬롯 분류(리뷰 G2 + codex 감사 폴백)**: 이 피커 UI는 주 표면
+  // `.main-menus`에만 렌더된다(아래 isPrimary 게이트). 그래서 `claudePicker`
+  // 요청은 **항상 primary**로 라우팅되고(store), 피커는 자기 표면-로컬 프로젝트·
+  // dock(surfaceProject·apiRef)으로 조회·열기를 한다 = **주 표면에서 조회·오픈**.
+  // 즉 활성=secondary라도 툴바 피커는 primary dock에 연다(항상 보이는 dock —
+  // **무음 유실 0**). "활성 표면에 툴바 피커로 열기"는 표면별 툴바를 세우는 **P5**
+  // 몫이다(primary-렌더 피커가 secondary dock을 조작하는 크로스-표면 배관은
+  // surface-local 설계를 3번째로 되짜는 churn이라 정지 규칙에 따라 이연). 반면
+  // **dock-패널 요청**(새 세션·터미널·resume·diff·메모 등)은 팝오버 없이 활성
+  // 표면 MainArea가 소비해 그 dock에 열리므로 **활성 표면을 따른다**(무음 유실 0).
   const picker = useSessionPicker({
     isPrimary,
-    // 피커는 표면-로컬 프로젝트로 (P1) — 주 표면에서 surfaceProject===activeProject라
-    // 무동작이고, 부 표면에서는 피커가 비활성(isPrimary 게이트)이라 무해.
+    // 피커는 표면-로컬 프로젝트로 (P1). 주 표면에서 surfaceProject===activeProject.
+    // (P4' 폴백: 툴바 피커는 primary 전용이라 여기 primary의 프로젝트가 조회 기준.)
     activeProject: surfaceProject,
     getApi: () => apiRef.current,
   });

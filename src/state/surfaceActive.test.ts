@@ -133,6 +133,13 @@ describe("활성 표면 + 요청버스 seam 라우팅 (P4')", () => {
     expect(useAppStore.getState().activeSurfaceId).toBe("primary");
   });
 
+  // [G2 + codex 감사 폴백] 슬롯 라우팅 계약 = 무음 유실 0.
+  //  · picker-UI(termMenu·claudePicker·focusMain)는 항상 primary — 팝오버가
+  //    primary `.main-menus`에만 렌더되므로 primary에 떠서 primary dock에 연다
+  //    (항상 보임). 활성 표면 툴바 피커는 P5.
+  //  · panel-destination(claude/codex/run/terminal/editor/diff/resume/memo/detach)은
+  //    활성 표면(secondary) — 그 표면 dock에 패널이 열려 보인다.
+  // 어느 쪽도 렌더되지 않는 표면으로 라우팅되지 않는다(무음 유실 0).
   it("[G2] 슬롯 재분류 — picker-UI는 항상 primary, panel-destination은 활성 표면", () => {
     useAppStore.setState({ projects: [{ path: "/a", name: "a", project_types: [], tree_state: { expanded: [] } }, { path: "/b", name: "b", project_types: [], tree_state: { expanded: [] } }], activeProject: "/a" });
     const s = useAppStore.getState();
