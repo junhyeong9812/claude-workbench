@@ -199,6 +199,12 @@ export function StudyTree({
         onFocus={() => {
           if (!cursor && visible.length > 0) setCursor(visible[0].entry.path);
         }}
+        onContextMenu={(e) => {
+          // 빈 영역 우클릭 = 트리 루트 대상 (파일 탭 트리 선례). 폴더가 텅 비어
+          // 있을 때 첫 파일을 만들 진입점이 여기밖에 없다.
+          e.preventDefault();
+          crud.openMenu(null, e.clientX, e.clientY);
+        }}
       >
         {visible.map(({ entry, depth, ignored }): ReactNode => (
           <div
@@ -211,6 +217,7 @@ export function StudyTree({
             onClick={() => onRowClick(entry)}
             onContextMenu={(e) => {
               e.preventDefault();
+              e.stopPropagation(); // 행 우클릭이 컨테이너(루트 대상)로 번지지 않게
               setCursor(entry.path);
               crud.openMenu(entry, e.clientX, e.clientY);
             }}
