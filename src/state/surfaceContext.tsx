@@ -88,3 +88,22 @@ export function activeSurfaceId(): SurfaceId {
 export function setActiveSurfaceSeam(id: SurfaceId): void {
   activeSurfaceHolder = id;
 }
+
+/**
+ * 표면 라우팅 **소비 판정** — fault-tolerant 소비자(리뷰 재슬라이스, 4라운드
+ * 정지 규칙). 요청은 자기 타깃 표면이 소비하되, **primary가 "비가시 타깃" 요청의
+ * catch-all 소비자**다. primary는 항상 마운트/가시이므로 어떤 전이 인터리빙(발행
+ * 후 소비 전 타깃 숨김)에도 요청이 **구조적으로 유실 불가**해진다.
+ *
+ * @param target 요청의 targetSurfaceId(발행 시점 활성 표면).
+ * @param mine 이 소비자(MainArea)의 표면 id.
+ * @param targetVisible 그 target 표면이 지금 실제로 렌더/가시인가(primary=항상 true·
+ *   secondary=store `secondaryIsVisible`). 호출부가 계산해 넘긴다.
+ *
+ * **exactly-once**: target 가시 → 그 표면이 매칭 소비(primary fallback 조건 false).
+ * target 비가시 → 그 표면은 마운트 안 돼 소비 불가이고 primary만 소비. 두 경우 모두
+ * 정확히 1회(object 슬롯은 consume 시 null, counter 슬롯은 nonce dedup이 최종 보증).
+ */
+export function consumesRequest(target: SurfaceId, mine: SurfaceId, targetVisible: boolean): boolean {
+  return target === mine || (mine === "primary" && !targetVisible);
+}

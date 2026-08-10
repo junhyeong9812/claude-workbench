@@ -271,7 +271,7 @@ function persistSurfaceTree(tree: SurfaceTree) {
  * (setProjectMode)뿐 아니라 **이미 dev인 프로젝트로 primary가 바뀌는**
  * (applyRemoteActive·closeProject 재인덱스) 경로까지 균일하게 정규화한다 — 숨은
  * dock으로의 무음 유실 갭이 자동으로 닫힌다. */
-function secondaryIsVisible(s: {
+export function secondaryIsVisible(s: {
   surfaceTree: SurfaceTree;
   activeProject: string | null;
   projects: Project[];

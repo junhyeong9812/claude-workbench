@@ -16,8 +16,10 @@ vi.mock("@tauri-apps/api/window", () => ({
   getCurrentWindow: () => ({ label: "main", listen: vi.fn(() => Promise.resolve(() => {})) }),
 }));
 
-import { useAppStore } from "./store";
-import { activeSurfaceId } from "./surfaceContext";
+import { useAppStore, secondaryIsVisible } from "./store";
+import { activeSurfaceId, consumesRequest } from "./surfaceContext";
+
+const proj = (p: string) => ({ path: p, name: p, project_types: [], tree_state: { expanded: [] } });
 
 describe("활성 표면 + 요청버스 seam 라우팅 (P4')", () => {
   beforeEach(() => {
@@ -210,5 +212,65 @@ describe("활성 표면 + 요청버스 seam 라우팅 (P4')", () => {
     useAppStore.getState().closeProject("/a");
     expect(useAppStore.getState().activeProject).toBe("/c"); // 재인덱스 → dev
     expect(useAppStore.getState().activeSurfaceId).toBe("primary");
+  });
+
+  // ── 재슬라이스: fault-tolerant 소비(primary catch-all) — 라우팅 무손실 구조화 ──
+  it("[RS pure] consumesRequest exactly-once — 가시/비가시 각 정확히 1 소비자", () => {
+    // target=secondary 가시: secondary만 소비.
+    expect(consumesRequest("secondary", "secondary", true)).toBe(true);
+    expect(consumesRequest("secondary", "primary", true)).toBe(false);
+    // target=secondary 비가시: primary catch-all만(secondary는 마운트 안 됨).
+    expect(consumesRequest("secondary", "primary", false)).toBe(true);
+    // target=primary: primary만(secondary는 절대 catch 안 함 → 이중 없음).
+    expect(consumesRequest("primary", "primary", true)).toBe(true);
+    expect(consumesRequest("primary", "secondary", true)).toBe(false);
+    expect(consumesRequest("primary", "secondary", false)).toBe(false);
+  });
+
+  it("[RS interleave] 발행 후 소비 전 secondary 숨김 → primary catch-all(전이별·무손실)", () => {
+    const setup = (modes: Record<string, "integrated" | "dev"> = {}) => {
+      useAppStore.setState({ projects: [proj("/a"), proj("/c"), proj("/b")], activeProject: "/a", projectModes: modes });
+      const s = useAppStore.getState();
+      s.setDualProject("/b");
+      s.setActiveSurface("secondary");
+      expect(useAppStore.getState().activeSurfaceId).toBe("secondary");
+      expect(secondaryIsVisible(useAppStore.getState())).toBe(true);
+      // 가시: secondary가 매칭 소비, primary는 skip(이중 아님).
+      expect(consumesRequest("secondary", "secondary", true)).toBe(true);
+      expect(consumesRequest("secondary", "primary", true)).toBe(false);
+    };
+    const expectCatchAll = () => {
+      const vis = secondaryIsVisible(useAppStore.getState());
+      expect(vis).toBe(false); // in-flight 요청의 타깃(secondary)이 이제 비가시
+      // primary가 catch-all로 소비(유실 0). secondary는 마운트 안 돼 소비 불가.
+      expect(consumesRequest("secondary", "primary", vis)).toBe(true);
+    };
+    // ① 우측 분할 닫힘
+    setup();
+    useAppStore.getState().setDualProject(null);
+    expectCatchAll();
+    // ② 크로스윈도우로 좌측이 이미-dev인 /c로
+    setup({ "/c": "dev" });
+    useAppStore.getState().applyRemoteActive("/c");
+    expectCatchAll();
+    // ③ close 재인덱스가 dev(/c)를 primary로
+    setup({ "/c": "dev" });
+    useAppStore.getState().closeProject("/a");
+    expectCatchAll();
+    // ④ 주 표면 dev 진입(오버레이가 dual 가림)
+    setup();
+    useAppStore.getState().setProjectMode("/a", "dev");
+    expectCatchAll();
+  });
+
+  it("[RS single] 단일 표면(우측 없음) 회귀 0 — target=primary, primary 소비·secondary catch 없음", () => {
+    useAppStore.setState({ projects: [proj("/a")], activeProject: "/a", projectModes: {} });
+    useAppStore.getState().setDualProject(null);
+    expect(useAppStore.getState().activeSurfaceId).toBe("primary");
+    expect(secondaryIsVisible(useAppStore.getState())).toBe(false);
+    // 발행 target은 항상 primary(활성=primary). primary가 소비.
+    expect(consumesRequest("primary", "primary", true)).toBe(true);
+    // secondary는 존재하지 않고, 존재해도 primary-target을 catch 안 함.
+    expect(consumesRequest("primary", "secondary", false)).toBe(false);
   });
 });
