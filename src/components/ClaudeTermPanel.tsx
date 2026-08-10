@@ -18,6 +18,7 @@ import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import "@xterm/xterm/css/xterm.css";
 import { useAppStore } from "../state/store";
 import { xtermTheme } from "./xtermTheme";
+import { TermSettingsButton } from "./TermSettingsButton";
 import { recallArea, rememberArea, type PanelArea } from "../state/panelFocus";
 import { openArgs, paramsAfterOpen } from "../state/claudeTermParams";
 import { getCurrentWindow } from "@tauri-apps/api/window";
@@ -2136,6 +2137,11 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
                 {archiveBusy ? "아카이브 중…" : "아카이브"}
               </button>
             )}
+            {/* 이 패널도 xterm을 직접 띄우고 termColors를 그대로 적용한다
+                (TerminalPanel과 같은 xtermTheme 구독). 색상 설정이 툴바에서
+                터미널 탭 안으로 옮겨간 이상 여기서도 닿아야 한다 — 안 그러면
+                claude 탭만 쓰는 사용자에게는 진입점이 사라진다. */}
+            <TermSettingsButton className="claudeterm-head-btn" />
           </span>
         </div>
   );
