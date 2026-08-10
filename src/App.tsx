@@ -1047,7 +1047,9 @@ function AppMain() {
                             표시 중인 프로젝트(visibleDual)를 주입한다 — MainArea가
                             받는 project prop과 동일 값(반사만, 소비 변경 0). */}
                         <SurfaceProvider surfaceId="secondary" project={visibleDual}>
-                          <MainArea project={visibleDual} secondary />
+                          {/* project는 이제 SurfaceProvider가 주입 — MainArea는
+                              useSurfaceProject()로 읽는다(P1). */}
+                          <MainArea secondary />
                         </SurfaceProvider>
                       </div>
                     </div>

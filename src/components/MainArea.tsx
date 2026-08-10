@@ -9,6 +9,7 @@ import { resolveCloseRequest } from "./sessionClose";
 import { CloseSessionModal } from "./CloseSessionModal";
 import { emit, listen } from "@tauri-apps/api/event";
 import { useAppStore } from "../state/store";
+import { useSurfaceProject } from "../state/surfaceContext";
 import { useClaudeUi } from "../state/claudeUi";
 import { recallArea, forgetArea, type PanelArea } from "../state/panelFocus";
 import { isTransferring } from "../state/panelTransfer";
@@ -81,16 +82,18 @@ function focusActivePanelContent(area?: PanelArea) {
  * changes are persisted back to the store via `onDidLayoutChange`.
  */
 export function MainArea({
-  project,
   secondary = false,
-}: { project?: string; secondary?: boolean } = {}) {
+}: { secondary?: boolean } = {}) {
   const activeProject = useAppStore((s) => s.activeProject);
-  // 이 surface가 소유한 프로젝트: 주(primary)는 activeProject, 부(secondary)는
-  // prop 고정(project-dual-surface). 부 surface는 **수동적 dock** — 전역 요청
-  // 버스·window 리스너·창 수명 훅·메뉴/모달을 일절 소비/등록하지 않는다
-  // (spec §2 단일 소비자 불변식). 아래 각 지점이 isPrimary로 게이트된다.
+  // 이 surface가 소유한 프로젝트: 표면 컨텍스트(P1)에서 읽는다 — 프로바이더가
+  // 주(primary)=activeProject·부(secondary)=우측 분할 프로젝트를 주입하므로 값은
+  // 종전(secondary ? project : activeProject)과 동일(무동작). 부 surface는
+  // **수동적 dock** — 전역 요청 버스·window 리스너·창 수명 훅·메뉴/모달을 일절
+  // 소비/등록하지 않는다(spec §2 단일 소비자 불변식). 아래 각 지점이 isPrimary로
+  // 게이트된다. activeProject는 요청 버스 라우팅·크로스-표면 조정(레이아웃 소실
+  // 방어 등)에 그대로 남는다(그건 전역 관심사 — P2/P3 몫).
   const isPrimary = !secondary;
-  const surfaceProject = secondary ? (project ?? null) : activeProject;
+  const surfaceProject = useSurfaceProject();
   const surfaceKey = isPrimary ? "primary" : "secondary";
   const theme = useAppStore((s) => s.theme);
   const projects = useAppStore((s) => s.projects);
@@ -128,7 +131,9 @@ export function MainArea({
   // 부른다.
   const picker = useSessionPicker({
     isPrimary,
-    activeProject,
+    // 피커는 표면-로컬 프로젝트로 (P1) — 주 표면에서 surfaceProject===activeProject라
+    // 무동작이고, 부 표면에서는 피커가 비활성(isPrimary 게이트)이라 무해.
+    activeProject: surfaceProject,
     getApi: () => apiRef.current,
   });
   const setPicker = picker.setPicker;
@@ -835,7 +840,7 @@ export function MainArea({
           />
         )}
         {picker.sessions !== null && (
-          <SessionPicker ctl={picker} addPanel={addPanel} activeProject={activeProject} />
+          <SessionPicker ctl={picker} addPanel={addPanel} activeProject={surfaceProject} />
         )}
       </div>
       )}
