@@ -114,6 +114,24 @@ describe("메모 툴바 — 저장하기 · 정리", () => {
     expect(has("정리"), "정리는 루트와 무관하다").toBe(true);
   });
 
+  it("메모를 읽지 못했으면 툴바를 내지 않는다 — 빈 본문이 파일을 덮는 경로 차단", async () => {
+    await act(async () => {
+      root.render(
+        <MemoEditor
+          storeKey="/home/u/repo"
+          read={async () => {
+            throw new Error("permission denied");
+          }}
+          write={write}
+          projectRoot={ROOT}
+        />,
+      );
+    });
+    expect(host.querySelector(".cm-content"), "에디터가 없다").toBeNull();
+    expect(has("저장하기"), "저장할 본문이 없는데 저장 버튼이 있으면 안 된다").toBe(false);
+    expect(has("정리")).toBe(false);
+  });
+
   it("기본 제안 경로로 프로젝트 안에 저장한다", async () => {
     invoke.mockResolvedValue({ status: "saved", path: `${ROOT}/docs/x.md` });
     await mount();

@@ -148,6 +148,12 @@ export function MemoEditor({
   // 자동 저장 경로에는 손대지 않는다: 여기서 본문을 바꿀 때도 CodeMirror
   // 트랜잭션으로 넣어 **평범한 편집과 같은 길**(updateListener → saver.schedule)을
   // 타게 한다. 툴바가 따로 디스크에 쓰면 유실 방어선이 둘로 갈린다.
+  //
+  // 본문을 실제로 읽어 에디터가 선 뒤에만 툴바를 낸다. 읽기 전(또는 읽기 실패로
+  // 에디터가 없을 때)의 "현재 본문"은 빈 문자열이라, 그때 [저장하기]가 눌리면
+  // **빈 파일이 멀쩡한 파일을 덮는다** — 자동 저장이 빈 에디터를 안 만드는 이유와
+  // 같은 실패 모드다(리뷰 P2-4).
+  const [loaded, setLoaded] = useState(false);
   const [saveOpen, setSaveOpen] = useState(false);
   const [savePath, setSavePath] = useState("");
   const [saveBusy, setSaveBusy] = useState(false);
@@ -242,6 +248,7 @@ export function MemoEditor({
   // 대상이 바뀌면 툴바 상태도 그 메모의 것이 아니다 — 되돌리기 버퍼까지 버린다
   // (다른 메모의 본문을 이 메모에 붓는 사고 방지).
   useEffect(() => {
+    setLoaded(false);
     setSaveOpen(false);
     setSaveErr(null);
     setOverwriteRel(null);
@@ -358,6 +365,8 @@ export function MemoEditor({
           }),
         });
         viewRef.current.focus();
+        // 본문이 손에 들어온 뒤에야 툴바를 낸다 (아래 `loaded` 참조).
+        setLoaded(true);
         if (recovered) {
           // 되살린 편집은 아직 디스크에 없다 — 곧바로 저장 큐에 올린다.
           saver.schedule(text);
@@ -399,7 +408,7 @@ export function MemoEditor({
         {subtitle && <span className="memo-path">{subtitle}</span>}
         {readOnly && readOnlyNote && <span className="memo-locked">{readOnlyNote}</span>}
         <span className="memo-status">{status}</span>
-        {projectRoot && (
+        {loaded && projectRoot && (
           <button
             className="memo-tool"
             title="메모를 프로젝트 안의 파일로 저장합니다"
@@ -414,17 +423,19 @@ export function MemoEditor({
             저장하기
           </button>
         )}
-        <button
-          className="memo-tool"
-          title="AI가 메모의 구조·중복만 정리합니다 (내용은 그대로 · 적용 전에 미리 봅니다)"
-          onClick={() => {
-            setTidyErr(null);
-            setNote(null);
-            setTidyOpen((v) => !v);
-          }}
-        >
-          정리
-        </button>
+        {loaded && (
+          <button
+            className="memo-tool"
+            title="AI가 메모의 구조·중복만 정리합니다 (내용은 그대로 · 적용 전에 미리 봅니다)"
+            onClick={() => {
+              setTidyErr(null);
+              setNote(null);
+              setTidyOpen((v) => !v);
+            }}
+          >
+            정리
+          </button>
+        )}
         {undoText !== null && (
           <button
             className="memo-tool"
