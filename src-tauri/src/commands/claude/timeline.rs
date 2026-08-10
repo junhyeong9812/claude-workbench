@@ -265,23 +265,6 @@ pub(super) fn emit_gate(
     }
 }
 
-/// 세션 종료 시 미발화 pending을 마지막으로 flush할지 — 순수 (AA1 — 듀얼 리뷰
-/// codex). `existed` = **이 폴 스레드가** 런타임에서 세션을 제거했는가 =
-/// **자연 종료**(claude가 스스로 종료). 수동 close(claude_close·detach-close)는
-/// 런타임이 락 안에서 by_id를 먼저 지운 뒤 stop을 세우므로, 폴 스레드가 뒤늦게
-/// remove_session을 부르면 이미 없어 `existed=false`가 된다. 즉 `existed`가
-/// 그 자체로 자연/수동을 가르는 신호다(새 플래그·메모리 순서 논쟁 불필요).
-///
-/// 자연 종료면서 직전 emit 후 EMIT_MIN_INTERVAL(400ms) 창 안에 최종 답변을
-/// poll하고 곧장 종료되면 게이트가 발화하지 못한 채(`pending=true`) 루프가
-/// 빠져 라이브 화면이 최종 답변을 못 받고 낡는다(스냅샷은 있으나 라이브 회귀).
-/// 그 경우만 마지막 상태를 한 번 더 emit한다. 수동 close는 화면이 곧 사라지므로
-/// flush하지 않는다 — 늦은 emit이 `claude-session-closed` 뒤에 도착해 종료 표시를
-/// 되돌리는 회귀(useClaudeTimeline `setEnded(false)`)도 이로써 막는다.
-pub(super) fn should_flush_on_end(existed: bool, emit_pending: bool) -> bool {
-    existed && emit_pending
-}
-
 /// payload 조립 + `claude-timeline` emit — 폴 루프의 정상 틱과 종료 flush(AA1)가
 /// **같은 경로**를 쓰도록 추출. items·turns·answers 등을 t에서 새로 복사하고,
 /// 서브에이전트 프레임을 발견 순서로 조립해(활성=본문 인라인, 완료=메타만) 보낸다.
@@ -757,14 +740,17 @@ pub(super) fn run_timeline_poll(
             existed = rt.remove_session(id).is_some(); // T7 (전이표 순수 메서드)
         }
     }
-    // AA1(듀얼 리뷰 codex): 자연 종료면서 미발화 pending이 남았으면 마지막
-    // 상태를 한 번 더 emit한다 — 직전 emit 후 400ms 창 안에 최종 답변을 poll하고
-    // claude가 종료된 경우 라이브 화면이 그 답변을 못 받고 낡던 것을 막는다.
-    // `claude-session-closed` **앞**에서 emit해 순서를 보장한다(closed가 나중에
-    // 도착해 최종 상태 위에 종료 표시를 얹는다). active_sig는 빈 맵으로 —
-    // 남아 있는 활성 프레임은 본문을 인라인으로 싣고, 완료 프레임은 DoneSub.sig를
-    // 쓰므로 서명 조회가 필요 없다. 마지막 poll로 종료 직전 바이트까지 반영한다.
-    if should_flush_on_end(existed, emit_pending) {
+    // AA1/BB1(듀얼 리뷰 codex): **자연 종료(existed=true)면 emit_pending과 무관하게**
+    // 마지막 poll 1회 후 최종 상태를 emit한다 — 직전 emit 후 400ms 창 안의 미발화
+    // 변화든, 종료 직전 아직 poll하지 못한 바이트든 모두 최종 화면에 반영된다
+    // (게이트가 도입한 라이브 회귀를 근본에서 닫는 단순 규칙: "자연 종료 = 최종
+    // poll+emit"). 정상 순서로는 이 timeline이 아래 `claude-session-closed`보다
+    // 먼저 도착하지만, **순서가 뒤집혀도 프론트가 종결 우선(idempotent)이라**
+    // 이미 닫힌 세션이 다시 열리지 않는다(BB2 — useClaudeTimeline). 즉 순서 안전은
+    // 프론트가 흡수하고 여기선 "최종 상태를 반드시 한 번 보낸다"만 책임진다.
+    // 재emit은 idempotent replace라 무변화여도 무해. active_sig는 빈 맵 — 남은
+    // 활성 프레임은 본문 인라인, 완료 프레임은 DoneSub.sig를 쓴다.
+    if existed {
         if let Some(t) = tail.as_mut() {
             let _ = t.poll();
             assemble_and_emit(
@@ -779,9 +765,7 @@ pub(super) fn run_timeline_poll(
                 &mut mention_memo,
             );
         }
-    }
-    // Notify any mirror windows that the session ended (review P6-impl #2).
-    if existed {
+        // Notify any mirror windows that the session ended (review P6-impl #2).
         let _ = app.emit("claude-session-closed", id);
     }
 }
@@ -982,23 +966,6 @@ mod tests {
         // 마지막 변화(틱 9) 이후의 전송이 존재 = 최종 상태 착지.
         assert!(last_emitted_tick.unwrap() >= 9, "마지막 변화 뒤 전송이 없으면 화면이 낡는다");
         assert!(!pending, "보류가 남은 채 끝나면 안 된다");
-    }
-
-    /// AA1 — 종료 flush 판정. 직전 emit 후 <400ms에 최종 답변 poll 뒤 종료되면
-    /// pending이 남고, **자연 종료(existed=true)** 일 때만 flush한다.
-    #[test]
-    fn should_flush_only_on_natural_end_with_pending() {
-        const MIN: Duration = Duration::from_millis(400);
-        // 시나리오: t=0 emit → t=+200ms 변화(게이트 미달, pending 유지) → 종료.
-        let (do_emit, pending) = emit_gate(true, false, Duration::from_millis(200), MIN);
-        assert!(!do_emit && pending, "400ms 창 안의 변화는 미발화 보류로 남는다");
-        // 자연 종료: 이 폴 스레드가 세션을 제거(existed=true) → 마지막 상태 flush.
-        assert!(should_flush_on_end(true, pending), "자연 종료면 최종 답변을 마지막에 보낸다");
-        // 수동 close: 런타임이 먼저 제거(existed=false) → flush 안 함(화면이 사라짐,
-        // 늦은 emit이 closed 뒤 종료 표시를 되돌리는 회귀도 차단).
-        assert!(!should_flush_on_end(false, pending));
-        // 이미 최종 상태를 emit했으면(pending=false) 자연 종료여도 flush 불필요.
-        assert!(!should_flush_on_end(true, false));
     }
 
     // P0 B1(재수정) — 메모 스캔이 naive와 완전 동치인지 + revision bump 반영.
