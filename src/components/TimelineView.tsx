@@ -12,6 +12,7 @@ import type { TimelineItem } from "../types";
 // 기존 소비처 호환을 위해 재수출.
 export type { TimelineItem } from "../types";
 import { groupItemsByTurn, sliceRecentTurns } from "./timelineIndex";
+import type { SubagentView } from "../hooks/useClaudeTimeline";
 import { useFileText } from "../hooks/useFileText";
 
 /** P1: 한 번에 렌더하는 최근 턴 수 (더 보기로 확장). */
@@ -76,6 +77,7 @@ export function TimelineView({
   answers,
   dates,
   subagents,
+  onExpandAgent,
   selectedId,
   selectedTurn,
   selectedScope,
@@ -89,9 +91,12 @@ export function TimelineView({
   turns: Map<number, string>;
   answers: Map<number, string>;
   dates: Map<number, string>;
-  /** [agentId, parentToolCallId|null, turn, items] per subagent (B1). Nested
-   * under its parent Agent item (recursive tree); orphans nest under their turn. */
-  subagents?: [string, string | null, number, TimelineItem[]][];
+  /** 서브에이전트 프레임(B1). 부모 Agent 아이템 밑에 재귀 중첩되고, 부모를 모르면
+   * 자기 턴 밑에 붙는다. 완료 에이전트는 본문이 payload에 없다(`loaded: false`) —
+   * 펼칠 때 `onExpandAgent`가 조회한다. */
+  subagents?: SubagentView[];
+  /** 완료 서브에이전트 본문 요청(펼침·재시도). 없으면 완료 그룹은 접힌 채 남는다. */
+  onExpandAgent?: (agentId: string, force?: boolean) => void;
   selectedId: string | null;
   /** The turn whose question/answer is selected (highlights its head), or null.
    * Distinct from `selectedId` (a tool item) — they are mutually exclusive. */
@@ -114,15 +119,17 @@ export function TimelineView({
    * Used by ↑/↓ landing on a question head and by clicking the head/answer. */
   onSelectTurn?: (turn: number) => void;
 }) {
-  // Collapsed subagent groups (B1), keyed by agentId.
-  const [collapsedAgents, setCollapsedAgents] = useState<Set<string>>(new Set());
-  const toggleAgent = (key: string) =>
-    setCollapsedAgents((prev) => {
-      const next = new Set(prev);
-      if (next.has(key)) next.delete(key);
-      else next.add(key);
-      return next;
-    });
+  // Subagent group folds (B1), keyed by agentId. 값이 없으면 기본은 "본문이
+  // 있으면 펼침, 없으면 접힘" — 완료 에이전트는 본문이 lazy라, 기본 펼침으로
+  // 두면 세션의 모든 완료 에이전트를 동시에 조회하게 되어 lazy의 의미가 없다.
+  const [agentFolds, setAgentFolds] = useState<Map<string, boolean>>(new Map());
+  const agentCollapsed = (a: SubagentView) => agentFolds.get(a.id) ?? !a.loaded;
+  const toggleAgent = (a: SubagentView) => {
+    const next = !agentCollapsed(a); // 새 collapsed 값
+    setAgentFolds((prev) => new Map(prev).set(a.id, next));
+    // 펼치는 순간 본문을 요청한다(이미 있으면 no-op).
+    if (!next && !a.loaded) onExpandAgent?.(a.id);
+  };
 
   // Collapsed turns: fold a whole Q&A (question + answer + its tool items) to its
   // head. The head stays as a ↑/↓ stop (unlike a collapsed *date*, which hides its
@@ -132,8 +139,8 @@ export function TimelineView({
   // group). Used to keep keyboard selection valid when a turn is collapsed.
   const itemTurn = (id: string): number | null => {
     for (const it of items) if (it.tool_call_id === id) return it.turn;
-    for (const [, , turn, its] of subagents ?? [])
-      for (const it of its) if (it.tool_call_id === id) return turn;
+    for (const a of subagents ?? [])
+      for (const it of a.items) if (it.tool_call_id === id) return a.turn;
     return null;
   };
   const toggleTurn = (turn: number) => {
@@ -151,17 +158,17 @@ export function TimelineView({
 
   // Subagents indexed by parent tool-call id (for nesting) and, for those with
   // no known parent, by turn (fallback).
-  const agentsByParent = new Map<string, [string, TimelineItem[]][]>();
-  const orphanAgentsByTurn = new Map<number, [string, TimelineItem[]][]>();
-  for (const [aid, parent, turn, its] of subagents ?? []) {
-    if (parent) {
-      const arr = agentsByParent.get(parent) ?? [];
-      arr.push([aid, its]);
-      agentsByParent.set(parent, arr);
+  const agentsByParent = new Map<string, SubagentView[]>();
+  const orphanAgentsByTurn = new Map<number, SubagentView[]>();
+  for (const a of subagents ?? []) {
+    if (a.parent) {
+      const arr = agentsByParent.get(a.parent) ?? [];
+      arr.push(a);
+      agentsByParent.set(a.parent, arr);
     } else {
-      const arr = orphanAgentsByTurn.get(turn) ?? [];
-      arr.push([aid, its]);
-      orphanAgentsByTurn.set(turn, arr);
+      const arr = orphanAgentsByTurn.get(a.turn) ?? [];
+      arr.push(a);
+      orphanAgentsByTurn.set(a.turn, arr);
     }
   }
 
@@ -203,38 +210,55 @@ export function TimelineView({
           {AGENT_BADGE[it.agent_status] ?? ""}
         </span>
       </div>
-      {(agentsByParent.get(it.tool_call_id) ?? []).map(([aid, its]) => renderAgent(aid, its))}
+      {(agentsByParent.get(it.tool_call_id) ?? []).map((a) => renderAgent(a))}
     </Fragment>
     );
   };
 
   // A collapsible subagent group; its items render recursively (agent-in-agent).
-  const renderAgent = (aid: string, its: TimelineItem[]): React.ReactNode => {
-    if (renderSeenAgent.has(aid)) return null;
-    renderSeenAgent.add(aid);
-    const collapsed = collapsedAgents.has(aid);
+  const renderAgent = (a: SubagentView): React.ReactNode => {
+    if (renderSeenAgent.has(a.id)) return null;
+    renderSeenAgent.add(a.id);
+    const collapsed = agentCollapsed(a);
     // Progress over this group's *direct* items only (not nested agents) — keeps
     // the count free of the cycle/dup concerns the recursive render guards against.
-    const total = its.length;
-    const done = its.filter((it) => it.agent_status === "completed").length;
+    // 카운트는 **메타**에서 온다 — 본문이 lazy라 아직 없어도 진행도는 같은 값이다.
+    const { total, completed: done } = a;
     const pct = total > 0 ? Math.round((done / total) * 100) : 0;
     return (
-      <div key={aid} className="timeline-agent">
+      <div key={a.id} className="timeline-agent">
         <div className="timeline-agent-rail" title={`${done}/${total} 완료`}>
           <div className="timeline-agent-rail-fill" style={{ width: `${pct}%` }} />
         </div>
         <div
           className="timeline-agent-head"
-          onClick={() => toggleAgent(aid)}
+          onClick={() => toggleAgent(a)}
           title={collapsed ? "펼치기" : "접기"}
         >
           <span className="timeline-date-caret">{collapsed ? "▸" : "▾"}</span>
-          서브에이전트 {aid.slice(0, 8)}
+          서브에이전트 {a.id.slice(0, 8)}
           <span className="timeline-agent-count">
             {done}/{total}
           </span>
         </div>
-        {!collapsed && its.map((it) => renderItem(it, true))}
+        {!collapsed && a.loaded && a.items.map((it) => renderItem(it, true))}
+        {/* 본문 lazy — 도착 전/실패를 명시한다(빈 그룹으로 보이면 안 된다).
+            조회 중이 아닌 미도착 상태(실패, 또는 조회 중 에이전트가 재활성해
+            요청이 무효가 된 경우)는 **클릭 가능한 안내**로 둔다 — "불러오는 중"인
+            척하며 영영 오지 않는 화면을 만들지 않는다. */}
+        {!collapsed && !a.loaded && (
+          <div
+            className="timeline-agent-lazy timeline-detail-empty"
+            onClick={a.loading ? undefined : () => onExpandAgent?.(a.id, true)}
+            title={a.loading ? undefined : "본문 불러오기"}
+          >
+            {a.loading
+              ? "불러오는 중…"
+              : a.failed
+                ? "불러오지 못했습니다 — 클릭해 다시 시도"
+                : "본문 불러오기 (클릭)"}
+          </div>
+        )}
       </div>
     );
   };
@@ -307,13 +331,14 @@ export function TimelineView({
     if (seenItem.has(it.tool_call_id)) return;
     seenItem.add(it.tool_call_id);
     navEntries.push({ kind: "item", item: it });
-    for (const [aid, its] of agentsByParent.get(it.tool_call_id) ?? []) pushAgentItems(aid, its);
+    for (const a of agentsByParent.get(it.tool_call_id) ?? []) pushAgentItems(a);
   };
-  function pushAgentItems(aid: string, its: TimelineItem[]) {
-    if (collapsedAgents.has(aid)) return; // collapsed group hides its rows
-    if (seenAgent.has(aid)) return; // cycle guard
-    seenAgent.add(aid);
-    for (const it of its) pushItemTree(it);
+  function pushAgentItems(a: SubagentView) {
+    if (agentCollapsed(a)) return; // collapsed group hides its rows
+    if (seenAgent.has(a.id)) return; // cycle guard
+    seenAgent.add(a.id);
+    // 본문 미도착 그룹은 화면에 행이 없다 — nav도 같은 목록을 쓴다(화면 일치).
+    for (const it of a.items) pushItemTree(it);
   }
   for (const turn of visibleTurnNos) {
     if (collapsedDates.has(dates.get(turn) ?? "")) continue;
@@ -322,7 +347,7 @@ export function TimelineView({
     for (const it of itemsByTurn.get(turn) ?? []) {
       pushItemTree(it);
     }
-    for (const [aid, its] of orphanAgentsByTurn.get(turn) ?? []) pushAgentItems(aid, its);
+    for (const a of orphanAgentsByTurn.get(turn) ?? []) pushAgentItems(a);
   }
 
   const listRef = useRef<HTMLDivElement>(null);
@@ -541,7 +566,7 @@ export function TimelineView({
             )}
             {!tCollapsed && turnItems.map((it) => renderItem(it, false))}
             {!tCollapsed &&
-              (orphanAgentsByTurn.get(turn) ?? []).map(([aid, its]) => renderAgent(aid, its))}
+              (orphanAgentsByTurn.get(turn) ?? []).map((a) => renderAgent(a))}
           </div>
               );
             })()}

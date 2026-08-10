@@ -17,7 +17,7 @@
  * 정확한 `seenNow`를 아는 소유 패널(ClaudeTermPanel) 몫이라, 그 훅 인자(onApply)로만
  * 주입된다.
  */
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import type { TimelineItem } from "../types";
@@ -44,9 +44,129 @@ export interface ClaudeTimelineEvent {
   /** Most recent assistant message's usage = current context occupancy (gauge
    * numerator), distinct from `tokens` which sums a turn's tool round-trips. */
   last_usage?: TokenUsage | null;
-  /** [agentId, parentToolCallId|null, turn, items] per subagent — nested under
-   * its spawning Agent item (parent), or its turn when there's no known parent. */
-  subagents: [string, string | null, number, TimelineItem[]][];
+  /** 서브에이전트 프레임(발견 순서) — 완료 에이전트는 본문 없이 메타만 온다. */
+  subagents: SubagentFrame[];
+}
+
+/**
+ * payload의 서브에이전트 프레임 (백엔드 `SubagentFrame`과 1:1).
+ *
+ * 메모리 1단계(2026-08-10): 완료 에이전트의 items를 매 emit마다 다시 싣던 것이
+ * payload 24.8MB 중 19.2MB(77%)였다. 이제 **완료 프레임은 `items: null`**로 오고,
+ * 본문은 사용자가 그룹을 펼칠 때 `claude_subagent_items`로 조회한다. 헤더가
+ * 보여주던 진행도·상태는 메타(`total`/`completed`/`last_status`)로 그대로 나온다.
+ */
+export interface SubagentFrame {
+  id: string;
+  /** 이 에이전트를 스폰한 Agent 툴콜(트리 부모). null이면 `turn` 밑에 붙는다. */
+  parent: string | null;
+  turn: number;
+  /** 아이템 수(진행도 분모) — 본문이 없어도 헤더는 같은 값을 보인다. */
+  total: number;
+  /** completed 아이템 수(진행도 분자). */
+  completed: number;
+  /** 마지막 아이템 상태 — 본문 없이도 "진행 중" 표시가 동일하다. */
+  last_status: string | null;
+  /** 본문 캐시 무효화 키(revision 합) — 재활성→재완료 시 값이 달라진다. */
+  rev: number;
+  /** 활성 프레임의 본문. 완료 프레임은 null = "펼칠 때 조회하라". */
+  items: TimelineItem[] | null;
+}
+
+/** lazy 본문 캐시의 한 칸. `rev`는 그 본문이 어느 프레임 버전의 것인지 —
+ * 프레임의 rev가 달라지면(재활성 후 재완료) stale이므로 버린다. */
+export type LazyAgentEntry =
+  | { state: "loading"; rev: number }
+  | { state: "ready"; rev: number; items: TimelineItem[] }
+  | { state: "error"; rev: number };
+
+/** 뷰가 실제로 그리는 서브에이전트 — 프레임(메타) + 본문 도착 상태. */
+export interface SubagentView {
+  id: string;
+  parent: string | null;
+  turn: number;
+  total: number;
+  completed: number;
+  lastStatus: string | null;
+  /** 본문(미도착이면 빈 배열 — `loaded`로 구분한다). */
+  items: TimelineItem[];
+  /** 본문 확보됨(활성 프레임은 항상 true). */
+  loaded: boolean;
+  /** lazy 조회 진행 중 — 뷰는 "불러오는 중"을 보인다. */
+  loading: boolean;
+  /** lazy 조회 실패 — 뷰는 재시도를 제공한다(무음 금지). */
+  failed: boolean;
+}
+
+/** 프레임 + lazy 캐시 → 뷰 모델 (순수). 활성 프레임은 payload 본문을 그대로
+ * 쓰고, 완료 프레임은 **rev가 일치하는** 캐시만 인정한다 — rev가 어긋난
+ * 캐시(재활성 후 재완료)는 없는 것으로 친다(낡은 본문 표시 금지). */
+export function mergeSubagents(
+  frames: readonly SubagentFrame[],
+  cache: ReadonlyMap<string, LazyAgentEntry>,
+): SubagentView[] {
+  return frames.map((f) => {
+    const meta = {
+      id: f.id,
+      parent: f.parent,
+      turn: f.turn,
+      total: f.total,
+      completed: f.completed,
+      lastStatus: f.last_status ?? null,
+    };
+    if (f.items != null) {
+      return { ...meta, items: f.items, loaded: true, loading: false, failed: false };
+    }
+    const e = cache.get(f.id);
+    const fresh = e && e.rev === f.rev ? e : undefined;
+    return {
+      ...meta,
+      items: fresh?.state === "ready" ? fresh.items : [],
+      loaded: fresh?.state === "ready",
+      loading: fresh?.state === "loading",
+      failed: fresh?.state === "error",
+    };
+  });
+}
+
+/**
+ * 인라인으로 받은 본문을 lazy 캐시에 넣는다 (순수) — 활성 프레임 전용.
+ *
+ * 왜 필요한가: 서브에이전트는 60초 무변화로 **완료 전이**한다. 그 순간 payload는
+ * 그 프레임을 메타만으로 바꾸므로, 방금까지 보고 있던 그룹의 행들과 (그 안의
+ * 아이템을 선택 중이었다면) 상세 뷰어가 조용히 비어 버린다. 활성일 때 이미
+ * 받아 둔 본문을 캐시에 남겨 두면 전이가 표시에 전혀 보이지 않는다 — 완료
+ * 시점에 items가 변하지 않으므로 `rev`도 그대로라 캐시가 그대로 유효하다.
+ *
+ * 보유량: 이 패널이 **살아서 지켜본** 에이전트의 본문뿐(= 변경 전과 동일).
+ * 절감의 본체는 "매 emit 재전송"을 없앤 것이지 보유를 줄인 게 아니다.
+ * 변화가 없으면 같은 Map을 그대로 돌려준다(불필요한 재렌더 방지).
+ */
+export function adoptInlineBodies(
+  frames: readonly SubagentFrame[],
+  cache: ReadonlyMap<string, LazyAgentEntry>,
+): Map<string, LazyAgentEntry> | ReadonlyMap<string, LazyAgentEntry> {
+  let next: Map<string, LazyAgentEntry> | null = null;
+  for (const f of frames) {
+    if (f.items == null) continue;
+    const cur = cache.get(f.id);
+    // rev는 items가 바뀔 때만 달라진다(revision 합) — 같은 rev면 같은 본문.
+    if (cur && cur.state === "ready" && cur.rev === f.rev) continue;
+    next ??= new Map(cache);
+    next.set(f.id, { state: "ready", rev: f.rev, items: f.items });
+  }
+  return next ?? cache;
+}
+
+/** 이 프레임의 본문을 지금 조회해야 하나 (순수). 활성 프레임(본문 인라인)은
+ * 불필요, 같은 rev의 캐시가 이미 있으면 불필요(실패 sentinel 포함 — 재시도는
+ * `force`로만, 실패 재조회 폭주 방지). */
+export function needsSubagentFetch(
+  frame: SubagentFrame | undefined,
+  entry: LazyAgentEntry | undefined,
+): boolean {
+  if (!frame || frame.items != null) return false;
+  return !entry || entry.rev !== frame.rev;
 }
 
 /** The part of a payload `applySnapshot` reads — a live event or the stored
@@ -99,10 +219,13 @@ export interface ClaudeTimelineState {
   turns: Map<number, string>;
   answers: Map<number, string>;
   dates: Map<number, string>;
-  subagents: [string, string | null, number, TimelineItem[]][];
+  subagents: SubagentView[];
   tokenTotal: { input: number; output: number };
   ctxModel: string | null;
   ctxTokens: number;
+  /** 완료 서브에이전트 본문 요청(펼침 시). 활성/이미 도착한 프레임은 no-op.
+   * `force`는 실패한 조회의 재시도용. */
+  requestSubagent: (agentId: string, force?: boolean) => void;
 }
 
 /**
@@ -116,16 +239,92 @@ export interface ClaudeTimelineState {
  */
 export function useTimelineState(
   onApply?: (s: TimelineSnapshotLike, origin: TimelineOrigin) => void,
+  /** lazy 서브에이전트 본문 조회 대상 세션. 없으면 조회는 no-op이고 완료
+   * 그룹은 접힌 채로 남는다(메타 표시는 그대로). */
+  source?: { project: string | null; uuid: string | null },
 ): ClaudeTimelineState & {
   applySnapshot: (s: TimelineSnapshotLike, origin: TimelineOrigin) => void;
-  setSubagents: (v: [string, string | null, number, TimelineItem[]][]) => void;
+  setSubagentFrames: (v: SubagentFrame[]) => void;
 } {
   const [items, setItems] = useState<TimelineItem[]>([]);
   const [turns, setTurns] = useState<Map<number, string>>(new Map());
   const [answers, setAnswers] = useState<Map<number, string>>(new Map());
   const [dates, setDates] = useState<Map<number, string>>(new Map());
-  // Per-subagent change lists [agentId, parentToolCallId|null, turn, items] (B1).
-  const [subagents, setSubagents] = useState<[string, string | null, number, TimelineItem[]][]>([]);
+  // Per-subagent frames (B1) — 완료 프레임은 메타만, 본문은 아래 lazy 캐시.
+  const [subagentFrames, setFrames] = useState<SubagentFrame[]>([]);
+  const [lazyAgents, setLazyAgents] = useState<Map<string, LazyAgentEntry>>(new Map());
+  // 최신 프레임/캐시/세션을 콜백에서 읽기 위한 거울(요청 콜백을 stable하게 유지).
+  const framesRef = useRef(subagentFrames);
+  framesRef.current = subagentFrames;
+  const lazyRef = useRef(lazyAgents);
+  lazyRef.current = lazyAgents;
+  const sourceRef = useRef(source);
+  sourceRef.current = source;
+
+  const putLazy = useCallback((aid: string, e: LazyAgentEntry) => {
+    setLazyAgents((prev) => {
+      const next = new Map(prev);
+      next.set(aid, e);
+      lazyRef.current = next;
+      return next;
+    });
+  }, []);
+
+  /** payload의 프레임 반영 + 인라인 본문을 캐시로 승계(완료 전이 시 표시 유지). */
+  const setSubagentFrames = useCallback((frames: SubagentFrame[]) => {
+    setFrames(frames);
+    setLazyAgents((prev) => {
+      const next = adoptInlineBodies(frames, prev) as Map<string, LazyAgentEntry>;
+      lazyRef.current = next;
+      return next;
+    });
+  }, []);
+
+  // 세션이 바뀌면 다른 세션의 서브에이전트 본문이 남아 있으면 안 된다.
+  const srcUuid = source?.uuid ?? null;
+  useEffect(() => {
+    lazyRef.current = new Map();
+    setLazyAgents(new Map());
+  }, [srcUuid]);
+
+  /**
+   * 완료 서브에이전트 본문 조회 — 사용자가 그룹을 펼칠 때만 호출된다(자동
+   * 프리페치 없음: 세션당 에이전트가 수십 개라 전부 당기면 lazy의 의미가 없다).
+   * 도착한 본문은 언마운트까지 유지한다 — 상한 축출을 두면 축출된 그룹이
+   * 재요청 없이 "불러오는 중"에 고착되기 때문(무음 실패). 보유량의 상한은
+   * "사용자가 실제로 펼친 에이전트 수"다.
+   */
+  const requestSubagent = useCallback(
+    (agentId: string, force = false) => {
+      const frame = framesRef.current.find((f) => f.id === agentId);
+      const entry = lazyRef.current.get(agentId);
+      if (!frame) return;
+      if (!force && !needsSubagentFetch(frame, entry)) return;
+      if (force && frame.items != null) return; // 활성 프레임은 조회 대상이 아니다
+      const rev = frame.rev;
+      const src = sourceRef.current;
+      if (!src?.project || !src?.uuid) {
+        // 조회 좌표를 모르면 본문은 영영 못 온다 — "불러오는 중"으로 매달아
+        // 두지 말고 실패로 표시한다(무음 금지).
+        putLazy(agentId, { state: "error", rev });
+        return;
+      }
+      putLazy(agentId, { state: "loading", rev });
+      invoke<TimelineItem[]>("claude_subagent_items", {
+        project: src.project,
+        uuid: src.uuid,
+        agentId,
+      })
+        .then((its) => putLazy(agentId, { state: "ready", rev, items: its ?? [] }))
+        .catch(() => putLazy(agentId, { state: "error", rev }));
+    },
+    [putLazy],
+  );
+
+  const subagents = useMemo(
+    () => mergeSubagents(subagentFrames, lazyAgents),
+    [subagentFrames, lazyAgents],
+  );
   const [tokenTotal, setTokenTotal] = useState<{ input: number; output: number }>({
     input: 0,
     output: 0,
@@ -160,7 +359,8 @@ export function useTimelineState(
     ctxModel,
     ctxTokens,
     applySnapshot,
-    setSubagents,
+    setSubagentFrames,
+    requestSubagent,
   };
 }
 
@@ -192,8 +392,9 @@ export function useClaudeTimeline({
   uuid: string | null;
   project: string | null;
 }): ClaudeTimelineState & { ended: boolean } {
-  const state = useTimelineState();
-  const { applySnapshot, setSubagents } = state;
+  // uuid/project를 넘겨야 완료 서브에이전트 본문을 펼침 시 조회할 수 있다.
+  const state = useTimelineState(undefined, { project, uuid });
+  const { applySnapshot, setSubagentFrames } = state;
   const [ended, setEnded] = useState(false);
 
   useEffect(() => {
@@ -218,7 +419,7 @@ export function useClaudeTimeline({
         // 표시도 여기서 풀린다.
         setEnded(false);
         applySnapshot(e.payload, "live");
-        setSubagents(e.payload.subagents ?? []);
+        setSubagentFrames(e.payload.subagents ?? []);
       });
       unClosed = await listen<number>("claude-session-closed", (e) => {
         if (numericId != null && e.payload === numericId) setEnded(true);
@@ -248,7 +449,7 @@ export function useClaudeTimeline({
       unTl?.();
       unClosed?.();
     };
-  }, [uuid, project, applySnapshot, setSubagents]);
+  }, [uuid, project, applySnapshot, setSubagentFrames]);
 
   return { ...state, ended };
 }

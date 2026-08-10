@@ -32,12 +32,39 @@ struct ClaudeTimelinePayload {
     /// Most recent assistant message's usage = current context occupancy (the gauge
     /// numerator). Distinct from `tokens`, which sums a turn's tool round-trips.
     last_usage: Option<TokenUsage>,
-    /// Per-subagent (`Agent`/`Task`) change lists:
-    /// `(agent_id, parent_tool_call_id, turn, items)`. `parent_tool_call_id` is
-    /// the timeline item (the spawning `Agent` tool call) the agent nests under —
+    /// Per-subagent (`Agent`/`Task`) frames in discovery order. Live agents carry
+    /// their items inline; **finished** ones carry meta only and the frontend
+    /// fetches the body on expand (`claude_subagent_items`) — see
+    /// [`SubagentFrame`].
+    subagents: Vec<SubagentFrame>,
+}
+
+/// One subagent's frame in the payload.
+///
+/// 메모리 1단계(2026-08-10): 완료 서브에이전트의 items를 매 emit마다 다시 실어
+/// 보내던 것이 payload의 **77%**(실측 24.8MB 중 19.2MB)였다. 완료 프레임은
+/// 정의상 "더 안 변하는 파일"의 캐시이므로 본문을 빼고(`items: None`) 메타만
+/// 싣는다 — 그룹 헤더(진행도·상태)는 메타로 그대로 그려지고, 본문은 사용자가
+/// 펼칠 때 `claude_subagent_items`로 조회한다(`claude_item_detail`과 동형).
+#[derive(Clone, Serialize)]
+struct SubagentFrame {
+    id: String,
+    /// The timeline item (the spawning `Agent` tool call) the agent nests under —
     /// found by matching the agent id inside that call's result. `None` ⇒ no
     /// known parent (nest under its `turn`). Enables the recursive agent tree.
-    subagents: Vec<(String, Option<String>, u64, Vec<TimelineItem>)>,
+    parent: Option<String>,
+    turn: u64,
+    /// 아이템 수(진행도 분모) — 본문이 빠져도 헤더가 같은 값을 보인다.
+    total: usize,
+    /// `completed` 아이템 수(진행도 분자).
+    completed: usize,
+    /// 마지막 아이템의 상태 — 본문 없이도 "진행 중" 표시가 동일하게 나온다.
+    last_status: Option<core_lib::AgentStatus>,
+    /// 본문 캐시 무효화 키(revision 합). 완료 에이전트가 재활성→재완료로 내용이
+    /// 바뀌면 값이 달라지므로, 프론트가 들고 있던 lazy 본문이 stale임을 안다.
+    rev: u32,
+    /// 활성 프레임의 본문. 완료(보존) 프레임은 `None` = "펼칠 때 조회하라".
+    items: Option<Vec<TimelineItem>>,
 }
 
 /// 서브에이전트의 부모(스폰한 `Agent`/`Task` 툴콜) 추론 — 순수 (P0 B1).
@@ -113,49 +140,78 @@ pub(super) fn advance_stability(
     }
 }
 
+/// 한 서브에이전트의 조립된 프레임 — items는 **빌려온다**(clone 없음).
+/// `done`은 이 프레임이 완료 보존(sub_done) 출처라는 뜻 = payload에서 본문을
+/// 빼고 메타만 싣는 대상.
+pub(super) struct Frame<'a> {
+    pub(super) aid: String,
+    pub(super) turn: u64,
+    pub(super) items: &'a [TimelineItem],
+    pub(super) done: bool,
+}
+
 /// 활성 + 완료 프레임을 **발견 순서**로 조립 — 순수 (P0 B2, 리뷰 재수정:
 /// active-뒤-done 병합은 순회 순서를 바꿔 미확정 부모의 first-match 후보
 /// 순위를 흔든다. 발견 순서는 결정적이며 기존 HashMap 비결정 순회의 유효한
 /// 정밀화 — spec §2 B2 순서 명세는 log에 기록).
 /// 보존 계약: 완료 에이전트의 (aid, turn, items)가 계속 포함되고, 재활성
 /// 재파싱이 끝나 active items가 비어 있지 않으면 active가 우선한다.
-pub(super) fn ordered_frames(
+///
+/// 메모리 1단계(2026-08-10): 반환을 소유(Vec<TimelineItem>)에서 차용(&[..])으로
+/// 바꿨다 — 이 함수가 매 emit마다 `sub_done`의 items를 통째로 clone하던 것이
+/// Rust 쪽 13MB/emit 처닝의 정체였다. 순서·우선순위 판정은 그대로다(`active`를
+/// 소비하며 `remove`하던 것이 `get`으로 바뀌었지만 `order`에 중복 aid가 없어
+/// — 호출부가 `contains` 검사로 push한다 — 결과 동일).
+pub(super) fn ordered_frames<'a>(
     order: &[String],
-    mut active: HashMap<String, (u64, Vec<TimelineItem>)>,
-    done: &HashMap<String, DoneSub>,
-) -> Vec<(String, u64, Vec<TimelineItem>)> {
+    active: &HashMap<String, (u64, &'a [TimelineItem])>,
+    done: &'a HashMap<String, DoneSub>,
+) -> Vec<Frame<'a>> {
     let mut out = Vec::new();
     for aid in order {
-        if let Some((turn, items)) = active.remove(aid) {
+        if let Some((turn, items)) = active.get(aid) {
             if !items.is_empty() {
-                out.push((aid.clone(), turn, items));
+                out.push(Frame { aid: aid.clone(), turn: *turn, items, done: false });
                 continue;
             }
             // 활성이지만 아직 빈 tail(재활성 재파싱 전 등) — done 폴백 시도.
         }
         if let Some(d) = done.get(aid) {
-            out.push((aid.clone(), d.turn, d.items.clone()));
+            out.push(Frame { aid: aid.clone(), turn: d.turn, items: &d.items, done: true });
         }
     }
     out
 }
 
-#[cfg_attr(not(test), allow(dead_code))] // 특성테스트의 naive 기준 구현(메모판과 동치 검증용)
-pub(super) fn subagent_parent(
-    aid: &str,
-    main_items: &[TimelineItem],
-    sub_raw: &[(String, u64, Vec<TimelineItem>)],
-) -> Option<String> {
-    main_items
+/// 프레임 → payload 항목 — 순수 (메모리 1단계 B).
+///
+/// 완료(보존) 프레임은 **본문을 싣지 않는다** — clone도 직렬화도 하지 않고
+/// 메타(진행도·상태·rev)만 보낸다. 활성 프레임만 items를 복사·절단해 인라인한다
+/// (진행 중 에이전트는 아직 작고, 실시간 표시가 조회 왕복을 견디지 못한다).
+/// 메타는 **절단 전 원본 items**에서 세므로 본문 유무와 무관하게 같은 값이다.
+fn payload_frames(sub_raw: &[Frame<'_>], parents: Vec<Option<String>>) -> Vec<SubagentFrame> {
+    sub_raw
         .iter()
-        .chain(
-            sub_raw
+        .zip(parents)
+        .map(|(f, parent)| SubagentFrame {
+            id: f.aid.clone(),
+            parent,
+            turn: f.turn,
+            total: f.items.len(),
+            completed: f
+                .items
                 .iter()
-                .filter(|(other, _, _)| other != aid)
-                .flat_map(|(_, _, x)| x.iter()),
-        )
-        .find(|it| it.content_text.as_deref().is_some_and(|ct| ct.contains(aid)))
-        .map(|it| it.tool_call_id.clone())
+                .filter(|i| i.agent_status == core_lib::AgentStatus::Completed)
+                .count(),
+            last_status: f.items.last().map(|i| i.agent_status),
+            rev: f.items.iter().map(|i| i.revision).sum(),
+            items: (!f.done).then(|| {
+                let mut its = f.items.to_vec();
+                cap_content(&mut its);
+                its
+            }),
+        })
+        .collect()
 }
 
 /// emit 최소 간격 게이트 — 순수 (메모리 1단계 C). 폴 주기(150ms)는 그대로 두고
@@ -180,6 +236,24 @@ pub(super) fn emit_gate(
     }
 }
 
+#[cfg_attr(not(test), allow(dead_code))] // 특성테스트의 naive 기준 구현(메모판과 동치 검증용)
+pub(super) fn subagent_parent(
+    aid: &str,
+    main_items: &[TimelineItem],
+    sub_raw: &[Frame<'_>],
+) -> Option<String> {
+    main_items
+        .iter()
+        .chain(
+            sub_raw
+                .iter()
+                .filter(|f| f.aid != aid)
+                .flat_map(|f| f.items.iter()),
+        )
+        .find(|it| it.content_text.as_deref().is_some_and(|ct| ct.contains(aid)))
+        .map(|it| it.tool_call_id.clone())
+}
+
 /// P0 B1(리뷰 재수정 — Some-동결 캐시는 "늦게 채워진 상위 후보로의 부모
 /// 교체"라는 원본 동작을 잃는다): first-match를 **매 변경 틱 그대로 재계산**
 /// 하되, 아이템별 `contains(aid)` 판정만 `(revision)` 키로 메모한다.
@@ -190,7 +264,7 @@ pub(super) fn emit_gate(
 pub(super) fn subagent_parent_memo(
     aid: &str,
     main_items: &[TimelineItem],
-    sub_raw: &[(String, u64, Vec<TimelineItem>)],
+    sub_raw: &[Frame<'_>],
     memo: &mut HashMap<(String, String, String), (u32, bool)>,
 ) -> Option<String> {
     // 키 = (aid, **session_id**, tool_call_id) — tool_call_id만으로는 다른
@@ -218,11 +292,11 @@ pub(super) fn subagent_parent_memo(
             return Some(it.tool_call_id.clone());
         }
     }
-    for (other, _, its) in sub_raw {
-        if other == aid {
+    for f in sub_raw {
+        if f.aid == aid {
             continue;
         }
-        for it in its {
+        for it in f.items {
             if mentions(aid, it, memo) {
                 return Some(it.tool_call_id.clone());
             }
@@ -558,16 +632,13 @@ pub(super) fn run_timeline_poll(
         let last_usage_v: Option<TokenUsage> = t.last_usage();
         // P0 B2: 발견 순서로 활성+완료 프레임 조립(특성테스트 ordered_frames_*)
         // — 완료 프레임 보존 + active(재파싱 완료) 우선 + 결정적 순서.
-        let active_map: HashMap<String, (u64, Vec<TimelineItem>)> = subagents
+        let active_map: HashMap<String, (u64, &[TimelineItem])> = subagents
             .iter()
             .map(|(aid, st)| {
-                (
-                    aid.clone(),
-                    (*subagent_turn.get(aid).unwrap_or(&0), st.timeline().items().to_vec()),
-                )
+                (aid.clone(), (*subagent_turn.get(aid).unwrap_or(&0), st.timeline().items()))
             })
             .collect();
-        let sub_raw = ordered_frames(&sub_order, active_map, &sub_done);
+        let sub_raw = ordered_frames(&sub_order, &active_map, &sub_done);
         // Link each agent to the timeline item (the spawning `Agent`/`Task` call)
         // whose result mentions the agent id — that item, in main or in a parent
         // agent, is its parent (recursive tree). `None` ⇒ nest under its turn.
@@ -578,20 +649,13 @@ pub(super) fn run_timeline_poll(
         // P1 절단은 그 뒤 표시용 클론에만 적용).
         let parents: Vec<Option<String>> = sub_raw
             .iter()
-            .map(|(aid, _, _)| subagent_parent_memo(aid, &items_v, &sub_raw, &mut mention_memo))
+            .map(|f| subagent_parent_memo(&f.aid, &items_v, &sub_raw, &mut mention_memo))
             .collect();
         // P1: 표시 계층 절단 + payload는 clone 없이 move(스냅샷은 아래 debounce
         // 블록이 t에서 재구성 — 틱당 딥클론 2회→1회).
         let mut items_p = items_v;
         cap_content(&mut items_p);
-        let subagents_v: Vec<(String, Option<String>, u64, Vec<TimelineItem>)> = sub_raw
-            .into_iter()
-            .zip(parents)
-            .map(|((aid, turn, mut its), parent)| {
-                cap_content(&mut its);
-                (aid, parent, turn, its)
-            })
-            .collect();
+        let subagents_v = payload_frames(&sub_raw, parents);
 
         let _ = app.emit(
             "claude-timeline",
@@ -655,8 +719,10 @@ mod tests {
         .expect("fixture")
     }
 
-    fn agent(aid: &str, items: Vec<TimelineItem>) -> (String, u64, Vec<TimelineItem>) {
-        (aid.to_string(), 1, items)
+    /// 차용 프레임(메모리 1단계 — ordered_frames가 clone하지 않는다). items의
+    /// 소유권은 호출부(테스트 지역 변수)에 남는다.
+    fn agent<'a>(aid: &str, items: &'a [TimelineItem]) -> Frame<'a> {
+        Frame { aid: aid.to_string(), turn: 1, items, done: false }
     }
 
     // P1 특성테스트 — 절단은 UTF-8 경계 보존 + 플래그, 상한 이하는 불변.
@@ -699,30 +765,74 @@ mod tests {
     #[test]
     fn ordered_frames_keeps_done_in_discovery_order_and_prefers_reparsed_active() {
         let order = vec!["a1".to_string(), "a2".to_string(), "a3".to_string()];
-        let mut active: HashMap<String, (u64, Vec<TimelineItem>)> = HashMap::new();
-        active.insert("a1".into(), (1, vec![item("l-1", None)])); // 활성
-        active.insert("a3".into(), (3, vec![])); // 재활성 재파싱 전(빈 tail)
+        let (live1, empty3) = (vec![item("l-1", None)], Vec::new());
+        let mut active: HashMap<String, (u64, &[TimelineItem])> = HashMap::new();
+        active.insert("a1".into(), (1, &live1)); // 활성
+        active.insert("a3".into(), (3, &empty3)); // 재활성 재파싱 전(빈 tail)
         let mut d: HashMap<String, DoneSub> = HashMap::new();
         d.insert("a2".into(), done(7, vec![item("d-2", None)])); // 완료
         d.insert("a3".into(), done(9, vec![item("d-3", None)])); // 전이 중 — done 폴백
-        let out = ordered_frames(&order, active, &d);
+        let out = ordered_frames(&order, &active, &d);
         // 발견 순서 유지 + 완료 프레임 보존 + 빈 active는 done 폴백(공백 없음).
         assert_eq!(
-            out.iter().map(|(aid, turn, its)| (aid.as_str(), *turn, its[0].tool_call_id.as_str())).collect::<Vec<_>>(),
-            vec![("a1", 1, "l-1"), ("a2", 7, "d-2"), ("a3", 9, "d-3")]
+            out.iter()
+                .map(|f| (f.aid.as_str(), f.turn, f.items[0].tool_call_id.as_str(), f.done))
+                .collect::<Vec<_>>(),
+            vec![("a1", 1, "l-1", false), ("a2", 7, "d-2", true), ("a3", 9, "d-3", true)]
         );
     }
 
     #[test]
     fn ordered_frames_active_wins_over_stale_done_after_reparse() {
         let order = vec!["a1".to_string()];
-        let mut active: HashMap<String, (u64, Vec<TimelineItem>)> = HashMap::new();
-        active.insert("a1".into(), (1, vec![item("new-1", None)]));
+        let live = vec![item("new-1", None)];
+        let mut active: HashMap<String, (u64, &[TimelineItem])> = HashMap::new();
+        active.insert("a1".into(), (1, &live));
         let mut d: HashMap<String, DoneSub> = HashMap::new();
         d.insert("a1".into(), done(1, vec![item("old-1", None)]));
-        let out = ordered_frames(&order, active, &d);
+        let out = ordered_frames(&order, &active, &d);
         assert_eq!(out.len(), 1);
-        assert_eq!(out[0].2[0].tool_call_id, "new-1"); // 재파싱된 active 우선
+        assert_eq!(out[0].items[0].tool_call_id, "new-1"); // 재파싱된 active 우선
+        assert!(!out[0].done, "활성 프레임은 payload에 본문을 싣는다");
+    }
+
+    // 메모리 1단계 B — payload 분할: 완료 프레임은 메타만, 활성 프레임만 본문.
+    #[test]
+    fn payload_frames_drops_done_bodies_but_keeps_their_meta() {
+        let mut done_items = vec![item("d-1", None), item("d-2", None)];
+        done_items[1].agent_status = core_lib::AgentStatus::InProgress; // 마지막 아이템
+        done_items[1].revision = 4;
+        let live_items = vec![item("l-1", Some("x"))];
+        let frames = vec![
+            Frame { aid: "done".into(), turn: 2, items: &done_items, done: true },
+            Frame { aid: "live".into(), turn: 3, items: &live_items, done: false },
+        ];
+        let out = payload_frames(&frames, vec![Some("call-1".into()), None]);
+        // 완료: 본문 없음(= 프론트가 펼칠 때 조회) + 메타는 원본 items 기준.
+        assert!(out[0].items.is_none(), "완료 프레임의 본문이 payload에 실리면 절감이 사라진다");
+        assert_eq!((out[0].total, out[0].completed), (2, 1));
+        assert_eq!(out[0].last_status, Some(core_lib::AgentStatus::InProgress));
+        assert_eq!(out[0].rev, 5); // 1 + 4 — 본문 캐시 무효화 키
+        assert_eq!(out[0].parent.as_deref(), Some("call-1"));
+        assert_eq!(out[0].turn, 2);
+        // 활성: 본문 인라인(절단 적용).
+        assert_eq!(out[1].items.as_ref().map(Vec::len), Some(1));
+        assert_eq!((out[1].total, out[1].completed), (1, 1));
+    }
+
+    /// 절단(CONTENT_CAP)은 payload 본문에만 걸리고 **메타는 원본 기준**이어야
+    /// 한다 — 진행도 카운트가 절단 때문에 달라지면 안 된다.
+    #[test]
+    fn payload_frames_caps_live_bodies_without_touching_meta() {
+        let long = "가".repeat(CONTENT_CAP);
+        let live_items = vec![item("l-1", Some(&long))];
+        let frames = vec![Frame { aid: "live".into(), turn: 1, items: &live_items, done: false }];
+        let out = payload_frames(&frames, vec![None]);
+        let its = out[0].items.as_ref().unwrap();
+        assert!(its[0].content_truncated);
+        assert!(its[0].content_text.as_deref().unwrap().len() <= CONTENT_CAP);
+        assert_eq!(live_items[0].content_text.as_deref().unwrap().len(), long.len(), "원본 불변");
+        assert_eq!(out[0].total, 1);
     }
 
     // 메모리 1단계 C — emit 최소 간격 게이트. 핵심 계약은 **trailing edge**:
@@ -777,7 +887,8 @@ mod tests {
     fn parent_memo_matches_naive_and_tracks_revision_updates() {
         let mut memo: HashMap<(String, String, String), (u32, bool)> = HashMap::new();
         let mut main = vec![item("call-1", Some("nothing")), item("call-2", Some("spawn agent-A"))];
-        let subs = vec![agent("agent-A", vec![])];
+        let none: Vec<TimelineItem> = Vec::new();
+        let subs = vec![agent("agent-A", &none)];
         assert_eq!(
             subagent_parent_memo("agent-A", &main, &subs, &mut memo),
             subagent_parent("agent-A", &main, &subs)
@@ -812,10 +923,9 @@ mod tests {
         // main의 "dup"(미언급)이 먼저 스캔되고, agent-B transcript의 "dup"
         // (언급, 같은 revision)이 뒤에 온다 — naive는 b쪽 dup을 부모로 찾는다.
         let main = vec![item_in("main", "dup", Some("nothing"))];
-        let subs = vec![
-            agent("agent-A", vec![]),
-            ("agent-B".to_string(), 1, vec![item_in("agent-B", "dup", Some("spawn agent-A"))]),
-        ];
+        let (none, b_items) =
+            (Vec::new(), vec![item_in("agent-B", "dup", Some("spawn agent-A"))]);
+        let subs = vec![agent("agent-A", &none), agent("agent-B", &b_items)];
         assert_eq!(
             subagent_parent_memo("agent-A", &main, &subs, &mut memo),
             subagent_parent("agent-A", &main, &subs)
@@ -831,7 +941,8 @@ mod tests {
             item("call-2", Some("spawned agent-A here")),
             item("call-3", Some("agent-A again later")),
         ];
-        let subs = vec![agent("agent-A", vec![])];
+        let none: Vec<TimelineItem> = Vec::new();
+        let subs = vec![agent("agent-A", &none)];
         // 첫 매치(call-2)가 이긴다 — call-3이 아니라.
         assert_eq!(subagent_parent("agent-A", &main, &subs), Some("call-2".into()));
     }
@@ -840,10 +951,11 @@ mod tests {
     fn subagent_parent_excludes_own_transcript_but_scans_others() {
         // 자기 transcript가 자기 id를 에코해도 self-parent가 되면 안 된다.
         let main = vec![item("m-1", Some("nothing"))];
-        let subs = vec![
-            agent("agent-A", vec![item("a-1", Some("I am agent-A"))]),
-            agent("agent-B", vec![item("b-1", Some("delegating to agent-A"))]),
-        ];
+        let (a_items, b_items) = (
+            vec![item("a-1", Some("I am agent-A"))],
+            vec![item("b-1", Some("delegating to agent-A"))],
+        );
+        let subs = vec![agent("agent-A", &a_items), agent("agent-B", &b_items)];
         // main 무매치 → 다른 에이전트(B)의 아이템이 부모.
         assert_eq!(subagent_parent("agent-A", &main, &subs), Some("b-1".into()));
         // B 자신은 어디에도 언급이 없으니 None.
