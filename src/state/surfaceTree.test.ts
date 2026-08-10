@@ -124,3 +124,56 @@ describe("다운그레이드/포워드 안전 — 미래 버전 트리도 second
     expect(secondaryProject(parseSurfaceTree(weird, null))).toBe("/deep");
   });
 });
+
+describe("FC(리뷰): 손상 트리가 임의 secondary를 부활시키지 못한다", () => {
+  it("codex 픽스처 {version:1, root:{kind:bogus}, metadata:{…/resurrected}} → 기본", () => {
+    const fixture = {
+      version: 1, // 현재 버전 — loose 추출 금지(미래 버전에서만).
+      root: { kind: "bogus" },
+      metadata: { kind: "leaf", surfaceId: "secondary", projectKey: "/resurrected" },
+    };
+    expect(parseSurfaceTree(fixture, null)).toEqual(emptyTree());
+  });
+
+  it("primary가 없거나 중복이거나 projectKey!=null이면 손상 → 기본", () => {
+    const noPrimary = { version: 1, root: { kind: "leaf", surfaceId: "secondary", projectKey: "/x" } };
+    const primaryKeyed = { version: 1, root: { kind: "leaf", surfaceId: "primary", projectKey: "/x" } };
+    const twoPrimary = {
+      version: 1,
+      root: {
+        kind: "split",
+        direction: "row",
+        children: [
+          { kind: "leaf", surfaceId: "primary", projectKey: null },
+          { kind: "leaf", surfaceId: "primary", projectKey: null },
+        ],
+      },
+    };
+    for (const bad of [noPrimary, primaryKeyed, twoPrimary]) {
+      expect(parseSurfaceTree(bad, null)).toEqual(emptyTree());
+    }
+  });
+});
+
+describe("FA(리뷰): 깊은 트리·순환에서 크래시하지 않고 기본 복원", () => {
+  it("12k 깊이 중첩 split → throw 없이 기본(예외 경계)", () => {
+    // 예산 초과 재귀가 RangeError를 던져도 parseSurfaceTree가 잡아 기본 반환.
+    let node: unknown = { kind: "leaf", surfaceId: "primary", projectKey: null };
+    for (let i = 0; i < 12_000; i++) {
+      node = { kind: "split", direction: "row", children: [node] };
+    }
+    const deep = { version: 1, root: node };
+    expect(() => parseSurfaceTree(deep, null)).not.toThrow();
+    expect(parseSurfaceTree(deep, null)).toEqual(emptyTree());
+    // 레거시가 있으면 크래시 대신 레거시로 복구.
+    expect(secondaryProject(parseSurfaceTree(deep, "/safe"))).toBe("/safe");
+  });
+
+  it("순환 참조 → throw 없이 기본", () => {
+    const cyc: Record<string, unknown> = { kind: "split", direction: "row" };
+    cyc.children = [cyc]; // 자기참조
+    const looped = { version: 9, root: cyc }; // 미래 버전(loose 경로도 태움)
+    expect(() => parseSurfaceTree(looped, null)).not.toThrow();
+    expect(parseSurfaceTree(looped, null)).toEqual(emptyTree());
+  });
+});

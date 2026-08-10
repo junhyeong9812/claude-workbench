@@ -15,13 +15,18 @@
  * **secondary 리프의 projectKey만 저장 멤버십**이다. 이 덕에 현 동작이 정확히
  * 보존된다(primary가 activeProject를 그대로 따름).
  *
- * ## 다운그레이드 안전
- * 트리는 localStorage 신규 키 `"surfaceTree"`에 저장한다(store.ts). 구버전 앱은
- * 그 키의 존재를 모르고 레거시 `"dualProject"` 키만 읽으므로, store가 두 키를
- * 함께 기록하는 한 구버전 앱은 우측 분할을 그대로 복원한다(붕괴 0). 반대로 이
- * 버전은 미래(더 높은 version) 트리를 만나도 secondary 리프를 최선 노력으로
- * 추출해 복원한다(아래 parseSurfaceTree). 손상·해석 불가 = 기본 레이아웃(primary
- * 단독) — persist의 "로드 실패=default" 계약과 동형.
+ * ## 다운그레이드 안전 — 단일 키 persist (FB, 리뷰)
+ * P3'의 트리는 secondary 0~1개뿐이라 정보량이 레거시 `dualProject` 문자열과
+ * **동형**(direction 항상 row·ratio는 react-resizable-panels 소유·저장 정보 =
+ * secondaryProject 하나)이다. 그래서 트리는 **메모리 정본**으로만 두고 디스크
+ * persist는 레거시 `dualProject` 단일 키로만 한다(store.ts). 두 키의 비원자 이중
+ * 기록이 만들던 영구 분기(닫은 분할 부활·다중창·다운/업그레이드 유실)가 원천
+ * 소멸하고, 다운그레이드는 자명하다(구버전 앱이 읽는 유일 키를 그대로 쓴다).
+ * 방향·N-way를 실제로 담는 트리 persist는 그걸 필요로 하는 P6로 이연한다.
+ *
+ * 그럼에도 parseSurfaceTree는 트리 블롭 입력까지 완전 견고화한다(미래 P6 대비):
+ * 미래(더 높은 version) 트리는 secondary를 최선 추출, 손상·예산 초과·순환은 전부
+ * 기본 레이아웃(primary 단독)으로 — persist의 "로드 실패=default" 계약과 동형.
  */
 import type { SurfaceId } from "./surfaceContext";
 
@@ -120,30 +125,58 @@ function findLeaf(node: SurfaceNode, surfaceId: SurfaceId): SurfaceLeaf | null {
   return null;
 }
 
-/** 런타임 값이 유효한 노드 형태인지 엄격 검증(재귀). */
-function isNode(v: unknown): v is SurfaceNode {
-  if (!v || typeof v !== "object") return false;
-  const n = v as Record<string, unknown>;
-  if (n.kind === "leaf") {
-    return (
-      (n.surfaceId === "primary" || n.surfaceId === "secondary") &&
-      (n.projectKey === null || typeof n.projectKey === "string")
-    );
-  }
-  if (n.kind === "split") {
-    return (
-      (n.direction === "row" || n.direction === "column") &&
-      Array.isArray(n.children) &&
-      n.children.every(isNode)
-    );
-  }
-  return false;
+// 재귀/순회 예산(FA — 리뷰): 깊은(수천 depth) JSON·순환에서 앱 시작 크래시를
+// 막는다. 초과 = RangeError throw → parseSurfaceTree의 예외 경계가 손상 취급.
+// 실 트리는 depth 2·노드 3(P3'), N-way 미래도 이 예산 안. 넉넉하되 유한.
+const MAX_DEPTH = 64;
+const MAX_NODES = 4096;
+
+/**
+ * 구조 + 의미 엄격 검증(FC — 리뷰). 구조만이 아니라 **정합 불변식**까지 본다:
+ * primary 리프 정확히 1개(projectKey===null) · secondary 리프 0~1개 · 모든 split
+ * 은 비어있지 않음. 위반 = false. 깊이/노드 예산 초과 = RangeError(호출부 경계가
+ * 잡음). 이 강화로 손상 트리에서 임의 metadata의 secondary가 부활하지 못한다.
+ */
+function isValidTree(root: unknown): boolean {
+  let primary = 0;
+  let primaryKeyOk = true;
+  let secondary = 0;
+  let nodes = 0;
+  const walk = (v: unknown, depth: number): boolean => {
+    if (depth > MAX_DEPTH) throw new RangeError("surface tree too deep");
+    if (++nodes > MAX_NODES) throw new RangeError("surface tree too large");
+    if (!v || typeof v !== "object") return false;
+    const n = v as Record<string, unknown>;
+    if (n.kind === "leaf") {
+      if (n.surfaceId === "primary") {
+        primary++;
+        if (n.projectKey !== null) primaryKeyOk = false;
+        return true;
+      }
+      if (n.surfaceId === "secondary") {
+        secondary++;
+        return n.projectKey === null || typeof n.projectKey === "string";
+      }
+      return false; // 미지 surfaceId
+    }
+    if (n.kind === "split") {
+      if (n.direction !== "row" && n.direction !== "column") return false;
+      if (!Array.isArray(n.children) || n.children.length === 0) return false;
+      return n.children.every((c) => walk(c, depth + 1));
+    }
+    return false; // 미지 노드 종류
+  };
+  if (!walk(root, 0)) return false;
+  return primary === 1 && primaryKeyOk && secondary <= 1;
 }
 
-/** 미래(더 높은 version) 또는 느슨한 트리에서 secondary 경로만 최선 노력 추출. */
+/** 미래(더 높은 version) 트리에서 secondary 경로만 최선 노력 추출 — 예산·순환
+ * 가드 포함(초과=null → 기본으로 낙하). 현재/무버전 손상에는 호출하지 않는다. */
 function extractSecondaryLoose(raw: unknown): string | null {
   const seen = new Set<unknown>();
-  const walk = (v: unknown): string | null => {
+  let nodes = 0;
+  const walk = (v: unknown, depth: number): string | null => {
+    if (depth > MAX_DEPTH || ++nodes > MAX_NODES) return null;
     if (!v || typeof v !== "object" || seen.has(v)) return null;
     seen.add(v);
     const o = v as Record<string, unknown>;
@@ -152,38 +185,49 @@ function extractSecondaryLoose(raw: unknown): string | null {
     }
     for (const val of Object.values(o)) {
       const hit = Array.isArray(val)
-        ? val.reduce<string | null>((acc, item) => acc ?? walk(item), null)
-        : walk(val);
+        ? val.reduce<string | null>((acc, item) => acc ?? walk(item, depth + 1), null)
+        : walk(val, depth + 1);
       if (hit) return hit;
     }
     return null;
   };
-  return walk(raw);
+  return walk(raw, 0);
 }
 
 /**
  * 저장된 값 → 표면 트리(마이그레이션·복구 단일 진입점).
  *
+ * **예외 경계**(FA): 어떤 throw(깊이/노드 예산·순환·이상치)든 여기서 잡아 손상
+ * 취급 → 레거시/기본으로 낙하한다. 앱 시작이 이 함수로 절대 크래시하지 않는다.
+ *
  * 우선순위:
- *  1. `rawTree`가 이 버전의 잘 형성된 트리 → 정규화해 그대로.
- *  2. `rawTree`가 미래 버전/느슨한 형태 → secondary 경로 최선 추출로 복원.
- *  3. 신 트리 없음 → 레거시 `dualProject` 문자열로부터 구성(구→신 마이그레이션).
+ *  1. `rawTree`가 구조+의미 유효한 트리 → 정규화해 그대로(version 무관).
+ *  2. `rawTree`의 version이 **현재보다 높을 때만** secondary 최선 추출(미래 대비).
+ *     현재/무버전 손상은 즉시 기본 — 임의 부활 차단(FC).
+ *  3. 신 트리 없음/손상 → 레거시 `dualProject` 문자열로 구성(구→신 마이그레이션).
  *  4. 그 무엇도 아니면 → 기본(primary 단독).
  *
- * @param rawTree localStorage `"surfaceTree"`를 JSON.parse 한 값(또는 null).
- * @param legacyDual localStorage `"dualProject"` 문자열(구 표현) 또는 null.
+ * @param rawTree 트리 JSON을 파싱한 값(또는 null). P3'은 디스크에서 트리 블롭을
+ *   읽지 않으므로(FB — 단일 legacy 키 persist) 실사용은 null이지만, 스키마의
+ *   parse/validate 계약과 미래(P6) 트리 persist를 위해 완전 견고화한다.
+ * @param legacyDual localStorage `"dualProject"` 문자열(구·현 표현) 또는 null.
  */
 export function parseSurfaceTree(rawTree: unknown, legacyDual: string | null): SurfaceTree {
-  if (rawTree && typeof rawTree === "object") {
-    const t = rawTree as Record<string, unknown>;
-    if (typeof t.version === "number" && isNode(t.root)) {
-      // 알려진 형태(version 무관하게 root가 유효하면) 그대로 채택 — 정규화.
-      return { version: t.version, root: t.root as SurfaceNode };
+  try {
+    if (rawTree && typeof rawTree === "object") {
+      const t = rawTree as Record<string, unknown>;
+      const version = typeof t.version === "number" ? t.version : null;
+      if (version !== null && isValidTree(t.root)) {
+        return { version, root: t.root as SurfaceNode };
+      }
+      // 손상 또는 미래 스키마: **미래 버전일 때만** secondary 최선 추출.
+      if (version !== null && version > SURFACE_TREE_VERSION) {
+        const loose = extractSecondaryLoose(rawTree);
+        if (loose) return treeWithSecondary(loose);
+      }
     }
-    // 형태 불일치(손상 또는 미래 스키마): secondary만이라도 최선 추출.
-    const loose = extractSecondaryLoose(rawTree);
-    if (loose) return treeWithSecondary(loose);
-    // 추출 실패 → 아래 레거시/기본으로 낙하.
+  } catch {
+    // 예산 초과·순환 등 어떤 throw든 손상 취급 → 아래 레거시/기본.
   }
   if (typeof legacyDual === "string" && legacyDual) return treeWithSecondary(legacyDual);
   return emptyTree();
