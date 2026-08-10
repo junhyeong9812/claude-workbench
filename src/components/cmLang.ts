@@ -5,6 +5,7 @@ import { python } from "@codemirror/lang-python";
 import { rust } from "@codemirror/lang-rust";
 import { java } from "@codemirror/lang-java";
 import { kotlin } from "@codemirror/legacy-modes/mode/clike";
+import { go } from "@codemirror/legacy-modes/mode/go";
 import { json } from "@codemirror/lang-json";
 import { html } from "@codemirror/lang-html";
 import { css } from "@codemirror/lang-css";
@@ -34,6 +35,10 @@ export function langFor(path: string): Extension[] {
       // No official CM6 package for Kotlin — the legacy clike stream mode gives
       // solid highlighting (smart indent is weaker than the Lezer grammars).
       return [StreamLanguage.define(kotlin)];
+    case "go":
+      // Kotlin과 같은 이유 — 공식 CM6 패키지가 없어 이미 의존 중인 legacy-modes의
+      // go 스트림 모드를 쓴다(신규 의존 0).
+      return [StreamLanguage.define(go)];
     case "json":
       return [json()];
     case "html":

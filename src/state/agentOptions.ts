@@ -40,7 +40,7 @@ export const DEFAULT_AGENT: AgentId = "claude";
  * 터미널로만 보인다. 자유 입력이 필요한 곳(아카이브 추출)은 자기 화면에서
  * 따로 제공한다.
  */
-export const MODEL_CHOICES = ["opus", "sonnet", "haiku"] as const;
+export const MODEL_CHOICES = ["fable", "opus", "sonnet", "haiku"] as const;
 
 /**
  * 추론 강도 — `claude --effort <level>` 실측 어휘(강한 순). 모델과 달리 **잘못된
