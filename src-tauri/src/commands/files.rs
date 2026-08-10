@@ -190,24 +190,86 @@ pub fn write_file(path: String, content: String) -> Result<(), AppError> {
 /// Create an empty file at `path` (tree "새 파일"). Parent directories are
 /// created as needed (so a typed `sub/Foo.java` works). Errors if the path
 /// already exists, so an existing file is never clobbered.
+///
+/// 단일 경로 API — 구현은 [`create_files`]와 공유한다(생성 규칙 단일 출처).
 #[tauri::command]
 pub fn create_file(path: String, root: String) -> Result<(), AppError> {
-    reject_unsafe_path(&path)?;
-    ensure_within(&path, &root)?;
-    let p = std::path::Path::new(&path);
-    if std::fs::symlink_metadata(p).is_ok() {
-        return Err(AppError::new("이미 존재하는 경로입니다"));
+    create_files_impl(&[path], &root)
+}
+
+/// 한 번의 "새 파일"로 만들 수 있는 최대 개수. 프론트의 brace 확장 상한
+/// (`BRACE_MAX`)과 같은 값 — 프론트를 우회한 호출도 백엔드가 스스로 막는다.
+const MAX_CREATE_FILES: usize = 20;
+
+/// 여러 빈 파일을 **전부 아니면 전무**로 만든다 (트리 "새 파일"의 brace 다중 생성).
+///
+/// 충돌 정책: 하나라도 이미 존재하면 **아무것도 만들지 않고** 충돌 목록을 담은
+/// 오류를 돌려준다. 부분 생성은 "무엇이 만들어졌는지 모르는" 상태를 남기고,
+/// 사용자가 그걸 되돌리려면 트리에서 하나씩 지워야 한다 — 검사를 먼저 다 하는
+/// 비용이 훨씬 싸다. (검사 후 생성 사이의 경합은 `create_new`가 최후 방어선:
+/// 그 사이에 생긴 파일은 덮이지 않고 오류가 된다. 생성 도중의 I/O 실패는
+/// 되돌리지 않는다 — 조용히 삼키지 않고 오류로 드러낸다.)
+#[tauri::command]
+pub fn create_files(paths: Vec<String>, root: String) -> Result<(), AppError> {
+    create_files_impl(&paths, &root)
+}
+
+fn create_files_impl(paths: &[String], root: &str) -> Result<(), AppError> {
+    if paths.is_empty() {
+        return Err(AppError::new("생성할 경로가 없습니다"));
     }
-    if let Some(parent) = p.parent() {
-        std::fs::create_dir_all(parent)
+    if paths.len() > MAX_CREATE_FILES {
+        return Err(AppError::new(format!(
+            "한 번에 최대 {MAX_CREATE_FILES}개까지 만들 수 있습니다 (요청 {}개)",
+            paths.len()
+        )));
+    }
+    // 1) 경로 검증 — 전부 통과해야 한 개라도 만든다.
+    for p in paths {
+        reject_unsafe_path(p)?;
+        ensure_within(p, root)?;
+    }
+    // 2) 입력 자체의 중복도 부분 생성의 원인(두 번째가 no-clobber로 실패) — 먼저 막는다.
+    for (i, p) in paths.iter().enumerate() {
+        if paths[..i].contains(p) {
+            return Err(AppError::new("중복된 경로가 있습니다"));
+        }
+    }
+    // 3) 전수 충돌 검사. `symlink_metadata`(not `exists`)라 깨진 심링크도 점유로 본다.
+    let conflicts: Vec<String> = paths
+        .iter()
+        .filter(|p| std::fs::symlink_metadata(std::path::Path::new(p)).is_ok())
+        .map(|p| {
+            std::path::Path::new(p)
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or(p)
+                .to_string()
+        })
+        .collect();
+    if !conflicts.is_empty() {
+        // 단일 생성의 문구는 그대로 유지(기존 트리 동작 회귀 0).
+        return Err(AppError::new(if paths.len() == 1 {
+            "이미 존재하는 경로입니다".to_string()
+        } else {
+            format!("이미 존재하는 경로: {}", conflicts.join(", "))
+        }));
+    }
+    // 4) 생성.
+    for path in paths {
+        let p = std::path::Path::new(path);
+        if let Some(parent) = p.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| AppError::new(io_message("Cannot create file", &e)))?;
+        }
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(p)
+            .map(|_| ())
             .map_err(|e| AppError::new(io_message("Cannot create file", &e)))?;
     }
-    std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(p)
-        .map(|_| ())
-        .map_err(|e| AppError::new(io_message("Cannot create file", &e)))
+    Ok(())
 }
 
 /// Create a directory at `path` (tree "새 폴더"), including intermediate dirs —
@@ -555,6 +617,49 @@ mod tests {
         assert!(create_file(f.clone(), root_s.clone()).is_ok());
         // Second create on the same path fails (no clobber).
         assert!(create_file(f, root_s).is_err());
+    }
+
+    // 다중 생성(brace)의 핵심 계약: 충돌이 하나라도 있으면 **아무것도** 만들지
+    // 않는다 (부분 생성 금지).
+    #[test]
+    fn create_files_all_or_nothing() {
+        let root = std::env::temp_dir().join(format!("mt_cfs_{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let root_s = root.to_string_lossy().to_string();
+        let a = format!("{root_s}/a.ts");
+        let b = format!("{root_s}/b.ts");
+        let c = format!("{root_s}/sub/c.ts");
+
+        // 정상: 중첩 경로 포함 전부 생성.
+        assert!(create_files(vec![a.clone(), c.clone()], root_s.clone()).is_ok());
+        assert!(std::path::Path::new(&a).is_file());
+        assert!(std::path::Path::new(&c).is_file());
+
+        // 충돌(a) + 신규(b) → b는 만들어지지 않는다. 오류 문구에 충돌 이름이 실린다.
+        let e = create_files(vec![a.clone(), b.clone()], root_s.clone()).unwrap_err();
+        assert!(e.message.contains("a.ts"), "충돌 목록: {}", e.message);
+        assert!(!std::path::Path::new(&b).exists(), "충돌 시 부분 생성 없음");
+
+        // 중복 입력도 생성 전에 거부.
+        assert!(create_files(vec![b.clone(), b.clone()], root_s.clone()).is_err());
+        assert!(!std::path::Path::new(&b).exists());
+
+        // 상한 초과 거부.
+        let many: Vec<String> = (0..21).map(|i| format!("{root_s}/m{i}.ts")).collect();
+        assert!(create_files(many, root_s.clone()).is_err());
+        assert!(!std::path::Path::new(&format!("{root_s}/m0.ts")).exists());
+
+        // containment: 하나라도 루트 밖이면 전부 거부.
+        assert!(create_files(
+            vec![b.clone(), "/etc/mt_should_not_exist_multi".into()],
+            root_s.clone()
+        )
+        .is_err());
+        assert!(!std::path::Path::new(&b).exists());
+
+        // 빈 목록.
+        assert!(create_files(vec![], root_s).is_err());
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     fn temp_root(tag: &str) -> (std::path::PathBuf, String) {

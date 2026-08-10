@@ -158,6 +158,7 @@ pub fn run() {
             commands::files::write_file,
             commands::files::delete_path,
             commands::files::create_file,
+            commands::files::create_files,
             commands::files::create_dir,
             commands::files::rename_path,
             commands::files::copy_path,
