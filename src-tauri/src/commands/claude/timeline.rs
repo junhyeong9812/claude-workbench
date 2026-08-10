@@ -60,11 +60,23 @@ struct SubagentFrame {
     completed: usize,
     /// 마지막 아이템의 상태 — 본문 없이도 "진행 중" 표시가 동일하게 나온다.
     last_status: Option<core_lib::AgentStatus>,
-    /// 본문 캐시 무효화 키(revision 합). 완료 에이전트가 재활성→재완료로 내용이
-    /// 바뀌면 값이 달라지므로, 프론트가 들고 있던 lazy 본문이 stale임을 안다.
-    rev: u32,
+    /// 본문 캐시 무효화 키 = **파일 서명**(len·mtime ns의 문자열). 완료
+    /// 에이전트가 재활성→재구축→재완료하면 transcript 파일이 달라져 서명이
+    /// 바뀌므로(AA2 — 듀얼 리뷰 codex), 프론트가 들고 있던 lazy 본문이 stale임을
+    /// 안다. revision 합만으로는 재구축 시 revision이 리셋되어 같은 합·다른 내용을
+    /// 낼 수 있었다(그 재활성은 백엔드 fp의 `sub_gen`엔 반영됐지만 payload엔
+    /// 안 실렸다). 파일 서명은 백엔드가 완료 판정에 이미 쓰는 신호이고, 완료
+    /// 안정 구간(DONE_STREAK)엔 값이 고정이라 활성→완료 전이에도 동일하다
+    /// (활성 프레임은 인라인 본문이라 서명이 없어도 무방 — `None`).
+    sig: Option<String>,
     /// 활성 프레임의 본문. 완료(보존) 프레임은 `None` = "펼칠 때 조회하라".
     items: Option<Vec<TimelineItem>>,
+}
+
+/// `FileSig`를 payload용 문자열 서명으로 — u128 mtime은 JS number로 정밀도를
+/// 잃으므로 문자열로 싣는다(프론트는 동등성만 본다).
+fn sig_string(sig: FileSig) -> String {
+    format!("{}-{}", sig.0, sig.1)
 }
 
 /// 서브에이전트의 부모(스폰한 `Agent`/`Task` 툴콜) 추론 — 순수 (P0 B1).
@@ -148,6 +160,10 @@ pub(super) struct Frame<'a> {
     pub(super) turn: u64,
     pub(super) items: &'a [TimelineItem],
     pub(super) done: bool,
+    /// 본문 캐시 무효화용 파일 서명(AA2). 완료 프레임 = 완료 시점 서명, 활성
+    /// 프레임 = 이번 틱의 서명(전이 시 완료 서명과 일치 — 안정 구간이라 고정),
+    /// 서명 조회 실패 = `None`.
+    pub(super) sig: Option<FileSig>,
 }
 
 /// 활성 + 완료 프레임을 **발견 순서**로 조립 — 순수 (P0 B2, 리뷰 재수정:
@@ -165,19 +181,32 @@ pub(super) struct Frame<'a> {
 pub(super) fn ordered_frames<'a>(
     order: &[String],
     active: &HashMap<String, (u64, &'a [TimelineItem])>,
+    active_sig: &HashMap<String, FileSig>,
     done: &'a HashMap<String, DoneSub>,
 ) -> Vec<Frame<'a>> {
     let mut out = Vec::new();
     for aid in order {
         if let Some((turn, items)) = active.get(aid) {
             if !items.is_empty() {
-                out.push(Frame { aid: aid.clone(), turn: *turn, items, done: false });
+                out.push(Frame {
+                    aid: aid.clone(),
+                    turn: *turn,
+                    items,
+                    done: false,
+                    sig: active_sig.get(aid).copied(),
+                });
                 continue;
             }
             // 활성이지만 아직 빈 tail(재활성 재파싱 전 등) — done 폴백 시도.
         }
         if let Some(d) = done.get(aid) {
-            out.push(Frame { aid: aid.clone(), turn: d.turn, items: &d.items, done: true });
+            out.push(Frame {
+                aid: aid.clone(),
+                turn: d.turn,
+                items: &d.items,
+                done: true,
+                sig: Some(d.sig),
+            });
         }
     }
     out
@@ -204,7 +233,7 @@ fn payload_frames(sub_raw: &[Frame<'_>], parents: Vec<Option<String>>) -> Vec<Su
                 .filter(|i| i.agent_status == core_lib::AgentStatus::Completed)
                 .count(),
             last_status: f.items.last().map(|i| i.agent_status),
-            rev: f.items.iter().map(|i| i.revision).sum(),
+            sig: f.sig.map(sig_string),
             items: (!f.done).then(|| {
                 let mut its = f.items.to_vec();
                 cap_content(&mut its);
@@ -234,6 +263,79 @@ pub(super) fn emit_gate(
     } else {
         (false, pending)
     }
+}
+
+/// 세션 종료 시 미발화 pending을 마지막으로 flush할지 — 순수 (AA1 — 듀얼 리뷰
+/// codex). `existed` = **이 폴 스레드가** 런타임에서 세션을 제거했는가 =
+/// **자연 종료**(claude가 스스로 종료). 수동 close(claude_close·detach-close)는
+/// 런타임이 락 안에서 by_id를 먼저 지운 뒤 stop을 세우므로, 폴 스레드가 뒤늦게
+/// remove_session을 부르면 이미 없어 `existed=false`가 된다. 즉 `existed`가
+/// 그 자체로 자연/수동을 가르는 신호다(새 플래그·메모리 순서 논쟁 불필요).
+///
+/// 자연 종료면서 직전 emit 후 EMIT_MIN_INTERVAL(400ms) 창 안에 최종 답변을
+/// poll하고 곧장 종료되면 게이트가 발화하지 못한 채(`pending=true`) 루프가
+/// 빠져 라이브 화면이 최종 답변을 못 받고 낡는다(스냅샷은 있으나 라이브 회귀).
+/// 그 경우만 마지막 상태를 한 번 더 emit한다. 수동 close는 화면이 곧 사라지므로
+/// flush하지 않는다 — 늦은 emit이 `claude-session-closed` 뒤에 도착해 종료 표시를
+/// 되돌리는 회귀(useClaudeTimeline `setEnded(false)`)도 이로써 막는다.
+pub(super) fn should_flush_on_end(existed: bool, emit_pending: bool) -> bool {
+    existed && emit_pending
+}
+
+/// payload 조립 + `claude-timeline` emit — 폴 루프의 정상 틱과 종료 flush(AA1)가
+/// **같은 경로**를 쓰도록 추출. items·turns·answers 등을 t에서 새로 복사하고,
+/// 서브에이전트 프레임을 발견 순서로 조립해(활성=본문 인라인, 완료=메타만) 보낸다.
+#[allow(clippy::too_many_arguments)]
+fn assemble_and_emit(
+    app: &AppHandle,
+    id: u64,
+    t: &core_lib::jsonl::SessionTail,
+    subagents: &HashMap<String, core_lib::jsonl::SessionTail>,
+    subagent_turn: &HashMap<String, u64>,
+    active_sig: &HashMap<String, FileSig>,
+    sub_order: &[String],
+    sub_done: &HashMap<String, DoneSub>,
+    mention_memo: &mut HashMap<(String, String, String), (u32, bool)>,
+) {
+    let items = t.timeline().items();
+    let items_v = items.to_vec();
+    let turns_v: Vec<(u64, String)> = t.turns().iter().map(|(k, v)| (*k, v.clone())).collect();
+    let answers_v: Vec<(u64, String)> = t.answers().iter().map(|(k, v)| (*k, v.clone())).collect();
+    let dates_v: Vec<(u64, String)> = t.dates().iter().map(|(k, v)| (*k, v.clone())).collect();
+    let tokens_v: Vec<(u64, TokenUsage)> = t.tokens().iter().map(|(k, v)| (*k, *v)).collect();
+    let model_v: Option<String> = t.model().map(str::to_string);
+    let last_usage_v: Option<TokenUsage> = t.last_usage();
+    // P0 B2: 발견 순서로 활성+완료 프레임 조립(특성테스트 ordered_frames_*)
+    // — 완료 프레임 보존 + active(재파싱 완료) 우선 + 결정적 순서.
+    let active_map: HashMap<String, (u64, &[TimelineItem])> = subagents
+        .iter()
+        .map(|(aid, st)| (aid.clone(), (*subagent_turn.get(aid).unwrap_or(&0), st.timeline().items())))
+        .collect();
+    let sub_raw = ordered_frames(sub_order, &active_map, active_sig, sub_done);
+    // 부모 추론은 **절단 전** 원문으로(멘션이 CAP 밖에 있을 수 있다 — P1 절단은
+    // 그 뒤 표시용 클론에만 적용). first-match를 매 변경 틱 재계산하되 아이템별
+    // contains 판정만 revision 키로 메모(naive와 완전 동치, 비용만 국한).
+    let parents: Vec<Option<String>> = sub_raw
+        .iter()
+        .map(|f| subagent_parent_memo(&f.aid, &items_v, &sub_raw, mention_memo))
+        .collect();
+    let mut items_p = items_v;
+    cap_content(&mut items_p);
+    let subagents_v = payload_frames(&sub_raw, parents);
+    let _ = app.emit(
+        "claude-timeline",
+        ClaudeTimelinePayload {
+            id,
+            items: items_p,
+            turns: turns_v,
+            answers: answers_v,
+            dates: dates_v,
+            tokens: tokens_v,
+            model: model_v,
+            last_usage: last_usage_v,
+            subagents: subagents_v,
+        },
+    );
 }
 
 #[cfg_attr(not(test), allow(dead_code))] // 특성테스트의 naive 기준 구현(메모판과 동치 검증용)
@@ -543,9 +645,15 @@ pub(super) fn run_timeline_poll(
             sub_gen += 1; // 지연 교체 확정(빈 tail → 증분으로 items 도달) — N2
         }
         let mut newly_done: Vec<(String, FileSig)> = Vec::new();
+        // AA2: 활성 에이전트의 이번 틱 파일 서명 — payload 프레임의 캐시 키.
+        // 완료 전이 안정 구간엔 값이 고정이라 done 서명(DoneSub.sig)과 일치한다.
+        let mut active_sig: HashMap<String, FileSig> = HashMap::new();
         for (aid, st) in subagents.iter() {
             let Some(p) = sub_path.get(aid) else { continue };
             let sig = file_sig(p);
+            if let Some(s) = sig {
+                active_sig.insert(aid.clone(), s);
+            }
             let prev = sub_stable.get(aid).copied().unwrap_or((None, 0));
             let next = advance_stability(prev, sig);
             sub_stable.insert(aid.clone(), next);
@@ -622,54 +730,16 @@ pub(super) fn run_timeline_poll(
         }
         last_emit = std::time::Instant::now();
 
-        let items_v = items.to_vec();
-        let turns_v: Vec<(u64, String)> = t.turns().iter().map(|(k, v)| (*k, v.clone())).collect();
-        let answers_v: Vec<(u64, String)> =
-            t.answers().iter().map(|(k, v)| (*k, v.clone())).collect();
-        let dates_v: Vec<(u64, String)> = t.dates().iter().map(|(k, v)| (*k, v.clone())).collect();
-        let tokens_v: Vec<(u64, TokenUsage)> = t.tokens().iter().map(|(k, v)| (*k, *v)).collect();
-        let model_v: Option<String> = t.model().map(str::to_string);
-        let last_usage_v: Option<TokenUsage> = t.last_usage();
-        // P0 B2: 발견 순서로 활성+완료 프레임 조립(특성테스트 ordered_frames_*)
-        // — 완료 프레임 보존 + active(재파싱 완료) 우선 + 결정적 순서.
-        let active_map: HashMap<String, (u64, &[TimelineItem])> = subagents
-            .iter()
-            .map(|(aid, st)| {
-                (aid.clone(), (*subagent_turn.get(aid).unwrap_or(&0), st.timeline().items()))
-            })
-            .collect();
-        let sub_raw = ordered_frames(&sub_order, &active_map, &sub_done);
-        // Link each agent to the timeline item (the spawning `Agent`/`Task` call)
-        // whose result mentions the agent id — that item, in main or in a parent
-        // agent, is its parent (recursive tree). `None` ⇒ nest under its turn.
-        // P0 B1(재수정): first-match를 매 변경 틱 그대로 재계산하되, 아이템별
-        // contains 판정만 revision 키로 메모 — naive와 완전 동치(부모 승격
-        // 포함), 비용은 변경 아이템으로 국한(재점검 N3 주석 정정).
-        // 부모 추론은 **절단 전** 원문으로(멘션이 32KB 밖에 있을 수 있다 —
-        // P1 절단은 그 뒤 표시용 클론에만 적용).
-        let parents: Vec<Option<String>> = sub_raw
-            .iter()
-            .map(|f| subagent_parent_memo(&f.aid, &items_v, &sub_raw, &mut mention_memo))
-            .collect();
-        // P1: 표시 계층 절단 + payload는 clone 없이 move(스냅샷은 아래 debounce
-        // 블록이 t에서 재구성 — 틱당 딥클론 2회→1회).
-        let mut items_p = items_v;
-        cap_content(&mut items_p);
-        let subagents_v = payload_frames(&sub_raw, parents);
-
-        let _ = app.emit(
-            "claude-timeline",
-            ClaudeTimelinePayload {
-                id,
-                items: items_p,
-                turns: turns_v,
-                answers: answers_v,
-                dates: dates_v,
-                tokens: tokens_v,
-                model: model_v,
-                last_usage: last_usage_v,
-                subagents: subagents_v,
-            },
+        assemble_and_emit(
+            &app,
+            id,
+            t,
+            &subagents,
+            &subagent_turn,
+            &active_sig,
+            &sub_order,
+            &sub_done,
+            &mut mention_memo,
         );
         // 저장 자체는 위(틱 진입부) debounce 플러시가 수행하고, dirty 마킹은
         // 변화 감지 시점(emit 게이트 앞)에서 이미 끝났다.
@@ -685,6 +755,29 @@ pub(super) fn run_timeline_poll(
     if let Some(state) = app.try_state::<super::runtime::ClaudeState>() {
         if let Ok(mut rt) = state.rt.lock() {
             existed = rt.remove_session(id).is_some(); // T7 (전이표 순수 메서드)
+        }
+    }
+    // AA1(듀얼 리뷰 codex): 자연 종료면서 미발화 pending이 남았으면 마지막
+    // 상태를 한 번 더 emit한다 — 직전 emit 후 400ms 창 안에 최종 답변을 poll하고
+    // claude가 종료된 경우 라이브 화면이 그 답변을 못 받고 낡던 것을 막는다.
+    // `claude-session-closed` **앞**에서 emit해 순서를 보장한다(closed가 나중에
+    // 도착해 최종 상태 위에 종료 표시를 얹는다). active_sig는 빈 맵으로 —
+    // 남아 있는 활성 프레임은 본문을 인라인으로 싣고, 완료 프레임은 DoneSub.sig를
+    // 쓰므로 서명 조회가 필요 없다. 마지막 poll로 종료 직전 바이트까지 반영한다.
+    if should_flush_on_end(existed, emit_pending) {
+        if let Some(t) = tail.as_mut() {
+            let _ = t.poll();
+            assemble_and_emit(
+                &app,
+                id,
+                t,
+                &subagents,
+                &subagent_turn,
+                &HashMap::new(),
+                &sub_order,
+                &sub_done,
+                &mut mention_memo,
+            );
         }
     }
     // Notify any mirror windows that the session ended (review P6-impl #2).
@@ -722,7 +815,7 @@ mod tests {
     /// 차용 프레임(메모리 1단계 — ordered_frames가 clone하지 않는다). items의
     /// 소유권은 호출부(테스트 지역 변수)에 남는다.
     fn agent<'a>(aid: &str, items: &'a [TimelineItem]) -> Frame<'a> {
-        Frame { aid: aid.to_string(), turn: 1, items, done: false }
+        Frame { aid: aid.to_string(), turn: 1, items, done: false, sig: None }
     }
 
     // P1 특성테스트 — 절단은 UTF-8 경계 보존 + 플래그, 상한 이하는 불변.
@@ -772,7 +865,10 @@ mod tests {
         let mut d: HashMap<String, DoneSub> = HashMap::new();
         d.insert("a2".into(), done(7, vec![item("d-2", None)])); // 완료
         d.insert("a3".into(), done(9, vec![item("d-3", None)])); // 전이 중 — done 폴백
-        let out = ordered_frames(&order, &active, &d);
+        // AA2: 활성 프레임의 파일 서명이 캐시 키로 실린다(완료 프레임은 DoneSub.sig).
+        let mut asig: HashMap<String, FileSig> = HashMap::new();
+        asig.insert("a1".into(), SIG_B);
+        let out = ordered_frames(&order, &active, &asig, &d);
         // 발견 순서 유지 + 완료 프레임 보존 + 빈 active는 done 폴백(공백 없음).
         assert_eq!(
             out.iter()
@@ -780,6 +876,10 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![("a1", 1, "l-1", false), ("a2", 7, "d-2", true), ("a3", 9, "d-3", true)]
         );
+        // 서명: 활성=active_sig, 완료=DoneSub.sig(SIG_A).
+        assert_eq!(out[0].sig, Some(SIG_B));
+        assert_eq!(out[1].sig, Some(SIG_A));
+        assert_eq!(out[2].sig, Some(SIG_A));
     }
 
     #[test]
@@ -790,7 +890,7 @@ mod tests {
         active.insert("a1".into(), (1, &live));
         let mut d: HashMap<String, DoneSub> = HashMap::new();
         d.insert("a1".into(), done(1, vec![item("old-1", None)]));
-        let out = ordered_frames(&order, &active, &d);
+        let out = ordered_frames(&order, &active, &HashMap::new(), &d);
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].items[0].tool_call_id, "new-1"); // 재파싱된 active 우선
         assert!(!out[0].done, "활성 프레임은 payload에 본문을 싣는다");
@@ -804,20 +904,21 @@ mod tests {
         done_items[1].revision = 4;
         let live_items = vec![item("l-1", Some("x"))];
         let frames = vec![
-            Frame { aid: "done".into(), turn: 2, items: &done_items, done: true },
-            Frame { aid: "live".into(), turn: 3, items: &live_items, done: false },
+            Frame { aid: "done".into(), turn: 2, items: &done_items, done: true, sig: Some((42, 7)) },
+            Frame { aid: "live".into(), turn: 3, items: &live_items, done: false, sig: None },
         ];
         let out = payload_frames(&frames, vec![Some("call-1".into()), None]);
         // 완료: 본문 없음(= 프론트가 펼칠 때 조회) + 메타는 원본 items 기준.
         assert!(out[0].items.is_none(), "완료 프레임의 본문이 payload에 실리면 절감이 사라진다");
         assert_eq!((out[0].total, out[0].completed), (2, 1));
         assert_eq!(out[0].last_status, Some(core_lib::AgentStatus::InProgress));
-        assert_eq!(out[0].rev, 5); // 1 + 4 — 본문 캐시 무효화 키
+        assert_eq!(out[0].sig.as_deref(), Some("42-7")); // AA2: 파일 서명 문자열
         assert_eq!(out[0].parent.as_deref(), Some("call-1"));
         assert_eq!(out[0].turn, 2);
-        // 활성: 본문 인라인(절단 적용).
+        // 활성: 본문 인라인(절단 적용) + 서명 없음(인라인이라 불필요).
         assert_eq!(out[1].items.as_ref().map(Vec::len), Some(1));
         assert_eq!((out[1].total, out[1].completed), (1, 1));
+        assert!(out[1].sig.is_none());
     }
 
     /// 절단(CONTENT_CAP)은 payload 본문에만 걸리고 **메타는 원본 기준**이어야
@@ -826,7 +927,8 @@ mod tests {
     fn payload_frames_caps_live_bodies_without_touching_meta() {
         let long = "가".repeat(CONTENT_CAP);
         let live_items = vec![item("l-1", Some(&long))];
-        let frames = vec![Frame { aid: "live".into(), turn: 1, items: &live_items, done: false }];
+        let frames =
+            vec![Frame { aid: "live".into(), turn: 1, items: &live_items, done: false, sig: None }];
         let out = payload_frames(&frames, vec![None]);
         let its = out[0].items.as_ref().unwrap();
         assert!(its[0].content_truncated);
@@ -880,6 +982,23 @@ mod tests {
         // 마지막 변화(틱 9) 이후의 전송이 존재 = 최종 상태 착지.
         assert!(last_emitted_tick.unwrap() >= 9, "마지막 변화 뒤 전송이 없으면 화면이 낡는다");
         assert!(!pending, "보류가 남은 채 끝나면 안 된다");
+    }
+
+    /// AA1 — 종료 flush 판정. 직전 emit 후 <400ms에 최종 답변 poll 뒤 종료되면
+    /// pending이 남고, **자연 종료(existed=true)** 일 때만 flush한다.
+    #[test]
+    fn should_flush_only_on_natural_end_with_pending() {
+        const MIN: Duration = Duration::from_millis(400);
+        // 시나리오: t=0 emit → t=+200ms 변화(게이트 미달, pending 유지) → 종료.
+        let (do_emit, pending) = emit_gate(true, false, Duration::from_millis(200), MIN);
+        assert!(!do_emit && pending, "400ms 창 안의 변화는 미발화 보류로 남는다");
+        // 자연 종료: 이 폴 스레드가 세션을 제거(existed=true) → 마지막 상태 flush.
+        assert!(should_flush_on_end(true, pending), "자연 종료면 최종 답변을 마지막에 보낸다");
+        // 수동 close: 런타임이 먼저 제거(existed=false) → flush 안 함(화면이 사라짐,
+        // 늦은 emit이 closed 뒤 종료 표시를 되돌리는 회귀도 차단).
+        assert!(!should_flush_on_end(false, pending));
+        // 이미 최종 상태를 emit했으면(pending=false) 자연 종료여도 flush 불필요.
+        assert!(!should_flush_on_end(true, false));
     }
 
     // P0 B1(재수정) — 메모 스캔이 naive와 완전 동치인지 + revision bump 반영.
