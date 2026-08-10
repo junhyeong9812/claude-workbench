@@ -165,17 +165,34 @@ export function adoptInlineBodies(
   return next ?? cache;
 }
 
-/** lazy 조회 응답을 캐시에 반영해도 되나 (순수 — AA3 CAS). 늦게 도착한 응답이
- * 그 사이 발주된 더 새 요청(승계·재조회)이나 세션 전환을 덮으면 미도착 회귀가
- * 생긴다. `myReq`가 이 에이전트의 최신 요청이고 세션 uuid도 발주 때와 같을 때만
- * 반영한다. */
+/** lazy 조회 응답을 캐시에 반영해도 되나 (순수 — AA3 CAS + BB3). 늦게 도착한
+ * 응답이 그 사이 발주된 더 새 요청(승계·재조회)·세션 전환·**재활성(서명 변화)** 을
+ * 덮으면 미도착 회귀나 낡은 본문 표시가 생긴다. 셋 다 발주 시점과 같을 때만
+ * 반영한다:
+ * - `latestReq === myReq`: 이 에이전트의 최신 요청이 아직 나(새 조회가 앞지르지 않음).
+ * - `currentUuid === myUuid`: 세션이 그대로(전환된 세션 캐시 오염 방지).
+ * - `currentSig === mySig`: 프레임 서명이 그대로 — 재활성으로 서명이 바뀌었으면
+ *   그 조회는 낡은 것이라 폐기한다(활성 인라인 승계 본문을 늦은 조회가 덮는 경로 차단). */
 export function lazyResponseIsCurrent(
   latestReq: number | undefined,
   myReq: number,
   currentUuid: string | null,
   myUuid: string | null,
+  currentSig: string | null,
+  mySig: string | null,
 ): boolean {
-  return latestReq === myReq && currentUuid === myUuid;
+  return latestReq === myReq && currentUuid === myUuid && currentSig === mySig;
+}
+
+/** 이 timeline 이벤트가 종료 표시를 풀어야 하나 (순수 — BB2, 종결 우선).
+ *
+ * 세션을 닫은 뒤(`claude-session-closed`) 그 세션의 **같은 PTY id**로 늦게 도착한
+ * straggler timeline(자연 종료 flush가 closed보다 늦게 도착하는 순서 뒤집힘 등)은
+ * 최종 상태를 그리되 **종료 표시를 되돌리면 안 된다**. 오직 **새 id**(같은 uuid를
+ * 다시 연 resume — 새 PTY)일 때만 다시 연다. 이로써 백엔드 emit 순서와 무관하게
+ * "닫힌 세션이 다시 열리는" 회귀가 사라진다(순서 안전을 프론트가 흡수). */
+export function resumesSession(eventId: number, closedId: number | null): boolean {
+  return closedId == null || eventId !== closedId;
 }
 
 /** 이 프레임의 본문을 지금 조회해야 하나 (순수). 활성 프레임(본문 인라인)은
@@ -336,15 +353,20 @@ export function useTimelineState(
       reqOfRef.current.set(agentId, myReq);
       const myUuid = src?.uuid ?? null;
       const commit = (e: LazyAgentEntry) => {
+        // BB3: 반영 시점의 현재 프레임 서명 — 재활성으로 프레임이 활성(인라인)이
+        // 되었거나 사라졌으면 발주 시 sig와 달라져 폐기된다.
+        const curSig = framesRef.current.find((f) => f.id === agentId)?.sig ?? null;
         if (
           !lazyResponseIsCurrent(
             reqOfRef.current.get(agentId),
             myReq,
             sourceRef.current?.uuid ?? null,
             myUuid,
+            curSig,
+            sig,
           )
         )
-          return; // 더 새 요청이 앞질렀거나 세션이 바뀌었다 — 늦은 응답 폐기
+          return; // 더 새 요청·세션 전환·재활성(서명 변화) — 늦은 응답 폐기
         putLazy(agentId, e);
       };
       if (!src?.project || !src?.uuid) {
@@ -451,22 +473,33 @@ export function useClaudeTimeline({
     // opened) so a session that ends without emitting another timeline event is
     // still recognized as ours.
     let numericId: number | null = lookupSessionId(uuid) ?? null;
+    // BB2: 이미 닫힌 PTY id를 기억한다(종결 우선). 자연 종료 flush(BB1)로 closed
+    // 뒤에 같은 id의 straggler timeline이 늦게 와도 종료 표시를 되돌리지 않는다.
+    let closedId: number | null = null;
     let unTl: UnlistenFn | undefined;
     let unClosed: UnlistenFn | undefined;
     (async () => {
       unTl = await listen<ClaudeTimelineEvent>("claude-timeline", (e) => {
         if (lookupSessionUuid(e.payload.id) !== uuid) return;
-        numericId = e.payload.id;
+        const eid = e.payload.id;
         gotLive = true;
         // 폴 스레드는 세션이 살아 있을 때만 emit한다 — 이벤트 자체가 생존 증거다.
-        // 같은 uuid를 다시 열면(resume) 새 PTY id로 이벤트가 재개되므로 종료
-        // 표시도 여기서 풀린다.
-        setEnded(false);
+        // 하지만 **닫힌 그 세션(같은 id)의 늦은 straggler**는 최종 상태만 그리고
+        // 종료 표시는 유지한다(BB2 — 백엔드 emit 순서 무관 종결 우선). 새 id로
+        // 재개되면(resume — 새 PTY) 그때만 다시 연다.
+        if (resumesSession(eid, closedId)) {
+          setEnded(false);
+          closedId = null;
+        }
+        numericId = eid;
         applySnapshot(e.payload, "live");
         setSubagentFrames(e.payload.subagents ?? []);
       });
       unClosed = await listen<number>("claude-session-closed", (e) => {
-        if (numericId != null && e.payload === numericId) setEnded(true);
+        if (numericId != null && e.payload === numericId) {
+          setEnded(true);
+          closedId = e.payload;
+        }
       });
       // Unmounted while awaiting listen() — cleanup already ran, so release here.
       if (disposed) {

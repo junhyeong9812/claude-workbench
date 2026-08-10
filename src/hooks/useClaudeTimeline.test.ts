@@ -9,6 +9,7 @@ import {
   adoptInlineBodies,
   ctxOccupancy,
   lazyResponseIsCurrent,
+  resumesSession,
   ctxWindow,
   mergeSubagents,
   needsSubagentFetch,
@@ -170,19 +171,35 @@ describe("adoptInlineBodies — 활성 본문 승계(완료 전이 시 화면이
   });
 });
 
-describe("lazyResponseIsCurrent — AA3 CAS (늦은 응답이 새 요청/세션을 덮지 않게)", () => {
-  it("최신 요청 + 같은 세션이면 반영한다", () => {
-    expect(lazyResponseIsCurrent(5, 5, "u1", "u1")).toBe(true);
+describe("lazyResponseIsCurrent — AA3 CAS + BB3 (늦은 응답이 새 요청/세션/재활성을 덮지 않게)", () => {
+  it("최신 요청 + 같은 세션 + 같은 서명이면 반영한다", () => {
+    expect(lazyResponseIsCurrent(5, 5, "u1", "u1", "sA", "sA")).toBe(true);
   });
   it("그 사이 더 새 요청(승계·재조회)이 발주됐으면 폐기", () => {
-    // myReq=5로 나간 rev7 응답이 늦게 도착했는데, 이미 req=6이 발주됨.
-    expect(lazyResponseIsCurrent(6, 5, "u1", "u1")).toBe(false);
+    expect(lazyResponseIsCurrent(6, 5, "u1", "u1", "sA", "sA")).toBe(false);
   });
   it("세션이 전환됐으면 폐기 — 다른 세션의 캐시를 오염시키지 않는다", () => {
-    expect(lazyResponseIsCurrent(5, 5, "u2", "u1")).toBe(false);
-    expect(lazyResponseIsCurrent(5, 5, null, "u1")).toBe(false);
+    expect(lazyResponseIsCurrent(5, 5, "u2", "u1", "sA", "sA")).toBe(false);
+    expect(lazyResponseIsCurrent(5, 5, null, "u1", "sA", "sA")).toBe(false);
+  });
+  it("BB3: 재활성으로 프레임 서명이 바뀌었으면 폐기 — 활성 인라인 승계를 늦은 조회가 안 덮게", () => {
+    // 발주 시 done(sig=sA) → 응답 도착 전 재활성(활성 sig=sB, 또는 프레임 소멸 null).
+    expect(lazyResponseIsCurrent(5, 5, "u1", "u1", "sB", "sA")).toBe(false);
+    expect(lazyResponseIsCurrent(5, 5, "u1", "u1", null, "sA")).toBe(false);
   });
   it("이 에이전트로 발주된 요청 기록이 없으면(세션 리셋 등) 폐기", () => {
-    expect(lazyResponseIsCurrent(undefined, 5, "u1", "u1")).toBe(false);
+    expect(lazyResponseIsCurrent(undefined, 5, "u1", "u1", "sA", "sA")).toBe(false);
+  });
+});
+
+describe("resumesSession — BB2 종결 우선(닫힌 세션이 straggler로 다시 안 열림)", () => {
+  it("닫힌 적 없으면(closedId=null) 항상 연다 — 정상 라이브", () => {
+    expect(resumesSession(5, null)).toBe(true);
+  });
+  it("닫힌 그 세션과 같은 id의 늦은 timeline은 다시 열지 않는다(순서 뒤집힘 견고)", () => {
+    expect(resumesSession(5, 5)).toBe(false);
+  });
+  it("새 id(같은 uuid resume — 새 PTY)면 다시 연다", () => {
+    expect(resumesSession(7, 5)).toBe(true);
   });
 });
