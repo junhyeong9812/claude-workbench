@@ -258,15 +258,21 @@ export function useTreeCrud(host: TreeCrudHost): TreeCrud {
                   <button onClick={() => setDialog(null)}>취소</button>
                   <button
                     className="tree-menu-danger"
-                    onClick={() =>
+                    onClick={() => {
+                      // 루트 없이 지우면 백엔드 containment가 꺼진 채로 도는 옛
+                      // 경로가 된다 — 프로젝트 전환 등으로 루트가 사라졌으면 거부.
+                      if (!host.root) {
+                        setOpErr("트리 루트를 확인할 수 없습니다");
+                        return;
+                      }
                       void runOp(
                         () =>
                           invoke("delete_path", { path: dialog.node.path, root: host.root }),
                         parentDir(dialog.node.path),
                       ).then((ok) => {
                         if (ok) host.onDeleted?.(dialog.node.path);
-                      })
-                    }
+                      });
+                    }}
                   >
                     삭제
                   </button>
