@@ -108,6 +108,8 @@ export function MainArea({
   const requestCodexOpen = useAppStore((s) => s.requestCodexOpen);
   const runRequest = useAppStore((s) => s.runRequest);
   const requestRun = useAppStore((s) => s.requestRun);
+  const terminalOpenRequest = useAppStore((s) => s.terminalOpenRequest);
+  const requestTerminalOpen = useAppStore((s) => s.requestTerminalOpen);
   const focusMainRequest = useAppStore((s) => s.focusMainRequest);
   const focusSessionRequest = useAppStore((s) => s.focusSessionRequest);
   const setLayout = useAppStore((s) => s.setLayout);
@@ -505,6 +507,20 @@ export function MainArea({
     });
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [runRequest, apiReady, activeProject, layerMode]);
+
+  // 트리 "여기서 터미널 열기": 그 폴더를 cwd로 하는 일반 터미널 탭. 통합 레이어가
+  // 앞일 때만 소비한다 — 개발 레이어가 앞이면 DevView가, 스터디 모드면
+  // StudySession이 자기 dock에 연다(요청은 남겨 둔다: 유실≠소비).
+  useEffect(() => {
+    if (!isPrimary) return; // 부 surface는 요청 버스 비소비 (spec §2)
+    if (!integratedIsFront(layerMode)) return;
+    if (!terminalOpenRequest) return;
+    const api = apiRef.current;
+    if (!api) return; // dock not ready — keep the request; apiReady re-runs
+    requestTerminalOpen(null);
+    addPanel("terminal", { title: terminalOpenRequest.title, cwd: terminalOpenRequest.cwd });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [terminalOpenRequest, apiReady, layerMode]);
 
   // 고아 closeRequest 백스톱 (리뷰 D3): 어느 surface도 패널을 소유하지 않으면
   // (전이 타이밍·이미 닫힌 패널) 요청이 영구 잔류해 ×가 먹통이 된다 — 주

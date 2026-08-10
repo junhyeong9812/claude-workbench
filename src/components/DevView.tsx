@@ -4,6 +4,7 @@ import { DockviewReact, type DockviewApi, type DockviewReadyEvent } from "dockvi
 import "dockview-react/dist/styles/dockview.css";
 import { invoke } from "@tauri-apps/api/core";
 import { ClaudeTermPanel } from "./ClaudeTermPanel";
+import { TerminalPanel } from "./TerminalPanel";
 import { StudyFileView } from "./StudyFileView";
 import { useAppStore } from "../state/store";
 import { fileReviewSeed } from "../state/seedPrompts";
@@ -15,7 +16,8 @@ import {
   nextDevReviewAction,
 } from "../state/layerRouting";
 
-const components = { claudeterm: ClaudeTermPanel };
+// 개발 세션 + (트리 "여기서 터미널 열기"로 열리는) 일반 터미널 탭.
+const components = { claudeterm: ClaudeTermPanel, terminal: TerminalPanel };
 const basename = (p: string) => p.split("/").pop() ?? p;
 
 /**
@@ -51,11 +53,16 @@ export function DevView({ project }: { project: string }) {
   // Ctrl+B focus request: when the dev layer is in front, DevView (not MainArea)
   // owns the focus target (its editor or its dev dock).
   const focusMainRequest = useAppStore((s) => s.focusMainRequest);
+  // 트리 "여기서 터미널 열기" — 개발 레이어가 앞이면 이 dock이 소비한다.
+  const terminalOpenRequest = useAppStore((s) => s.terminalOpenRequest);
 
   // Open tabs, MRU-first; in-memory per mount (the durable continuity is the
   // dev session itself, whose uuid persists).
   const [tabs, setTabs] = useState<string[]>([]);
   const [active, setActive] = useState<string | null>(null);
+  // dock 준비 신호 — 마운트 직후 도착한 터미널 요청이 api 없이 흘러가지 않도록
+  // (onReady에서 1로 올려 소비 효과를 재발화시킨다).
+  const [dockReady, setDockReady] = useState(0);
   const apiRef = useRef<DockviewApi | null>(null);
 
   // Consume tree/peek file-open requests only while the dev layer is in front.
@@ -156,6 +163,24 @@ export function DevView({ project }: { project: string }) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [devReviewQueue, claudeInjectRequest]);
 
+  // 트리 폴더 터미널: 개발 레이어가 앞일 때만 이 dock에 연다(뒤면 요청을 그대로
+  // 두어 통합 레이어의 MainArea가 소비한다 — 유실≠소비).
+  useEffect(() => {
+    if (!devIsFront(layerMode)) return;
+    if (!terminalOpenRequest) return;
+    const api = apiRef.current;
+    if (!api) return; // dock 준비 전 — 요청 보존
+    const { cwd, title } = terminalOpenRequest;
+    useAppStore.getState().requestTerminalOpen(null);
+    api.addPanel({
+      id: `terminal-dev-${crypto.randomUUID()}`, // 연타해도 id 충돌 없음
+      component: "terminal",
+      title,
+      params: { kind: "terminal", title, cwd },
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [terminalOpenRequest, layerMode, dockReady]);
+
   // Embedded dev session dock (StudySession 선례): seed once with the project's
   // persisted dev-session uuid so it resumes across restarts; a re-entry within
   // a run re-attaches to the still-live PTY. If a devReview is already pending
@@ -164,6 +189,7 @@ export function DevView({ project }: { project: string }) {
   const onReady = (event: DockviewReadyEvent) => {
     const api = event.api;
     apiRef.current = api;
+    setDockReady((n) => n + 1);
     if (api.panels.length === 0) {
       // CAS: grab our project's head devReview (if any) to seed the fresh session
       // with, and consume it by id — so the devReview effect (parent, runs after
@@ -174,11 +200,16 @@ export function DevView({ project }: { project: string }) {
     }
     // Explicit close of the dev session → stop its PTY (the pane stays empty
     // until the dev mode is re-entered, which re-seeds the same uuid).
+    // 폴더 터미널 탭은 단일 소유라 자기 PTY만 닫는다 — claude_close에 터미널 id를
+    // 넘기지 않도록 kind로 갈라 둔다.
     api.onDidRemovePanel((panel) => {
-      const p = panel.params as { sessionId?: number } | undefined;
-      if (typeof p?.sessionId === "number") {
-        invoke("claude_close", { id: p.sessionId }).catch(() => {});
+      const p = panel.params as { kind?: string; sessionId?: number } | undefined;
+      if (typeof p?.sessionId !== "number") return;
+      if (p.kind === "terminal") {
+        invoke("terminal_close", { id: p.sessionId }).catch(() => {});
+        return;
       }
+      invoke("claude_close", { id: p.sessionId }).catch(() => {});
     });
     // Deliver any remaining same-project entries now that the dock is live (a
     // rapid double ✓확인 before mount leaves >1 queued).
