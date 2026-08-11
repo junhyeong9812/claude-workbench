@@ -31,10 +31,12 @@ describe("store: setDualProject → 트리 + 이중 기록", () => {
     expect(s.dualProject).toBe("/b");
     // 메모리 트리에 secondary 멤버십.
     expect(JSON.stringify(s.surfaceTree)).toContain("/b");
-    // 디스크 정본 = 트리 블롭(방향까지 담음, P6).
+    // 디스크 정본 = 트리 블롭(방향까지 담음, P6) + provenance 마커 legacyMirror(F1).
     const blob = localStorage.getItem("surfaceTree");
     expect(blob).not.toBeNull();
-    expect(JSON.parse(blob!)).toEqual(s.surfaceTree);
+    expect(JSON.parse(blob!)).toEqual({ ...s.surfaceTree, legacyMirror: "/b" });
+    // F1 불변식: legacyMirror는 항상 트리 secondary와 일치(쓰기 시점 동봉).
+    expect(JSON.parse(blob!).legacyMirror).toBe(secondaryProject(s.surfaceTree));
     // 다운그레이드 파생 미러 = 구버전 앱이 읽는 legacy 문자열 키.
     expect(localStorage.getItem("dualProject")).toBe("/b");
   });

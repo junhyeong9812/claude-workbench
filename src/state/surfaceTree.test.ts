@@ -303,6 +303,48 @@ describe("P6: resolveSurfaceTree — 디스크 로드 + 다운그레이드 화�
   });
 });
 
+describe("F1(codex P1-1): legacyMirror provenance — stale legacy가 valid 트리를 못 이긴다", () => {
+  // persist가 쓰는 블롭 형태 = 트리 + legacyMirror(= 그때의 legacy = secondary).
+  const withMirror = (t: SurfaceTree) => ({ ...t, legacyMirror: secondaryProject(t) });
+
+  it("(a) same-version(마커 == 현재 legacy) → 트리 정본(방향 보존, 마커 stripped)", () => {
+    const tree = addSurface(emptyTree(), "/b", { direction: "column", before: false });
+    const r = resolveSurfaceTree(withMirror(tree), "/b");
+    expect(r).toEqual(tree); // legacyMirror는 parse가 떼어냄
+    expect(surfaceLayout(r)).toEqual({ direction: "column", before: false });
+  });
+
+  it("(b) 다운그레이드 교체(마커 stale /b, 구버전이 legacy=/other) → legacy 멤버십·트리 방향", () => {
+    const tree = addSurface(emptyTree(), "/b", { direction: "column", before: true });
+    const r = resolveSurfaceTree(withMirror(tree), "/other");
+    expect(secondaryProject(r)).toBe("/other");
+    expect(surfaceLayout(r)).toEqual({ direction: "column", before: true });
+  });
+
+  it("(b') 다운그레이드 닫음(마커 stale /b, 구버전이 legacy 제거) → 기본(부활 금지)", () => {
+    const tree = addSurface(emptyTree(), "/b", { direction: "row", before: false });
+    expect(resolveSurfaceTree(withMirror(tree), null)).toEqual(emptyTree());
+  });
+
+  it("(c) 마커 == 현재 legacy면 트리 방향 우선 — 방향-only 재기록 후 legacy 미세지연도 트리 신뢰", () => {
+    // 마커(/b) == 현재 legacy(/b)인데 트리 멤버십도 /b → 정상 일치 경로로 트리 채택.
+    const tree = addSurface(emptyTree(), "/b", { direction: "column", before: true });
+    const r = resolveSurfaceTree(withMirror(tree), "/b");
+    expect(secondaryProject(r)).toBe("/b");
+    expect(surfaceLayout(r)).toEqual({ direction: "column", before: true });
+  });
+
+  it("(하위호환) 마커 부재(구 P6-이전 블롭) → 기존 화해로 폴백(legacy 멤버십)", () => {
+    const stale = addSurface(emptyTree(), "/b", { direction: "column", before: true });
+    // 마커 없는 블롭 + legacy=/other → 다운그레이드로 간주(현행 화해 유지).
+    const r = resolveSurfaceTree(JSON.parse(JSON.stringify(stale)), "/other");
+    expect(secondaryProject(r)).toBe("/other");
+    expect(surfaceLayout(r)).toEqual({ direction: "column", before: true });
+    // 마커 없는 블롭 + legacy 부재 → 기본(부활 금지).
+    expect(resolveSurfaceTree(JSON.parse(JSON.stringify(stale)), null)).toEqual(emptyTree());
+  });
+});
+
 describe("FA(리뷰): 깊은 트리·순환에서 크래시하지 않고 기본 복원", () => {
   it("12k 깊이 중첩 split → throw 없이 기본(예외 경계)", () => {
     // 예산 초과 재귀가 RangeError를 던져도 parseSurfaceTree가 잡아 기본 반환.

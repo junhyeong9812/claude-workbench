@@ -328,7 +328,11 @@ function loadSurfaceTree(): SurfaceTree {
 function persistSurfaceTree(tree: SurfaceTree) {
   const secondary = secondaryProject(tree);
   if (secondary) {
-    localStorage.setItem(SURFACE_TREE_KEY, JSON.stringify(tree)); // 정본(방향 포함)
+    // 정본(방향 포함) + provenance 마커 `legacyMirror`(= 이 쓰기 시점의 legacy 값).
+    // 로드 시 legacyMirror ≠ 현재 legacy면 그 사이 구버전이 legacy를 바꾼 것
+    // (진짜 다운그레이드)임을 판별해 stale legacy가 valid 트리를 이기지 못하게 한다
+    // (F1 — codex P1-1). 마커는 항상 secondary와 일치(불변식).
+    localStorage.setItem(SURFACE_TREE_KEY, JSON.stringify({ ...tree, legacyMirror: secondary }));
     localStorage.setItem(LEGACY_DUAL_KEY, secondary); // 다운그레이드 파생 미러
   } else {
     localStorage.removeItem(SURFACE_TREE_KEY);

@@ -314,23 +314,43 @@ export function parseSurfaceTree(rawTree: unknown, legacyDual: string | null): S
   return emptyTree();
 }
 
+/** 트리 블롭에 동봉된 provenance 마커 `legacyMirror`(쓰기 시점의 legacy 값 =
+ * secondaryProject) 읽기. 없으면 undefined(P6-이전·손 안 탄 블롭 = 구 화해로 폴백). */
+function legacyMirrorOf(rawTree: unknown): string | undefined {
+  if (rawTree && typeof rawTree === "object") {
+    const m = (rawTree as Record<string, unknown>).legacyMirror;
+    if (typeof m === "string") return m;
+  }
+  return undefined;
+}
+
 /**
  * 디스크 로드 정본화 + 다운그레이드 화해(멀티프로젝트 P6).
  *
  * P6부터 트리 블롭(`rawTree`)이 방향까지 담는 디스크 정본이고, 레거시 문자열
- * (`legacy`)은 구버전 앱이 읽는 **파생 미러**다. parseSurfaceTree로 파싱한 뒤,
- * 두 표현이 어긋나면(구버전 세션이 legacy만 변경 — surfaceTree는 못 만짐)
- * **legacy를 멤버십 정본, 트리를 방향 정본**으로 단방향 화해한다:
- *  - legacy 부재인데 트리에 secondary → 구버전이 닫음 → 부활 금지(기본).
- *  - legacy가 다른 프로젝트 → 그 프로젝트로, 트리 방향 보존.
- *  - rawTree 부재 → parse가 이미 legacy로 구성(정의상 일치) → 그대로.
- *  - 일치(신버전 동기 기록의 정상 경로) → 트리 그대로(방향 보존).
+ * (`legacy`)은 구버전 앱이 읽는 **파생 미러**다. 두 표현이 어긋나는 원인은 여럿이다
+ * (다운그레이드 vs stale vs 실패쓰기 vs 손상). **legacyMirror provenance 마커**로
+ * 구별한다(F1 — codex P1-1). persist가 트리 블롭에 `legacyMirror = 그때의 legacy`를
+ * 동봉하므로:
+ *  - `rawTree` 부재(null) → parse가 이미 legacy로 마이그레이션(정의상 일치) → 그대로.
+ *  - 멤버십 일치(legacy === 트리 secondary) → 트리 정본(방향 보존).
+ *  - **legacyMirror === 현재 legacy** → 그 사이 구버전이 legacy를 건드리지 않음
+ *    (신버전 쓰기·무변경) → 트리 정본(방향 보존). 실패쓰기·same-version이 여기.
+ *  - **legacyMirror ≠ 현재 legacy(또는 마커 부재)** → 그 사이 구버전이 legacy 변경
+ *    = 진짜 다운그레이드 → legacy 멤버십 정본, 트리 방향 보존. legacy 부재면 닫힘.
  */
 export function resolveSurfaceTree(rawTree: unknown, legacy: string | null): SurfaceTree {
   const tree = parseSurfaceTree(rawTree, legacy);
   if (rawTree === null || rawTree === undefined) return tree; // legacy 경로 = 정의상 일치
   const treeSec = secondaryProject(tree);
-  if ((legacy || null) === (treeSec || null)) return tree; // 정상 경로
+  if ((legacy || null) === (treeSec || null)) return tree; // 멤버십 일치 → 트리 정본
+  // 멤버십 불일치 → provenance 마커로 원인 판별.
+  const mirror = legacyMirrorOf(rawTree);
+  if (mirror !== undefined && mirror === legacy) {
+    // 마커 == 현재 legacy → 구버전이 legacy를 안 바꿈 → 트리를 정본으로 신뢰.
+    return tree;
+  }
+  // 마커 부재(구 블롭) 또는 마커 ≠ legacy → 구버전이 legacy 변경(다운그레이드).
   if (!legacy) return emptyTree(); // 구버전이 닫음 → 부활 금지
   return addSurface(emptyTree(), legacy, surfaceLayout(tree) ?? undefined); // 방향 보존
 }
