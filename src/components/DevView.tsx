@@ -70,11 +70,11 @@ export function DevView({ project }: { project: string }) {
   // so it must leave the request untouched for MainArea (유실≠소비).
   useEffect(() => {
     if (!devIsFront(layerMode)) return; // integrated layer's request — leave it
-    if (!editorOpenRequest) return;
-    // 요청버스 표면 라우팅(P2): editorOpenRequest는 이제 {path, targetSurfaceId}.
-    // DevView는 primary 표면의 dev 레이어 단일 인스턴스라 표면 게이트 없이(항상
-    // primary 대상) path만 읽는다 — 표면별 dev 레이어는 P5 몫.
-    const path = editorOpenRequest.path;
+    // 요청버스 표면 슬롯(P5 F1): DevView는 **주 표면(primary)** dev 레이어 단일
+    // 인스턴스라 primary 슬롯만 읽는다 — 표면별 dev 레이어는 P6 몫.
+    const req = editorOpenRequest.primary;
+    if (!req) return;
+    const path = req.path;
     // Clear only AFTER the tab actually opens (side effect before clear, T1) so a
     // dropped request can't read as "consumed".
     setTabs((prev) => (prev.includes(path) ? prev : [path, ...prev]));
@@ -170,10 +170,11 @@ export function DevView({ project }: { project: string }) {
   // 두어 통합 레이어의 MainArea가 소비한다 — 유실≠소비).
   useEffect(() => {
     if (!devIsFront(layerMode)) return;
-    if (!terminalOpenRequest) return;
+    const req = terminalOpenRequest.primary; // P5 F1: 주 표면 슬롯만(dev=primary 전용)
+    if (!req) return;
     const api = apiRef.current;
     if (!api) return; // dock 준비 전 — 요청 보존
-    const { cwd, title } = terminalOpenRequest;
+    const { cwd, title } = req;
     // 소비는 패널이 열린 뒤 (실패 시 요청 보존 — MainArea와 같은 계약).
     try {
       api.addPanel({

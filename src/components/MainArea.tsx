@@ -392,11 +392,11 @@ export function MainArea({
   // 같은 틱 모드 전환에도 재평가된다.)
   useEffect(() => {
     if (!integratedIsFront(layerMode)) return; // dev layer's request — leave it
-    if (!editorOpenRequest) return;
-    if (editorOpenRequest.targetSurfaceId !== mySurfaceId) return; // 표면 라우팅(P2): 내 표면 것만
+    const req = editorOpenRequest[mySurfaceId]; // P5 F1: 내 표면 슬롯만
+    if (!req) return;
     const api = apiRef.current;
     if (!api) return; // dock not ready (mount/project switch) — keep the request
-    const path = editorOpenRequest.path;
+    const path = req.path;
     // Clear only AFTER the side effect (activate/open) succeeds, so a throw leaves
     // the request in place to retry (side effect before clear, T1 / codex P2 E4).
     try {
@@ -406,7 +406,7 @@ export function MainArea({
       });
       if (existing) existing.api.setActive();
       else addPanel("editor", { path, title: fileName(path) });
-      requestEditorOpen(null);
+      requestEditorOpen(null, mySurfaceId); // 내 표면 슬롯만 clear
     } catch (err) {
       console.error("editorOpen failed; keeping request", err);
     }
@@ -418,13 +418,11 @@ export function MainArea({
   // 개발 모드면 요청을 클리어하지 않고 남겨 두어 통합 복귀 시 소비된다: 유실≠소비.)
   useEffect(() => {
     if (!integratedIsFront(layerMode)) return; // dev layer in front — leave the request
-    if (!diffRequest) return;
-    // 라우팅 키는 여기서 벗겨내 spec(DiffSpec)만 패널 params로 흘려보낸다(P2).
-    const { targetSurfaceId, ...spec } = diffRequest;
-    if (targetSurfaceId !== mySurfaceId) return; // 표면 라우팅(P2): 내 표면 것만
+    const spec = diffRequest[mySurfaceId]; // P5 F1: 내 표면 슬롯만(spec=DiffSpec 그대로)
+    if (!spec) return;
     const api = apiRef.current;
     if (!api) return;
-    requestDiff(null);
+    requestDiff(null, mySurfaceId);
     // Scope the dedupe key by cwd: with multi-root, two repos can share a path or
     // commit hash, and a cwd-less key would reactivate the wrong repo's diff (codex P1).
     const key = spec.hash
@@ -452,9 +450,9 @@ export function MainArea({
   // 개발 모드면 요청을 클리어하지 않고 남겨 두어 통합 복귀 시 소비된다: 유실≠소비.)
   useEffect(() => {
     if (!integratedIsFront(layerMode)) return; // dev layer in front — leave the request
-    if (!claudeOpenRequest) return;
-    if (claudeOpenRequest.targetSurfaceId !== mySurfaceId) return; // 표면 라우팅(P2): 내 표면 것만
-    const { project, seed, title: reqTitle, referencePanelId, model, effort } = claudeOpenRequest;
+    const req = claudeOpenRequest[mySurfaceId]; // P5 F1: 내 표면 슬롯만
+    if (!req) return;
+    const { project, seed, title: reqTitle, referencePanelId, model, effort } = req;
     // Only THIS surface's project mount may consume (DockviewReact is keyed by
     // surfaceProject): otherwise a not-yet-switched old mount would add the panel
     // to the wrong project's dock. **P5**: compare against surfaceProject (not the
@@ -462,7 +460,7 @@ export function MainArea({
     if (project !== surfaceProject) return;
     const api = apiRef.current;
     if (!api) return; // dock not ready (project-switch remount) — keep the request; apiReady re-runs this
-    requestClaudeOpen(null); // consume only once we can actually act
+    requestClaudeOpen(null, mySurfaceId); // consume only once we can actually act (내 표면 슬롯)
     const title = reqTitle ?? `에이전트 ${counterRef.current + 1}`;
     addPanel("claudeterm", {
       project,
@@ -485,13 +483,13 @@ export function MainArea({
   // 수 없고, 지속성은 이번 범위 밖).
   useEffect(() => {
     if (!integratedIsFront(layerMode)) return;
-    if (!codexOpenRequest) return;
-    if (codexOpenRequest.targetSurfaceId !== mySurfaceId) return; // 표면 라우팅(P2): 내 표면 것만
-    const { project, model, effort } = codexOpenRequest;
+    const req = codexOpenRequest[mySurfaceId]; // P5 F1: 내 표면 슬롯만
+    if (!req) return;
+    const { project, model, effort } = req;
     if (project !== surfaceProject) return; // P5: 표면-로컬 게이트
     const api = apiRef.current;
     if (!api) return;
-    requestCodexOpen(null);
+    requestCodexOpen(null, mySurfaceId);
     addPanel("codexterm", {
       project,
       cwd: project,
@@ -510,16 +508,16 @@ export function MainArea({
   // 개발 모드면 요청을 클리어하지 않고 남겨 두어 통합 복귀 시 소비된다: 유실≠소비.)
   useEffect(() => {
     if (!integratedIsFront(layerMode)) return; // dev layer in front — leave the request
-    if (!runRequest) return;
-    if (runRequest.targetSurfaceId !== mySurfaceId) return; // 표면 라우팅: 내 표면 것만
-    if (runRequest.project !== surfaceProject) return; // P5: 표면-로컬 게이트
+    const req = runRequest[mySurfaceId]; // P5 F1: 내 표면 슬롯만
+    if (!req) return;
+    if (req.project !== surfaceProject) return; // P5: 표면-로컬 게이트
     const api = apiRef.current;
     if (!api) return; // dock not ready — keep the request; apiReady re-runs
-    requestRun(null);
+    requestRun(null, mySurfaceId);
     addPanel("terminal", {
-      title: runRequest.title,
-      runCmd: runRequest.cmd,
-      cwd: runRequest.project,
+      title: req.title,
+      runCmd: req.cmd,
+      cwd: req.project,
     });
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [runRequest, apiReady, activeProject, layerMode]);
@@ -529,8 +527,8 @@ export function MainArea({
   // StudySession이 자기 dock에 연다(요청은 남겨 둔다: 유실≠소비).
   useEffect(() => {
     if (!integratedIsFront(layerMode)) return;
-    if (!terminalOpenRequest) return;
-    if (terminalOpenRequest.targetSurfaceId !== mySurfaceId) return; // 표면 라우팅(P2): 내 표면 것만
+    const req = terminalOpenRequest[mySurfaceId]; // P5 F1: 내 표면 슬롯만
+    if (!req) return;
     const api = apiRef.current;
     if (!api) return; // dock not ready — keep the request; apiReady re-runs
     // 소비(clear)는 패널이 실제로 열린 뒤 — 실패하면 요청을 남겨 다음 발화에
@@ -538,8 +536,8 @@ export function MainArea({
     // 마지막 것이 이긴다: 폴더 터미널은 "지금 누른 그 폴더"를 여는 게 맞고,
     // 앞선 요청이 아직 못 열렸다는 건 dock이 준비 전이었다는 뜻이라 수용한다.
     try {
-      addPanel("terminal", { title: terminalOpenRequest.title, cwd: terminalOpenRequest.cwd });
-      requestTerminalOpen(null);
+      addPanel("terminal", { title: req.title, cwd: req.cwd });
+      requestTerminalOpen(null, mySurfaceId);
     } catch (err) {
       console.error("terminalOpen failed; keeping request", err);
     }
@@ -688,11 +686,11 @@ export function MainArea({
   }, [termMenuRequest]);
 
   const claudePickerRequest = useAppStore((s) => s.claudePickerRequest);
-  const claudePickerHandledRef = useRef(claudePickerRequest.nonce);
+  const claudePickerHandledRef = useRef(claudePickerRequest[mySurfaceId].nonce);
   useEffect(() => {
-    if (claudePickerRequest.targetSurfaceId !== mySurfaceId) return; // 표면 라우팅(P2)
-    if (claudePickerRequest.nonce === claudePickerHandledRef.current) return;
-    claudePickerHandledRef.current = claudePickerRequest.nonce;
+    const myReq = claudePickerRequest[mySurfaceId]; // P5 F1: 내 표면 카운터만
+    if (myReq.nonce === claudePickerHandledRef.current) return;
+    claudePickerHandledRef.current = myReq.nonce;
     if (!integratedIsFront(layerMode)) return;
     setTermMenu(false);
     // Always (re)open — the pre-move button refetched sessions on every press
@@ -706,11 +704,11 @@ export function MainArea({
   // 버튼과 같은 bump 카운터 계약이고, 규칙(결정적 id·중복 방지)은 순수 모듈
   // state/projectMemo가 소유한다. 프로젝트가 없으면 저장 키가 없으므로 no-op.
   const memoRequest = useAppStore((s) => s.memoRequest);
-  const memoHandledRef = useRef(memoRequest.nonce);
+  const memoHandledRef = useRef(memoRequest[mySurfaceId].nonce);
   useEffect(() => {
-    if (memoRequest.targetSurfaceId !== mySurfaceId) return; // 표면 라우팅(P2)
-    if (memoRequest.nonce === memoHandledRef.current) return;
-    memoHandledRef.current = memoRequest.nonce;
+    const myReq = memoRequest[mySurfaceId]; // P5 F1: 내 표면 카운터만
+    if (myReq.nonce === memoHandledRef.current) return;
+    memoHandledRef.current = myReq.nonce;
     if (!integratedIsFront(layerMode)) return;
     const api = apiRef.current;
     if (!api || !surfaceProject) return; // P5: 표면-로컬 메모(자기 프로젝트)
@@ -768,12 +766,12 @@ export function MainArea({
   const requestSessionResume = useAppStore((s) => s.requestSessionResume);
   useEffect(() => {
     if (!integratedIsFront(layerMode)) return;
-    if (!sessionResumeRequest) return;
-    if (sessionResumeRequest.targetSurfaceId !== mySurfaceId) return; // 표면 라우팅(P2): 내 표면 것만
+    const req = sessionResumeRequest[mySurfaceId]; // P5 F1: 내 표면 슬롯만
+    if (!req) return;
     const api = apiRef.current;
     if (!api) return; // dock not ready — keep the request; apiReady re-runs
-    const { uuid, project, title } = sessionResumeRequest;
-    requestSessionResume(null); // consume only once we can actually act
+    const { uuid, project, title } = req;
+    requestSessionResume(null, mySurfaceId); // consume only once we can actually act
     openOrActivateSession({ uuid, project, title });
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [sessionResumeRequest, apiReady, layerMode]);

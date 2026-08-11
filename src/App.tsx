@@ -404,9 +404,11 @@ function AppMain() {
   useEffect(() => {
     if (layerMode !== "dev" || !activeProject) return;
     const flip = () => useAppStore.getState().setProjectMode(activeProject, "integrated");
-    if (shouldFlipToIntegrated(layerMode, diffRequest?.cwd, activeProject)) return flip();
-    if (shouldFlipToIntegrated(layerMode, claudeOpenRequest?.project, activeProject)) return flip();
-    if (shouldFlipToIntegrated(layerMode, runRequest?.project, activeProject)) return flip();
+    // P5 F1: 자동-flip은 **주 표면(primary)** 슬롯만 본다 — dev 레이어는 주 표면
+    // 전용이고 부 표면은 integrated 고정이라 flip 대상이 아니다.
+    if (shouldFlipToIntegrated(layerMode, diffRequest.primary?.cwd, activeProject)) return flip();
+    if (shouldFlipToIntegrated(layerMode, claudeOpenRequest.primary?.project, activeProject)) return flip();
+    if (shouldFlipToIntegrated(layerMode, runRequest.primary?.project, activeProject)) return flip();
   }, [diffRequest, claudeOpenRequest, runRequest, layerMode, activeProject]);
 
   useEffect(() => {

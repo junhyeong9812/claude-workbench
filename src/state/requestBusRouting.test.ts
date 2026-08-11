@@ -3,26 +3,27 @@ import { useAppStore } from "./store";
 import { activeSurfaceId } from "./surfaceContext";
 
 /**
- * 요청버스 표면 라우팅 — **발행부 stamp 계약** 고정.
+ * 요청버스 **표면별 슬롯** 계약 (멀티프로젝트 P5 F1 — 동시발행 격리).
  *
- * 각 표면-라우팅 슬롯의 발행부는 `targetSurfaceId`를 stamp한다. **P4' 범위
- * 축소(라우팅 5라운드 정지 규칙)**: 발행은 **항상 상수 "primary"** 다 — 소비부
- * (MainArea)가 `targetSurfaceId === mySurfaceId`로 소비하므로 요청이 언제나 항상
- * 가시인 primary dock에 열려 무음 유실이 구조적으로 불가하다. 목적지-활성-추종
- * 라우팅은 P5(표면별 툴바·소비자)로 이연. 이 테스트는 그 상수-primary 계약을
- * 고정한다. (활성 표면 추적/표시는 surfaceActive.test 담당.)
+ * 각 라우팅 채널은 `{ primary, secondary }` 표면별 슬롯이다. 발행부는 origin
+ * surfaceId 슬롯에만 기록하고(기본 primary — 앱-전역·상단 툴바), 소비부(MainArea)는
+ * `slot[mySurfaceId]`만 읽고 자기 슬롯만 clear 한다. 두 표면이 소비 전에 같은 채널을
+ * 동시 발행해도 서로를 덮어쓰지 않는다(무음 유실 0) — 이 파일이 그 격리를 못박는다.
  */
-describe("요청버스 표면 라우팅 stamp (P4' — 항상 primary)", () => {
+const NO_OBJ = { primary: null, secondary: null };
+
+describe("요청버스 표면별 슬롯 — 기본 primary 라우팅 (앱-전역/상단 툴바)", () => {
   beforeEach(() => {
-    // 슬롯 초기화 (다른 테스트 오염 방지).
     useAppStore.setState({
-      editorOpenRequest: null,
-      diffRequest: null,
-      claudeOpenRequest: null,
-      codexOpenRequest: null,
-      runRequest: null,
-      terminalOpenRequest: null,
-      sessionResumeRequest: null,
+      editorOpenRequest: { ...NO_OBJ },
+      diffRequest: { ...NO_OBJ },
+      claudeOpenRequest: { ...NO_OBJ },
+      codexOpenRequest: { ...NO_OBJ },
+      runRequest: { ...NO_OBJ },
+      terminalOpenRequest: { ...NO_OBJ },
+      sessionResumeRequest: { ...NO_OBJ },
+      claudePickerRequest: { primary: { nonce: 0 }, secondary: { nonce: 0 } },
+      memoRequest: { primary: { nonce: 0 }, secondary: { nonce: 0 } },
     });
   });
 
@@ -30,82 +31,74 @@ describe("요청버스 표면 라우팅 stamp (P4' — 항상 primary)", () => {
     expect(activeSurfaceId()).toBe("primary");
   });
 
-  it("object 슬롯 발행부는 targetSurfaceId='primary'를 실어 준다 (sibling 필드)", () => {
+  it("surfaceId 생략 발행부는 primary 슬롯에만 기록하고 secondary는 비운다", () => {
     const s = useAppStore.getState();
     s.requestClaudeOpen({ project: "/p" });
     s.requestCodexOpen({ project: "/p" });
     s.requestRun({ project: "/p", cmd: "x", title: "t" });
     s.requestTerminalOpen({ cwd: "/p", title: "t" });
     s.requestDiff({ title: "d", cwd: "/p", path: "a" });
+    s.requestEditorOpen("/repo/a.ts");
     s.requestSessionResume({ uuid: "u", project: "/p", title: "t" });
     const g = useAppStore.getState();
-    expect(g.claudeOpenRequest?.targetSurfaceId).toBe("primary");
-    expect(g.claudeOpenRequest?.project).toBe("/p"); // 기존 필드 보존
-    expect(g.codexOpenRequest?.targetSurfaceId).toBe("primary");
-    expect(g.runRequest?.targetSurfaceId).toBe("primary");
-    expect(g.terminalOpenRequest?.targetSurfaceId).toBe("primary");
-    expect(g.terminalOpenRequest?.nonce).toBe(1); // 기존 nonce 계약 유지
-    expect(g.diffRequest?.targetSurfaceId).toBe("primary");
-    expect(g.diffRequest?.cwd).toBe("/p"); // App flip 로직이 읽는 필드 보존
-    expect(g.sessionResumeRequest?.targetSurfaceId).toBe("primary");
+    expect(g.claudeOpenRequest.primary?.project).toBe("/p");
+    expect(g.claudeOpenRequest.secondary).toBeNull();
+    expect(g.codexOpenRequest.primary?.project).toBe("/p");
+    expect(g.runRequest.primary?.cmd).toBe("x");
+    expect(g.terminalOpenRequest.primary?.nonce).toBe(1); // nonce 계약 유지
+    expect(g.terminalOpenRequest.secondary).toBeNull();
+    expect(g.diffRequest.primary?.cwd).toBe("/p"); // App flip 로직이 읽는 필드 보존
+    expect(g.editorOpenRequest.primary?.path).toBe("/repo/a.ts");
+    expect(g.sessionResumeRequest.primary?.uuid).toBe("u");
   });
 
-  it("editorOpenRequest는 {path, targetSurfaceId}로 감싸고 null은 그대로 null", () => {
+  it("editorOpenRequest(null)은 그 표면 슬롯만 null (반대 표면 무영향)", () => {
     const s = useAppStore.getState();
-    s.requestEditorOpen("/repo/a.ts");
-    expect(useAppStore.getState().editorOpenRequest).toEqual({
-      path: "/repo/a.ts",
-      targetSurfaceId: "primary",
-    });
-    s.requestEditorOpen(null);
-    expect(useAppStore.getState().editorOpenRequest).toBeNull();
+    s.requestEditorOpen("/repo/a.ts", "secondary");
+    s.requestEditorOpen(null); // primary clear — secondary 무영향
+    expect(useAppStore.getState().editorOpenRequest.primary).toBeNull();
+    expect(useAppStore.getState().editorOpenRequest.secondary?.path).toBe("/repo/a.ts");
   });
 
-  it("카운터 슬롯 발행부는 {targetSurfaceId, nonce}이고 nonce가 매 발행 증가", () => {
-    const before = useAppStore.getState().memoRequest.nonce;
-    useAppStore.getState().requestMemo();
-    const after = useAppStore.getState().memoRequest;
-    expect(after.targetSurfaceId).toBe("primary");
-    expect(after.nonce).toBe(before + 1);
-
-    const f0 = useAppStore.getState().focusMainRequest.nonce;
-    useAppStore.getState().requestFocusMain();
-    expect(useAppStore.getState().focusMainRequest.nonce).toBe(f0 + 1);
-    expect(useAppStore.getState().focusMainRequest.targetSurfaceId).toBe("primary");
-  });
-
-  it("clear(null)는 targetSurfaceId를 남기지 않는다 (소비 후 빈 슬롯)", () => {
+  it("카운터 슬롯(picker·memo)은 표면별 nonce가 각자 증가", () => {
     const s = useAppStore.getState();
-    s.requestClaudeOpen({ project: "/p" });
-    s.requestClaudeOpen(null);
-    expect(useAppStore.getState().claudeOpenRequest).toBeNull();
-    s.requestRun(null);
-    expect(useAppStore.getState().runRequest).toBeNull();
+    s.requestMemo();
+    s.requestClaudePicker();
+    const g = useAppStore.getState();
+    expect(g.memoRequest.primary.nonce).toBe(1);
+    expect(g.memoRequest.secondary.nonce).toBe(0);
+    expect(g.claudePickerRequest.primary.nonce).toBe(1);
+    expect(g.claudePickerRequest.secondary.nonce).toBe(0);
+  });
+
+  it("termMenu·detach·focusMain은 주 표면 고정 단일 슬롯(SSH/전송 envelope 전역)", () => {
+    const s = useAppStore.getState();
+    s.requestTermMenu();
+    s.requestDetachPanel();
+    s.requestFocusMain();
+    const g = useAppStore.getState();
+    expect(g.termMenuRequest.targetSurfaceId).toBe("primary");
+    expect(g.detachPanelRequest.targetSurfaceId).toBe("primary");
+    expect(g.focusMainRequest.targetSurfaceId).toBe("primary");
   });
 });
 
-/**
- * P5 표면-로컬 소유: 발행부가 **origin surfaceId**를 실을 수 있다(기본 primary).
- * 각 표면-스코프 emitter(부 표면 툴바·양 표면 사이드바)가 자기 `useSurfaceId()`를
- * 넘기면 그 표면 소비부만 소비 → 표면 dock에 열린다. **활성(동적) 스탬프·reconcile·
- * catch-all 없음** — 목적지가 컴파일-고정이라 P4' 라우팅 유실 클래스가 소멸한다.
- */
-describe("요청버스 origin-표면 stamp (P5 — surfaceId 고정 라우팅)", () => {
+describe("요청버스 표면별 슬롯 — origin='secondary' 라우팅", () => {
   beforeEach(() => {
     useAppStore.setState({
-      editorOpenRequest: null,
-      diffRequest: null,
-      claudeOpenRequest: null,
-      codexOpenRequest: null,
-      runRequest: null,
-      terminalOpenRequest: null,
-      sessionResumeRequest: null,
-      claudePickerRequest: { targetSurfaceId: "primary", nonce: 0 },
-      memoRequest: { targetSurfaceId: "primary", nonce: 0 },
+      editorOpenRequest: { ...NO_OBJ },
+      diffRequest: { ...NO_OBJ },
+      claudeOpenRequest: { ...NO_OBJ },
+      codexOpenRequest: { ...NO_OBJ },
+      runRequest: { ...NO_OBJ },
+      terminalOpenRequest: { ...NO_OBJ },
+      sessionResumeRequest: { ...NO_OBJ },
+      claudePickerRequest: { primary: { nonce: 0 }, secondary: { nonce: 0 } },
+      memoRequest: { primary: { nonce: 0 }, secondary: { nonce: 0 } },
     });
   });
 
-  it("object 슬롯이 origin='secondary'를 그대로 stamp한다", () => {
+  it("origin='secondary' 발행부는 secondary 슬롯에만 기록(primary 무영향)", () => {
     const s = useAppStore.getState();
     s.requestClaudeOpen({ project: "/p" }, "secondary");
     s.requestCodexOpen({ project: "/p" }, "secondary");
@@ -115,42 +108,103 @@ describe("요청버스 origin-표면 stamp (P5 — surfaceId 고정 라우팅)",
     s.requestEditorOpen("/p/a.ts", "secondary");
     s.requestSessionResume({ uuid: "u", project: "/p", title: "t" }, "secondary");
     const g = useAppStore.getState();
-    expect(g.claudeOpenRequest?.targetSurfaceId).toBe("secondary");
-    expect(g.codexOpenRequest?.targetSurfaceId).toBe("secondary");
-    expect(g.runRequest?.targetSurfaceId).toBe("secondary");
-    expect(g.terminalOpenRequest?.targetSurfaceId).toBe("secondary");
-    expect(g.diffRequest?.targetSurfaceId).toBe("secondary");
-    expect(g.editorOpenRequest?.targetSurfaceId).toBe("secondary");
-    expect(g.sessionResumeRequest?.targetSurfaceId).toBe("secondary");
+    expect(g.claudeOpenRequest.secondary?.project).toBe("/p");
+    expect(g.claudeOpenRequest.primary).toBeNull();
+    expect(g.codexOpenRequest.secondary?.project).toBe("/p");
+    expect(g.runRequest.secondary?.cmd).toBe("x");
+    expect(g.terminalOpenRequest.secondary?.nonce).toBe(1);
+    expect(g.diffRequest.secondary?.cwd).toBe("/p");
+    expect(g.editorOpenRequest.secondary?.path).toBe("/p/a.ts");
+    expect(g.sessionResumeRequest.secondary?.uuid).toBe("u");
+    // primary 슬롯은 전부 비어 있다.
+    expect(g.codexOpenRequest.primary).toBeNull();
+    expect(g.runRequest.primary).toBeNull();
+    expect(g.editorOpenRequest.primary).toBeNull();
   });
 
-  it("카운터 슬롯(picker·memo)도 origin='secondary'를 stamp하고 nonce 증가", () => {
+  it("카운터 origin='secondary'는 secondary nonce만 증가", () => {
     const s = useAppStore.getState();
     s.requestClaudePicker("secondary");
     s.requestMemo("secondary");
     const g = useAppStore.getState();
-    expect(g.claudePickerRequest.targetSurfaceId).toBe("secondary");
-    expect(g.claudePickerRequest.nonce).toBe(1);
-    expect(g.memoRequest.targetSurfaceId).toBe("secondary");
-    expect(g.memoRequest.nonce).toBe(1);
+    expect(g.claudePickerRequest.secondary.nonce).toBe(1);
+    expect(g.claudePickerRequest.primary.nonce).toBe(0);
+    expect(g.memoRequest.secondary.nonce).toBe(1);
+    expect(g.memoRequest.primary.nonce).toBe(0);
+  });
+});
+
+/**
+ * F1 핵심 반례 — **두 표면 동시발행이 서로를 덮어쓰지 않는다**. (예전 단일 슬롯은
+ * 마지막 set이 이전 표면 요청을 삼켜 무음 유실이었다 — codex P1.)
+ */
+describe("요청버스 표면별 슬롯 — 동시발행 격리 (F1 반례)", () => {
+  beforeEach(() => {
+    useAppStore.setState({
+      claudeOpenRequest: { ...NO_OBJ },
+      terminalOpenRequest: { ...NO_OBJ },
+      memoRequest: { primary: { nonce: 0 }, secondary: { nonce: 0 } },
+      claudePickerRequest: { primary: { nonce: 0 }, secondary: { nonce: 0 } },
+    });
   });
 
-  it("인자 생략 시 기본 'primary' (앱-전역/상단 툴바 발행부 무변경)", () => {
+  it("두 표면이 소비 전에 같은 채널을 발행 → 각자 자기 요청을 보존(덮어쓰기 없음)", () => {
     const s = useAppStore.getState();
-    s.requestClaudeOpen({ project: "/p" });
-    s.requestMemo();
+    s.requestClaudeOpen({ project: "/primary" }, "primary");
+    s.requestClaudeOpen({ project: "/secondary" }, "secondary");
     const g = useAppStore.getState();
-    expect(g.claudeOpenRequest?.targetSurfaceId).toBe("primary");
-    expect(g.memoRequest.targetSurfaceId).toBe("primary");
+    expect(g.claudeOpenRequest.primary?.project).toBe("/primary");
+    expect(g.claudeOpenRequest.secondary?.project).toBe("/secondary");
   });
 
-  it("termMenu·detach는 주 표면 고정(SSH/전송 envelope 전역) — 인자 없음", () => {
-    // 시그니처상 surfaceId 인자가 없다(주 표면 전용). 항상 primary.
+  it("secondary 소비(clear)가 primary 슬롯에 무영향", () => {
     const s = useAppStore.getState();
-    s.requestTermMenu();
-    s.requestDetachPanel();
+    s.requestClaudeOpen({ project: "/primary" }, "primary");
+    s.requestClaudeOpen({ project: "/secondary" }, "secondary");
+    // secondary MainArea가 자기 슬롯만 소비/clear.
+    s.requestClaudeOpen(null, "secondary");
     const g = useAppStore.getState();
-    expect(g.termMenuRequest.targetSurfaceId).toBe("primary");
-    expect(g.detachPanelRequest.targetSurfaceId).toBe("primary");
+    expect(g.claudeOpenRequest.secondary).toBeNull();
+    expect(g.claudeOpenRequest.primary?.project).toBe("/primary"); // primary 온전
+  });
+
+  it("카운터 동시발행 — 표면별 nonce가 서로 독립(마지막 target만 관측되던 버그 해소)", () => {
+    const s = useAppStore.getState();
+    s.requestMemo("primary");
+    s.requestMemo("secondary");
+    const g = useAppStore.getState();
+    // 두 표면 각자 자기 nonce가 1 — 예전엔 단일 {target,nonce}라 마지막(secondary)만 남았다.
+    expect(g.memoRequest.primary.nonce).toBe(1);
+    expect(g.memoRequest.secondary.nonce).toBe(1);
+  });
+});
+
+/**
+ * F1 teardown — 부 표면이 닫히면(removeSurface / closeProject) 그 표면 object 슬롯이
+ * 비워진다: 닫는 프레임에 대기하던 요청이 다음 부 표면으로 누출되지 않게(Opus P3-2).
+ */
+describe("요청버스 표면별 슬롯 — teardown clear (F1 / P3-2)", () => {
+  beforeEach(() => {
+    localStorage.clear();
+    useAppStore.setState({ projects: [], activeProject: null });
+    useAppStore.getState().setDualProject(null);
+    useAppStore.setState({
+      claudeOpenRequest: { ...NO_OBJ },
+      editorOpenRequest: { ...NO_OBJ },
+    });
+  });
+
+  it("setDualProject(null)이 부 표면 object 슬롯을 비운다(primary 무영향)", () => {
+    const s = useAppStore.getState();
+    // 부 표면을 연다(멤버십 존재) → 부 슬롯에 대기 요청.
+    s.setDualProject("/proj-b");
+    s.requestClaudeOpen({ project: "/primary" }, "primary");
+    s.requestClaudeOpen({ project: "/proj-b" }, "secondary");
+    expect(useAppStore.getState().claudeOpenRequest.secondary?.project).toBe("/proj-b");
+    // 부 표면 닫힘 → 부 슬롯 clear, 주 슬롯 보존.
+    s.setDualProject(null);
+    const g = useAppStore.getState();
+    expect(g.claudeOpenRequest.secondary).toBeNull();
+    expect(g.claudeOpenRequest.primary?.project).toBe("/primary");
   });
 });
