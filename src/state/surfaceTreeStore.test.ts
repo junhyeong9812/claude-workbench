@@ -17,7 +17,7 @@ vi.mock("@tauri-apps/api/window", () => ({
 }));
 
 import { loadSurfaceTree, useAppStore } from "./store";
-import { secondaryProject, surfaceLayout } from "./surfaceTree";
+import { emptyTree, secondaryProject, surfaceLayout } from "./surfaceTree";
 
 describe("store: setDualProject → 트리 + 이중 기록", () => {
   beforeEach(() => {
@@ -136,21 +136,42 @@ describe("loadSurfaceTree — 트리 블롭 유일 정본(P6 재슬라이스, �
     useAppStore.getState().setDualProject(null);
   });
 
-  it("(g) 닫기: emptyTree tombstone(키 present) → 로드 기본(primary 단독)", () => {
+  it("(g) 닫기: 저장값이 실제 emptyTree tombstone → 로드 기본(primary 단독)", () => {
     useAppStore.getState().setDualProject("/b");
     useAppStore.getState().setDualProject(null);
-    expect(localStorage.getItem("surfaceTree")).not.toBeNull(); // tombstone(removeItem 아님)
+    const blob = localStorage.getItem("surfaceTree");
+    expect(blob).not.toBeNull(); // 키 제거 아님
+    // "null"·손상도 통과하지 않도록 저장값이 진짜 emptyTree인지 비교(codex P2).
+    expect(JSON.parse(blob!)).toEqual(emptyTree());
     expect(secondaryProject(loadSurfaceTree())).toBeNull();
   });
 
-  it("(h) 닫기 부분실패(tombstone 기록·legacy 제거 실패로 stale 잔존) → 기본(부활 없음)", () => {
-    // codex 최종확인: 닫기가 emptyTree tombstone은 기록했으나 legacy 제거가
-    // 실패/중단돼 stale로 남은 상황. 트리 키가 present(tombstone)라 로드는 legacy를
-    // 읽지 않는다 → /b 부활 없음. (예전 removeItem 방식은 여기서 /b를 부활시켰다.)
+  it("(h) 닫기 부분실패(legacy removeItem이 throw) → tombstone 먼저 기록·부활 없음", () => {
+    // codex 최종확인: 닫기의 legacy removeItem이 stale 값을 남긴 채 throw해도,
+    // tombstone setItem이 **먼저** 실행되므로 트리 키는 emptyTree로 갱신된다.
+    // 로드는 present tombstone을 읽어 legacy를 무시 → /b 부활 없음. 이 목킹은
+    // 쓰기 순서까지 고정한다: removeItem을 setItem보다 앞으로 옮기는 회귀가 생기면
+    // 트리 키에 옛 /b 블롭이 남아 로드가 /b를 부활시켜 이 단언이 깨진다.
     useAppStore.getState().setDualProject("/b");
-    useAppStore.getState().setDualProject(null);
-    localStorage.setItem("dualProject", "/b"); // 제거 실패 흉내 — stale legacy 잔존
-    expect(secondaryProject(loadSurfaceTree())).toBeNull();
+    const realRemove = Storage.prototype.removeItem;
+    const spy = vi
+      .spyOn(Storage.prototype, "removeItem")
+      .mockImplementation(function (this: Storage, key: string) {
+        if (key === "dualProject") throw new Error("io"); // stale /b 잔존
+        realRemove.call(this, key);
+      });
+    try {
+      try {
+        useAppStore.getState().setDualProject(null);
+      } catch {
+        /* persist가 throw를 전파할 수 있음 — 최종 디스크 상태만 검증 */
+      }
+    } finally {
+      spy.mockRestore();
+    }
+    expect(JSON.parse(localStorage.getItem("surfaceTree")!)).toEqual(emptyTree()); // tombstone 먼저
+    expect(localStorage.getItem("dualProject")).toBe("/b"); // stale legacy 잔존
+    expect(secondaryProject(loadSurfaceTree())).toBeNull(); // 그래도 부활 없음
   });
 
   it("유효 블롭(방향 포함) 왕복 로드 → 방향·멤버십 보존", () => {

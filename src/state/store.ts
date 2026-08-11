@@ -340,9 +340,12 @@ function persistSurfaceTree(tree: SurfaceTree) {
   // 트리 키는 **절대 제거하지 않는다** — 닫힘도 emptyTree tombstone으로 기록해
   // "키 부재 ⟺ pre-P6"를 불변으로 유지한다(codex 최종확인: 닫기의 removeItem이
   // 부분 실패하면 키 부재로 오인돼 stale legacy가 부활). 로드는 트리만 보므로
-  // present tombstone이 항상 legacy를 이긴다 — 두 키 쓰기 순서·부분실패 무관.
-  localStorage.setItem(SURFACE_TREE_KEY, JSON.stringify(tree)); // 정본(방향 포함·닫힘=emptyTree)
-  if (secondary) localStorage.setItem(LEGACY_DUAL_KEY, secondary); // write-only 다운그레이드 빵부스러기
+  // present tombstone이 항상 legacy를 이긴다.
+  //   ⚠️ 순서 중요: tombstone setItem이 **반드시 legacy 조작보다 먼저**여야 한다.
+  //   legacy op가 먼저라면 그것이 throw할 때 tombstone이 안 써져 트리 키에 옛 분할
+  //   블롭이 남아 부활한다. setItem(tree)를 무조건 첫 줄로 둔다(테스트 (h)가 고정).
+  localStorage.setItem(SURFACE_TREE_KEY, JSON.stringify(tree)); // ① 정본(방향 포함·닫힘=emptyTree)
+  if (secondary) localStorage.setItem(LEGACY_DUAL_KEY, secondary); // ② write-only 다운그레이드 빵부스러기
   else localStorage.removeItem(LEGACY_DUAL_KEY);
 }
 
