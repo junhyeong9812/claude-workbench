@@ -166,19 +166,23 @@ describe("parseSurfaceTree — 손상/이상치 = 기본 복원(로드 실패 �
 });
 
 describe("다운그레이드/포워드 안전 — 미래 버전 트리도 secondary 최선 복원", () => {
-  it("미래 version + 알려진 root 형태 → root 보존 채택", () => {
+  it("미래 version + 알려진 root 형태 → secondary 최선 추출(구조 그대로 채택 아님 — F3)", () => {
     const future: SurfaceTree = {
       version: 99,
       root: {
         kind: "split",
-        direction: "row",
+        direction: "column",
         children: [
           { kind: "leaf", surfaceId: "primary", projectKey: null },
           { kind: "leaf", surfaceId: "secondary", projectKey: "/future" },
         ],
       },
     };
-    expect(secondaryProject(parseSurfaceTree(future, null))).toBe("/future");
+    const r = parseSurfaceTree(future, null);
+    expect(secondaryProject(r)).toBe("/future");
+    // 미래 version은 구조를 신뢰하지 않는다: 멤버십만 건지고 현재 version·기본 배치로.
+    expect(r.version).toBe(SURFACE_TREE_VERSION);
+    expect(surfaceLayout(r)).toEqual(DEFAULT_PLACEMENT);
   });
 
   it("미래 스키마(느슨/미지 필드)라도 secondary 리프가 있으면 경로 추출", () => {
@@ -194,6 +198,34 @@ describe("다운그레이드/포워드 안전 — 미래 버전 트리도 second
       },
     };
     expect(secondaryProject(parseSurfaceTree(weird, null))).toBe("/deep");
+  });
+});
+
+describe("F3(codex P2-1): 미지 version → default/loose (그대로 채택 금지)", () => {
+  const validRoot = {
+    kind: "split",
+    direction: "column",
+    children: [
+      { kind: "leaf", surfaceId: "primary", projectKey: null },
+      { kind: "leaf", surfaceId: "secondary", projectKey: "/x" },
+    ],
+  };
+  it("현재 version + 유효 구조 → 방향까지 그대로 채택", () => {
+    const cur = { version: SURFACE_TREE_VERSION, root: validRoot };
+    const r = parseSurfaceTree(cur, null);
+    expect(secondaryProject(r)).toBe("/x");
+    expect(surfaceLayout(r)).toEqual({ direction: "column", before: false });
+  });
+  it("미지 version(2) + 유효 구조 → loose extract(방향 유실·기본 배치, 채택 아님)", () => {
+    const v2 = { version: 2, root: validRoot };
+    const r = parseSurfaceTree(v2, null);
+    expect(secondaryProject(r)).toBe("/x"); // 멤버십만 최선 추출
+    expect(r.version).toBe(SURFACE_TREE_VERSION); // v2 구조 그대로 채택 아님
+    expect(surfaceLayout(r)).toEqual(DEFAULT_PLACEMENT); // 방향 유실 → 기본
+  });
+  it("과거 version(0) + 유효 구조 → default(부활·채택 없음)", () => {
+    const v0 = { version: 0, root: validRoot };
+    expect(parseSurfaceTree(v0, null)).toEqual(emptyTree());
   });
 });
 

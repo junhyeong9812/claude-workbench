@@ -271,9 +271,10 @@ function extractSecondaryLoose(raw: unknown): string | null {
  *
  * 우선순위:
  *  1. `rawTree` present:
- *     a. 구조+의미 유효 → 정규화해 그대로(version 무관).
- *     b. version이 **현재보다 높을 때만** secondary 최선 추출(미래 대비).
- *     c. 그 외(현재/무버전 손상·throw) → 기본(primary 단독) — legacy 무시.
+ *     a. version === **현재와 정확히 일치** && 구조+의미 유효 → 그대로(방향 보존).
+ *     b. version이 **현재보다 높을 때만** secondary 최선 추출(미래 대비 — 구조를
+ *        그대로 신뢰하지 않는다: 미래 스키마 의미가 달라질 수 있어 멤버십만 건진다).
+ *     c. 그 외(version < 현재·미지·무버전·손상·throw) → 기본 — legacy 무시.
  *  2. `rawTree` 부재(null) → 레거시 `dualProject` 문자열로 구성(구→신 마이그레이션).
  *  3. 레거시도 없으면 → 기본.
  *
@@ -289,14 +290,19 @@ export function parseSurfaceTree(rawTree: unknown, legacyDual: string | null): S
       if (typeof rawTree === "object") {
         const t = rawTree as Record<string, unknown>;
         const version = typeof t.version === "number" ? t.version : null;
-        if (version !== null && isValidTree(t.root)) {
+        // 현재 버전과 **정확히 일치**할 때만 구조를 그대로 채택한다(F3 — codex P2-1).
+        // 미지 version(구조만 유효)을 그대로 믿으면 미래/과거 스키마의 의미 변화가
+        // 현재 필드 계약을 조용히 깨뜨린다("미지 version→default" 계약 위반).
+        if (version === SURFACE_TREE_VERSION && isValidTree(t.root)) {
           return { version, root: t.root as SurfaceNode };
         }
-        // 미래(더 높은 version) 스키마만 secondary 최선 추출.
+        // 미래(더 높은 version) 스키마만 secondary 최선 추출(구조 채택 아님 —
+        // 멤버십만 건져 기본 배치로 재구성).
         if (version !== null && version > SURFACE_TREE_VERSION) {
           const loose = extractSecondaryLoose(rawTree);
           if (loose) return treeWithSecondary(loose);
         }
+        // version < 현재·미지·무버전 = 아래 emptyTree()로 낙하(default 계약).
       }
     } catch {
       // 예산 초과·순환 등 어떤 throw든 손상 취급.
