@@ -32,6 +32,7 @@ import {
 } from "../state/sessionCatalog";
 import { fmtAgo, fmtUnix } from "../utils/time";
 import { useAppStore } from "../state/store";
+import { useSurfaceId } from "../state/surfaceContext";
 import { AgentOptionsPopover } from "./AgentOptionsPopover";
 import {
   loadAgentOptions,
@@ -288,6 +289,9 @@ export function SessionPicker({
   activeProject: string | null;
 }) {
   const { setPicker, archBusy, newName, setNewName, collapsed, toggleGroup } = ctl;
+  // 이 피커가 속한 표면 id (P5 F3) — 메모/세션 요청을 이 표면 슬롯으로 라우팅해
+  // 부 피커에서 눌러도 부 dock에 열린다(SurfaceToolbar ▤와 정합).
+  const surfaceId = useSurfaceId();
   // 드래그 직전 실제로 눌린 요소 — dragstart의 e.target은 HTML DnD 표준상
   // draggable 조상(행)이라 내부 버튼 판별이 불가능하다(리뷰 S6 감사, WHATWG
   // dnd). mousedown 캡처로 기록해 dragstart에서 판별한다.
@@ -585,8 +589,8 @@ export function SessionPicker({
             onClick={() => {
               // 여는 실행부는 MainArea가 소유한다(dockview api가 거기 있다) —
               // 피커는 툴바 버튼과 **같은** 요청 버스를 두드릴 뿐이라 두 진입점이
-              // 갈라질 수 없다. 닫기는 그 소비자가 한다.
-              useAppStore.getState().requestMemo();
+              // 갈라질 수 없다. 닫기는 그 소비자가 한다. P5 F3: 이 표면 슬롯으로.
+              useAppStore.getState().requestMemo(surfaceId);
             }}
           >
             <span className="claude-picker-title">▤ 메모장</span>
