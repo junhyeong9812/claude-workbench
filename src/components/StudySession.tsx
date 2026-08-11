@@ -93,10 +93,11 @@ export function StudySession() {
   // 소비(clear)는 **패널이 실제로 열린 뒤**다 — addPanel이 던지면 요청을 남겨
   // 다음 발화에 다시 시도한다(부수효과 후 clear: 유실≠소비).
   useEffect(() => {
-    if (!terminalOpenRequest) return;
+    const req = terminalOpenRequest.primary; // P5 F1: 주 표면 슬롯만(스터디=primary 전용)
+    if (!req) return;
     const api = apiRef.current;
     if (!api) return; // dock 준비 전 — 요청 보존
-    const { cwd: dir, title } = terminalOpenRequest;
+    const { cwd: dir, title } = req;
     try {
       api.addPanel({
         id: `terminal-study-${crypto.randomUUID()}`, // 연타해도 id 충돌 없음

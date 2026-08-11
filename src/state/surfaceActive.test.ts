@@ -37,7 +37,10 @@ describe("활성 표면 추적/정규화 (P4' 범위 축소)", () => {
     const s = useAppStore.getState();
     s.setDualProject(null);
     s.setActiveSurface("primary");
-    useAppStore.setState({ claudeOpenRequest: null, memoRequest: { targetSurfaceId: "primary", nonce: 0 } });
+    useAppStore.setState({
+      claudeOpenRequest: { primary: null, secondary: null },
+      memoRequest: { primary: { nonce: 0 }, secondary: { nonce: 0 } },
+    });
   });
 
   it("기본 활성 표면은 primary (seam + 상태 정합)", () => {
@@ -128,14 +131,19 @@ describe("요청버스는 항상 primary로 발행 (P4' 범위 축소 — 목적
     localStorage.clear();
     useAppStore.setState({
       projects: [], activeProject: null, projectModes: {},
-      editorOpenRequest: null, diffRequest: null, claudeOpenRequest: null, codexOpenRequest: null,
-      runRequest: null, terminalOpenRequest: null, sessionResumeRequest: null,
+      editorOpenRequest: { primary: null, secondary: null },
+      diffRequest: { primary: null, secondary: null },
+      claudeOpenRequest: { primary: null, secondary: null },
+      codexOpenRequest: { primary: null, secondary: null },
+      runRequest: { primary: null, secondary: null },
+      terminalOpenRequest: { primary: null, secondary: null },
+      sessionResumeRequest: { primary: null, secondary: null },
     });
     useAppStore.getState().setDualProject(null);
     useAppStore.getState().setActiveSurface("primary");
   });
 
-  it("활성=secondary여도 모든 슬롯이 targetSurfaceId='primary'로 stamp된다(무손실)", () => {
+  it("활성=secondary여도 surfaceId 생략 발행은 전부 primary 슬롯으로(무손실)", () => {
     dualActiveSecondary();
     expect(useAppStore.getState().activeSurfaceId).toBe("secondary"); // 추적은 secondary
     const g = useAppStore.getState();
@@ -152,18 +160,22 @@ describe("요청버스는 항상 primary로 발행 (P4' 범위 축소 — 목적
     g.requestClaudePicker();
     g.requestFocusMain();
     const h = useAppStore.getState();
-    // 활성 추적은 secondary지만 **발행은 전부 primary**(pre-P4' 정상 경로 — 항상 가시).
-    expect(h.claudeOpenRequest?.targetSurfaceId).toBe("primary");
-    expect(h.codexOpenRequest?.targetSurfaceId).toBe("primary");
-    expect(h.runRequest?.targetSurfaceId).toBe("primary");
-    expect(h.terminalOpenRequest?.targetSurfaceId).toBe("primary");
-    expect(h.editorOpenRequest?.targetSurfaceId).toBe("primary");
-    expect(h.diffRequest?.targetSurfaceId).toBe("primary");
-    expect(h.sessionResumeRequest?.targetSurfaceId).toBe("primary");
-    expect(h.memoRequest.targetSurfaceId).toBe("primary");
+    // 활성 추적은 secondary지만 **발행(surfaceId 생략)은 전부 primary 슬롯** — 부
+    // 표면 슬롯은 비어 있다(앱-전역/상단 툴바 발행부는 origin=primary 고정).
+    expect(h.claudeOpenRequest.primary?.project).toBe("/b");
+    expect(h.claudeOpenRequest.secondary).toBeNull();
+    expect(h.codexOpenRequest.primary?.project).toBe("/b");
+    expect(h.runRequest.primary?.cmd).toBe("x");
+    expect(h.terminalOpenRequest.primary?.cwd).toBe("/b");
+    expect(h.editorOpenRequest.primary?.path).toBe("/b/f.ts");
+    expect(h.diffRequest.primary?.cwd).toBe("/b");
+    expect(h.sessionResumeRequest.primary?.uuid).toBe("u");
+    expect(h.memoRequest.primary.nonce).toBe(1);
+    expect(h.memoRequest.secondary.nonce).toBe(0);
+    expect(h.claudePickerRequest.primary.nonce).toBe(1);
+    // 단일 슬롯(주 표면 고정)은 그대로.
     expect(h.detachPanelRequest.targetSurfaceId).toBe("primary");
     expect(h.termMenuRequest.targetSurfaceId).toBe("primary");
-    expect(h.claudePickerRequest.targetSurfaceId).toBe("primary");
     expect(h.focusMainRequest.targetSurfaceId).toBe("primary");
   });
 });

@@ -20,6 +20,54 @@ import { basename } from "../utils/path";
 /** Clamp a font size to the allowed range (also normalizes NaN). */
 export const clampFontSize = (n: number): number => Math.max(9, Math.min(28, Math.round(n) || 13));
 
+/**
+ * 표면별 요청 슬롯 (멀티프로젝트 P5 F1 — **동시발행 격리**). 각 표면(primary·
+ * secondary)이 **자기 슬롯만** read/clear 한다 — 두 표면이 소비 전에 같은 채널을
+ * 발행해도 서로의 요청을 덮어쓰지 않는다(무음 유실 0). 발행부는 origin surfaceId
+ * 슬롯에 기록하고, 소비부(MainArea)는 `slot[mySurfaceId]`만 읽는다. targetSurfaceId
+ * 필드는 **슬롯 키가 대체**했다(라우팅 = 컴파일-고정 표면 키).
+ */
+export type SurfaceSlots<T> = { primary: T | null; secondary: T | null };
+/** 표면별 카운터 슬롯(picker·memo — object 슬롯과 달리 null이 아니라 nonce 증분으로
+ * 재발화). 각 표면이 자기 nonce를 들고 자기 dedup ref로 소비한다. */
+export type SurfaceCounters = { primary: { nonce: number }; secondary: { nonce: number } };
+
+/** 빈 표면 슬롯(초기값·teardown clear). */
+const noSlots = <T>(): SurfaceSlots<T> => ({ primary: null, secondary: null });
+/** origin 표면 슬롯에 값을 쓴다(상대 표면 슬롯 무영향 — 명시 분기로 union 키 타입 회피). */
+function putSlot<T>(slots: SurfaceSlots<T>, surfaceId: SurfaceId, value: T | null): SurfaceSlots<T> {
+  return surfaceId === "secondary"
+    ? { primary: slots.primary, secondary: value }
+    : { primary: value, secondary: slots.secondary };
+}
+/** origin 표면 카운터의 nonce를 증분한다(상대 표면 무영향). */
+function bumpCounter(slots: SurfaceCounters, surfaceId: SurfaceId): SurfaceCounters {
+  return surfaceId === "secondary"
+    ? { primary: slots.primary, secondary: { nonce: slots.secondary.nonce + 1 } }
+    : { primary: { nonce: slots.primary.nonce + 1 }, secondary: slots.secondary };
+}
+/** 부 표면 object 슬롯을 전부 비운다(teardown clear — P5 F1). 카운터는 새 마운트
+ * ref가 nonce를 캡처하므로 제외. AppState 부분집합을 돌려 set에 스프레드한다. */
+function clearSecondarySlots(s: {
+  editorOpenRequest: SurfaceSlots<{ path: string }>;
+  diffRequest: SurfaceSlots<DiffSpec>;
+  claudeOpenRequest: SurfaceSlots<{ project: string; seed?: string; title?: string; referencePanelId?: string; model?: string; effort?: string }>;
+  codexOpenRequest: SurfaceSlots<{ project: string; model?: string; effort?: string }>;
+  runRequest: SurfaceSlots<{ project: string; cmd: string; title: string }>;
+  terminalOpenRequest: SurfaceSlots<{ cwd: string; title: string; nonce: number }>;
+  sessionResumeRequest: SurfaceSlots<{ uuid: string; project: string; title: string; nonce: number }>;
+}) {
+  return {
+    editorOpenRequest: { ...s.editorOpenRequest, secondary: null },
+    diffRequest: { ...s.diffRequest, secondary: null },
+    claudeOpenRequest: { ...s.claudeOpenRequest, secondary: null },
+    codexOpenRequest: { ...s.codexOpenRequest, secondary: null },
+    runRequest: { ...s.runRequest, secondary: null },
+    terminalOpenRequest: { ...s.terminalOpenRequest, secondary: null },
+    sessionResumeRequest: { ...s.sessionResumeRequest, secondary: null },
+  };
+}
+
 /** Persisted study slice (folders + tabs + active + per-side mode). */
 interface StudyPersist {
   folders: { left: string | null; right: string | null };
@@ -317,8 +365,8 @@ interface AppState {
    * 표면. **표시/추적 전용**: 사이드바·헤더·검색 내용이 이 표면의 프로젝트
    * (`activeSurfaceProject`, App 파생)를 반영하고 시각 지시자(테두리)가 이 표면을
    * 강조한다. 우측 표면이 뚜렷이 안 보이면 "primary"로 정규화(표시 정합). **요청버스
-   * 목적지 라우팅에는 쓰지 않는다** — 모든 요청은 항상 primary로 발행된다(P4'
-   * 범위 축소, 라우팅 5라운드 정지 규칙; 목적지-활성-추종은 P5 표면별 툴바 몫).
+   * 목적지 라우팅에는 쓰지 않는다** — 라우팅은 P5 F1에서 **표면별 슬롯**으로 바뀌어
+   * 발행부가 자기 origin surfaceId 슬롯에 기록한다(활성-추종 아님 — 컴파일-고정).
    * `activeProject`는 primary/left 앵커(persist·sync·dev·resolveVisibleDual). */
   activeSurfaceId: SurfaceId;
   /** dirPath -> its immediate children (transient cache). */
@@ -339,28 +387,29 @@ interface AppState {
    * the main area (file content at the commit + diff toggle), or null. Transient. */
   gitHistoryFile: { root: string; commit: string; path: string } | null;
   /**
-   * ── 요청버스 표면 라우팅 (멀티프로젝트 P2 — P4'에서 dormant 유지) ────────
-   * 아래 표면-라우팅 슬롯들은 각자 `targetSurfaceId`를 실어 나른다. 소비자
-   * (MainArea)는 자기 `useSurfaceId()`와 `targetSurfaceId`가 일치할 때만 소비한다.
-   * **P4' 범위 축소**: 발행부가 targetSurfaceId를 **항상 "primary" 상수**로 stamp해
-   * (아래 발행부 참조) 소비 표면이 primary 하나로 고정된다 — pre-P4' 알려진 정상
-   * 경로(무음 유실 구조적 불가). 목적지-활성-추종 라우팅은 P5(표면별 툴바·소비자)로
-   * 이연하고, 이 슬롯·필드·게이트 인프라는 그때까지 dormant로 둔다.
+   * ── 요청버스 표면 라우팅 (멀티프로젝트 P5 F1 — 표면별 슬롯) ─────────────
+   * 아래 라우팅 채널들은 `SurfaceSlots<T>`(`{primary, secondary}`)다. 발행부는
+   * **origin surfaceId 슬롯에만** 기록하고(기본 primary — 앱-전역·상단 툴바),
+   * 소비자(MainArea)는 자기 `useSurfaceId()` 슬롯(`slot[mySurfaceId]`)만 읽고
+   * 자기 슬롯만 clear 한다. **두 표면이 소비 전에 같은 채널을 동시 발행해도
+   * 서로를 덮어쓰지 않는다**(무음 유실 0 — 예전 단일 슬롯의 last-write 삼킴 해소,
+   * codex P1). 표면 키가 라우팅이라 별도 targetSurfaceId 필드는 없다(컴파일-고정).
    *
    * 표면 단위가 아니라 **세션 단위**인 요청(`claudeInjectRequest`/`Acks`·
    * `devReviewQueue`·`focusSessionRequest` — uuid/프로젝트로 짝지어 어느 표면이든
-   * 그 세션을 찾아가는 것)은 이 라우팅 대상이 **아니다**(P2 범위 밖).
+   * 그 세션을 찾아가는 것)은 이 라우팅 대상이 **아니다**. focusMain·termMenu·
+   * detach는 **주 표면 고정 단일 슬롯**(SSH/전송 envelope 전역 — 부 표면 미발행).
    * ──────────────────────────────────────────────────────────────────── */
   /** A request to open a file in the editor (consumed by MainArea, which owns the
-   * dockview api), or null. Transient. `targetSurfaceId`로 라우팅(P2). */
-  editorOpenRequest: { path: string; targetSurfaceId: SurfaceId } | null;
+   * dockview api). 표면별 슬롯(P5 F1) — `slot[mySurfaceId]`만 소비. */
+  editorOpenRequest: SurfaceSlots<{ path: string }>;
   /** A request to open a diff panel (consumed by MainArea), or null. Transient. */
-  diffRequest: (DiffSpec & { targetSurfaceId: SurfaceId }) | null;
+  diffRequest: SurfaceSlots<DiffSpec>;
   /** A request to open a new Claude session bound to `project` (consumed by
    * MainArea, which owns the dockview api), or null. Transient — used by the
    * worktree panel's one-click "Claude 열기" and review mode (`seed`/`title`:
    * a fresh review session pre-seeded with "이 커밋 리뷰하자"). */
-  claudeOpenRequest: {
+  claudeOpenRequest: SurfaceSlots<{
     project: string;
     seed?: string;
     title?: string;
@@ -371,9 +420,7 @@ interface AppState {
      * surfaces that inherit the last-used options (worktree, review). */
     model?: string;
     effort?: string;
-    /** 표면 라우팅 키(P2) — 발행 시점의 활성 표면. */
-    targetSurfaceId: SurfaceId;
-  } | null;
+  }>;
   /**
    * A request to open a new **codex** session bound to `project` (consumed by
    * MainArea), or null.
@@ -384,7 +431,7 @@ interface AppState {
    * codex가 절대 쓰지 않을 필드를 계속 지나치게 된다. 두 요청은 각자 작고
    * 각자 완결이다.
    */
-  codexOpenRequest: { project: string; model?: string; effort?: string; targetSurfaceId: SurfaceId } | null;
+  codexOpenRequest: SurfaceSlots<{ project: string; model?: string; effort?: string }>;
   /** Inject a prompt into an already-live Claude session (dev mode's 확인 button
    * re-uses the project's dev session). Matched by session uuid in ClaudeTermPanel.
    *
@@ -426,7 +473,7 @@ interface AppState {
    * project's entries, in order; other projects' entries never block it. */
   devReviewQueue: Array<{ id: string; project: string; prompt: string }>;
   /** Build/test runner: open a terminal panel that runs `cmd` (consumed by MainArea). */
-  runRequest: { project: string; cmd: string; title: string; targetSurfaceId: SurfaceId } | null;
+  runRequest: SurfaceSlots<{ project: string; cmd: string; title: string }>;
   /** 트리 폴더 우클릭 "여기서 터미널 열기" → 그 폴더 cwd의 일반 터미널 탭.
    *
    * 소비자는 **화면 앞에 있는 dock 하나**다 — 통합=MainArea(주 surface)·개발=
@@ -434,7 +481,7 @@ interface AppState {
    * (스터디 모드는 MainArea 자체가 언마운트, 개발/통합은 레이어 게이트) 요청
    * 하나가 두 dock에 열리지 않는다. `nonce`는 같은 폴더를 연달아 열어도 효과가
    * 다시 발화하게 한다. */
-  terminalOpenRequest: { cwd: string; title: string; nonce: number; targetSurfaceId: SurfaceId } | null;
+  terminalOpenRequest: SurfaceSlots<{ cwd: string; title: string; nonce: number }>;
   /** Bumped to ask MainArea to focus the active dockview panel (Ctrl+B from the
    * already-focused tree toggles focus back to the open tab). `nonce` counter so
    * every press re-fires even when the value would otherwise be unchanged.
@@ -451,7 +498,7 @@ interface AppState {
   termMenuRequest: { targetSurfaceId: SurfaceId; nonce: number };
   /** App-toolbar "+ Claude" click → MainArea opens its session picker. `nonce`
    * counter. `targetSurfaceId`로 라우팅(P2). */
-  claudePickerRequest: { targetSurfaceId: SurfaceId; nonce: number };
+  claudePickerRequest: SurfaceCounters;
   /** App-toolbar "⤢ 분리" click → MainArea pops the active panel out to a new
    * window. `nonce` counter. `targetSurfaceId`로 라우팅(P2). Consumed only while
    * the integrated layer is front. */
@@ -459,11 +506,11 @@ interface AppState {
   /** App-toolbar "메모" click (and the session picker's memo row) → MainArea
    * opens this project's memo panel. `nonce` counter. `targetSurfaceId`로
    * 라우팅(P2). Consumed only while the integrated layer is front. */
-  memoRequest: { targetSurfaceId: SurfaceId; nonce: number };
+  memoRequest: SurfaceCounters;
   /** 아카이브 "이어서" — resume a saved session in the main dock, pinned to its
    * own `project` (no activeProject switch; MainArea consumes without a project
    * gate and clears with null). Already-open session → activate that panel. */
-  sessionResumeRequest: { uuid: string; project: string; title: string; nonce: number; targetSurfaceId: SurfaceId } | null;
+  sessionResumeRequest: SurfaceSlots<{ uuid: string; project: string; title: string; nonce: number }>;
   /** 우측 분할 surface에 열린 프로젝트 경로 (null=닫힘). 수동적 dock —
    * 전역 요청 버스는 주(좌) surface만 소비한다. surfaceTree의 secondary 파생
    * 미러(소비처 호환). 닫힌 프로젝트 정리는 store(closeProject·init)가 정본. */
@@ -574,14 +621,22 @@ interface AppState {
   /** Subscribe to cross-window `project-sync` events; returns an unlisten fn.
    * Both the main window and popout windows call this (review R0-4). */
   initProjectSync: () => Promise<UnlistenFn>;
-  /** Expand/collapse a directory for the active project. */
+  /** Expand/collapse a directory for the active project (= toggleExpandedFor의
+   * 활성 프로젝트 위임 — 하위호환). */
   toggleExpanded: (dirPath: string) => void;
+  /** Expand/collapse a directory for a **specific project** (P5 F2 — 부 표면
+   * 트리가 자기 프로젝트의 tree_state에만 기록하게). */
+  toggleExpandedFor: (project: string | null, dirPath: string) => void;
   /** Lazily load a directory's children via the backend. */
   loadChildren: (dirPath: string) => Promise<void>;
   /** Force re-read a directory (after create/delete) — bypasses the cache. */
   reloadDir: (dirPath: string) => Promise<void>;
   /** Re-read the active project's root + expanded dirs (disk reload). */
   reloadActiveTree: () => Promise<void>;
+  /** Re-read a **specific** project's root + expanded dirs (disk reload). P5:
+   * 표면-스코프 — 각 표면의 FolderTree가 자기 프로젝트 트리만 폴한다(전역
+   * activeProject 재로드하던 2인스턴스 버그 차단). null이면 no-op. */
+  reloadTreeFor: (project: string | null) => Promise<void>;
   /** Save a project's dockview main-area layout (opaque JSON) and persist. */
   setLayout: (path: string, layout: unknown) => void;
   /** Dockview layouts for popout windows, per project (multiwindow swap — review
@@ -612,10 +667,17 @@ interface AppState {
   /** Open/close the peek-style file view for a file in the selected commit. */
   openGitHistoryFile: (root: string, commit: string, path: string) => void;
   closeGitHistoryFile: () => void;
+  /**
+   * 표면별 슬롯 라우팅(P5 F1): 요청 발행부는 자기 표면의 **origin id** 슬롯에 쓴다
+   * (기본 "primary" — 앱-전역/상단 툴바 발행부는 그대로 primary). 각 emitter가
+   * 자기 `<SurfaceProvider>`의 `useSurfaceId()`(컴파일-고정)를 넘기고, 소비부
+   * (MainArea)가 `slot[mySurfaceId]`만 읽어 자기 슬롯을 소비/clear → 그 표면 dock에
+   * 열리고 **두 표면 동시발행이 서로를 안 덮는다**(무음 유실 0 — codex P1 해소).
+   */
   /** Request opening a file in the editor (MainArea consumes + clears with null). */
-  requestEditorOpen: (path: string | null) => void;
+  requestEditorOpen: (path: string | null, surfaceId?: SurfaceId) => void;
   /** Request opening a diff panel (MainArea consumes + clears with null). */
-  requestDiff: (spec: DiffSpec | null) => void;
+  requestDiff: (spec: DiffSpec | null, surfaceId?: SurfaceId) => void;
   /** Request opening a new Claude session in `project` (MainArea consumes + clears).
    * Optional `seed`/`title` pre-seed a review session. */
   requestClaudeOpen: (
@@ -627,9 +689,13 @@ interface AppState {
       model?: string;
       effort?: string;
     } | null,
+    surfaceId?: SurfaceId,
   ) => void;
   /** Request opening a new codex session in `project` (MainArea consumes + clears). */
-  requestCodexOpen: (req: { project: string; model?: string; effort?: string } | null) => void;
+  requestCodexOpen: (
+    req: { project: string; model?: string; effort?: string } | null,
+    surfaceId?: SurfaceId,
+  ) => void;
   /** Inject a prompt into a live Claude session (consumed by the matching panel). */
   requestClaudeInject: (
     req: { id: string; uuid: string; text: string; mode?: "submit" | "fill" } | null,
@@ -645,23 +711,26 @@ interface AppState {
    * id is a no-op, so a double consume from the onReady/effect paths is safe). */
   consumeDevReview: (id: string) => void;
   /** Request running a build/test command in a terminal (MainArea consumes). */
-  requestRun: (req: { project: string; cmd: string; title: string } | null) => void;
+  requestRun: (req: { project: string; cmd: string; title: string } | null, surfaceId?: SurfaceId) => void;
   /** 트리 "여기서 터미널 열기" 요청 (앞 dock이 소비); null이면 지운다. */
-  requestTerminalOpen: (req: { cwd: string; title: string } | null) => void;
+  requestTerminalOpen: (req: { cwd: string; title: string } | null, surfaceId?: SurfaceId) => void;
   /** Ask MainArea to focus the active dockview panel (Ctrl+B tree→tab toggle). */
   requestFocusMain: () => void;
   /** Ask MainArea to activate the panel for `uuid` (attention roll-up cycle). */
   requestFocusSession: (uuid: string) => void;
   /** Ask MainArea to toggle the "+ Terminal" menu (app-toolbar button). */
   requestTermMenu: () => void;
-  /** Ask MainArea to open the "+ Claude" session picker (app-toolbar button). */
-  requestClaudePicker: () => void;
+  /** Ask MainArea to open the "+ Claude" session picker (툴바 버튼). */
+  requestClaudePicker: (surfaceId?: SurfaceId) => void;
   /** Ask MainArea to detach the active panel to a new window (app-toolbar button). */
   requestDetachPanel: () => void;
   /** Ask MainArea to open the active project's memo panel (툴바·피커). */
-  requestMemo: () => void;
+  requestMemo: (surfaceId?: SurfaceId) => void;
   /** Ask MainArea to resume a saved session (아카이브 "이어서"); null clears. */
-  requestSessionResume: (req: { uuid: string; project: string; title: string } | null) => void;
+  requestSessionResume: (
+    req: { uuid: string; project: string; title: string } | null,
+    surfaceId?: SurfaceId,
+  ) => void;
   /** Switch the color theme. */
   setTheme: (theme: "dark" | "light") => void;
   /** Set the code font size (clamped 9–28). */
@@ -711,11 +780,13 @@ function broadcastActiveProject(path: string | null) {
   );
 }
 
-/** P2: reloadActiveTree 배치 사이클 in-flight 가드 + 재실행 요청 비트(모듈
- * 스코프 — 창 단위). 겹친 호출(수동 ↻ 포함)은 버리지 않고 현 사이클 종료 후
- * 한 번 더 돈다 — "최신 요청 우선"(spec ②, 리뷰: 수동 ↻ 무시 방지). */
-let treeReloadInFlight = false;
-let treeReloadPending = false;
+/** P2: 트리 배치 사이클 in-flight 가드 + 재실행 요청 비트. **P5: 프로젝트별**
+ * (Set) — 두 표면이 서로 다른 프로젝트 트리를 동시 폴할 수 있으므로 가드를
+ * 프로젝트 키로 분리한다(같은 프로젝트 2표면이면 자연 직렬화: 한쪽 사이클 중
+ * 다른 호출은 pending 표시 → 종료 후 1회 더). 겹친 호출(수동 ↻ 포함)은 버리지
+ * 않고 현 사이클 종료 후 한 번 더 돈다 — "최신 요청 우선". */
+const treeReloadInFlight = new Set<string>();
+const treeReloadPending = new Set<string>();
 
 /** hang한 read_dir(끊긴 네트워크 마운트 등) 하나가 폴링을 영구 정지시키지
  * 않도록 사이클당 가드 점유 상한 — 초과 시 가드만 풀고 늦은 응답의 쓰기는
@@ -724,8 +795,9 @@ const TREE_RELOAD_GUARD_MS = 10_000;
 
 /** 배치 사이클 세대 — 새 사이클 시작마다 증가. 타임아웃으로 가드를 넘긴 구
  * 사이클의 늦은 set은 세대 불일치로 무효(감사 B1: 구 사이클이 신 사이클의
- * before 기준을 오염시켜 더 새 결과를 버리게 하던 경로 차단). */
-let treeCycleGen = 0;
+ * before 기준을 오염시켜 더 새 결과를 버리게 하던 경로 차단). **P5: 프로젝트별**
+ * — 다른 프로젝트 사이클이 서로를 교차 취소하지 않게 세대를 키로 분리한다. */
+const treeCycleGen = new Map<string, number>();
 
 /** 트리 캐시 세대 — closeProject 축출마다 증가. 축출 **이전에** 발주된 모든
  * read_dir 응답은 세대 불일치로 버려진다(감사 B3: 응답 대기 중 재오픈하면
@@ -788,22 +860,22 @@ export const useAppStore = create<AppState>((set, get) => ({
   peekLine: null,
   gitHistory: null,
   gitHistoryFile: null,
-  editorOpenRequest: null,
-  diffRequest: null,
-  claudeOpenRequest: null,
-  codexOpenRequest: null,
+  editorOpenRequest: noSlots(),
+  diffRequest: noSlots(),
+  claudeOpenRequest: noSlots(),
+  codexOpenRequest: noSlots(),
   claudeInjectRequest: null,
   claudeInjectAcks: [],
   devReviewQueue: [],
-  runRequest: null,
-  terminalOpenRequest: null,
+  runRequest: noSlots(),
+  terminalOpenRequest: noSlots(),
   focusMainRequest: { targetSurfaceId: "primary", nonce: 0 },
   focusSessionRequest: null,
   termMenuRequest: { targetSurfaceId: "primary", nonce: 0 },
-  claudePickerRequest: { targetSurfaceId: "primary", nonce: 0 },
+  claudePickerRequest: { primary: { nonce: 0 }, secondary: { nonce: 0 } },
   detachPanelRequest: { targetSurfaceId: "primary", nonce: 0 },
-  memoRequest: { targetSurfaceId: "primary", nonce: 0 },
-  sessionResumeRequest: null,
+  memoRequest: { primary: { nonce: 0 }, secondary: { nonce: 0 } },
+  sessionResumeRequest: noSlots(),
   surfaceTree: SURFACE_TREE_INIT,
   dualProject: secondaryProject(SURFACE_TREE_INIT),
   theme: (localStorage.getItem("theme") as "dark" | "light") || "dark",
@@ -955,6 +1027,8 @@ export const useAppStore = create<AppState>((set, get) => ({
         dualProject: secondaryProject(surfaceTree),
         childrenCache: pruneTreeCache(s.childrenCache, path, keep),
         loadingDirs: pruneTreeCache(s.loadingDirs, path, keep),
+        // P5 F1: 부 표면이 닫혔으면 그 표면 요청 슬롯도 비운다(teardown 누출 차단).
+        ...(clearedSurface ? clearSecondarySlots(s) : {}),
       };
     });
     // 우측 표면이 닫혔으면 legacy 키(디스크 정본)도 즉시 정리 — 잔존 방지.
@@ -1033,24 +1107,21 @@ export const useAppStore = create<AppState>((set, get) => ({
   openGitHistoryFile: (root, commit, path) =>
     set({ gitHistoryFile: { root, commit, path } }),
   closeGitHistoryFile: () => set({ gitHistoryFile: null }),
-  // 요청버스 라우팅 — **P4' 범위 축소(정지 규칙, 라우팅 5라운드)**: 모든 슬롯은
-  // **항상 primary**를 타깃한다(상수). 소비부(MainArea)는 pre-P4' 그대로
-  // `targetSurfaceId === mySurfaceId`(=primary)로 소비 → 요청이 언제나 항상 마운트/
-  // 가시인 primary dock에 열려 **무음 유실이 구조적으로 불가**하다. 목적지-활성-추종
-  // 라우팅(발행을 활성 표면으로)은 오버레이 계층(dev/study)·전이 인터리빙·이중 소비
-  // 클래스를 만들어(visible≠mounted 등) 게이트 정교화로 못 닫혔다 — 그래서 P4'에서
-  // 제외하고, 표면별 자기 툴바·소비자면 스탬프·catch-all 없이 표면-로컬로 자명한
-  // **P5로 이연**한다. P2 라우팅 인프라(targetSurfaceId 필드·소비 게이트)는 dormant로
-  // 남고, `activeSurfaceId()` seam(활성 표면)은 사이드바 표시/추적용 상태와 별개로
-  // P5용 접점으로만 존치한다(현재 발행은 seam을 읽지 않는다).
-  requestEditorOpen: (path) =>
-    set({ editorOpenRequest: path === null ? null : { path, targetSurfaceId: "primary" } }),
-  requestDiff: (spec) =>
-    set({ diffRequest: spec === null ? null : { ...spec, targetSurfaceId: "primary" } }),
-  requestClaudeOpen: (req) =>
-    set({ claudeOpenRequest: req === null ? null : { ...req, targetSurfaceId: "primary" } }),
-  requestCodexOpen: (req) =>
-    set({ codexOpenRequest: req === null ? null : { ...req, targetSurfaceId: "primary" } }),
+  // 요청버스 라우팅 — **P5 F1 표면별 슬롯**: 각 발행부가 자기 표면의 **origin id**
+  // 슬롯에 쓴다(기본 "primary" — 앱-전역/상단 툴바). 표면-스코프 emitter(부 표면
+  // 툴바·양 표면 사이드바)는 자기 `useSurfaceId()`(컴파일-고정)를 넘긴다. 소비부
+  // (MainArea)는 `slot[mySurfaceId]`만 읽고 자기 슬롯만 clear → 그 표면 dock에 열리고
+  // **두 표면 동시발행이 서로를 안 덮는다**(무음 유실 0). putSlot/bumpCounter가 상대
+  // 표면 슬롯을 보존하며 origin 슬롯만 갱신한다. `activeSurfaceId()` seam은 라우팅에
+  // 쓰이지 않고(사이드바 표시/추적용 상태만) 존치한다.
+  requestEditorOpen: (path, surfaceId = "primary") =>
+    set((s) => ({ editorOpenRequest: putSlot(s.editorOpenRequest, surfaceId, path === null ? null : { path }) })),
+  requestDiff: (spec, surfaceId = "primary") =>
+    set((s) => ({ diffRequest: putSlot(s.diffRequest, surfaceId, spec) })),
+  requestClaudeOpen: (req, surfaceId = "primary") =>
+    set((s) => ({ claudeOpenRequest: putSlot(s.claudeOpenRequest, surfaceId, req) })),
+  requestCodexOpen: (req, surfaceId = "primary") =>
+    set((s) => ({ codexOpenRequest: putSlot(s.codexOpenRequest, surfaceId, req) })),
   requestClaudeInject: (req) => set({ claudeInjectRequest: req }),
   reportClaudeInjectAck: (ack) =>
     set((s) => ({
@@ -1065,13 +1136,15 @@ export const useAppStore = create<AppState>((set, get) => ({
     })),
   consumeDevReview: (id) =>
     set((s) => ({ devReviewQueue: s.devReviewQueue.filter((r) => r.id !== id) })),
-  requestRun: (req) =>
-    set({ runRequest: req === null ? null : { ...req, targetSurfaceId: "primary" } }),
-  requestTerminalOpen: (req) =>
+  requestRun: (req, surfaceId = "primary") =>
+    set((s) => ({ runRequest: putSlot(s.runRequest, surfaceId, req) })),
+  requestTerminalOpen: (req, surfaceId = "primary") =>
     set((s) => ({
-      terminalOpenRequest: req
-        ? { ...req, nonce: (s.terminalOpenRequest?.nonce ?? 0) + 1, targetSurfaceId: "primary" }
-        : null,
+      terminalOpenRequest: putSlot(
+        s.terminalOpenRequest,
+        surfaceId,
+        req ? { ...req, nonce: (s.terminalOpenRequest[surfaceId]?.nonce ?? 0) + 1 } : null,
+      ),
     })),
   requestFocusMain: () =>
     // picker-UI-open(G2): 항상 primary. Ctrl+B 포커스는 primary 크롬 기준.
@@ -1081,28 +1154,44 @@ export const useAppStore = create<AppState>((set, get) => ({
       focusSessionRequest: { uuid, nonce: (s.focusSessionRequest?.nonce ?? 0) + 1 },
     })),
   requestTermMenu: () =>
-    // picker-UI-open(G2): 팝오버가 primary `.main-menus`에만 렌더 → 항상 primary.
+    // termMenu 팝오버(+SSH 다이얼로그/호스트키 모달)는 주 표면 `.main-menus`에만
+    // 렌더 → 항상 primary. 부 표면 "터미널"은 requestTerminalOpen 직접(로컬).
     set((s) => ({ termMenuRequest: { targetSurfaceId: "primary", nonce: s.termMenuRequest.nonce + 1 } })),
-  requestClaudePicker: () =>
-    // picker-UI-open(G2): SessionPicker가 primary `.main-menus`에만 렌더 → 항상 primary.
-    set((s) => ({ claudePickerRequest: { targetSurfaceId: "primary", nonce: s.claudePickerRequest.nonce + 1 } })),
+  requestClaudePicker: (surfaceId = "primary") =>
+    // 세션 피커는 표면-로컬(P5): 각 표면이 자기 `.main-menus`에 SessionPicker를
+    // 렌더하고 자기 dock/project로 조회·오픈한다. **F1**: 표면별 카운터라 두 표면이
+    // 동시에 눌러도 서로의 발화를 삼키지 않는다.
+    set((s) => ({ claudePickerRequest: bumpCounter(s.claudePickerRequest, surfaceId) })),
   requestDetachPanel: () =>
+    // 분리(창 전송)는 주 표면만 — installDragOut/전송 envelope가 activeProject 기준.
     set((s) => ({ detachPanelRequest: { targetSurfaceId: "primary", nonce: s.detachPanelRequest.nonce + 1 } })),
-  requestMemo: () =>
-    set((s) => ({ memoRequest: { targetSurfaceId: "primary", nonce: s.memoRequest.nonce + 1 } })),
+  requestMemo: (surfaceId = "primary") =>
+    set((s) => ({ memoRequest: bumpCounter(s.memoRequest, surfaceId) })),
   setDualProject: (path) => {
     // 트리가 멤버십 정본: 열기=addSurface(secondary 추가/교체), 닫기=removeSurface.
+    const prevSecondary = secondaryProject(get().surfaceTree);
     const tree = path ? addSurface(get().surfaceTree, path) : removeSurface(get().surfaceTree);
     persistSurfaceTree(tree); // legacy dualProject 단일 키만 기록(FB — 원자·다운그레이드 자명)
-    set({ surfaceTree: tree, dualProject: secondaryProject(tree) });
+    const nextSecondary = secondaryProject(tree);
+    set((s) => ({
+      surfaceTree: tree,
+      dualProject: nextSecondary,
+      // **P5 F1 teardown**: 부 표면 멤버십이 바뀌면(닫힘·교체) 부 표면 object
+      // 슬롯을 전부 비운다 — 닫는 프레임에 대기하던 요청이 다음 부 표면으로
+      // 누출(Opus P3-2 레이스)되지 않게. 카운터(picker·memo)는 새 마운트의
+      // dedup ref가 현재 nonce를 캡처하므로 clear 불필요.
+      ...(prevSecondary !== nextSecondary ? clearSecondarySlots(s) : {}),
+    }));
     get().reconcileActiveSurface(); // 우측이 안 보이게 됐으면 활성→primary(무음 유실 차단)
   },
-  requestSessionResume: (req) =>
-    set((s) =>
-      req === null
-        ? { sessionResumeRequest: null }
-        : { sessionResumeRequest: { ...req, nonce: (s.sessionResumeRequest?.nonce ?? 0) + 1, targetSurfaceId: "primary" } },
-    ),
+  requestSessionResume: (req, surfaceId = "primary") =>
+    set((s) => ({
+      sessionResumeRequest: putSlot(
+        s.sessionResumeRequest,
+        surfaceId,
+        req === null ? null : { ...req, nonce: (s.sessionResumeRequest[surfaceId]?.nonce ?? 0) + 1 },
+      ),
+    })),
   setTheme: (theme) => set({ theme }),
   setFontSize: (n) => set({ fontSize: clampFontSize(n) }),
   setTermColors: (c) => {
@@ -1219,12 +1308,16 @@ export const useAppStore = create<AppState>((set, get) => ({
     saveStudyView(get());
   },
 
-  toggleExpanded: (dirPath) => {
+  toggleExpanded: (dirPath) => get().toggleExpandedFor(get().activeProject, dirPath),
+  toggleExpandedFor: (project, dirPath) => {
+    if (!project) return;
     // expanded는 항상 **새 배열**로 교체한다 — expandedSetOf의 identity 메모
-    // 계약(in-place push/splice 금지, treeSelectors 참조).
+    // 계약(in-place push/splice 금지, treeSelectors 참조). P5 F2: **인자 project**의
+    // tree_state에만 기록 → 부 표면 확장이 주 프로젝트 확장을 오염시키지 않고,
+    // reloadTreeFor(project)가 자기 확장 dir를 정확히 본다.
     set((s) => ({
       projects: s.projects.map((p) => {
-        if (p.path !== s.activeProject) return p;
+        if (p.path !== project) return p;
         const expanded = p.tree_state.expanded;
         const next = expanded.includes(dirPath)
           ? expanded.filter((d) => d !== dirPath)
@@ -1290,28 +1383,35 @@ export const useAppStore = create<AppState>((set, get) => ({
   },
 
   reloadActiveTree: async () => {
+    await get().reloadTreeFor(get().activeProject);
+  },
+  reloadTreeFor: async (project) => {
+    if (!project) return;
     // P2(리뷰 재설계): 겹침은 pending 비트로 "종료 후 1회 더"(최신 우선 —
     // 수동 ↻ 무시 방지), 사이클은 가드 점유 상한으로 hang 복구, 쓰기는
     // ①before-스냅샷(읽는 사이 사용자 조작이 쓴 dir는 건드리지 않는다 —
     // 삭제 파일 유령 부활 차단) ②treeWriteAllowed(축출 부활 차단) 이중 가드.
-    if (treeReloadInFlight) {
-      treeReloadPending = true;
+    // P5: 가드는 **프로젝트 키**(Set) — 두 표면이 다른 프로젝트를 동시 폴 가능.
+    if (treeReloadInFlight.has(project)) {
+      treeReloadPending.add(project);
       return;
     }
-    treeReloadInFlight = true;
+    treeReloadInFlight.add(project);
     try {
       do {
-        treeReloadPending = false;
-        const { activeProject, projects } = get();
-        if (!activeProject) return;
+        treeReloadPending.delete(project);
+        const { projects } = get();
         const expanded =
-          projects.find((p) => p.path === activeProject)?.tree_state.expanded ?? [];
+          projects.find((p) => p.path === project)?.tree_state.expanded ?? [];
         // hang으로 미해결인 dir는 제외 — 미해결 invoke를 dir당 1건으로 상한
         // (감사 B2: 타임아웃마다 새 배치가 같은 dir에 무한 누적하던 경로).
-        const dirs = [activeProject, ...expanded].filter((d) => !treeDirInFlight.has(d));
+        const dirs = [project, ...expanded].filter((d) => !treeDirInFlight.has(d));
         if (dirs.length === 0) continue;
         const before = get().childrenCache;
-        const gen = ++treeCycleGen;
+        // 세대는 **프로젝트별**(P5) — 두 표면이 다른 프로젝트를 동시 폴할 때
+        // 공유 세대면 서로의 사이클을 교차 취소한다(다른 dir인데도).
+        const gen = (treeCycleGen.get(project) ?? 0) + 1;
+        treeCycleGen.set(project, gen);
         const epoch = treeCacheEpoch;
         const cycle = (async () => {
           // 배치 — 직렬 IPC N회·set N회를 병렬 조회 1배치·set 1회로. 실패
@@ -1331,7 +1431,7 @@ export const useAppStore = create<AppState>((set, get) => ({
           );
           // 세대 가드: 그 사이 새 사이클이 시작됐거나(gen — 타임아웃 경유 구
           // 사이클) 축출이 있었으면(epoch) 이 사이클의 결과 전체를 버린다.
-          if (gen !== treeCycleGen || epoch !== treeCacheEpoch) return;
+          if (gen !== treeCycleGen.get(project) || epoch !== treeCacheEpoch) return;
           set((s) => {
             let changed = false;
             const next = { ...s.childrenCache };
@@ -1355,9 +1455,9 @@ export const useAppStore = create<AppState>((set, get) => ({
           cycle,
           new Promise<void>((r) => setTimeout(r, TREE_RELOAD_GUARD_MS)),
         ]);
-      } while (treeReloadPending);
+      } while (treeReloadPending.has(project));
     } finally {
-      treeReloadInFlight = false;
+      treeReloadInFlight.delete(project);
     }
   },
 

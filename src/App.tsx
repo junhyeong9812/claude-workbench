@@ -45,6 +45,7 @@ import { initNotify } from "./state/notify";
 import { resolveLayerMode, devLayerMounted, shouldFlipToIntegrated } from "./state/layerRouting";
 import { resolveVisibleDual } from "./state/dualSurface";
 import { SurfaceProvider } from "./state/surfaceContext";
+import { SurfaceShell } from "./components/SurfaceShell";
 import {
   applyActivityPick,
   applyTabPick,
@@ -403,9 +404,11 @@ function AppMain() {
   useEffect(() => {
     if (layerMode !== "dev" || !activeProject) return;
     const flip = () => useAppStore.getState().setProjectMode(activeProject, "integrated");
-    if (shouldFlipToIntegrated(layerMode, diffRequest?.cwd, activeProject)) return flip();
-    if (shouldFlipToIntegrated(layerMode, claudeOpenRequest?.project, activeProject)) return flip();
-    if (shouldFlipToIntegrated(layerMode, runRequest?.project, activeProject)) return flip();
+    // P5 F1: 자동-flip은 **주 표면(primary)** 슬롯만 본다 — dev 레이어는 주 표면
+    // 전용이고 부 표면은 integrated 고정이라 flip 대상이 아니다.
+    if (shouldFlipToIntegrated(layerMode, diffRequest.primary?.cwd, activeProject)) return flip();
+    if (shouldFlipToIntegrated(layerMode, claudeOpenRequest.primary?.project, activeProject)) return flip();
+    if (shouldFlipToIntegrated(layerMode, runRequest.primary?.project, activeProject)) return flip();
   }, [diffRequest, claudeOpenRequest, runRequest, layerMode, activeProject]);
 
   useEffect(() => {
@@ -634,6 +637,11 @@ function AppMain() {
   return (
     <div className="app">
       <ProjectTabs />
+      {/* 상단 툴바는 **주 표면(primary)의 툴바**다(P5) — 세션 버튼·RunMenu가
+          여기서 origin "primary"로 발행한다. SurfaceProvider로 감싸 RunMenu 등이
+          표면 컨텍스트(useSurfaceId/useSurfaceProject)를 읽게 한다. 테마·모드·헤더
+          같은 앱-전역 요소는 컨텍스트를 읽지 않아 무해. */}
+      <SurfaceProvider surfaceId="primary" project={activeProject}>
       <div className="toolbar">
         <div className="seg" role="group" aria-label="화면 모드">
           <button
@@ -874,6 +882,7 @@ function AppMain() {
           {activeSurfaceProject ?? "claude-workbench"}
         </span>
       </div>
+      </SurfaceProvider>
       {mode === "study" ? (
         <StudyView />
       ) : (
@@ -938,13 +947,13 @@ function AppMain() {
           onExpand={() => setCollapsed(false)}
           className="pane-left"
         >
-          {/* 사이드바 클러스터를 표면 컨텍스트로 감싼다(P1 배선). **P4'**: 위치는
-              아직 단일(dual-row 밖 1개)이지만 **활성 표면**을 반영한다 — 활성 표면
-              전환 시 FolderTree·GitPanel·WorktreePanel·GraphPanel이 그 표면의
-              프로젝트로 내용 전환된다(useSurfaceProject/useSurfaceId 경유). 활성
-              표면의 프로젝트/ id를 주입하되 위치·인스턴스는 그대로(표면별 사이드바
-              인스턴스는 P5). */}
-          <SurfaceProvider surfaceId={activeSurfaceId} project={activeSurfaceProject}>
+          {/* 좌측 사이드바 컬럼은 **주 표면(primary)의 사이드바**다(P5) — 위치
+              무변경(회귀 0). 자기 프로젝트(activeProject)를 고정 바인딩하고, 부 표면은
+              dual-secondary 프레임 안에 자기 사이드바를 **가산**한다(SurfaceShell).
+              둘이 동시에 보이며 각자 자기 프로젝트를 반영 = "각 표면 자기 사이드바
+              소유". (P4'에서 이 컬럼이 활성 표면을 추종하던 것은, 부 표면에 사이드바가
+              없던 임시 조치 — 이제 부가 자기 것을 가지므로 primary 고정이 정답.) */}
+          <SurfaceProvider surfaceId="primary" project={activeProject}>
           <div className="sidebar-content">
             {/* PanelGroup은 분할 여부와 무관하게 **상시** 렌더 — ⊟ 토글이 위쪽
                 본문(keyed "body")의 identity를 보존해 GitPanel 커밋 메시지 등
@@ -1057,8 +1066,8 @@ function AppMain() {
                         className="dual-secondary-head"
                         title={`${visibleDual}\n${
                           activeSurfaceId === "secondary"
-                            ? "활성 표면 — 사이드바·검색이 이 프로젝트를 가리킵니다 (표면별 툴바·세션 열기는 다음 단계)"
-                            : "클릭하면 이 표면이 활성이 되어 사이드바·검색이 이 프로젝트로 전환됩니다"
+                            ? "활성 표면 — 이 표면의 툴바·사이드바가 자기 세션을 이 dock에 엽니다"
+                            : "이 표면은 자기 사이드바·툴바로 세션을 자기 dock에 엽니다 (클릭 시 활성)"
                         }`}
                       >
                         <span className="dual-secondary-name">
@@ -1076,15 +1085,14 @@ function AppMain() {
                         </button>
                       </div>
                       <div className="dual-secondary-body">
-                        {/* 내부 DockviewReact가 surfaceProject로 키잉되어
-                            프로젝트 교체 시 dock만 리마운트된다(외부 key 불요 — D11). */}
-                        {/* P0 무동작 인프라: 부 표면 서브트리에 우측 분할이
-                            표시 중인 프로젝트(visibleDual)를 주입한다 — MainArea가
-                            받는 project prop과 동일 값(반사만, 소비 변경 0). */}
+                        {/* P5: 부 표면이 자기 툴바+사이드바 클러스터를 완전 소유
+                            한다(SurfaceShell). 자식(툴바·사이드바·MainArea)이 모두
+                            secondary SurfaceProvider 안이라 요청이 origin
+                            "secondary"로 stamp되어 이 표면 dock에만 열린다. */}
                         <SurfaceProvider surfaceId="secondary" project={visibleDual}>
-                          {/* project는 이제 SurfaceProvider가 주입 — MainArea는
-                              useSurfaceProject()로 읽는다(P1). */}
-                          <MainArea secondary />
+                          <SurfaceShell>
+                            <MainArea secondary />
+                          </SurfaceShell>
                         </SurfaceProvider>
                       </div>
                     </div>

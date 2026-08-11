@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { useAppStore } from "../state/store";
+import { useSurfaceProject, useSurfaceId } from "../state/surfaceContext";
 import type { RunTarget } from "../types";
 
 /**
@@ -10,7 +11,10 @@ import type { RunTarget } from "../types";
  * types the command into a terminal (the user sees full output + can re-run).
  */
 export function RunMenu() {
-  const activeProject = useAppStore((s) => s.activeProject);
+  // 표면-로컬(P5): 이 표면의 프로젝트를 감지하고, 실행 요청도 이 표면 origin으로
+  // 발행한다 — 각 표면 툴바가 자기 dock에 터미널을 연다.
+  const activeProject = useSurfaceProject();
+  const surfaceId = useSurfaceId();
   const requestRun = useAppStore((s) => s.requestRun);
   const [targets, setTargets] = useState<RunTarget[]>([]);
   const [open, setOpen] = useState(false);
@@ -49,7 +53,7 @@ export function RunMenu() {
   if (!activeProject || targets.length === 0) return null;
 
   const run = (cmd: string, label: string) => {
-    requestRun({ project: activeProject, cmd, title: label });
+    requestRun({ project: activeProject, cmd, title: label }, surfaceId);
     setOpen(false);
   };
 

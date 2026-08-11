@@ -3,7 +3,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { WebviewWindow } from "@tauri-apps/api/webviewWindow";
 import { errText } from "../utils/error";
 import { useAppStore } from "../state/store";
-import { useSurfaceProject } from "../state/surfaceContext";
+import { useSurfaceProject, useSurfaceId } from "../state/surfaceContext";
 import { expandedSetOf } from "../state/treeSelectors";
 import type { DirEntry } from "../types";
 import { TypeBadges } from "./TypeBadges";
@@ -37,6 +37,8 @@ function TreeNode({
   onContext,
   parentIgnored,
   dnd,
+  treeId,
+  project,
 }: {
   entry: DirEntry;
   depth: number;
@@ -45,15 +47,21 @@ function TreeNode({
    * it, so ignored-ness is inherited down the subtree for consistent dimming. */
   parentIgnored?: boolean;
   dnd: TreeDndHandlers;
+  /** 표면-스코프 트리 DOM id (P5 — 2 표면이면 중복 방지). onClick 후 이 트리로
+   * 포커스를 되돌릴 때 쓴다. */
+  treeId: string;
+  /** 이 트리가 소유한 표면 프로젝트 (P5 F2 — 확장 판정/토글이 이 프로젝트의
+   * tree_state에만 걸린다). */
+  project: string;
 }) {
   // P2 F1: expanded 배열 identity 메모 Set의 O(1) 조회 — 기존 노드당
   // find+includes O(P+E)가 store set마다 전 노드에서 돌던 비용 제거(동치는
-  // treeSelectors 특성테스트).
-  const expanded = useAppStore((s) => expandedSetOf(s).has(entry.path));
+  // treeSelectors 특성테스트). P5 F2: **이 표면 프로젝트**의 확장만 본다.
+  const expanded = useAppStore((s) => expandedSetOf(s, project).has(entry.path));
   const children = useAppStore((s) => s.childrenCache[entry.path]);
   const isCursor = useAppStore((s) => s.treeCursor === entry.path);
   const isPeeked = useAppStore((s) => s.peekFile === entry.path);
-  const toggleExpanded = useAppStore((s) => s.toggleExpanded);
+  const toggleExpandedFor = useAppStore((s) => s.toggleExpandedFor);
   const loadChildren = useAppStore((s) => s.loadChildren);
   const setTreeCursor = useAppStore((s) => s.setTreeCursor);
   const setPeekFile = useAppStore((s) => s.setPeekFile);
@@ -66,10 +74,12 @@ function TreeNode({
 
   const onClick = () => {
     setTreeCursor(entry.path);
-    if (entry.is_dir) toggleExpanded(entry.path);
+    if (entry.is_dir) toggleExpandedFor(project, entry.path);
     else setPeekFile(entry.path);
-    // Focus the tree so subsequent ↑/↓ navigate from here.
-    document.getElementById("folder-tree")?.focus();
+    // Focus **this surface's** tree so subsequent ↑/↓ navigate from here (P5:
+    // scoped id — 두 트리가 같은 "folder-tree" id면 getElementById가 첫 것만 잡아
+    // 부 표면 클릭이 주 표면 트리를 포커스했다).
+    document.getElementById(treeId)?.focus();
   };
 
   const icon = entry.is_dir ? (expanded ? "▾" : "▸") : "·";
@@ -117,6 +127,8 @@ function TreeNode({
                 onContext={onContext}
                 parentIgnored={ignored}
                 dnd={dnd}
+                treeId={treeId}
+                project={project}
               />
             ))
           )}
@@ -133,7 +145,7 @@ function TreeNode({
 function visibleNodes(root: string | null): DirEntry[] {
   if (!root) return [];
   const s = useAppStore.getState();
-  const expanded = expandedSetOf(s);
+  const expanded = expandedSetOf(s, root); // P5 F2: 이 표면 프로젝트의 확장만
   const out: DirEntry[] = [];
   const walk = (entries: DirEntry[] | undefined) => {
     for (const e of entries ?? []) {
@@ -149,17 +161,27 @@ export function FolderTree() {
   // 표면-로컬 프로젝트 (P1) — 활성 표면(primary)이 activeProject 반사라 무동작.
   // 변수명 activeProject 유지 → 아래 root·loadChildren·드롭 파생이 전부 무변경.
   const activeProject = useSurfaceProject();
+  // 표면-스코프 트리 DOM id (P5) — 두 표면이 각자 트리를 인스턴스화하므로 중복
+  // "folder-tree" id를 피한다. 주 표면은 기존 "folder-tree"(App Ctrl+B가 참조).
+  const surfaceId = useSurfaceId();
+  const treeId = surfaceId === "secondary" ? "folder-tree-secondary" : "folder-tree";
   const rootChildren = useAppStore((s) =>
     activeProject ? s.childrenCache[activeProject] : undefined,
   );
   const loadChildren = useAppStore((s) => s.loadChildren);
-  const toggleExpanded = useAppStore((s) => s.toggleExpanded);
+  const toggleExpandedFor = useAppStore((s) => s.toggleExpandedFor);
   const setTreeCursor = useAppStore((s) => s.setTreeCursor);
   const setPeekFile = useAppStore((s) => s.setPeekFile);
   const requestEditorOpen = useAppStore((s) => s.requestEditorOpen);
-  const reloadActiveTree = useAppStore((s) => s.reloadActiveTree);
+  const reloadTreeFor = useAppStore((s) => s.reloadTreeFor);
   const reloadDir = useAppStore((s) => s.reloadDir);
   const requestTerminalOpen = useAppStore((s) => s.requestTerminalOpen);
+  // C3 백그라운드 폴 정지: **활성 표면**의 트리만 4s 폴을 돌린다 — 비활성 표면은
+  // 파일워처 인터벌을 멈춰 프로젝트 N개의 폴 N배를 막는다. 활성화 시 즉시 1회
+  // 리로드로 정지 동안의 변경을 따라잡는다. (타임라인은 앱-전역 폴이라 계속 —
+  // 에이전트 진행 관찰, 확정 축.)
+  const activeSurfaceId = useAppStore((s) => s.activeSurfaceId);
+  const pollActive = surfaceId === activeSurfaceId;
 
   // 우클릭 CRUD(메뉴·입력/삭제 다이얼로그)는 공용 훅 소유 — 스터디·개발 트리와
   // 같은 코드다. 여기 남는 다이얼로그는 트리 DnD 고유의 덮어쓰기 확인 하나뿐.
@@ -179,7 +201,7 @@ export function FolderTree() {
   const dropZoneOpeningRef = useRef(false);
 
   const ensureExpanded = (dir: string) => {
-    if (dir !== activeProject && !isExpanded(dir)) toggleExpanded(dir);
+    if (dir !== activeProject && !isExpanded(dir)) toggleExpandedFor(activeProject, dir);
   };
 
   // 우클릭 CRUD 공용 훅 — 이 트리 고유의 것만 호스트로 넘긴다: containment 루트
@@ -189,8 +211,9 @@ export function FolderTree() {
     reloadDir,
     expandDir: ensureExpanded,
     // 다중 생성(brace)이면 첫 파일만 연다 — 탭 20개가 한꺼번에 열리지 않도록.
-    onCreated: (paths) => requestEditorOpen(paths[0]),
-    onOpenTerminal: (dir) => requestTerminalOpen({ cwd: dir, title: baseName(dir) }),
+    // P5: 이 표면의 origin id를 실어 이 표면 dock에 연다.
+    onCreated: (paths) => requestEditorOpen(paths[0], surfaceId),
+    onOpenTerminal: (dir) => requestTerminalOpen({ cwd: dir, title: baseName(dir) }, surfaceId),
     extraItems: (_node, dir) => [
       {
         label: "파일 가져오기 (드롭 존)",
@@ -208,15 +231,20 @@ export function FolderTree() {
     if (activeProject) void loadChildren(activeProject);
   }, [activeProject, loadChildren]);
 
-  // Disk reload: poll the active tree (root + expanded) so external file
-  // add/delete shows up on its own (manual ↻ in the toolbar bumps it too).
+  // Disk reload: poll **this surface's** tree (root + expanded) so external file
+  // add/delete shows up on its own (manual ↻ in the toolbar bumps it too). P5:
+  // reloadTreeFor(activeProject=surfaceProject) — 부 표면 트리가 전역 activeProject
+  // (주 프로젝트)를 리로드하던 2인스턴스 버그 차단. C3: **활성 표면만** 폴한다
+  // (비활성 표면은 인터벌 없음 → N배 폴 방지). 활성화 즉시 1회 리로드로 catch-up.
   useEffect(() => {
-    if (!activeProject) return;
-    const t = setInterval(() => void reloadActiveTree(), 4000);
+    if (!activeProject || !pollActive) return;
+    void reloadTreeFor(activeProject);
+    const t = setInterval(() => void reloadTreeFor(activeProject), 4000);
     return () => clearInterval(t);
-  }, [activeProject, reloadActiveTree]);
+  }, [activeProject, pollActive, reloadTreeFor]);
 
-  const isExpanded = (p: string): boolean => expandedSetOf(useAppStore.getState()).has(p);
+  const isExpanded = (p: string): boolean =>
+    expandedSetOf(useAppStore.getState(), activeProject).has(p); // P5 F2: 이 표면 프로젝트
 
   // Move the cursor to a node; when the peek viewer is open, follow it onto files
   // (so ↑/↓ reads through the tree). Keep the moved row in view.
@@ -242,7 +270,7 @@ export function FolderTree() {
     if (e.ctrlKey && (e.key === "e" || e.key === "E")) {
       if (cur && !cur.is_dir) {
         e.preventDefault();
-        requestEditorOpen(cur.path);
+        requestEditorOpen(cur.path, surfaceId);
         setPeekFile(null);
       }
       return;
@@ -272,20 +300,20 @@ export function FolderTree() {
       case "ArrowRight":
         if (cur?.is_dir && !isExpanded(cur.path)) {
           e.preventDefault();
-          toggleExpanded(cur.path);
+          toggleExpandedFor(activeProject, cur.path);
         }
         break;
       case "ArrowLeft":
         if (cur?.is_dir && isExpanded(cur.path)) {
           e.preventDefault();
-          toggleExpanded(cur.path);
+          toggleExpandedFor(activeProject, cur.path);
         }
         break;
       case "Enter":
         if (cur) {
           e.preventDefault();
           if (cur.is_dir) {
-            toggleExpanded(cur.path);
+            toggleExpandedFor(activeProject, cur.path);
           } else {
             // Open the peek and hand focus to it, so ↑/↓ scroll its content (like
             // opening a timeline detail tab). Ctrl+B / Esc return focus to the tree.
@@ -461,7 +489,7 @@ export function FolderTree() {
   return (
     <div
       className={`tree${dndHover === "" ? " tree-drop-root" : ""}`}
-      id="folder-tree"
+      id={treeId}
       tabIndex={0}
       onKeyDown={onKeyDown}
       onFocus={onFocus}
@@ -478,7 +506,7 @@ export function FolderTree() {
       }}
     >
       {rootChildren.map((entry) => (
-        <TreeNode key={entry.path} entry={entry} depth={0} onContext={onContext} dnd={dnd} />
+        <TreeNode key={entry.path} entry={entry} depth={0} onContext={onContext} dnd={dnd} treeId={treeId} project={activeProject} />
       ))}
 
       {crud.ui}

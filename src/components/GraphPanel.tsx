@@ -2,7 +2,6 @@ import { useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { errText } from "../utils/error";
-import { useAppStore } from "../state/store";
 import { useSurfaceProject } from "../state/surfaceContext";
 
 /**
@@ -60,11 +59,14 @@ const fmtTime = (iso: string): string => {
 };
 
 export function GraphPanel() {
-  // 표면-로컬 프로젝트 (P1) — 활성 표면(primary)이 activeProject 반사라 무동작.
-  // 아래 비동기 stale-guard(getState().activeProject !== project)는 **전역**
-  // activeProject를 계속 읽는다: 현재 표면=전역이라 동치이고, 이 가드를 표면
-  // 기준으로 바꾸는 것은 다중 사이드바(P5)의 몫이다(회귀 방지 — 무접촉).
+  // 표면-로컬 프로젝트 (P1/P5). 비동기 stale-guard는 **이 표면의** 프로젝트와
+  // 비교한다(전역 activeProject 아님) — 부 표면 GraphPanel은 surfaceProject≠전역
+  // activeProject라, 전역 비교면 자기 응답을 전량 거절했다(2인스턴스 버그). 최신
+  // 표면 프로젝트를 ref로 들어 비동기 클로저가 "그 사이 이 표면이 프로젝트를
+  // 바꿨나"를 정확히 판정한다.
   const activeProject = useSurfaceProject();
+  const projectRef = useRef(activeProject);
+  projectRef.current = activeProject;
   const [info, setInfo] = useState<GraphInfo | null>(null);
   const [loading, setLoading] = useState(false);
   const [generating, setGenerating] = useState(false);
@@ -90,12 +92,12 @@ export function GraphPanel() {
   const loadMarkers = (project: string) => {
     invoke<MarkedFolder[]>("graph_marked_folders", { projectPath: project })
       .then((res) => {
-        if (useAppStore.getState().activeProject !== project) return;
+        if (projectRef.current !== project) return;
         setMarkers(res ?? []);
         setMarkersError(null);
       })
       .catch((e) => {
-        if (useAppStore.getState().activeProject !== project) return;
+        if (projectRef.current !== project) return;
         setMarkers([]);
         setMarkersError(errText(e));
       });
@@ -110,7 +112,7 @@ export function GraphPanel() {
     folderTokens.current.set(folderPath, token);
     const current = () =>
       folderTokens.current.get(folderPath) === token &&
-      useAppStore.getState().activeProject === project;
+      projectRef.current === project;
     setGenFolders((prev) => new Set(prev).add(folderPath));
     invoke<GraphPaths>("graph_generate", { projectPath: folderPath })
       .then(() => {
@@ -137,15 +139,15 @@ export function GraphPanel() {
     setError(null);
     invoke<GraphInfo | null>("graph_list", { projectPath: project })
       .then((res) => {
-        if (useAppStore.getState().activeProject !== project) return;
+        if (projectRef.current !== project) return;
         setInfo(res ?? null);
       })
       .catch((e) => {
-        if (useAppStore.getState().activeProject !== project) return;
+        if (projectRef.current !== project) return;
         setError(errText(e));
       })
       .finally(() => {
-        if (useAppStore.getState().activeProject === project) setLoading(false);
+        if (projectRef.current === project) setLoading(false);
       });
   };
 
@@ -200,7 +202,7 @@ export function GraphPanel() {
     // hasn't changed underneath it (the two guards are complementary: the token
     // rejects a superseded same-project run, activeProject rejects a switch away).
     const current = () =>
-      genToken.current === token && useAppStore.getState().activeProject === project;
+      genToken.current === token && projectRef.current === project;
     setGenerating(true);
     setError(null);
     invoke<GraphPaths>("graph_generate", { projectPath: project })

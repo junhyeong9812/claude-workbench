@@ -2,7 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { errText } from "../utils/error";
 import { invoke } from "@tauri-apps/api/core";
 import { useAppStore } from "../state/store";
-import { useSurfaceProject } from "../state/surfaceContext";
+import { useSurfaceProject, useSurfaceId } from "../state/surfaceContext";
 import { loadAgentOptions, spawnOptionFields } from "../state/agentOptions";
 import {
   groupWorktrees,
@@ -36,6 +36,12 @@ export function WorktreePanel() {
   const cwd = useSurfaceProject();
   const addProject = useAppStore((s) => s.addProject);
   const requestClaudeOpen = useAppStore((s) => s.requestClaudeOpen);
+  // C3/F4 백그라운드 폴 정지: **활성 표면**의 워크트리 패널만 4s 폴·focus 리로드를
+  // 돈다(FolderTree pollActive 선례). 비활성 부 표면은 인터벌·focus 리스너를
+  // 미부착 → 프로젝트 N개의 git_worktrees 폴 N배·focus당 인스턴스 수만큼 reload 방지.
+  const surfaceId = useSurfaceId();
+  const activeSurfaceId = useAppStore((s) => s.activeSurfaceId);
+  const pollActive = surfaceId === activeSurfaceId;
 
   // Register a worktree as a project tab and open a fresh Claude session bound to
   // it — one-click "work this worktree with Claude". Must `await addProject` first:
@@ -48,6 +54,9 @@ export function WorktreePanel() {
   // 모든 버튼마다 팝오버가 붙는다(표면 11곳). 옵션은 주 표면(툴바·피커) 두 곳에서만
   // 고르고, 나머지는 그 선택을 따라간다.
   const openClaude = async (path: string) => {
+    // P5 경계: openClaude는 **본질 primary 액션** — 워크트리를 프로젝트로 추가하며
+    // activeProject(=primary)를 전환하므로, 부 사이드바에서 눌러도 primary에 연다
+    // (detach·SSH primary-only와 동류 — 무음 유실 아님). 부 표면 라우팅은 P6.
     await addProject(path);
     requestClaudeOpen({ project: path, ...spawnOptionFields(loadAgentOptions("claude")) });
   };
@@ -140,7 +149,8 @@ export function WorktreePanel() {
   // and on window focus so the panel stays current without a manual ↻. Skips while
   // a mutating action is in flight to avoid clobbering its own post-action reload.
   useEffect(() => {
-    if (!cwd) return;
+    if (!cwd || !pollActive) return; // F4: 비활성 표면은 폴·focus 리스너 미부착
+    void reload(); // 활성화 즉시 1회 catch-up(정지 동안의 변경 반영)
     const tick = () => {
       if (!busyRef.current) void reload();
     };
@@ -150,7 +160,7 @@ export function WorktreePanel() {
       clearInterval(id);
       window.removeEventListener("focus", tick);
     };
-  }, [cwd, reload]);
+  }, [cwd, pollActive, reload]);
 
   const act = async (fn: () => Promise<unknown>) => {
     setBusy(true);

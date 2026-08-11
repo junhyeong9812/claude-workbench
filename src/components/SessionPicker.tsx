@@ -32,6 +32,7 @@ import {
 } from "../state/sessionCatalog";
 import { fmtAgo, fmtUnix } from "../utils/time";
 import { useAppStore } from "../state/store";
+import { useSurfaceId } from "../state/surfaceContext";
 import { AgentOptionsPopover } from "./AgentOptionsPopover";
 import {
   loadAgentOptions,
@@ -99,13 +100,12 @@ type PickerAddPanel = {
 };
 
 export function useSessionPicker(deps: {
-  /** 피커는 주 surface 전용. */
-  isPrimary: boolean;
+  /** 이 피커/표면이 소유한 프로젝트 (주=activeProject, 부=우측 분할 프로젝트). */
   activeProject: string | null;
   /** 리마운트 stale 방지 — 호출마다 다시 읽는다. */
   getApi: () => DockviewApi | null;
 }): SessionPickerController {
-  const { isPrimary, activeProject, getApi } = deps;
+  const { activeProject, getApi } = deps;
 
   // Saved-session picker for "+ Claude" (null = closed) + the name a "새 세션"
   // would get (B3-4: per-project "Claude N", computed when the picker opens).
@@ -196,10 +196,17 @@ export function useSessionPicker(deps: {
   // raw cwd를 activeProject와 문자열 비교하면 경로 정규화 차이(심링크·슬래시)
   // 에 취약하므로, 이벤트는 트리거로만 쓰고 판정은 백엔드 in_flight 재조회로
   // 한다 (리뷰 F7 — 백엔드가 canonicalize로 동일성을 판정).
+  // **P5 F5**: 주·부 표면 피커가 **각자** 구독하되(예전 !isPrimary early-return이
+  // 부 피커를 stale하게 뒀다 — codex P2), 이벤트 payload.project가 **이 표면
+  // 프로젝트**와 같을 때만 반영한다(표면-안전 — 남의 프로젝트 이벤트로 리로드하지
+  // 않는다). busy 판정 자체는 여전히 백엔드 in_flight 재조회로(canonicalize, 리뷰 F7).
   useEffect(() => {
-    if (!isPrimary) return; // 피커는 주 surface 전용
+    if (!activeProject) return;
+    // payload.project는 트리거 필터로만 쓴다(백엔드가 이 프로젝트 경로 문자열로
+    // emit — 없으면 방어적으로 통과시켜 stale보다 과-리프레시를 택한다).
+    const mine = (e: { payload?: { project?: string } }) =>
+      !e?.payload?.project || e.payload.project === activeProject;
     const refresh = () => {
-      if (!activeProject) return;
       // started/finished 연속 발생 시 응답 역전으로 낡은 true가 나중에 도착해
       // 배지가 busy에 갇힐 수 있다 — 최신 요청만 반영(post-fix P4).
       const my = ++archReqRef.current;
@@ -215,8 +222,11 @@ export function useSessionPicker(deps: {
           if (next !== null) setArchBusy(next);
         });
     };
-    const un1 = listen("mt-archive-started", refresh);
-    const un2 = listen("mt-archive-finished", () => {
+    const un1 = listen<{ project?: string }>("mt-archive-started", (e) => {
+      if (mine(e)) refresh();
+    });
+    const un2 = listen<{ project?: string }>("mt-archive-finished", (e) => {
+      if (!mine(e)) return;
       refresh();
       if (pickerRef.current !== null) void openPicker();
     });
@@ -288,6 +298,9 @@ export function SessionPicker({
   activeProject: string | null;
 }) {
   const { setPicker, archBusy, newName, setNewName, collapsed, toggleGroup } = ctl;
+  // 이 피커가 속한 표면 id (P5 F3) — 메모/세션 요청을 이 표면 슬롯으로 라우팅해
+  // 부 피커에서 눌러도 부 dock에 열린다(SurfaceToolbar ▤와 정합).
+  const surfaceId = useSurfaceId();
   // 드래그 직전 실제로 눌린 요소 — dragstart의 e.target은 HTML DnD 표준상
   // draggable 조상(행)이라 내부 버튼 판별이 불가능하다(리뷰 S6 감사, WHATWG
   // dnd). mousedown 캡처로 기록해 dragstart에서 판별한다.
@@ -585,8 +598,8 @@ export function SessionPicker({
             onClick={() => {
               // 여는 실행부는 MainArea가 소유한다(dockview api가 거기 있다) —
               // 피커는 툴바 버튼과 **같은** 요청 버스를 두드릴 뿐이라 두 진입점이
-              // 갈라질 수 없다. 닫기는 그 소비자가 한다.
-              useAppStore.getState().requestMemo();
+              // 갈라질 수 없다. 닫기는 그 소비자가 한다. P5 F3: 이 표면 슬롯으로.
+              useAppStore.getState().requestMemo(surfaceId);
             }}
           >
             <span className="claude-picker-title">▤ 메모장</span>

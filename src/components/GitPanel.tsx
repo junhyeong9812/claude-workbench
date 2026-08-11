@@ -3,7 +3,7 @@ import { buildPathTree, type PathNode } from "../utils/pathTree";
 import { errText } from "../utils/error";
 import { invoke } from "@tauri-apps/api/core";
 import { useAppStore } from "../state/store";
-import { useSurfaceProject } from "../state/surfaceContext";
+import { useSurfaceProject, useSurfaceId } from "../state/surfaceContext";
 import { computeGraph, GitGraphRow } from "./GitGraph";
 
 /** Mirrors core_lib::git serialized types. */
@@ -99,6 +99,7 @@ export function GitPanel() {
   // 표면-로컬 프로젝트 (P1) — 현재는 활성 표면(primary)이 activeProject를 반사하므로
   // 값·동작 동일. 변수명 activeProject를 유지해 아래 cwd·git_roots 파생이 무변경.
   const activeProject = useSurfaceProject();
+  const surfaceId = useSurfaceId(); // P5: diff/편집을 이 표면 dock에 연다
   const requestDiff = useAppStore((s) => s.requestDiff);
   const requestEditorOpen = useAppStore((s) => s.requestEditorOpen);
   const openGitHistory = useAppStore((s) => s.openGitHistory);
@@ -367,7 +368,7 @@ export function GitPanel() {
             cwd: cwd as string,
             path: c.path,
             staged: kind === "staged",
-          })
+          }, surfaceId)
         }
       >
         {label}
@@ -728,7 +729,7 @@ export function GitPanel() {
                         cwd: cwd as string,
                         path: c.path,
                         staged: false,
-                      })
+                      }, surfaceId)
                     }
                   >
                     {c.path}
@@ -737,7 +738,7 @@ export function GitPanel() {
                     className="git-mini"
                     disabled={busy}
                     title="에디터로 충돌 마커 직접 편집"
-                    onClick={() => requestEditorOpen(`${cwd}/${c.path}`)}
+                    onClick={() => requestEditorOpen(`${cwd}/${c.path}`, surfaceId)}
                   >
                     편집
                   </button>

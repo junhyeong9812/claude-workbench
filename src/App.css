@@ -2246,6 +2246,50 @@ body {
   min-height: 0;
 }
 
+/* ---- 부 표면 셸 (P5 — 표면별 툴바+사이드바 완전 소유) ---- */
+.surface-shell {
+  height: 100%;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+/* 부 표면 툴바 — 상단 앱 툴바의 세션 버튼과 같은 어휘(.toolbar-btn 재사용), 컴팩트. */
+.surface-toolbar {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 3px 6px;
+  background: var(--bg-alt);
+  border-bottom: 1px solid var(--border);
+}
+.surface-shell-row {
+  flex: 1;
+  min-height: 0;
+}
+.surface-sidebar {
+  height: 100%;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  background: var(--bg);
+  border-right: 1px solid var(--border);
+  overflow: hidden;
+}
+.surface-sidebar-head {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 3px 4px;
+  border-bottom: 1px solid var(--border);
+}
+.surface-sidebar-body {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+}
+
 /* 프로젝트 탭 우클릭 메뉴 (dual-surface 진입점) */
 .tab-ctx-backdrop {
   position: fixed;
