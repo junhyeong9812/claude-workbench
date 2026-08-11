@@ -33,8 +33,42 @@ import type { SurfaceId } from "./surfaceContext";
 /** 현재 트리 스키마 버전. 필드 추가 시 올린다(구 파서는 미지 필드 무시). */
 export const SURFACE_TREE_VERSION = 1;
 
-/** 분할 방향. row=좌우(수평), column=상하(수직). P3'은 row만 실사용. */
+/** 분할 방향. row=좌우(수평), column=상하(수직). P6부터 column 실사용. */
 export type SplitDirection = "row" | "column";
+
+/**
+ * 부 표면 배치(멀티프로젝트 P6) — 자유 방향 분할.
+ * `direction` = row(좌우)·column(상하). `before` = 부 표면이 주 표면보다 **앞**
+ * (좌/상)인가. 기본 = 우측 분할(row·after) — 우클릭 "우측 분할로 열기"·기존
+ * setDualProject·기존 테스트가 그대로 성립한다(회귀 0).
+ */
+export interface SurfacePlacement {
+  direction: SplitDirection;
+  before: boolean;
+}
+
+/** 기본 배치 = 우측(row·after). 방향 인자 없이 부르면 이것 — 기존 동작 보존. */
+export const DEFAULT_PLACEMENT: SurfacePlacement = { direction: "row", before: false };
+
+/**
+ * 드롭 존(sessionDropZone `DropZone`) → 배치 매핑(P6). 좌/우=row, 상/하=column,
+ * before는 좌·상. center·미지 = null(분할 아님 — 호출부가 무시). sessionDropZone을
+ * import 하지 않으려 문자열을 받는다(순수·테스트 용이 — state→components 결합 회피).
+ */
+export function placementForZone(zone: string): SurfacePlacement | null {
+  switch (zone) {
+    case "left":
+      return { direction: "row", before: true };
+    case "right":
+      return { direction: "row", before: false };
+    case "above":
+      return { direction: "column", before: true };
+    case "below":
+      return { direction: "column", before: false };
+    default:
+      return null; // center / 미지 = 분할 아님
+  }
+}
 
 /** 리프 = 하나의 프로젝트 표면. */
 export interface SurfaceLeaf {
@@ -72,19 +106,45 @@ export function emptyTree(): SurfaceTree {
   return { version: SURFACE_TREE_VERSION, root: primaryLeaf() };
 }
 
-/** secondary 프로젝트가 담긴 row-분할 트리. */
-function treeWithSecondary(projectKey: string): SurfaceTree {
+/** secondary 프로젝트가 담긴 분할 트리(방향·위치 = placement, 기본 우측 row·after). */
+function treeWithSecondary(
+  projectKey: string,
+  placement: SurfacePlacement = DEFAULT_PLACEMENT,
+): SurfaceTree {
+  const primary = primaryLeaf();
+  const secondary: SurfaceLeaf = { kind: "leaf", surfaceId: "secondary", projectKey };
   return {
     version: SURFACE_TREE_VERSION,
     root: {
       kind: "split",
-      direction: "row",
-      children: [
-        primaryLeaf(),
-        { kind: "leaf", surfaceId: "secondary", projectKey },
-      ],
+      direction: placement.direction,
+      // before = 부 표면이 주 표면 앞(좌/상). findLeaf/secondaryProject는 순서
+      // 무관하게 secondary를 찾으므로 멤버십 조회는 그대로 성립한다.
+      children: placement.before ? [secondary, primary] : [primary, secondary],
     },
   };
+}
+
+/**
+ * 트리의 부 표면 배치(방향·위치)를 읽는다(P6 렌더용) — secondary 없으면 null.
+ * P6 트리는 root가 flat 2-child split이라 직접 자식에서 primary/secondary 인덱스를
+ * 비교한다. secondary가 더 깊이 중첩된(미래) 경우엔 방향을 못 읽어 기본(row·after)로
+ * 안전 낙하한다(멤버십은 secondaryProject가 여전히 정확).
+ */
+export function surfaceLayout(tree: SurfaceTree): SurfacePlacement | null {
+  const root = tree.root;
+  if (root.kind !== "split") return null;
+  const secIdx = root.children.findIndex(
+    (c) => c.kind === "leaf" && c.surfaceId === "secondary",
+  );
+  if (secIdx === -1) {
+    // 직접 자식에 없음 — 멤버십은 있을 수 있으나(중첩) 방향 판독 불가 → 기본.
+    return secondaryProject(tree) !== null ? { ...DEFAULT_PLACEMENT } : null;
+  }
+  const priIdx = root.children.findIndex(
+    (c) => c.kind === "leaf" && c.surfaceId === "primary",
+  );
+  return { direction: root.direction, before: priIdx !== -1 && secIdx < priIdx };
 }
 
 /**
@@ -103,9 +163,13 @@ export function secondaryProject(tree: SurfaceTree): string | null {
  * 파생(resolveVisibleDual)이 비파괴적으로 막는다. `projectKey`가 빈 값이면 제거로
  * 취급(레거시 setDualProject(null)과 동형).
  */
-export function addSurface(tree: SurfaceTree, projectKey: string | null): SurfaceTree {
+export function addSurface(
+  tree: SurfaceTree,
+  projectKey: string | null,
+  placement: SurfacePlacement = DEFAULT_PLACEMENT,
+): SurfaceTree {
   if (!projectKey) return removeSurface(tree);
-  return treeWithSecondary(projectKey);
+  return treeWithSecondary(projectKey, placement);
 }
 
 /** 우측 표면을 닫아 primary 단독으로 되돌린다. */
