@@ -307,3 +307,24 @@ export function parseSurfaceTree(rawTree: unknown, legacyDual: string | null): S
   if (typeof legacyDual === "string" && legacyDual) return treeWithSecondary(legacyDual);
   return emptyTree();
 }
+
+/**
+ * 디스크 로드 정본화 + 다운그레이드 화해(멀티프로젝트 P6).
+ *
+ * P6부터 트리 블롭(`rawTree`)이 방향까지 담는 디스크 정본이고, 레거시 문자열
+ * (`legacy`)은 구버전 앱이 읽는 **파생 미러**다. parseSurfaceTree로 파싱한 뒤,
+ * 두 표현이 어긋나면(구버전 세션이 legacy만 변경 — surfaceTree는 못 만짐)
+ * **legacy를 멤버십 정본, 트리를 방향 정본**으로 단방향 화해한다:
+ *  - legacy 부재인데 트리에 secondary → 구버전이 닫음 → 부활 금지(기본).
+ *  - legacy가 다른 프로젝트 → 그 프로젝트로, 트리 방향 보존.
+ *  - rawTree 부재 → parse가 이미 legacy로 구성(정의상 일치) → 그대로.
+ *  - 일치(신버전 동기 기록의 정상 경로) → 트리 그대로(방향 보존).
+ */
+export function resolveSurfaceTree(rawTree: unknown, legacy: string | null): SurfaceTree {
+  const tree = parseSurfaceTree(rawTree, legacy);
+  if (rawTree === null || rawTree === undefined) return tree; // legacy 경로 = 정의상 일치
+  const treeSec = secondaryProject(tree);
+  if ((legacy || null) === (treeSec || null)) return tree; // 정상 경로
+  if (!legacy) return emptyTree(); // 구버전이 닫음 → 부활 금지
+  return addSurface(emptyTree(), legacy, surfaceLayout(tree) ?? undefined); // 방향 보존
+}

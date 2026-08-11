@@ -25,19 +25,21 @@ describe("store: setDualProject → 트리 + 이중 기록", () => {
     useAppStore.getState().setDualProject(null);
   });
 
-  it("열기: 트리 secondary(메모리 정본) + 단일 legacy 키만 디스크 기록 (FB)", () => {
+  it("열기: 트리 블롭(정본, 방향 포함) + legacy 파생 미러 함께 기록 (P6)", () => {
     useAppStore.getState().setDualProject("/b");
     const s = useAppStore.getState();
     expect(s.dualProject).toBe("/b");
     // 메모리 트리에 secondary 멤버십.
     expect(JSON.stringify(s.surfaceTree)).toContain("/b");
-    // 디스크 정본 = 단일 legacy 키(구버전 앱이 읽는 유일 키).
+    // 디스크 정본 = 트리 블롭(방향까지 담음, P6).
+    const blob = localStorage.getItem("surfaceTree");
+    expect(blob).not.toBeNull();
+    expect(JSON.parse(blob!)).toEqual(s.surfaceTree);
+    // 다운그레이드 파생 미러 = 구버전 앱이 읽는 legacy 문자열 키.
     expect(localStorage.getItem("dualProject")).toBe("/b");
-    // 트리 블롭은 디스크에 쓰지 않는다(분기 원천 소멸 — FB).
-    expect(localStorage.getItem("surfaceTree")).toBeNull();
   });
 
-  it("닫기: primary 단독 + 단일 legacy 키 제거(구버전 앱도 닫힘 반영)", () => {
+  it("닫기: primary 단독 + 두 키 모두 제거(구버전 앱도 닫힘 반영)", () => {
     useAppStore.getState().setDualProject("/b");
     useAppStore.getState().setDualProject(null);
     const s = useAppStore.getState();
@@ -45,6 +47,14 @@ describe("store: setDualProject → 트리 + 이중 기록", () => {
     expect(secondaryProject(s.surfaceTree)).toBeNull();
     expect(localStorage.getItem("dualProject")).toBeNull();
     expect(localStorage.getItem("surfaceTree")).toBeNull();
+  });
+
+  it("방향(placement) 열기: 트리 블롭에 direction 보존 (하=column)", () => {
+    useAppStore.getState().setDualProject("/b", { direction: "column", before: false });
+    const blob = JSON.parse(localStorage.getItem("surfaceTree")!);
+    expect(blob.root.direction).toBe("column");
+    // 미러는 여전히 secondary 문자열(방향 정보 없음 — 파생).
+    expect(localStorage.getItem("dualProject")).toBe("/b");
   });
 
   it("교체: secondary 재지정 시 중복 없이 최신 프로젝트만", () => {

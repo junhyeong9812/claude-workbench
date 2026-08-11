@@ -7,6 +7,7 @@ import {
   parseSurfaceTree,
   placementForZone,
   removeSurface,
+  resolveSurfaceTree,
   secondaryProject,
   surfaceLayout,
   type SurfaceTree,
@@ -234,6 +235,39 @@ describe("FC(리뷰): 손상 트리가 임의 secondary를 부활시키지 못�
       metadata: { kind: "leaf", surfaceId: "secondary", projectKey: "/resurrected" },
     };
     expect(parseSurfaceTree(fixture, "/legacy")).toEqual(emptyTree());
+  });
+});
+
+describe("P6: resolveSurfaceTree — 디스크 로드 + 다운그레이드 화해", () => {
+  it("정상(두 키 동기 기록·일치) → 트리 채택, 방향 보존", () => {
+    const tree = addSurface(emptyTree(), "/b", { direction: "column", before: true });
+    const round = resolveSurfaceTree(JSON.parse(JSON.stringify(tree)), "/b");
+    expect(round).toEqual(tree);
+    expect(surfaceLayout(round)).toEqual({ direction: "column", before: true });
+  });
+
+  it("다운그레이드 닫음: 트리엔 secondary 있는데 legacy 부재 → 기본(부활 금지)", () => {
+    // 구버전 앱이 dualProject 키만 지웠고 stale surfaceTree 블롭이 남은 케이스.
+    const stale = addSurface(emptyTree(), "/b", { direction: "row", before: false });
+    expect(resolveSurfaceTree(JSON.parse(JSON.stringify(stale)), null)).toEqual(emptyTree());
+  });
+
+  it("다운그레이드 교체: legacy가 다른 프로젝트 → legacy 멤버십·트리 방향 보존", () => {
+    // 구버전이 dualProject를 "/other"로 바꿈. 트리 방향(column)은 유지하되
+    // 멤버십은 legacy가 이긴다.
+    const stale = addSurface(emptyTree(), "/b", { direction: "column", before: true });
+    const r = resolveSurfaceTree(JSON.parse(JSON.stringify(stale)), "/other");
+    expect(secondaryProject(r)).toBe("/other");
+    expect(surfaceLayout(r)).toEqual({ direction: "column", before: true });
+  });
+
+  it("rawTree 부재 → legacy 마이그레이션(정의상 일치, 화해 no-op)", () => {
+    expect(secondaryProject(resolveSurfaceTree(null, "/b"))).toBe("/b");
+    expect(resolveSurfaceTree(null, null)).toEqual(emptyTree());
+  });
+
+  it("present-but-corrupt 블롭 + legacy 부재 → 기본(크래시 없음)", () => {
+    expect(resolveSurfaceTree({ version: 1, root: { kind: "bogus" } }, null)).toEqual(emptyTree());
   });
 });
 
