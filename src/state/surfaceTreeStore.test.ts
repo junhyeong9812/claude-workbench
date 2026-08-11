@@ -16,8 +16,8 @@ vi.mock("@tauri-apps/api/window", () => ({
   getCurrentWindow: () => ({ label: "main", listen: vi.fn(() => Promise.resolve(() => {})) }),
 }));
 
-import { useAppStore } from "./store";
-import { secondaryProject } from "./surfaceTree";
+import { loadSurfaceTree, useAppStore } from "./store";
+import { secondaryProject, surfaceLayout } from "./surfaceTree";
 
 describe("store: setDualProject → 트리 + 이중 기록", () => {
   beforeEach(() => {
@@ -92,5 +92,28 @@ describe("store: closeProject가 우측 표면·미러·키를 정리 (FD)", () 
     const s = useAppStore.getState();
     expect(secondaryProject(s.surfaceTree)).toBe("/b");
     expect(localStorage.getItem("dualProject")).toBe("/b");
+  });
+});
+
+describe("F2(codex P1-2): loadSurfaceTree — 손상 블롭 ≠ 블롭 부재", () => {
+  beforeEach(() => localStorage.clear());
+
+  it("손상 블롭(파싱 실패) + legacy=/b → 기본(닫힌 분할 부활 금지)", () => {
+    localStorage.setItem("surfaceTree", "{not valid json");
+    localStorage.setItem("dualProject", "/b");
+    expect(secondaryProject(loadSurfaceTree())).toBeNull();
+  });
+
+  it("블롭 부재(키 없음) + legacy=/b → /b 승격(pre-P6 마이그레이션 정상)", () => {
+    localStorage.setItem("dualProject", "/b");
+    expect(secondaryProject(loadSurfaceTree())).toBe("/b");
+  });
+
+  it("유효 블롭(방향 포함) 왕복 로드 → 방향·멤버십 보존", () => {
+    useAppStore.getState().setDualProject("/c", { direction: "column", before: false });
+    const t = loadSurfaceTree();
+    expect(secondaryProject(t)).toBe("/c");
+    expect(surfaceLayout(t)).toEqual({ direction: "column", before: false });
+    useAppStore.getState().setDualProject(null);
   });
 });

@@ -308,14 +308,20 @@ const LEGACY_DUAL_KEY = "dualProject";
  * 화해한다 — "닫힌 분할 부활"(stale 트리가 legacy null을 이김)을 원천 차단.
  * 신버전이 두 키를 동기 기록하는 정상 경로에선 항상 일치라 화해는 no-op. 화해
  * 로직 정본 = surfaceTree.resolveSurfaceTree(순수·테스트 대상). */
-function loadSurfaceTree(): SurfaceTree {
-  let rawTree: unknown = null;
+export function loadSurfaceTree(): SurfaceTree {
+  const stored = localStorage.getItem(SURFACE_TREE_KEY);
+  const legacy = localStorage.getItem(LEGACY_DUAL_KEY);
+  // 진짜 부재(키 없음) → 레거시 마이그레이션 경로(pre-P6 세션 정상 승격).
+  if (stored === null) return resolveSurfaceTree(null, legacy);
+  let rawTree: unknown;
   try {
-    rawTree = JSON.parse(localStorage.getItem(SURFACE_TREE_KEY) || "null");
+    rawTree = JSON.parse(stored);
   } catch {
-    rawTree = null; // 손상 블롭 → parse 부재 경로(legacy 마이그레이션)
+    // 손상 블롭(문법 깨짐)은 **부재가 아니다**(F2 — codex P1-2): stale legacy를
+    // 신뢰해 닫힌 분할을 부활시키지 않도록 손상 플래그로 보수적 기본을 알린다.
+    return resolveSurfaceTree(null, legacy, true);
   }
-  return resolveSurfaceTree(rawTree, localStorage.getItem(LEGACY_DUAL_KEY));
+  return resolveSurfaceTree(rawTree, legacy);
 }
 
 /**

@@ -332,6 +332,8 @@ function legacyMirrorOf(rawTree: unknown): string | undefined {
  * (다운그레이드 vs stale vs 실패쓰기 vs 손상). **legacyMirror provenance 마커**로
  * 구별한다(F1 — codex P1-1). persist가 트리 블롭에 `legacyMirror = 그때의 legacy`를
  * 동봉하므로:
+ *  - `rawCorrupt` (블롭이 있으나 파싱 자체 실패, F2) → 블롭 **부재가 아니라 손상** →
+ *    stale legacy를 신뢰하지 않고 보수적 기본(primary 단독). 부재(마이그레이션)와 구별.
  *  - `rawTree` 부재(null) → parse가 이미 legacy로 마이그레이션(정의상 일치) → 그대로.
  *  - 멤버십 일치(legacy === 트리 secondary) → 트리 정본(방향 보존).
  *  - **legacyMirror === 현재 legacy** → 그 사이 구버전이 legacy를 건드리지 않음
@@ -339,7 +341,13 @@ function legacyMirrorOf(rawTree: unknown): string | undefined {
  *  - **legacyMirror ≠ 현재 legacy(또는 마커 부재)** → 그 사이 구버전이 legacy 변경
  *    = 진짜 다운그레이드 → legacy 멤버십 정본, 트리 방향 보존. legacy 부재면 닫힘.
  */
-export function resolveSurfaceTree(rawTree: unknown, legacy: string | null): SurfaceTree {
+export function resolveSurfaceTree(
+  rawTree: unknown,
+  legacy: string | null,
+  rawCorrupt = false,
+): SurfaceTree {
+  // 손상 블롭(파싱 실패)은 블롭 부재와 다르다(F2) — stale legacy 부활 금지, 보수적 기본.
+  if (rawCorrupt) return emptyTree();
   const tree = parseSurfaceTree(rawTree, legacy);
   if (rawTree === null || rawTree === undefined) return tree; // legacy 경로 = 정의상 일치
   const treeSec = secondaryProject(tree);

@@ -301,6 +301,13 @@ describe("P6: resolveSurfaceTree — 디스크 로드 + 다운그레이드 화�
   it("present-but-corrupt 블롭 + legacy 부재 → 기본(크래시 없음)", () => {
     expect(resolveSurfaceTree({ version: 1, root: { kind: "bogus" } }, null)).toEqual(emptyTree());
   });
+
+  it("(F2) rawCorrupt=true + legacy=/b → 기본(손상 ≠ 부재, stale legacy 부활 금지)", () => {
+    expect(resolveSurfaceTree(null, "/b", true)).toEqual(emptyTree());
+  });
+  it("(F2) rawCorrupt=false + rawTree 부재 + legacy=/b → /b 승격(마이그레이션)", () => {
+    expect(secondaryProject(resolveSurfaceTree(null, "/b", false))).toBe("/b");
+  });
 });
 
 describe("F1(codex P1-1): legacyMirror provenance — stale legacy가 valid 트리를 못 이긴다", () => {
