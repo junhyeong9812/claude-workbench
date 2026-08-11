@@ -2168,6 +2168,26 @@ body {
   height: 100%;
   min-height: 0;
 }
+/* 주 표면 컨테이너(P4') — MainArea가 채우도록 사이즈 상자만 제공. 활성 강조는
+   .surface-active::after 오버레이 테두리가 준다(레이아웃 밀림 없음). */
+.surface-frame {
+  height: 100%;
+  min-height: 0;
+  position: relative;
+}
+/* 활성 표면 시각 피드백(P4') — 어느 표면의 프로젝트가 사이드바·검색에 반영되는지 알린다.
+   dock 콘텐츠 위에 pointer-events 없는 accent 테두리를 덧그린다(레이아웃 불변).
+   주 표면은 dual 표시 중일 때만 클래스가 붙고(App), 부 표면은 활성일 때 붙는다. */
+.surface-frame.surface-active::after,
+.dual-secondary.surface-active::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  border: 2px solid var(--accent);
+  border-radius: 3px;
+  z-index: var(--z-drop-preview);
+}
 .dual-secondary {
   height: 100%;
   min-height: 0;
@@ -2176,6 +2196,8 @@ body {
   overflow: hidden;
   border-left: 1px solid var(--border);
   background: var(--bg);
+  /* .surface-active::after 오버레이 테두리(P4')의 위치 기준. */
+  position: relative;
 }
 .dual-secondary-head {
   flex: 0 0 auto;

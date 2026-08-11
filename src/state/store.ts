@@ -5,7 +5,7 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 import type { ITheme } from "@xterm/xterm";
 import type { DirEntry, Project, ProjectType, SshConnection, WorkspaceState } from "../types";
 import { capTreeCache, computeTreeKeepSet, pruneTreeCache, sameEntries, underRoot } from "./treeSelectors";
-import { activeSurfaceId, type SurfaceId } from "./surfaceContext";
+import { setActiveSurfaceSeam, type SurfaceId } from "./surfaceContext";
 import {
   addSurface,
   parseSurfaceTree,
@@ -13,6 +13,8 @@ import {
   secondaryProject,
   type SurfaceTree,
 } from "./surfaceTree";
+import { resolveVisibleDual } from "./dualSurface";
+import { resolveLayerMode } from "./layerRouting";
 import { basename } from "../utils/path";
 
 /** Clamp a font size to the allowed range (also normalizes NaN). */
@@ -258,6 +260,33 @@ function persistSurfaceTree(tree: SurfaceTree) {
   else localStorage.removeItem("dualProject");
 }
 
+/** 우측(secondary) 표면이 실제로 렌더되는가 — **활성 표면 정규화의 단일 술어**
+ * (G4 + codex 최종확인 H1). 두 축을 AND한다:
+ *   ① **멤버십·겹침·닫힘**: `resolveVisibleDual`과 동일 판정(우측 프로젝트가 열린
+ *      탭이고 좌측과 다른가).
+ *   ② **dual 레이어 가시**: 주 프로젝트가 dev 모드면 DevView 오버레이가 dual-row
+ *      **전체**를 가린다(App: layerMode=activeProject 구동 → main-layer-back). 이땐
+ *      어떤 표면도 실제로 안 보이므로 secondary도 false.
+ * 이로써 dev 축이 술어에 통합되어, 단일 진입점 reconcileActiveSurface가 dev **진입**
+ * (setProjectMode)뿐 아니라 **이미 dev인 프로젝트로 primary가 바뀌는**
+ * (applyRemoteActive·closeProject 재인덱스) 경로까지 균일하게 정규화한다 — 숨은
+ * dock으로의 무음 유실 갭이 자동으로 닫힌다. */
+function secondaryIsVisible(s: {
+  surfaceTree: SurfaceTree;
+  activeProject: string | null;
+  projects: Project[];
+  projectModes: Record<string, "integrated" | "dev">;
+}): boolean {
+  if (resolveLayerMode(s.projectModes, s.activeProject) === "dev") return false;
+  return (
+    resolveVisibleDual(
+      secondaryProject(s.surfaceTree),
+      s.activeProject,
+      s.projects.map((p) => p.path),
+    ) !== null
+  );
+}
+
 /** A request to open a diff in the main area (file change or a commit). */
 export interface DiffSpec {
   title: string;
@@ -283,6 +312,15 @@ export interface DiffSpec {
 interface AppState {
   projects: Project[];
   activeProject: string | null;
+  /**
+   * 활성 표면(멀티프로젝트 P4', 범위 축소본) — 마지막으로 클릭/상호작용(dock)한
+   * 표면. **표시/추적 전용**: 사이드바·헤더·검색 내용이 이 표면의 프로젝트
+   * (`activeSurfaceProject`, App 파생)를 반영하고 시각 지시자(테두리)가 이 표면을
+   * 강조한다. 우측 표면이 뚜렷이 안 보이면 "primary"로 정규화(표시 정합). **요청버스
+   * 목적지 라우팅에는 쓰지 않는다** — 모든 요청은 항상 primary로 발행된다(P4'
+   * 범위 축소, 라우팅 5라운드 정지 규칙; 목적지-활성-추종은 P5 표면별 툴바 몫).
+   * `activeProject`는 primary/left 앵커(persist·sync·dev·resolveVisibleDual). */
+  activeSurfaceId: SurfaceId;
   /** dirPath -> its immediate children (transient cache). */
   childrenCache: Record<string, DirEntry[]>;
   /** dirPath -> in-flight read_dir guard. */
@@ -301,13 +339,13 @@ interface AppState {
    * the main area (file content at the commit + diff toggle), or null. Transient. */
   gitHistoryFile: { root: string; commit: string; path: string } | null;
   /**
-   * ── 요청버스 표면 라우팅 (멀티프로젝트 P2) ─────────────────────────────
-   * 아래 표면-라우팅 슬롯들은 각자 `targetSurfaceId`(발행 시점의 활성 표면 id,
-   * `activeSurfaceId()`가 stamp)를 실어 나른다. 소비자(MainArea)는 자기
-   * `useSurfaceId()`와 `targetSurfaceId`가 일치할 때만 소비한다. P2에서는
-   * `activeSurfaceId()`가 항상 "primary"이고 소비 표면도 primary 하나뿐이라
-   * 완전 무동작이다 — P4'가 `activeSurfaceId()`를 실제 활성 표면으로 교체하면
-   * 이 버스 전체가 그 표면으로 라우팅된다(소비부 무변경, seam은 그 함수 하나).
+   * ── 요청버스 표면 라우팅 (멀티프로젝트 P2 — P4'에서 dormant 유지) ────────
+   * 아래 표면-라우팅 슬롯들은 각자 `targetSurfaceId`를 실어 나른다. 소비자
+   * (MainArea)는 자기 `useSurfaceId()`와 `targetSurfaceId`가 일치할 때만 소비한다.
+   * **P4' 범위 축소**: 발행부가 targetSurfaceId를 **항상 "primary" 상수**로 stamp해
+   * (아래 발행부 참조) 소비 표면이 primary 하나로 고정된다 — pre-P4' 알려진 정상
+   * 경로(무음 유실 구조적 불가). 목적지-활성-추종 라우팅은 P5(표면별 툴바·소비자)로
+   * 이연하고, 이 슬롯·필드·게이트 인프라는 그때까지 dormant로 둔다.
    *
    * 표면 단위가 아니라 **세션 단위**인 요청(`claudeInjectRequest`/`Acks`·
    * `devReviewQueue`·`focusSessionRequest` — uuid/프로젝트로 짝지어 어느 표면이든
@@ -522,6 +560,14 @@ interface AppState {
   /** Make a project active (swaps the visible tree) + broadcast to other
    * windows so every window shares the same project (multiwindow). */
   setActive: (path: string) => void;
+  /** 활성 표면 전환(P4' 포커스 모델) — 표면 클릭/상호작용 시 호출. 우측 표면이
+   * 뚜렷이 보이지 않으면 "primary"로 정규화한다. React 상태와 `activeSurfaceId()`
+   * seam 홀더를 함께 갱신해 요청버스 라우팅과 화면(사이드바·시각 피드백)이 정합. */
+  setActiveSurface: (id: SurfaceId) => void;
+  /** 활성 표면 정규화(무음 유실 차단) — 좌/우 프로젝트·멤버십이 바뀌는 경로
+   * (setDualProject·closeProject·applyRemoteActive)가 호출한다. 활성이 secondary
+   * 인데 우측이 렌더되지 않으면 primary로 되돌린다. */
+  reconcileActiveSurface: () => void;
   /** Apply a project switch broadcast from ANOTHER window — sets state only, no
    * persist/re-emit (the originating window already did both; review R0-3). */
   applyRemoteActive: (path: string | null) => void;
@@ -734,6 +780,7 @@ const SURFACE_TREE_INIT = loadSurfaceTree();
 export const useAppStore = create<AppState>((set, get) => ({
   projects: [],
   activeProject: null,
+  activeSurfaceId: "primary",
   childrenCache: {},
   loadingDirs: {},
   treeCursor: null,
@@ -750,12 +797,12 @@ export const useAppStore = create<AppState>((set, get) => ({
   devReviewQueue: [],
   runRequest: null,
   terminalOpenRequest: null,
-  focusMainRequest: { targetSurfaceId: activeSurfaceId(), nonce: 0 },
+  focusMainRequest: { targetSurfaceId: "primary", nonce: 0 },
   focusSessionRequest: null,
-  termMenuRequest: { targetSurfaceId: activeSurfaceId(), nonce: 0 },
-  claudePickerRequest: { targetSurfaceId: activeSurfaceId(), nonce: 0 },
-  detachPanelRequest: { targetSurfaceId: activeSurfaceId(), nonce: 0 },
-  memoRequest: { targetSurfaceId: activeSurfaceId(), nonce: 0 },
+  termMenuRequest: { targetSurfaceId: "primary", nonce: 0 },
+  claudePickerRequest: { targetSurfaceId: "primary", nonce: 0 },
+  detachPanelRequest: { targetSurfaceId: "primary", nonce: 0 },
+  memoRequest: { targetSurfaceId: "primary", nonce: 0 },
   sessionResumeRequest: null,
   surfaceTree: SURFACE_TREE_INIT,
   dualProject: secondaryProject(SURFACE_TREE_INIT),
@@ -846,11 +893,12 @@ export const useAppStore = create<AppState>((set, get) => ({
   },
 
   addProject: async (path) => {
-    // Already open -> just focus it.
+    // Already open -> just focus it (좌측 primary로 — 목적지 라우팅은 P4' 범위 밖).
     if (get().projects.some((p) => p.path === path)) {
       set({ activeProject: path });
       get().persist();
       broadcastActiveProject(path);
+      get().reconcileActiveSurface(); // 새 activeProject가 dev/겹침이면 활성 표면 표시 정규화
       return;
     }
 
@@ -876,6 +924,7 @@ export const useAppStore = create<AppState>((set, get) => ({
     }));
     get().persist();
     broadcastActiveProject(path);
+    get().reconcileActiveSurface(); // 새 activeProject가 dev/겹침이면 활성 표면 표시 정규화
   },
 
   closeProject: (path) => {
@@ -910,6 +959,10 @@ export const useAppStore = create<AppState>((set, get) => ({
     });
     // 우측 표면이 닫혔으면 legacy 키(디스크 정본)도 즉시 정리 — 잔존 방지.
     if (clearedSurface) persistSurfaceTree(get().surfaceTree);
+    // G1(리뷰): 우측 표면 제거뿐 아니라 **재인덱스로 좌측이 우측과 같은 프로젝트가
+    // 되는 경로**(primary 닫힘 → projects[0]=secondary 프로젝트 → 겹침 숨김)에서도
+    // 활성이 secondary로 남아 무음 유실됐다. 최종 상태에서 정규화 술어를 재적용한다.
+    get().reconcileActiveSurface();
     get().persist();
     // If closing the active project moved focus elsewhere, sync other windows
     // so they swap too (review R1-9).
@@ -938,8 +991,27 @@ export const useAppStore = create<AppState>((set, get) => ({
     set({ activeProject: path });
     get().persist();
     broadcastActiveProject(path);
+    get().reconcileActiveSurface(); // 새 activeProject가 dev/겹침이면 활성 정규화(H1 균일)
   },
-  applyRemoteActive: (path) => set({ activeProject: path }),
+  setActiveSurface: (id) => {
+    // 우측 표면이 **뚜렷이 보이지 않으면**(없음·좌우 겹침 숨김·닫힘) secondary를
+    // 활성으로 둘 수 없다 — primary로 정규화(G4: 완전 가시성 술어 통일).
+    const next: SurfaceId = id === "secondary" && secondaryIsVisible(get()) ? "secondary" : "primary";
+    setActiveSurfaceSeam(next); // imperative 발행 경로(요청버스 stamp)가 읽는 홀더
+    if (get().activeSurfaceId !== next) set({ activeSurfaceId: next });
+  },
+  reconcileActiveSurface: () => {
+    // 좌/우 프로젝트·멤버십이 바뀌는 모든 경로가 호출하는 정규화 단일 진입점.
+    // 활성이 secondary인데 우측이 안 보이면 primary로 되돌린다 — setActiveSurface가
+    // 가시성 술어를 재적용하므로 현재 id를 그대로 재확정하면 된다(무음 유실 차단).
+    if (get().activeSurfaceId === "secondary") get().setActiveSurface("secondary");
+  },
+  applyRemoteActive: (path) => {
+    set({ activeProject: path });
+    // 크로스윈도우 전환이 좌측을 우측 표면과 같은 프로젝트로 만들면 secondary가
+    // 숨겨진다 — 활성을 primary로 정규화해 유령 라우팅(무음 유실)을 막는다(P4').
+    get().reconcileActiveSurface();
+  },
   initProjectSync: async () => {
     const self = getCurrentWindow().label;
     return await listen<{ activeProject: string | null; sourceWindow: string }>(
@@ -961,17 +1033,24 @@ export const useAppStore = create<AppState>((set, get) => ({
   openGitHistoryFile: (root, commit, path) =>
     set({ gitHistoryFile: { root, commit, path } }),
   closeGitHistoryFile: () => set({ gitHistoryFile: null }),
-  // 요청버스 발행부는 발행 시점의 활성 표면 id(`activeSurfaceId()`)를 라우팅 키로
-  // stamp한다(P2). P2에서는 항상 "primary"라 무동작 — 발행부(버튼) 호출부는
-  // 무변경이고, 이 setter 하나가 표면 키를 실어 준다(발행 계약의 seam).
+  // 요청버스 라우팅 — **P4' 범위 축소(정지 규칙, 라우팅 5라운드)**: 모든 슬롯은
+  // **항상 primary**를 타깃한다(상수). 소비부(MainArea)는 pre-P4' 그대로
+  // `targetSurfaceId === mySurfaceId`(=primary)로 소비 → 요청이 언제나 항상 마운트/
+  // 가시인 primary dock에 열려 **무음 유실이 구조적으로 불가**하다. 목적지-활성-추종
+  // 라우팅(발행을 활성 표면으로)은 오버레이 계층(dev/study)·전이 인터리빙·이중 소비
+  // 클래스를 만들어(visible≠mounted 등) 게이트 정교화로 못 닫혔다 — 그래서 P4'에서
+  // 제외하고, 표면별 자기 툴바·소비자면 스탬프·catch-all 없이 표면-로컬로 자명한
+  // **P5로 이연**한다. P2 라우팅 인프라(targetSurfaceId 필드·소비 게이트)는 dormant로
+  // 남고, `activeSurfaceId()` seam(활성 표면)은 사이드바 표시/추적용 상태와 별개로
+  // P5용 접점으로만 존치한다(현재 발행은 seam을 읽지 않는다).
   requestEditorOpen: (path) =>
-    set({ editorOpenRequest: path === null ? null : { path, targetSurfaceId: activeSurfaceId() } }),
+    set({ editorOpenRequest: path === null ? null : { path, targetSurfaceId: "primary" } }),
   requestDiff: (spec) =>
-    set({ diffRequest: spec === null ? null : { ...spec, targetSurfaceId: activeSurfaceId() } }),
+    set({ diffRequest: spec === null ? null : { ...spec, targetSurfaceId: "primary" } }),
   requestClaudeOpen: (req) =>
-    set({ claudeOpenRequest: req === null ? null : { ...req, targetSurfaceId: activeSurfaceId() } }),
+    set({ claudeOpenRequest: req === null ? null : { ...req, targetSurfaceId: "primary" } }),
   requestCodexOpen: (req) =>
-    set({ codexOpenRequest: req === null ? null : { ...req, targetSurfaceId: activeSurfaceId() } }),
+    set({ codexOpenRequest: req === null ? null : { ...req, targetSurfaceId: "primary" } }),
   requestClaudeInject: (req) => set({ claudeInjectRequest: req }),
   reportClaudeInjectAck: (ack) =>
     set((s) => ({
@@ -987,38 +1066,42 @@ export const useAppStore = create<AppState>((set, get) => ({
   consumeDevReview: (id) =>
     set((s) => ({ devReviewQueue: s.devReviewQueue.filter((r) => r.id !== id) })),
   requestRun: (req) =>
-    set({ runRequest: req === null ? null : { ...req, targetSurfaceId: activeSurfaceId() } }),
+    set({ runRequest: req === null ? null : { ...req, targetSurfaceId: "primary" } }),
   requestTerminalOpen: (req) =>
     set((s) => ({
       terminalOpenRequest: req
-        ? { ...req, nonce: (s.terminalOpenRequest?.nonce ?? 0) + 1, targetSurfaceId: activeSurfaceId() }
+        ? { ...req, nonce: (s.terminalOpenRequest?.nonce ?? 0) + 1, targetSurfaceId: "primary" }
         : null,
     })),
   requestFocusMain: () =>
-    set((s) => ({ focusMainRequest: { targetSurfaceId: activeSurfaceId(), nonce: s.focusMainRequest.nonce + 1 } })),
+    // picker-UI-open(G2): 항상 primary. Ctrl+B 포커스는 primary 크롬 기준.
+    set((s) => ({ focusMainRequest: { targetSurfaceId: "primary", nonce: s.focusMainRequest.nonce + 1 } })),
   requestFocusSession: (uuid) =>
     set((s) => ({
       focusSessionRequest: { uuid, nonce: (s.focusSessionRequest?.nonce ?? 0) + 1 },
     })),
   requestTermMenu: () =>
-    set((s) => ({ termMenuRequest: { targetSurfaceId: activeSurfaceId(), nonce: s.termMenuRequest.nonce + 1 } })),
+    // picker-UI-open(G2): 팝오버가 primary `.main-menus`에만 렌더 → 항상 primary.
+    set((s) => ({ termMenuRequest: { targetSurfaceId: "primary", nonce: s.termMenuRequest.nonce + 1 } })),
   requestClaudePicker: () =>
-    set((s) => ({ claudePickerRequest: { targetSurfaceId: activeSurfaceId(), nonce: s.claudePickerRequest.nonce + 1 } })),
+    // picker-UI-open(G2): SessionPicker가 primary `.main-menus`에만 렌더 → 항상 primary.
+    set((s) => ({ claudePickerRequest: { targetSurfaceId: "primary", nonce: s.claudePickerRequest.nonce + 1 } })),
   requestDetachPanel: () =>
-    set((s) => ({ detachPanelRequest: { targetSurfaceId: activeSurfaceId(), nonce: s.detachPanelRequest.nonce + 1 } })),
+    set((s) => ({ detachPanelRequest: { targetSurfaceId: "primary", nonce: s.detachPanelRequest.nonce + 1 } })),
   requestMemo: () =>
-    set((s) => ({ memoRequest: { targetSurfaceId: activeSurfaceId(), nonce: s.memoRequest.nonce + 1 } })),
+    set((s) => ({ memoRequest: { targetSurfaceId: "primary", nonce: s.memoRequest.nonce + 1 } })),
   setDualProject: (path) => {
     // 트리가 멤버십 정본: 열기=addSurface(secondary 추가/교체), 닫기=removeSurface.
     const tree = path ? addSurface(get().surfaceTree, path) : removeSurface(get().surfaceTree);
     persistSurfaceTree(tree); // legacy dualProject 단일 키만 기록(FB — 원자·다운그레이드 자명)
     set({ surfaceTree: tree, dualProject: secondaryProject(tree) });
+    get().reconcileActiveSurface(); // 우측이 안 보이게 됐으면 활성→primary(무음 유실 차단)
   },
   requestSessionResume: (req) =>
     set((s) =>
       req === null
         ? { sessionResumeRequest: null }
-        : { sessionResumeRequest: { ...req, nonce: (s.sessionResumeRequest?.nonce ?? 0) + 1, targetSurfaceId: activeSurfaceId() } },
+        : { sessionResumeRequest: { ...req, nonce: (s.sessionResumeRequest?.nonce ?? 0) + 1, targetSurfaceId: "primary" } },
     ),
   setTheme: (theme) => set({ theme }),
   setFontSize: (n) => set({ fontSize: clampFontSize(n) }),
@@ -1037,6 +1120,11 @@ export const useAppStore = create<AppState>((set, get) => ({
     else delete next[project]; // "integrated" is the default — keep the map sparse
     localStorage.setItem("projectModes", JSON.stringify(next));
     set({ projectModes: next });
+    // G3→H1(codex 최종확인): dev 축이 secondaryIsVisible 술어에 통합됐으므로,
+    // dev 진입도 단일 진입점 reconcileActiveSurface가 균일하게 처리한다(예전
+    // setActiveSurface("primary") 특수 경로 제거 — 단일 술어가 정본). 주 프로젝트가
+    // dev면 술어가 false → 활성=secondary는 primary로 정규화(오버레이가 dual 가림).
+    get().reconcileActiveSurface();
   },
   ensureDevUuid: (project) => {
     const cur = get().devUuids[project];

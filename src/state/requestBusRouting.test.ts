@@ -3,15 +3,16 @@ import { useAppStore } from "./store";
 import { activeSurfaceId } from "./surfaceContext";
 
 /**
- * 요청버스 표면 라우팅 (멀티프로젝트 P2) — **무동작 계약** 고정.
+ * 요청버스 표면 라우팅 — **발행부 stamp 계약** 고정.
  *
- * 각 표면-라우팅 슬롯의 발행부는 `activeSurfaceId()`(P2=상수 "primary")를
- * `targetSurfaceId`로 stamp한다. 소비자(MainArea)는 자기 `useSurfaceId()`와
- * 일치할 때만 소비하므로, 표면이 primary 하나뿐인 현재는 종전 `isPrimary`
- * 게이트와 결과가 동일하다. 이 테스트는 그 stamp 계약(발행 측)을 고정한다 —
- * P4'가 `activeSurfaceId()`를 실제 활성 표면으로 교체할 때 여기가 신호가 된다.
+ * 각 표면-라우팅 슬롯의 발행부는 `targetSurfaceId`를 stamp한다. **P4' 범위
+ * 축소(라우팅 5라운드 정지 규칙)**: 발행은 **항상 상수 "primary"** 다 — 소비부
+ * (MainArea)가 `targetSurfaceId === mySurfaceId`로 소비하므로 요청이 언제나 항상
+ * 가시인 primary dock에 열려 무음 유실이 구조적으로 불가하다. 목적지-활성-추종
+ * 라우팅은 P5(표면별 툴바·소비자)로 이연. 이 테스트는 그 상수-primary 계약을
+ * 고정한다. (활성 표면 추적/표시는 surfaceActive.test 담당.)
  */
-describe("요청버스 표면 라우팅 stamp (P2 무동작)", () => {
+describe("요청버스 표면 라우팅 stamp (P4' — 항상 primary)", () => {
   beforeEach(() => {
     // 슬롯 초기화 (다른 테스트 오염 방지).
     useAppStore.setState({
@@ -25,7 +26,7 @@ describe("요청버스 표면 라우팅 stamp (P2 무동작)", () => {
     });
   });
 
-  it("activeSurfaceId()는 P2에서 상수 'primary' (라우팅 seam)", () => {
+  it("기본 활성 표면 seam은 'primary' (setActiveSurface 미호출 시)", () => {
     expect(activeSurfaceId()).toBe("primary");
   });
 

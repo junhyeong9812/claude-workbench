@@ -189,6 +189,11 @@ function AppMain() {
   const init = useAppStore((s) => s.init);
   const initProjectSync = useAppStore((s) => s.initProjectSync);
   const activeProject = useAppStore((s) => s.activeProject);
+  // 활성 표면(P4' 포커스 모델) — 마지막 클릭한 표면. 툴바·검색·사이드바·요청버스가
+  // 이 표면을 따른다. activeProject는 primary/left 앵커로 유지하고, 활성 표면의
+  // 프로젝트는 아래 activeSurfaceProject 파생값으로 노출한다.
+  const activeSurfaceId = useAppStore((s) => s.activeSurfaceId);
+  const setActiveSurface = useAppStore((s) => s.setActiveSurface);
   const peekFile = useAppStore((s) => s.peekFile);
   const peekLine = useAppStore((s) => s.peekLine);
   const setPeekFile = useAppStore((s) => s.setPeekFile);
@@ -212,6 +217,12 @@ function AppMain() {
     activeProject,
     projects.map((p) => p.path),
   );
+  // 활성 표면의 프로젝트(P4' 범위 축소 — **표시 전용**). 사이드바·헤더·검색이 이
+  // 값을 읽어 활성 표면을 반영한다(라우팅 아님 — 요청/새 세션/실행/메모는 항상
+  // primary=activeProject로 발행). 활성=secondary이고 우측 표면이 실제 보일 때만 그
+  // 프로젝트, 그 외(닫힘/hydration 전/겹침 숨김)엔 primary 폴백(유령 프로젝트 방지).
+  const activeSurfaceProject =
+    activeSurfaceId === "secondary" && visibleDual ? visibleDual : activeProject;
   // P3'(리뷰): dual 정리 이펙트 **전부 제거**. 멤버십은 이제 store가 정본으로
   // 관리한다 — ① 동일-프로젝트 겹침은 위 렌더 가드가 비파괴적으로 숨기고(트리
   // 멤버십 보존 → P4' alias 전환 안전), ② 닫힌 프로젝트 정리는 closeProject의
@@ -711,6 +722,8 @@ function AppMain() {
                   onClose={() => setAgentOptsOpen(false)}
                   onStart={(agent, opts) => {
                     setAgentOptsOpen(false);
+                    // 새 세션은 primary(activeProject)에 연다 — 요청버스는 항상
+                    // primary로 발행된다(P4' 범위 축소; 활성 secondary에 열기는 P5).
                     if (!activeProject) return;
                     const req = { project: activeProject, ...spawnOptionFields(opts) };
                     if (agent === "codex") requestCodexOpen(req);
@@ -857,7 +870,8 @@ function AppMain() {
         </div>
         <ToolbarRollup />
         <span className="toolbar-title">
-          {activeProject ?? "claude-workbench"}
+          {/* 헤더는 활성 표면의 프로젝트를 가리킨다(P4'). */}
+          {activeSurfaceProject ?? "claude-workbench"}
         </span>
       </div>
       {mode === "study" ? (
@@ -924,12 +938,13 @@ function AppMain() {
           onExpand={() => setCollapsed(false)}
           className="pane-left"
         >
-          {/* P1: 사이드바 클러스터를 표면 컨텍스트로 감싼다. 사이드바는 dual-row
-              밖 단일 인스턴스라 P0 배선(MainArea만 감쌈)에 포함되지 않았다 —
-              활성 표면(현재는 primary)의 프로젝트를 주입해 FolderTree·GitPanel·
-              WorktreePanel·GraphPanel이 useSurfaceProject()를 읽게 한다. 값은
-              activeProject 반사라 완전 무동작(P5에서 표면별 사이드바로 실체화). */}
-          <SurfaceProvider surfaceId="primary" project={activeProject}>
+          {/* 사이드바 클러스터를 표면 컨텍스트로 감싼다(P1 배선). **P4'**: 위치는
+              아직 단일(dual-row 밖 1개)이지만 **활성 표면**을 반영한다 — 활성 표면
+              전환 시 FolderTree·GitPanel·WorktreePanel·GraphPanel이 그 표면의
+              프로젝트로 내용 전환된다(useSurfaceProject/useSurfaceId 경유). 활성
+              표면의 프로젝트/ id를 주입하되 위치·인스턴스는 그대로(표면별 사이드바
+              인스턴스는 P5). */}
+          <SurfaceProvider surfaceId={activeSurfaceId} project={activeSurfaceProject}>
           <div className="sidebar-content">
             {/* PanelGroup은 분할 여부와 무관하게 **상시** 렌더 — ⊟ 토글이 위쪽
                 본문(keyed "body")의 identity를 보존해 GitPanel 커밋 메시지 등
@@ -1010,25 +1025,48 @@ function AppMain() {
                 않도록 조건부는 우측 쌍에만 둔다. */}
             <PanelGroup direction="horizontal" autoSaveId="dual-surface" className="dual-row">
               <Panel id="dual-primary" order={1} minSize={25}>
-                {/* P0 무동작 인프라: 주 표면 서브트리에 자기 프로젝트를 주입한다
-                    (값은 현행 그대로 — MainArea는 여전히 activeProject 직독). */}
-                <SurfaceProvider surfaceId="primary" project={activeProject}>
-                  <MainArea />
-                </SurfaceProvider>
+                {/* 주 표면 컨테이너: pointerdown-capture로 이 표면의 **모든**
+                    상호작용을 잡아 활성 표면을 primary로 전환한다(P4' 포커스
+                    모델 — "마지막 클릭=활성", 스모크에서 dockview 이벤트보다
+                    견고하다고 확정). SurfaceProvider는 primary가 소유한 프로젝트
+                    (=activeProject 앵커, 활성 표면과 무관하게 안정)를 주입한다. */}
+                <div
+                  className={`surface-frame${
+                    visibleDual && activeSurfaceId === "primary" ? " surface-active" : ""
+                  }`}
+                  onPointerDownCapture={() => setActiveSurface("primary")}
+                >
+                  <SurfaceProvider surfaceId="primary" project={activeProject}>
+                    <MainArea />
+                  </SurfaceProvider>
+                </div>
               </Panel>
               {visibleDual && (
                 <>
                   <PanelResizeHandle className="resize-handle" />
                   <Panel id="dual-secondary" order={2} minSize={20} defaultSize={40}>
-                    <div className="dual-secondary">
+                    {/* 부 표면 컨테이너: 같은 pointerdown-capture로 활성 표면을
+                        secondary로 전환한다(P4'). 활성일 때 surface-active 강조. */}
+                    <div
+                      className={`dual-secondary${
+                        activeSurfaceId === "secondary" ? " surface-active" : ""
+                      }`}
+                      onPointerDownCapture={() => setActiveSurface("secondary")}
+                    >
                       <div
                         className="dual-secondary-head"
-                        title={`${visibleDual}\n수동 dock — 툴바 버튼·단축키·요청은 좌측(주) 작업 영역 기준입니다`}
+                        title={`${visibleDual}\n${
+                          activeSurfaceId === "secondary"
+                            ? "활성 표면 — 사이드바·검색이 이 프로젝트를 가리킵니다 (표면별 툴바·세션 열기는 다음 단계)"
+                            : "클릭하면 이 표면이 활성이 되어 사이드바·검색이 이 프로젝트로 전환됩니다"
+                        }`}
                       >
                         <span className="dual-secondary-name">
                           {projects.find((p) => p.path === visibleDual)?.name ?? visibleDual}
                         </span>
-                        <span className="dual-secondary-hint">보조</span>
+                        <span className="dual-secondary-hint">
+                          {activeSurfaceId === "secondary" ? "활성" : "보조"}
+                        </span>
                         <button
                           className="dual-secondary-close"
                           title="우측 분할 닫기"
@@ -1099,9 +1137,9 @@ function AppMain() {
       {/* 설정 모달 레이어 — 창에 하나. 어느 탭의 ⚙에서 열든, 팝오버의 전역
           링크에서 열든 여기서 그린다(트리거가 사라져도 모달이 살아남는다). */}
       <TermSettingsLayer />
-      {searchOpen && activeProject && (
+      {searchOpen && activeSurfaceProject && (
         <SearchPanel
-          root={activeProject}
+          root={activeSurfaceProject}
           onClose={() => setSearchOpen(false)}
           onOpen={(path, line) => {
             setPeekFile(path, line);
