@@ -25,19 +25,18 @@ describe("store: setDualProject → 트리 + 이중 기록", () => {
     useAppStore.getState().setDualProject(null);
   });
 
-  it("열기: 트리 블롭(정본, 방향 포함) + legacy 파생 미러 함께 기록 (P6)", () => {
+  it("열기: 트리 블롭(정본, 방향 포함) + legacy 빵부스러기 함께 기록 (P6 재슬라이스)", () => {
     useAppStore.getState().setDualProject("/b");
     const s = useAppStore.getState();
     expect(s.dualProject).toBe("/b");
     // 메모리 트리에 secondary 멤버십.
     expect(JSON.stringify(s.surfaceTree)).toContain("/b");
-    // 디스크 정본 = 트리 블롭(방향까지 담음, P6) + provenance 마커 legacyMirror(F1).
+    // 디스크 정본 = 트리 블롭(방향까지 담음). provenance 마커 없음(화해 폐지).
     const blob = localStorage.getItem("surfaceTree");
     expect(blob).not.toBeNull();
-    expect(JSON.parse(blob!)).toEqual({ ...s.surfaceTree, legacyMirror: "/b" });
-    // F1 불변식: legacyMirror는 항상 트리 secondary와 일치(쓰기 시점 동봉).
-    expect(JSON.parse(blob!).legacyMirror).toBe(secondaryProject(s.surfaceTree));
-    // 다운그레이드 파생 미러 = 구버전 앱이 읽는 legacy 문자열 키.
+    expect(JSON.parse(blob!)).toEqual(s.surfaceTree);
+    expect(JSON.parse(blob!).legacyMirror).toBeUndefined();
+    // write-only 다운그레이드 빵부스러기 = 구버전 앱이 읽는 legacy 문자열 키.
     expect(localStorage.getItem("dualProject")).toBe("/b");
   });
 
@@ -95,18 +94,50 @@ describe("store: closeProject가 우측 표면·미러·키를 정리 (FD)", () 
   });
 });
 
-describe("F2(codex P1-2): loadSurfaceTree — 손상 블롭 ≠ 블롭 부재", () => {
+describe("loadSurfaceTree — 트리 블롭 유일 정본(P6 재슬라이스, 화해 없음)", () => {
   beforeEach(() => localStorage.clear());
 
-  it("손상 블롭(파싱 실패) + legacy=/b → 기본(닫힌 분할 부활 금지)", () => {
+  it("(a) 트리 present valid + legacy 다른 값 → 트리 채택(legacy 무관)", () => {
+    // 트리 = /b(column), legacy = /old. 로드는 legacy를 무시하고 트리를 채택한다.
+    useAppStore.getState().setDualProject("/b", { direction: "column", before: true });
+    localStorage.setItem("dualProject", "/old"); // 어긋난 legacy — 무시돼야 함.
+    const t = loadSurfaceTree();
+    expect(secondaryProject(t)).toBe("/b");
+    expect(surfaceLayout(t)).toEqual({ direction: "column", before: true });
+    useAppStore.getState().setDualProject(null);
+  });
+
+  it('(b) 트리 present "null" (parsed null) → 기본(stale legacy 부활 없음)', () => {
+    localStorage.setItem("surfaceTree", "null");
+    localStorage.setItem("dualProject", "/b");
+    expect(secondaryProject(loadSurfaceTree())).toBeNull();
+  });
+
+  it("(c) 트리 present 손상 JSON + legacy=/b → 기본(닫힌 분할 부활 금지)", () => {
     localStorage.setItem("surfaceTree", "{not valid json");
     localStorage.setItem("dualProject", "/b");
     expect(secondaryProject(loadSurfaceTree())).toBeNull();
   });
 
-  it("블롭 부재(키 없음) + legacy=/b → /b 승격(pre-P6 마이그레이션 정상)", () => {
+  it("(d) 트리 키 부재 + legacy=/b → /b 승격(pre-P6 마이그레이션)", () => {
     localStorage.setItem("dualProject", "/b");
     expect(secondaryProject(loadSurfaceTree())).toBe("/b");
+  });
+
+  it("(e) 실패쓰기 유사(트리=/new present, legacy=/old stale) → /new 승(트리)", () => {
+    // 신버전이 트리+legacy를 쓰려다 legacy 쓰기만 실패해 어긋난 상황을 흉내낸다.
+    // 예전 화해는 여기서 /old로 오판했다 — 재슬라이스는 트리(/new)를 그대로 채택.
+    useAppStore.getState().setDualProject("/new");
+    localStorage.setItem("dualProject", "/old");
+    expect(secondaryProject(loadSurfaceTree())).toBe("/new");
+    useAppStore.getState().setDualProject(null);
+  });
+
+  it("(g) 닫기: 두 키 제거 → 키 부재 → 기본(primary 단독)", () => {
+    useAppStore.getState().setDualProject("/b");
+    useAppStore.getState().setDualProject(null);
+    expect(localStorage.getItem("surfaceTree")).toBeNull();
+    expect(secondaryProject(loadSurfaceTree())).toBeNull();
   });
 
   it("유효 블롭(방향 포함) 왕복 로드 → 방향·멤버십 보존", () => {

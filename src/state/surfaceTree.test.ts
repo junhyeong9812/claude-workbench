@@ -7,7 +7,6 @@ import {
   parseSurfaceTree,
   placementForZone,
   removeSurface,
-  resolveSurfaceTree,
   secondaryProject,
   surfaceLayout,
   type SurfaceTree,
@@ -270,85 +269,29 @@ describe("FC(리뷰): 손상 트리가 임의 secondary를 부활시키지 못�
   });
 });
 
-describe("P6: resolveSurfaceTree — 디스크 로드 + 다운그레이드 화해", () => {
-  it("정상(두 키 동기 기록·일치) → 트리 채택, 방향 보존", () => {
+describe("P6 재슬라이스: parseSurfaceTree present → 트리 정본(legacy 무시)", () => {
+  // 로드 계약(store.loadSurfaceTree)은 트리 블롭이 present면 legacy=null을 넘긴다.
+  // 화해가 사라졌으므로 present 트리는 legacy와 무관하게 자기 자신으로만 해석된다.
+  it("정상 트리(현재 version) present → 채택, 방향 보존", () => {
     const tree = addSurface(emptyTree(), "/b", { direction: "column", before: true });
-    const round = resolveSurfaceTree(JSON.parse(JSON.stringify(tree)), "/b");
+    const round = parseSurfaceTree(JSON.parse(JSON.stringify(tree)), null);
     expect(round).toEqual(tree);
     expect(surfaceLayout(round)).toEqual({ direction: "column", before: true });
   });
 
-  it("다운그레이드 닫음: 트리엔 secondary 있는데 legacy 부재 → 기본(부활 금지)", () => {
-    // 구버전 앱이 dualProject 키만 지웠고 stale surfaceTree 블롭이 남은 케이스.
-    const stale = addSurface(emptyTree(), "/b", { direction: "row", before: false });
-    expect(resolveSurfaceTree(JSON.parse(JSON.stringify(stale)), null)).toEqual(emptyTree());
-  });
-
-  it("다운그레이드 교체: legacy가 다른 프로젝트 → legacy 멤버십·트리 방향 보존", () => {
-    // 구버전이 dualProject를 "/other"로 바꿈. 트리 방향(column)은 유지하되
-    // 멤버십은 legacy가 이긴다.
-    const stale = addSurface(emptyTree(), "/b", { direction: "column", before: true });
-    const r = resolveSurfaceTree(JSON.parse(JSON.stringify(stale)), "/other");
-    expect(secondaryProject(r)).toBe("/other");
-    expect(surfaceLayout(r)).toEqual({ direction: "column", before: true });
-  });
-
-  it("rawTree 부재 → legacy 마이그레이션(정의상 일치, 화해 no-op)", () => {
-    expect(secondaryProject(resolveSurfaceTree(null, "/b"))).toBe("/b");
-    expect(resolveSurfaceTree(null, null)).toEqual(emptyTree());
-  });
-
-  it("present-but-corrupt 블롭 + legacy 부재 → 기본(크래시 없음)", () => {
-    expect(resolveSurfaceTree({ version: 1, root: { kind: "bogus" } }, null)).toEqual(emptyTree());
-  });
-
-  it("(F2) rawCorrupt=true + legacy=/b → 기본(손상 ≠ 부재, stale legacy 부활 금지)", () => {
-    expect(resolveSurfaceTree(null, "/b", true)).toEqual(emptyTree());
-  });
-  it("(F2) rawCorrupt=false + rawTree 부재 + legacy=/b → /b 승격(마이그레이션)", () => {
-    expect(secondaryProject(resolveSurfaceTree(null, "/b", false))).toBe("/b");
-  });
-});
-
-describe("F1(codex P1-1): legacyMirror provenance — stale legacy가 valid 트리를 못 이긴다", () => {
-  // persist가 쓰는 블롭 형태 = 트리 + legacyMirror(= 그때의 legacy = secondary).
-  const withMirror = (t: SurfaceTree) => ({ ...t, legacyMirror: secondaryProject(t) });
-
-  it("(a) same-version(마커 == 현재 legacy) → 트리 정본(방향 보존, 마커 stripped)", () => {
+  it("legacyMirror 잔재가 붙은 구 블롭도 그대로 채택(초과 필드 무시)", () => {
+    // 재슬라이스 이전 persist가 남긴 블롭엔 legacyMirror가 섞여 있을 수 있다.
+    // parse는 version+root만 취하므로 방향 보존·마커 무시로 정상 채택된다.
     const tree = addSurface(emptyTree(), "/b", { direction: "column", before: false });
-    const r = resolveSurfaceTree(withMirror(tree), "/b");
-    expect(r).toEqual(tree); // legacyMirror는 parse가 떼어냄
+    const legacyBlob = { ...tree, legacyMirror: "/stale" };
+    const r = parseSurfaceTree(legacyBlob, null);
+    expect(r).toEqual(tree);
     expect(surfaceLayout(r)).toEqual({ direction: "column", before: false });
   });
 
-  it("(b) 다운그레이드 교체(마커 stale /b, 구버전이 legacy=/other) → legacy 멤버십·트리 방향", () => {
-    const tree = addSurface(emptyTree(), "/b", { direction: "column", before: true });
-    const r = resolveSurfaceTree(withMirror(tree), "/other");
-    expect(secondaryProject(r)).toBe("/other");
-    expect(surfaceLayout(r)).toEqual({ direction: "column", before: true });
-  });
-
-  it("(b') 다운그레이드 닫음(마커 stale /b, 구버전이 legacy 제거) → 기본(부활 금지)", () => {
-    const tree = addSurface(emptyTree(), "/b", { direction: "row", before: false });
-    expect(resolveSurfaceTree(withMirror(tree), null)).toEqual(emptyTree());
-  });
-
-  it("(c) 마커 == 현재 legacy면 트리 방향 우선 — 방향-only 재기록 후 legacy 미세지연도 트리 신뢰", () => {
-    // 마커(/b) == 현재 legacy(/b)인데 트리 멤버십도 /b → 정상 일치 경로로 트리 채택.
-    const tree = addSurface(emptyTree(), "/b", { direction: "column", before: true });
-    const r = resolveSurfaceTree(withMirror(tree), "/b");
-    expect(secondaryProject(r)).toBe("/b");
-    expect(surfaceLayout(r)).toEqual({ direction: "column", before: true });
-  });
-
-  it("(하위호환) 마커 부재(구 P6-이전 블롭) → 기존 화해로 폴백(legacy 멤버십)", () => {
-    const stale = addSurface(emptyTree(), "/b", { direction: "column", before: true });
-    // 마커 없는 블롭 + legacy=/other → 다운그레이드로 간주(현행 화해 유지).
-    const r = resolveSurfaceTree(JSON.parse(JSON.stringify(stale)), "/other");
-    expect(secondaryProject(r)).toBe("/other");
-    expect(surfaceLayout(r)).toEqual({ direction: "column", before: true });
-    // 마커 없는 블롭 + legacy 부재 → 기본(부활 금지).
-    expect(resolveSurfaceTree(JSON.parse(JSON.stringify(stale)), null)).toEqual(emptyTree());
+  it("rawTree 부재(null) → legacy 마이그레이션(pre-P6 경로)", () => {
+    expect(secondaryProject(parseSurfaceTree(null, "/b"))).toBe("/b");
+    expect(parseSurfaceTree(null, null)).toEqual(emptyTree());
   });
 });
 
