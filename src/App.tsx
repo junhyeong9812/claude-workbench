@@ -204,23 +204,20 @@ function AppMain() {
   const dualProject = useAppStore((s) => s.dualProject);
   const setDualProject = useAppStore((s) => s.setDualProject);
   // **렌더는 파생값으로 그린다** (리뷰 D1): 이펙트(커밋 후) 정리에만 맡기면
-  // setActive 직후 1프레임 동안 같은 프로젝트 dock 두 개가 공존한다. 파생값은
+  // setActive 직후 1프레임 동안 같은 프로젝트 dock 두 개가 공존한다. dualProject는
+  // 이제 표면 트리(store.surfaceTree)의 secondary 멤버십 미러이고, 파생값은
   // 동일 프로젝트·비멤버십(닫힘/hydration 전)을 렌더 시점에 즉시 숨긴다.
   const visibleDual = resolveVisibleDual(
     dualProject,
     activeProject,
     projects.map((p) => p.path),
   );
-  // 이펙트는 persist 정리만: ① 동일 프로젝트로 전환되면 dual 해제 ② 닫힌
-  // 프로젝트 정리(hydration 전 오판 방지로 목록이 채워진 뒤에만).
-  useEffect(() => {
-    if (dualProject && dualProject === activeProject) setDualProject(null);
-  }, [dualProject, activeProject, setDualProject]);
-  useEffect(() => {
-    if (dualProject && projects.length > 0 && !projects.some((p) => p.path === dualProject)) {
-      setDualProject(null);
-    }
-  }, [dualProject, projects, setDualProject]);
+  // P3'(리뷰): dual 정리 이펙트 **전부 제거**. 멤버십은 이제 store가 정본으로
+  // 관리한다 — ① 동일-프로젝트 겹침은 위 렌더 가드가 비파괴적으로 숨기고(트리
+  // 멤버십 보존 → P4' alias 전환 안전), ② 닫힌 프로젝트 정리는 closeProject의
+  // zustand 갱신 안(마지막 프로젝트 close 포함)과 init() hydration 후 1회
+  // 정합화가 담당한다(예전 projects.length>0 이펙트가 마지막 프로젝트 close 시
+  // 정리를 건너뛰어 잔존시키던 FD 버그 제거).
   // 작업 영역에 드롭된 OS 파일들의 메모리 뷰 (workarea-drop-view — 완전 읽기
   // 전용, 디스크에 아무것도 쓰지 않음). 첫 파일 활성 + 탭 전환.
   const [droppedPeek, setDroppedPeek] = useState<{

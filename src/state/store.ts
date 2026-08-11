@@ -6,6 +6,13 @@ import type { ITheme } from "@xterm/xterm";
 import type { DirEntry, Project, ProjectType, SshConnection, WorkspaceState } from "../types";
 import { capTreeCache, computeTreeKeepSet, pruneTreeCache, sameEntries, underRoot } from "./treeSelectors";
 import { activeSurfaceId, type SurfaceId } from "./surfaceContext";
+import {
+  addSurface,
+  parseSurfaceTree,
+  removeSurface,
+  secondaryProject,
+  type SurfaceTree,
+} from "./surfaceTree";
 import { basename } from "../utils/path";
 
 /** Clamp a font size to the allowed range (also normalizes NaN). */
@@ -232,6 +239,25 @@ function persistPopoutGeometry(label: string, geo: PopoutGeo) {
   savePopoutGeometry(fresh);
 }
 
+/** Load the surface tree from localStorage (멀티프로젝트 P3'). FB(리뷰): the disk
+ * source of truth is the **single legacy `dualProject` key** — we never read a
+ * `surfaceTree` blob (그건 P6로 이연), so the two-key divergence class cannot
+ * exist. parseSurfaceTree(null, legacy) builds the in-memory tree; corrupt or
+ * missing legacy = 기본(primary 단독) via the recovery contract. */
+function loadSurfaceTree(): SurfaceTree {
+  return parseSurfaceTree(null, localStorage.getItem("dualProject"));
+}
+
+/** Persist the surface tree to the **single legacy `dualProject` key** (FB, 리뷰).
+ * P3'의 트리는 0~1 secondary라 legacy 문자열과 동형이므로 이 한 키가 저장 정보를
+ * 전부 담는다 — 원자적(한 키·한 setItem)이고 다운그레이드가 자명하다(구버전 앱이
+ * 읽는 유일 키). 방향·N-way를 담는 트리 persist는 P6로 이연. */
+function persistSurfaceTree(tree: SurfaceTree) {
+  const secondary = secondaryProject(tree);
+  if (secondary) localStorage.setItem("dualProject", secondary);
+  else localStorage.removeItem("dualProject");
+}
+
 /** A request to open a diff in the main area (file change or a commit). */
 export interface DiffSpec {
   title: string;
@@ -401,10 +427,17 @@ interface AppState {
    * gate and clears with null). Already-open session → activate that panel. */
   sessionResumeRequest: { uuid: string; project: string; title: string; nonce: number; targetSurfaceId: SurfaceId } | null;
   /** 우측 분할 surface에 열린 프로젝트 경로 (null=닫힘). 수동적 dock —
-   * 전역 요청 버스는 주(좌) surface만 소비한다. localStorage 복원(project-
-   * dual-surface). App이 activeProject와의 충돌·닫힌 프로젝트를 정리한다. */
+   * 전역 요청 버스는 주(좌) surface만 소비한다. surfaceTree의 secondary 파생
+   * 미러(소비처 호환). 닫힌 프로젝트 정리는 store(closeProject·init)가 정본. */
   dualProject: string | null;
-  /** 우측 분할 열기/닫기(null) — persist. */
+  /** 표면 트리(멀티프로젝트 P3') — 우측 표면 멤버십의 **정본**. dualProject는
+   * 이 트리의 secondary 파생 미러다(소비처 호환). P3'은 primary + secondary
+   * 0~1개까지만 실사용하되 스키마는 N-way·상하 분할을 대비한다. persist = P3'
+   * 트리는 legacy 문자열과 동형이라 **디스크는 legacy `dualProject` 단일 키만**
+   * 기록한다(FB — 분기 원천 제거·다운그레이드 자명). 트리는 메모리 정본. */
+  surfaceTree: SurfaceTree;
+  /** 우측 분할 열기(path)/닫기(null) — 트리 addSurface/removeSurface로 매핑되고
+   * dualProject 미러를 갱신한 뒤 legacy `dualProject` 단일 키로 저장. */
   setDualProject: (path: string | null) => void;
   /** Color theme (persisted to localStorage). Drives CSS vars + xterm palette. */
   theme: "dark" | "light";
@@ -693,6 +726,11 @@ function treeWriteAllowed(
   );
 }
 
+/** One-time migration/load of the surface tree at store construction (same
+ * timing as the old `dualProject` localStorage read). Shared so `surfaceTree`
+ * and its `dualProject` mirror start from the identical instance. */
+const SURFACE_TREE_INIT = loadSurfaceTree();
+
 export const useAppStore = create<AppState>((set, get) => ({
   projects: [],
   activeProject: null,
@@ -719,7 +757,8 @@ export const useAppStore = create<AppState>((set, get) => ({
   detachPanelRequest: { targetSurfaceId: activeSurfaceId(), nonce: 0 },
   memoRequest: { targetSurfaceId: activeSurfaceId(), nonce: 0 },
   sessionResumeRequest: null,
-  dualProject: localStorage.getItem("dualProject") || null,
+  surfaceTree: SURFACE_TREE_INIT,
+  dualProject: secondaryProject(SURFACE_TREE_INIT),
   theme: (localStorage.getItem("theme") as "dark" | "light") || "dark",
   fontSize: clampFontSize(Number(localStorage.getItem("fontSize")) || 13),
   termColors: loadTermColors(),
@@ -792,6 +831,14 @@ export const useAppStore = create<AppState>((set, get) => ({
       );
       set({ projects: refreshed });
       get().persist();
+
+      // FD(리뷰): 복원된 open_projects에 우측 표면 프로젝트가 없으면(예전 세션에서
+      // 닫혔거나 workspace.json과 legacy 키가 어긋난 경우) 여기서 정리한다 —
+      // hydration 완료 후 1회, App 이펙트 의존 없이 트리·미러·키를 정합화한다.
+      const secondary = secondaryProject(get().surfaceTree);
+      if (secondary && !refreshed.some((p) => p.path === secondary)) {
+        get().setDualProject(null);
+      }
     } catch (err) {
       // load_state is infallible on the Rust side, but guard anyway.
       console.error("load_state failed", err);
@@ -833,6 +880,11 @@ export const useAppStore = create<AppState>((set, get) => ({
 
   closeProject: (path) => {
     const before = get().activeProject;
+    // FD(리뷰): 닫는 프로젝트가 우측 표면이면 **이 갱신 안에서** 트리·미러를 함께
+    // 제거한다. 예전엔 App 이펙트(projects.length>0 가드)가 정리했는데, 마지막
+    // 프로젝트를 닫아 목록이 비면 그 가드가 정리를 막아 닫은 경로가 트리·미러·
+    // 키에 잔존했다. store 액션이 정본이 되어 effect 의존을 없앤다.
+    const clearedSurface = secondaryProject(get().surfaceTree) === path;
     set((s) => {
       const projects = s.projects.filter((p) => p.path !== path);
       let activeProject = s.activeProject;
@@ -846,13 +898,18 @@ export const useAppStore = create<AppState>((set, get) => ({
       // 새 캐시를 덮는(감사 B3) 경로 차단. 재오픈은 cache-miss → 새로 읽음.
       treeCacheEpoch++;
       const keep = [...projects.map((p) => p.path), s.studyFolders.left, s.studyFolders.right];
+      const surfaceTree = clearedSurface ? removeSurface(s.surfaceTree) : s.surfaceTree;
       return {
         projects,
         activeProject,
+        surfaceTree,
+        dualProject: secondaryProject(surfaceTree),
         childrenCache: pruneTreeCache(s.childrenCache, path, keep),
         loadingDirs: pruneTreeCache(s.loadingDirs, path, keep),
       };
     });
+    // 우측 표면이 닫혔으면 legacy 키(디스크 정본)도 즉시 정리 — 잔존 방지.
+    if (clearedSurface) persistSurfaceTree(get().surfaceTree);
     get().persist();
     // If closing the active project moved focus elsewhere, sync other windows
     // so they swap too (review R1-9).
@@ -952,9 +1009,10 @@ export const useAppStore = create<AppState>((set, get) => ({
   requestMemo: () =>
     set((s) => ({ memoRequest: { targetSurfaceId: activeSurfaceId(), nonce: s.memoRequest.nonce + 1 } })),
   setDualProject: (path) => {
-    if (path) localStorage.setItem("dualProject", path);
-    else localStorage.removeItem("dualProject");
-    set({ dualProject: path });
+    // 트리가 멤버십 정본: 열기=addSurface(secondary 추가/교체), 닫기=removeSurface.
+    const tree = path ? addSurface(get().surfaceTree, path) : removeSurface(get().surfaceTree);
+    persistSurfaceTree(tree); // legacy dualProject 단일 키만 기록(FB — 원자·다운그레이드 자명)
+    set({ surfaceTree: tree, dualProject: secondaryProject(tree) });
   },
   requestSessionResume: (req) =>
     set((s) =>
