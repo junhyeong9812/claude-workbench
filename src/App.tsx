@@ -45,6 +45,7 @@ import { initNotify } from "./state/notify";
 import { resolveLayerMode, devLayerMounted, shouldFlipToIntegrated } from "./state/layerRouting";
 import { resolveVisibleDual } from "./state/dualSurface";
 import { SurfaceProvider } from "./state/surfaceContext";
+import { surfaceLayout } from "./state/surfaceTree";
 import { SurfaceShell } from "./components/SurfaceShell";
 import {
   applyActivityPick,
@@ -209,6 +210,10 @@ function AppMain() {
   const projects = useAppStore((s) => s.projects);
   const dualProject = useAppStore((s) => s.dualProject);
   const setDualProject = useAppStore((s) => s.setDualProject);
+  // 부 표면 배치(P6) — 트리에서 읽는 방향/위치. 원시값 선택자라 zustand 기본
+  // 등가비교로 불필요한 리렌더가 없다(surfaceLayout 객체를 통째로 고르지 않음).
+  const dualDirection = useAppStore((s) => surfaceLayout(s.surfaceTree)?.direction ?? "row");
+  const dualSecondaryBefore = useAppStore((s) => surfaceLayout(s.surfaceTree)?.before ?? false);
   // **렌더는 파생값으로 그린다** (리뷰 D1): 이펙트(커밋 후) 정리에만 맡기면
   // setActive 직후 1프레임 동안 같은 프로젝트 dock 두 개가 공존한다. dualProject는
   // 이제 표면 트리(store.surfaceTree)의 secondary 멤버십 미러이고, 파생값은
@@ -1032,32 +1037,57 @@ function AppMain() {
             {/* project-dual-surface: 주 dock + (열려 있으면) 우측 수동 dock.
                 주 Panel은 항상 마운트 — 분할 토글이 주 dock을 리마운트하지
                 않도록 조건부는 우측 쌍에만 둔다. */}
-            <PanelGroup direction="horizontal" autoSaveId="dual-surface" className="dual-row">
-              <Panel id="dual-primary" order={1} minSize={25}>
-                {/* 주 표면 컨테이너: pointerdown-capture로 이 표면의 **모든**
-                    상호작용을 잡아 활성 표면을 primary로 전환한다(P4' 포커스
-                    모델 — "마지막 클릭=활성", 스모크에서 dockview 이벤트보다
-                    견고하다고 확정). SurfaceProvider는 primary가 소유한 프로젝트
-                    (=activeProject 앵커, 활성 표면과 무관하게 안정)를 주입한다. */}
-                <div
-                  className={`surface-frame${
-                    visibleDual && activeSurfaceId === "primary" ? " surface-active" : ""
-                  }`}
-                  onPointerDownCapture={() => setActiveSurface("primary")}
-                >
-                  <SurfaceProvider surfaceId="primary" project={activeProject}>
-                    <MainArea />
-                  </SurfaceProvider>
-                </div>
-              </Panel>
-              {visibleDual && (
-                <>
-                  <PanelResizeHandle className="resize-handle" />
-                  <Panel id="dual-secondary" order={2} minSize={20} defaultSize={40}>
+            {/* P6: 방향/위치를 표면 트리에서 읽어 자유 분할한다. row=수평(좌우)·
+                column=수직(상하), secondaryBefore=부 표면이 주 표면 앞(좌/상). 주
+                Panel은 **key로 정체성 보존** — 위치가 바뀌어도(order·children 순서)
+                리마운트되지 않아 터미널 scrollback·에디터 탭이 유지된다(불변식 ②).
+                P5 SurfaceShell·요청격리는 surfaceId(컴파일-고정)라 방향과 무관. */}
+            <PanelGroup
+              direction={dualDirection === "column" ? "vertical" : "horizontal"}
+              autoSaveId="dual-surface"
+              className="dual-row"
+            >
+              {(() => {
+                const primaryPanel = (
+                  <Panel
+                    key="dual-primary"
+                    id="dual-primary"
+                    order={dualSecondaryBefore ? 2 : 1}
+                    minSize={25}
+                  >
+                    {/* 주 표면 컨테이너: pointerdown-capture로 이 표면의 **모든**
+                        상호작용을 잡아 활성 표면을 primary로 전환한다(P4' 포커스
+                        모델 — "마지막 클릭=활성"). SurfaceProvider는 primary가 소유한
+                        프로젝트(=activeProject 앵커, 활성 표면과 무관하게 안정) 주입. */}
+                    <div
+                      className={`surface-frame${
+                        visibleDual && activeSurfaceId === "primary" ? " surface-active" : ""
+                      }`}
+                      onPointerDownCapture={() => setActiveSurface("primary")}
+                    >
+                      <SurfaceProvider surfaceId="primary" project={activeProject}>
+                        <MainArea />
+                      </SurfaceProvider>
+                    </div>
+                  </Panel>
+                );
+                if (!visibleDual) return primaryPanel;
+                const handle = <PanelResizeHandle key="dual-handle" className="resize-handle" />;
+                const secondaryPanel = (
+                  <Panel
+                    key="dual-secondary"
+                    id="dual-secondary"
+                    order={dualSecondaryBefore ? 1 : 2}
+                    minSize={20}
+                    defaultSize={40}
+                  >
                     {/* 부 표면 컨테이너: 같은 pointerdown-capture로 활성 표면을
-                        secondary로 전환한다(P4'). 활성일 때 surface-active 강조. */}
+                        secondary로 전환한다(P4'). 방향별 경계선 클래스로 border를
+                        올바른 변에 둔다(col=위, before=반대편). */}
                     <div
                       className={`dual-secondary${
+                        dualDirection === "column" ? " dual-secondary-col" : ""
+                      }${dualSecondaryBefore ? " dual-secondary-before" : ""}${
                         activeSurfaceId === "secondary" ? " surface-active" : ""
                       }`}
                       onPointerDownCapture={() => setActiveSurface("secondary")}
@@ -1078,7 +1108,7 @@ function AppMain() {
                         </span>
                         <button
                           className="dual-secondary-close"
-                          title="우측 분할 닫기"
+                          title="분할 닫기"
                           onClick={() => setDualProject(null)}
                         >
                           ×
@@ -1097,8 +1127,13 @@ function AppMain() {
                       </div>
                     </div>
                   </Panel>
-                </>
-              )}
+                );
+                // before = 부 표면 앞(좌/상): [부, 핸들, 주]; after: [주, 핸들, 부].
+                // key로 주 Panel 정체성이 보존돼 위치 이동이 리마운트가 아니다.
+                return dualSecondaryBefore
+                  ? [secondaryPanel, handle, primaryPanel]
+                  : [primaryPanel, handle, secondaryPanel];
+              })()}
             </PanelGroup>
           </div>
           {devMounted && activeProject && (

@@ -2194,10 +2194,25 @@ body {
   display: flex;
   flex-direction: column;
   overflow: hidden;
+  /* 기본 = 우측(row·after): 주 표면과의 경계는 왼쪽 변. P6 방향별 클래스가
+     경계선을 올바른 변으로 옮긴다(아래). */
   border-left: 1px solid var(--border);
   background: var(--bg);
   /* .surface-active::after 오버레이 테두리(P4')의 위치 기준. */
   position: relative;
+}
+/* P6 방향별 경계선: 세로 분할(column)은 위/아래 변, 앞 배치(before)는 반대편. */
+.dual-secondary.dual-secondary-col {
+  border-left: none;
+  border-top: 1px solid var(--border);
+}
+.dual-secondary.dual-secondary-before:not(.dual-secondary-col) {
+  border-left: none;
+  border-right: 1px solid var(--border);
+}
+.dual-secondary.dual-secondary-col.dual-secondary-before {
+  border-top: none;
+  border-bottom: 1px solid var(--border);
 }
 .dual-secondary-head {
   flex: 0 0 auto;
