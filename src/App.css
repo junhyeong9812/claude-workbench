@@ -953,10 +953,31 @@ body {
    mounted and stacked; the active one is in front, the other visibility:hidden
    (display:none would zero xterm's measured size). Both sit below the peek /
    git-history overlays (z 30) so those still cover them. ---- */
+/* P6 프로젝트 드롭 host — .pane-main을 채워 그 안의 레이어·오버레이의 위치
+   기준(offset parent)이 된다. 평상시 레이아웃 불변(단순 포지셔닝 박스). */
+.main-drop-host {
+  position: absolute;
+  inset: 0;
+}
 .main-layer {
   position: absolute;
   inset: 0;
   z-index: var(--z-layer-front);
+}
+/* P6 프로젝트 드롭 프리뷰 오버레이(dual 표면 진입) — 드래그 중에만 렌더.
+   pointer-events 없음(밑 dock 상호작용 무영향), 최상단(--z-dnd)에 반쪽 하이라이트. */
+.dual-drop-overlay {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  z-index: var(--z-dnd);
+}
+.dual-drop-hl {
+  position: absolute;
+  box-sizing: border-box;
+  background: rgba(74, 158, 255, 0.16);
+  border: 2px solid rgba(74, 158, 255, 0.9);
+  border-radius: 4px;
 }
 .main-layer-back {
   visibility: hidden;

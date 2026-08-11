@@ -1,11 +1,18 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState, type DragEvent as RDragEvent } from "react";
 import {
   Panel,
   PanelGroup,
   PanelResizeHandle,
   type ImperativePanelHandle,
 } from "react-resizable-panels";
-import { ProjectTabs } from "./components/ProjectTabs";
+import { ProjectTabs, PROJECT_DRAG_MIME } from "./components/ProjectTabs";
+import {
+  resolveDropZone,
+  zoneHighlight,
+  sameZoneRect,
+  type DropZone,
+  type ZoneRect,
+} from "./components/sessionDropZone";
 import { FolderTree } from "./components/FolderTree";
 import { GitPanel } from "./components/GitPanel";
 import { WorktreePanel } from "./components/WorktreePanel";
@@ -45,7 +52,7 @@ import { initNotify } from "./state/notify";
 import { resolveLayerMode, devLayerMounted, shouldFlipToIntegrated } from "./state/layerRouting";
 import { resolveVisibleDual } from "./state/dualSurface";
 import { SurfaceProvider } from "./state/surfaceContext";
-import { surfaceLayout } from "./state/surfaceTree";
+import { surfaceLayout, placementForZone } from "./state/surfaceTree";
 import { SurfaceShell } from "./components/SurfaceShell";
 import {
   applyActivityPick,
@@ -243,6 +250,56 @@ function AppMain() {
   } | null>(null);
   // 드롭 처리 직렬화 — 연속 드롭이 겹쳐 절반 상태를 만들지 않게.
   const dropBusyRef = useRef(false);
+
+  // ── 프로젝트 탭 → 화면 가장자리 드롭 분할 (멀티프로젝트 P6) ──────────────
+  // 프로젝트 탭 드래그(PROJECT_DRAG_MIME)를 작업 영역(.pane-main) 가장자리에
+  // 떨구면 그 방향으로 부 표면을 연다. 존 계산은 sessionDropZone(resolveDropZone/
+  // zoneHighlight/sameZoneRect)을 **그대로 재사용**(수정 아님) — App 루트 rect
+  // 기준. center는 무시(분할 아님). 세션행·dockview 드래그는 이 MIME이 없어 무관.
+  const projDropRef = useRef<HTMLDivElement>(null);
+  const [projDrop, setProjDrop] = useState<{ zone: DropZone; hl: ZoneRect } | null>(null);
+  const isProjectDrag = (e: RDragEvent) => e.dataTransfer.types.includes(PROJECT_DRAG_MIME);
+  const onProjDragOver = (e: RDragEvent<HTMLDivElement>) => {
+    if (!isProjectDrag(e)) return; // 우리 드래그 아니면 무개입(OS 파일·세션·dockview)
+    e.preventDefault();
+    e.dataTransfer.dropEffect = "move";
+    const el = projDropRef.current;
+    if (!el) return;
+    const r = el.getBoundingClientRect();
+    const zone = resolveDropZone(
+      { left: r.left, top: r.top, width: r.width, height: r.height },
+      e.clientX,
+      e.clientY,
+    );
+    if (!zone) {
+      setProjDrop(null);
+      return;
+    }
+    // 프리뷰는 host-로컬 좌표(원점 0,0)로 그린다 — 오버레이가 host 안에 absolute.
+    const hl = zoneHighlight({ left: 0, top: 0, width: r.width, height: r.height }, zone);
+    setProjDrop((prev) =>
+      prev && prev.zone === zone && sameZoneRect(prev.hl, hl) ? prev : { zone, hl },
+    );
+  };
+  const onProjDrop = (e: RDragEvent<HTMLDivElement>) => {
+    if (!isProjectDrag(e)) return;
+    e.preventDefault();
+    const path = e.dataTransfer.getData(PROJECT_DRAG_MIME);
+    const zone = projDrop?.zone ?? null;
+    setProjDrop(null);
+    if (!path) return;
+    const placement = zone ? placementForZone(zone) : null;
+    if (!placement) return; // center/무효 = 무시(명세: 중앙 무시, 분할 아님)
+    if (path === activeProject) return; // 활성=이미 주 표면 — 자기 자신 분할 무의미
+    setDualProject(path, placement);
+  };
+  const onProjDragLeave = (e: RDragEvent<HTMLDivElement>) => {
+    // 컨테이너를 실제로 벗어날 때만 프리뷰 해제(자식으로의 진입은 무시).
+    const el = projDropRef.current;
+    const to = e.relatedTarget;
+    if (el && to instanceof Node && el.contains(to)) return;
+    setProjDrop(null);
+  };
 
   // P3: droppedPeek 이미지의 objectURL 수명 관리 — 뷰가 교체/닫힐 때 이전
   // URL들을 revoke(누수 방지). 표시 중 URL은 절대 revoke하지 않는다(집합
@@ -1027,6 +1084,16 @@ function AppMain() {
         )}
         <PanelResizeHandle className="resize-handle" />
         <Panel id="main" order={3} defaultSize={60} minSize={30} className="pane-main">
+          {/* P6 프로젝트 드롭 host — .pane-main을 채우는 드래그 수신 상자.
+              PROJECT_DRAG_MIME 드래그에만 반응(다른 드래그·평상시 무개입: 오버레이는
+              드래그 중에만·pointer-events 없음). 존 계산은 이 host의 rect 기준. */}
+          <div
+            className="main-drop-host"
+            ref={projDropRef}
+            onDragOver={onProjDragOver}
+            onDrop={onProjDrop}
+            onDragLeave={onProjDragLeave}
+          >
           {/* Both layers stay mounted; the front/back swap is z-index +
               visibility (not conditional render) so toggling modes preserves
               each view's terminal scrollback and editor tabs (불변식 ②). The
@@ -1173,6 +1240,22 @@ function AppMain() {
               onClose={closeGitHistoryFile}
             />
           )}
+          {/* P6 드롭 프리뷰 — 떨굴 방향의 반쪽을 하이라이트(zoneHighlight 재사용,
+              host-로컬 좌표). center는 렌더 안 함(분할 아님). */}
+          {projDrop && projDrop.zone !== "center" && (
+            <div className="dual-drop-overlay">
+              <div
+                className="dual-drop-hl"
+                style={{
+                  left: projDrop.hl.left,
+                  top: projDrop.hl.top,
+                  width: projDrop.hl.width,
+                  height: projDrop.hl.height,
+                }}
+              />
+            </div>
+          )}
+          </div>
         </Panel>
         </PanelGroup>
         </div>
