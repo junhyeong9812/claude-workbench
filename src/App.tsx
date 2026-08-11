@@ -927,6 +927,12 @@ function AppMain() {
           onExpand={() => setCollapsed(false)}
           className="pane-left"
         >
+          {/* P1: 사이드바 클러스터를 표면 컨텍스트로 감싼다. 사이드바는 dual-row
+              밖 단일 인스턴스라 P0 배선(MainArea만 감쌈)에 포함되지 않았다 —
+              활성 표면(현재는 primary)의 프로젝트를 주입해 FolderTree·GitPanel·
+              WorktreePanel·GraphPanel이 useSurfaceProject()를 읽게 한다. 값은
+              activeProject 반사라 완전 무동작(P5에서 표면별 사이드바로 실체화). */}
+          <SurfaceProvider surfaceId="primary" project={activeProject}>
           <div className="sidebar-content">
             {/* PanelGroup은 분할 여부와 무관하게 **상시** 렌더 — ⊟ 토글이 위쪽
                 본문(keyed "body")의 identity를 보존해 GitPanel 커밋 메시지 등
@@ -977,6 +983,7 @@ function AppMain() {
               )}
             </PanelGroup>
           </div>
+          </SurfaceProvider>
         </Panel>
         {gitHistory && (
           <>
@@ -1040,7 +1047,9 @@ function AppMain() {
                             표시 중인 프로젝트(visibleDual)를 주입한다 — MainArea가
                             받는 project prop과 동일 값(반사만, 소비 변경 0). */}
                         <SurfaceProvider surfaceId="secondary" project={visibleDual}>
-                          <MainArea project={visibleDual} secondary />
+                          {/* project는 이제 SurfaceProvider가 주입 — MainArea는
+                              useSurfaceProject()로 읽는다(P1). */}
+                          <MainArea secondary />
                         </SurfaceProvider>
                       </div>
                     </div>

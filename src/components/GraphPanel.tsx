@@ -3,6 +3,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { errText } from "../utils/error";
 import { useAppStore } from "../state/store";
+import { useSurfaceProject } from "../state/surfaceContext";
 
 /**
  * Dependency-graph browser (sidebar tab): a per-project probe → on-demand
@@ -59,7 +60,11 @@ const fmtTime = (iso: string): string => {
 };
 
 export function GraphPanel() {
-  const activeProject = useAppStore((s) => s.activeProject);
+  // 표면-로컬 프로젝트 (P1) — 활성 표면(primary)이 activeProject 반사라 무동작.
+  // 아래 비동기 stale-guard(getState().activeProject !== project)는 **전역**
+  // activeProject를 계속 읽는다: 현재 표면=전역이라 동치이고, 이 가드를 표면
+  // 기준으로 바꾸는 것은 다중 사이드바(P5)의 몫이다(회귀 방지 — 무접촉).
+  const activeProject = useSurfaceProject();
   const [info, setInfo] = useState<GraphInfo | null>(null);
   const [loading, setLoading] = useState(false);
   const [generating, setGenerating] = useState(false);
