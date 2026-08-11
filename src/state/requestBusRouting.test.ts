@@ -83,3 +83,74 @@ describe("요청버스 표면 라우팅 stamp (P4' — 항상 primary)", () => {
     expect(useAppStore.getState().runRequest).toBeNull();
   });
 });
+
+/**
+ * P5 표면-로컬 소유: 발행부가 **origin surfaceId**를 실을 수 있다(기본 primary).
+ * 각 표면-스코프 emitter(부 표면 툴바·양 표면 사이드바)가 자기 `useSurfaceId()`를
+ * 넘기면 그 표면 소비부만 소비 → 표면 dock에 열린다. **활성(동적) 스탬프·reconcile·
+ * catch-all 없음** — 목적지가 컴파일-고정이라 P4' 라우팅 유실 클래스가 소멸한다.
+ */
+describe("요청버스 origin-표면 stamp (P5 — surfaceId 고정 라우팅)", () => {
+  beforeEach(() => {
+    useAppStore.setState({
+      editorOpenRequest: null,
+      diffRequest: null,
+      claudeOpenRequest: null,
+      codexOpenRequest: null,
+      runRequest: null,
+      terminalOpenRequest: null,
+      sessionResumeRequest: null,
+      claudePickerRequest: { targetSurfaceId: "primary", nonce: 0 },
+      memoRequest: { targetSurfaceId: "primary", nonce: 0 },
+    });
+  });
+
+  it("object 슬롯이 origin='secondary'를 그대로 stamp한다", () => {
+    const s = useAppStore.getState();
+    s.requestClaudeOpen({ project: "/p" }, "secondary");
+    s.requestCodexOpen({ project: "/p" }, "secondary");
+    s.requestRun({ project: "/p", cmd: "x", title: "t" }, "secondary");
+    s.requestTerminalOpen({ cwd: "/p", title: "t" }, "secondary");
+    s.requestDiff({ title: "d", cwd: "/p", path: "a" }, "secondary");
+    s.requestEditorOpen("/p/a.ts", "secondary");
+    s.requestSessionResume({ uuid: "u", project: "/p", title: "t" }, "secondary");
+    const g = useAppStore.getState();
+    expect(g.claudeOpenRequest?.targetSurfaceId).toBe("secondary");
+    expect(g.codexOpenRequest?.targetSurfaceId).toBe("secondary");
+    expect(g.runRequest?.targetSurfaceId).toBe("secondary");
+    expect(g.terminalOpenRequest?.targetSurfaceId).toBe("secondary");
+    expect(g.diffRequest?.targetSurfaceId).toBe("secondary");
+    expect(g.editorOpenRequest?.targetSurfaceId).toBe("secondary");
+    expect(g.sessionResumeRequest?.targetSurfaceId).toBe("secondary");
+  });
+
+  it("카운터 슬롯(picker·memo)도 origin='secondary'를 stamp하고 nonce 증가", () => {
+    const s = useAppStore.getState();
+    s.requestClaudePicker("secondary");
+    s.requestMemo("secondary");
+    const g = useAppStore.getState();
+    expect(g.claudePickerRequest.targetSurfaceId).toBe("secondary");
+    expect(g.claudePickerRequest.nonce).toBe(1);
+    expect(g.memoRequest.targetSurfaceId).toBe("secondary");
+    expect(g.memoRequest.nonce).toBe(1);
+  });
+
+  it("인자 생략 시 기본 'primary' (앱-전역/상단 툴바 발행부 무변경)", () => {
+    const s = useAppStore.getState();
+    s.requestClaudeOpen({ project: "/p" });
+    s.requestMemo();
+    const g = useAppStore.getState();
+    expect(g.claudeOpenRequest?.targetSurfaceId).toBe("primary");
+    expect(g.memoRequest.targetSurfaceId).toBe("primary");
+  });
+
+  it("termMenu·detach는 주 표면 고정(SSH/전송 envelope 전역) — 인자 없음", () => {
+    // 시그니처상 surfaceId 인자가 없다(주 표면 전용). 항상 primary.
+    const s = useAppStore.getState();
+    s.requestTermMenu();
+    s.requestDetachPanel();
+    const g = useAppStore.getState();
+    expect(g.termMenuRequest.targetSurfaceId).toBe("primary");
+    expect(g.detachPanelRequest.targetSurfaceId).toBe("primary");
+  });
+});

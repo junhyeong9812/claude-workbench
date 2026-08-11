@@ -106,7 +106,11 @@ export function MainArea({
   const projectModes = useAppStore((s) => s.projectModes);
   // MainArea is now always mounted (behind the dev layer when in dev mode), so
   // it must only consume main-area requests while it is the front layer.
-  const layerMode = resolveLayerMode(projectModes, activeProject);
+  // 표면-고정 레이어(P5): dev/study 오버레이는 **주 표면 전용**이다(부 표면은
+  // integrated 고정 — P4' 불변식). 부 표면의 layerMode를 전역 activeProject로
+  // 계산하면 주 프로젝트가 dev일 때 `integratedIsFront`가 false가 되어 부 표면이
+  // 자기 요청을 소비하지 못한다(P5 회귀) — 부는 항상 integrated로 고정한다.
+  const layerMode = isPrimary ? resolveLayerMode(projectModes, activeProject) : "integrated";
   const editorOpenRequest = useAppStore((s) => s.editorOpenRequest);
   const requestEditorOpen = useAppStore((s) => s.requestEditorOpen);
   const diffRequest = useAppStore((s) => s.diffRequest);
@@ -451,11 +455,11 @@ export function MainArea({
     if (!claudeOpenRequest) return;
     if (claudeOpenRequest.targetSurfaceId !== mySurfaceId) return; // 표면 라우팅(P2): 내 표면 것만
     const { project, seed, title: reqTitle, referencePanelId, model, effort } = claudeOpenRequest;
-    // Only THIS project's mount may consume the request (MainArea is keyed by
-    // activeProject): otherwise a not-yet-switched old mount would add the Claude
-    // panel to the wrong project's dock (codex P1). Keep the request until the
-    // worktree's mount is active.
-    if (project !== activeProject) return;
+    // Only THIS surface's project mount may consume (DockviewReact is keyed by
+    // surfaceProject): otherwise a not-yet-switched old mount would add the panel
+    // to the wrong project's dock. **P5**: compare against surfaceProject (not the
+    // global activeProject) so the secondary surface consumes its own requests.
+    if (project !== surfaceProject) return;
     const api = apiRef.current;
     if (!api) return; // dock not ready (project-switch remount) — keep the request; apiReady re-runs this
     requestClaudeOpen(null); // consume only once we can actually act
@@ -484,7 +488,7 @@ export function MainArea({
     if (!codexOpenRequest) return;
     if (codexOpenRequest.targetSurfaceId !== mySurfaceId) return; // 표면 라우팅(P2): 내 표면 것만
     const { project, model, effort } = codexOpenRequest;
-    if (project !== activeProject) return;
+    if (project !== surfaceProject) return; // P5: 표면-로컬 게이트
     const api = apiRef.current;
     if (!api) return;
     requestCodexOpen(null);
@@ -507,8 +511,8 @@ export function MainArea({
   useEffect(() => {
     if (!integratedIsFront(layerMode)) return; // dev layer in front — leave the request
     if (!runRequest) return;
-    if (runRequest.targetSurfaceId !== mySurfaceId) return; // 표면 라우팅(P2): 내 표면 것만
-    if (runRequest.project !== activeProject) return;
+    if (runRequest.targetSurfaceId !== mySurfaceId) return; // 표면 라우팅: 내 표면 것만
+    if (runRequest.project !== surfaceProject) return; // P5: 표면-로컬 게이트
     const api = apiRef.current;
     if (!api) return; // dock not ready — keep the request; apiReady re-runs
     requestRun(null);
@@ -563,7 +567,8 @@ export function MainArea({
     clearClose();
     if (!req) return;
     // 실행부는 sessionClose 단일 출처 (P4 — Popout과 문자단위 동일이던 것).
-    await resolveCloseRequest(req, activeProject, deleteHistory, (panelId) =>
+    // P5: 삭제 폴백 project를 표면-로컬로(부 표면 패널은 activeProject가 아님).
+    await resolveCloseRequest(req, surfaceProject, deleteHistory, (panelId) =>
       apiRef.current?.getPanel(panelId)?.api.close(),
     );
   };
@@ -708,10 +713,10 @@ export function MainArea({
     memoHandledRef.current = memoRequest.nonce;
     if (!integratedIsFront(layerMode)) return;
     const api = apiRef.current;
-    if (!api || !activeProject) return;
+    if (!api || !surfaceProject) return; // P5: 표면-로컬 메모(자기 프로젝트)
     setTermMenu(false);
     setPicker(null);
-    openProjectMemo(api, activeProject);
+    openProjectMemo(api, surfaceProject);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [memoRequest]);
 
@@ -833,12 +838,14 @@ export function MainArea({
           }}
         />
       )}
-      {/* Zero-height anchor for the dropdowns that used to hang off the removed
-          main-toolbar row — the "+ Terminal"/"+ Claude" buttons now live in the
-          app toolbar and drive these via store request counters (task 01). */}
-      {isPrimary && (
+      {/* Zero-height anchor for the toolbar dropdowns. **P5**: the session picker
+          is surface-local — each surface renders its OWN SessionPicker into its
+          own `.main-menus` and opens into its own dock (surfaceProject/apiRef).
+          The terminal menu (+ SSH dialog/host-key modals) stays primary-only —
+          the secondary "터미널" opens a local terminal directly (requestTerminalOpen).
+          The div is width-0/height-0, so rendering it in both surfaces is inert. */}
       <div className="main-menus">
-        {termMenu && (
+        {isPrimary && termMenu && (
           <TerminalMenu
             onClose={() => setTermMenu(false)}
             onLocalTerminal={() => addPanel("terminal")}
@@ -850,7 +857,6 @@ export function MainArea({
           <SessionPicker ctl={picker} addPanel={addPanel} activeProject={surfaceProject} />
         )}
       </div>
-      )}
       <DockviewReact
         key={surfaceProject ?? "none"}
         className={`dockview-theme-${theme === "light" ? "light" : "dark"} ${isPrimary ? "main-dock" : "secondary-dock"}`}
