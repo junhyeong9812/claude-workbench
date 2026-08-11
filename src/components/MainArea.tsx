@@ -140,9 +140,9 @@ export function MainArea({
   // 여는 트리거(툴바 요청 버스)와 드롭 취소는 여기 남아 setPicker/openPicker만
   // 부른다.
   const picker = useSessionPicker({
-    isPrimary,
-    // 피커는 표면-로컬 프로젝트로 (P1) — 주 표면에서 surfaceProject===activeProject라
-    // 무동작이고, 부 표면에서는 피커가 비활성(isPrimary 게이트)이라 무해.
+    // 피커는 표면-로컬 프로젝트로 (P1) — 각 표면이 자기 프로젝트로 조회/오픈한다.
+    // P5 F5: 아카이브 이벤트 구독도 표면별(payload.project 필터) — 부 피커 열린
+    // 동안 자기 프로젝트 아카이브 종료가 목록·busy 배지에 반영된다.
     activeProject: surfaceProject,
     getApi: () => apiRef.current,
   });
