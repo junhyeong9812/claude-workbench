@@ -582,6 +582,10 @@ interface AppState {
   reloadDir: (dirPath: string) => Promise<void>;
   /** Re-read the active project's root + expanded dirs (disk reload). */
   reloadActiveTree: () => Promise<void>;
+  /** Re-read a **specific** project's root + expanded dirs (disk reload). P5:
+   * 표면-스코프 — 각 표면의 FolderTree가 자기 프로젝트 트리만 폴한다(전역
+   * activeProject 재로드하던 2인스턴스 버그 차단). null이면 no-op. */
+  reloadTreeFor: (project: string | null) => Promise<void>;
   /** Save a project's dockview main-area layout (opaque JSON) and persist. */
   setLayout: (path: string, layout: unknown) => void;
   /** Dockview layouts for popout windows, per project (multiwindow swap — review
@@ -726,11 +730,13 @@ function broadcastActiveProject(path: string | null) {
   );
 }
 
-/** P2: reloadActiveTree 배치 사이클 in-flight 가드 + 재실행 요청 비트(모듈
- * 스코프 — 창 단위). 겹친 호출(수동 ↻ 포함)은 버리지 않고 현 사이클 종료 후
- * 한 번 더 돈다 — "최신 요청 우선"(spec ②, 리뷰: 수동 ↻ 무시 방지). */
-let treeReloadInFlight = false;
-let treeReloadPending = false;
+/** P2: 트리 배치 사이클 in-flight 가드 + 재실행 요청 비트. **P5: 프로젝트별**
+ * (Set) — 두 표면이 서로 다른 프로젝트 트리를 동시 폴할 수 있으므로 가드를
+ * 프로젝트 키로 분리한다(같은 프로젝트 2표면이면 자연 직렬화: 한쪽 사이클 중
+ * 다른 호출은 pending 표시 → 종료 후 1회 더). 겹친 호출(수동 ↻ 포함)은 버리지
+ * 않고 현 사이클 종료 후 한 번 더 돈다 — "최신 요청 우선". */
+const treeReloadInFlight = new Set<string>();
+const treeReloadPending = new Set<string>();
 
 /** hang한 read_dir(끊긴 네트워크 마운트 등) 하나가 폴링을 영구 정지시키지
  * 않도록 사이클당 가드 점유 상한 — 초과 시 가드만 풀고 늦은 응답의 쓰기는
@@ -739,8 +745,9 @@ const TREE_RELOAD_GUARD_MS = 10_000;
 
 /** 배치 사이클 세대 — 새 사이클 시작마다 증가. 타임아웃으로 가드를 넘긴 구
  * 사이클의 늦은 set은 세대 불일치로 무효(감사 B1: 구 사이클이 신 사이클의
- * before 기준을 오염시켜 더 새 결과를 버리게 하던 경로 차단). */
-let treeCycleGen = 0;
+ * before 기준을 오염시켜 더 새 결과를 버리게 하던 경로 차단). **P5: 프로젝트별**
+ * — 다른 프로젝트 사이클이 서로를 교차 취소하지 않게 세대를 키로 분리한다. */
+const treeCycleGen = new Map<string, number>();
 
 /** 트리 캐시 세대 — closeProject 축출마다 증가. 축출 **이전에** 발주된 모든
  * read_dir 응답은 세대 불일치로 버려진다(감사 B3: 응답 대기 중 재오픈하면
@@ -1306,28 +1313,35 @@ export const useAppStore = create<AppState>((set, get) => ({
   },
 
   reloadActiveTree: async () => {
+    await get().reloadTreeFor(get().activeProject);
+  },
+  reloadTreeFor: async (project) => {
+    if (!project) return;
     // P2(리뷰 재설계): 겹침은 pending 비트로 "종료 후 1회 더"(최신 우선 —
     // 수동 ↻ 무시 방지), 사이클은 가드 점유 상한으로 hang 복구, 쓰기는
     // ①before-스냅샷(읽는 사이 사용자 조작이 쓴 dir는 건드리지 않는다 —
     // 삭제 파일 유령 부활 차단) ②treeWriteAllowed(축출 부활 차단) 이중 가드.
-    if (treeReloadInFlight) {
-      treeReloadPending = true;
+    // P5: 가드는 **프로젝트 키**(Set) — 두 표면이 다른 프로젝트를 동시 폴 가능.
+    if (treeReloadInFlight.has(project)) {
+      treeReloadPending.add(project);
       return;
     }
-    treeReloadInFlight = true;
+    treeReloadInFlight.add(project);
     try {
       do {
-        treeReloadPending = false;
-        const { activeProject, projects } = get();
-        if (!activeProject) return;
+        treeReloadPending.delete(project);
+        const { projects } = get();
         const expanded =
-          projects.find((p) => p.path === activeProject)?.tree_state.expanded ?? [];
+          projects.find((p) => p.path === project)?.tree_state.expanded ?? [];
         // hang으로 미해결인 dir는 제외 — 미해결 invoke를 dir당 1건으로 상한
         // (감사 B2: 타임아웃마다 새 배치가 같은 dir에 무한 누적하던 경로).
-        const dirs = [activeProject, ...expanded].filter((d) => !treeDirInFlight.has(d));
+        const dirs = [project, ...expanded].filter((d) => !treeDirInFlight.has(d));
         if (dirs.length === 0) continue;
         const before = get().childrenCache;
-        const gen = ++treeCycleGen;
+        // 세대는 **프로젝트별**(P5) — 두 표면이 다른 프로젝트를 동시 폴할 때
+        // 공유 세대면 서로의 사이클을 교차 취소한다(다른 dir인데도).
+        const gen = (treeCycleGen.get(project) ?? 0) + 1;
+        treeCycleGen.set(project, gen);
         const epoch = treeCacheEpoch;
         const cycle = (async () => {
           // 배치 — 직렬 IPC N회·set N회를 병렬 조회 1배치·set 1회로. 실패
@@ -1347,7 +1361,7 @@ export const useAppStore = create<AppState>((set, get) => ({
           );
           // 세대 가드: 그 사이 새 사이클이 시작됐거나(gen — 타임아웃 경유 구
           // 사이클) 축출이 있었으면(epoch) 이 사이클의 결과 전체를 버린다.
-          if (gen !== treeCycleGen || epoch !== treeCacheEpoch) return;
+          if (gen !== treeCycleGen.get(project) || epoch !== treeCacheEpoch) return;
           set((s) => {
             let changed = false;
             const next = { ...s.childrenCache };
@@ -1371,9 +1385,9 @@ export const useAppStore = create<AppState>((set, get) => ({
           cycle,
           new Promise<void>((r) => setTimeout(r, TREE_RELOAD_GUARD_MS)),
         ]);
-      } while (treeReloadPending);
+      } while (treeReloadPending.has(project));
     } finally {
-      treeReloadInFlight = false;
+      treeReloadInFlight.delete(project);
     }
   },
 

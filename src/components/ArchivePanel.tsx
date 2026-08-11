@@ -4,6 +4,7 @@ import { listen } from "@tauri-apps/api/event";
 import { errText } from "../utils/error";
 import { fmtUnix } from "../utils/time";
 import { useAppStore } from "../state/store";
+import { useSurfaceId } from "../state/surfaceContext";
 import { SESSION_DRAG_MIME, encodeSessionDrag } from "./sessionDropZone";
 import { EffortSelect, ModelSelect } from "./AgentOptionFields";
 import { MODEL_CHOICES } from "../state/agentOptions";
@@ -69,6 +70,7 @@ export function ArchivePanel() {
   // 과거 버전 목록이 펼쳐진 세션(uuid)들.
   const [versionsOpen, setVersionsOpen] = useState<Set<string>>(new Set());
   const setPeekFile = useAppStore((s) => s.setPeekFile);
+  const surfaceId = useSurfaceId(); // P5: "이어서"를 이 표면 dock에 연다
   const requestSessionResume = useAppStore((s) => s.requestSessionResume);
   const archiveRoot = useAppStore((s) => s.archiveRoot);
   const archiveModel = useAppStore((s) => s.archiveModel);
@@ -356,7 +358,7 @@ export function ArchivePanel() {
                               uuid: s.uuid,
                               project: g.project,
                               title: s.title.slice(0, 24) || s.date,
-                            })
+                            }, surfaceId)
                           }
                         >
                           이어서

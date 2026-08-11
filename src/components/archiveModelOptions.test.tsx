@@ -29,6 +29,7 @@ vi.mock("@tauri-apps/api/window", () => ({
 import { ArchivePanel } from "./ArchivePanel";
 import { MODEL_CHOICES } from "../state/agentOptions";
 import { useAppStore } from "../state/store";
+import { SurfaceProvider } from "../state/surfaceContext";
 
 (globalThis as unknown as { IS_REACT_ACT_ENVIRONMENT: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 
@@ -53,7 +54,13 @@ describe("아카이브 설정 — 모델 선택지", () => {
   /** 패널을 띄우고 [설정]을 눌러 모델 `<select>`를 돌려준다. */
   const openSettings = async (): Promise<HTMLSelectElement> => {
     await act(async () => {
-      root.render(<ArchivePanel />);
+      // P5: ArchivePanel은 표면 컨텍스트 안에서만 렌더된다(useSurfaceId — "이어서"를
+      // 자기 표면 dock에 연다). 테스트도 SurfaceProvider로 감싼다.
+      root.render(
+        <SurfaceProvider surfaceId="primary" project="/repo">
+          <ArchivePanel />
+        </SurfaceProvider>,
+      );
     });
     const settings = [...host.querySelectorAll("button")].find(
       (b) => b.textContent?.trim() === "설정",
