@@ -2175,7 +2175,7 @@ body {
   min-height: 0;
   position: relative;
 }
-/* 활성 표면 시각 피드백(P4') — 어느 표면이 툴바·단축키·요청을 받는지 알린다.
+/* 활성 표면 시각 피드백(P4') — 어느 표면의 프로젝트가 사이드바·검색에 반영되는지 알린다.
    dock 콘텐츠 위에 pointer-events 없는 accent 테두리를 덧그린다(레이아웃 불변).
    주 표면은 dual 표시 중일 때만 클래스가 붙고(App), 부 표면은 활성일 때 붙는다. */
 .surface-frame.surface-active::after,
