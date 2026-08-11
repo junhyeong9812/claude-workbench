@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, type DragEvent as RDragEvent } from "react";
+import { useEffect, useMemo, useRef, useState, type DragEvent as RDragEvent } from "react";
 import {
   Panel,
   PanelGroup,
@@ -217,10 +217,13 @@ function AppMain() {
   const projects = useAppStore((s) => s.projects);
   const dualProject = useAppStore((s) => s.dualProject);
   const setDualProject = useAppStore((s) => s.setDualProject);
-  // 부 표면 배치(P6) — 트리에서 읽는 방향/위치. 원시값 선택자라 zustand 기본
-  // 등가비교로 불필요한 리렌더가 없다(surfaceLayout 객체를 통째로 고르지 않음).
-  const dualDirection = useAppStore((s) => surfaceLayout(s.surfaceTree)?.direction ?? "row");
-  const dualSecondaryBefore = useAppStore((s) => surfaceLayout(s.surfaceTree)?.before ?? false);
+  // 부 표면 배치(P6) — 트리에서 읽는 방향/위치. surfaceTree 참조는 setDualProject/
+  // closeProject가 새 트리를 만들 때만 바뀌므로(그 외 상태변경엔 불변) useMemo가
+  // 트리당 1회만 surfaceLayout을 돈다(선택자 2벌 중복 계산 제거).
+  const surfaceTree = useAppStore((s) => s.surfaceTree);
+  const dualLayout = useMemo(() => surfaceLayout(surfaceTree), [surfaceTree]);
+  const dualDirection = dualLayout?.direction ?? "row";
+  const dualSecondaryBefore = dualLayout?.before ?? false;
   // **렌더는 파생값으로 그린다** (리뷰 D1): 이펙트(커밋 후) 정리에만 맡기면
   // setActive 직후 1프레임 동안 같은 프로젝트 dock 두 개가 공존한다. dualProject는
   // 이제 표면 트리(store.surfaceTree)의 secondary 멤버십 미러이고, 파생값은
@@ -253,62 +256,97 @@ function AppMain() {
 
   // ── 프로젝트 탭 → 화면 가장자리 드롭 분할 (멀티프로젝트 P6) ──────────────
   // 프로젝트 탭 드래그(PROJECT_DRAG_MIME)를 작업 영역(.pane-main) 가장자리에
-  // 떨구면 그 방향으로 부 표면을 연다. 존 계산은 sessionDropZone(resolveDropZone/
-  // zoneHighlight/sameZoneRect)을 **그대로 재사용**(수정 아님) — App 루트 rect
-  // 기준. center는 무시(분할 아님). 세션행·dockview 드래그는 이 MIME이 없어 무관.
+  // 떨구면 그 방향으로 부 표면을 연다. 존 계산은 sessionDropZone의 순수 헬퍼
+  // (resolveDropZone/zoneHighlight/sameZoneRect)를 **그대로 재사용**(수정 아님) —
+  // 좌표계 기준 = drop host(.pane-main을 채우는 상자)의 rect. 생명주기 가드는
+  // useSessionDropZone과 동형으로 갖춘다: S1(drop 좌표 재계산)·S2(취소 백스톱)·
+  // S5(dragleave 지연 클리어). center는 무시(분할 아님). 세션행·dockview 드래그는
+  // 이 MIME이 없어 무관.
   const projDropRef = useRef<HTMLDivElement>(null);
   const [projDrop, setProjDrop] = useState<{ zone: DropZone; hl: ZoneRect } | null>(null);
+  // dragleave 지연 클리어 타이머(S5) — WebKitGTK는 자식 경계 전이에서도
+  // relatedTarget이 null일 수 있어 즉시 지우면 60Hz 깜빡인다. 다음 dragover가
+  // 취소하고, 진짜 이탈이면 타이머가 지운다.
+  const projLeaveTimerRef = useRef<number | null>(null);
+  const cancelProjLeaveTimer = () => {
+    if (projLeaveTimerRef.current !== null) {
+      window.clearTimeout(projLeaveTimerRef.current);
+      projLeaveTimerRef.current = null;
+    }
+  };
   const isProjectDrag = (e: RDragEvent) => e.dataTransfer.types.includes(PROJECT_DRAG_MIME);
-  const onProjDragOver = (e: RDragEvent<HTMLDivElement>) => {
-    if (!isProjectDrag(e)) return; // 우리 드래그 아니면 무개입(OS 파일·세션·dockview)
-    e.preventDefault();
-    e.dataTransfer.dropEffect = "move";
+  /** host rect에서 존·하이라이트를 계산(dragover 프리뷰·drop 실행 공용 — S1). */
+  const projTargetAt = (x: number, y: number): { zone: DropZone; hl: ZoneRect } | null => {
     const el = projDropRef.current;
-    if (!el) return;
+    if (!el) return null;
     const r = el.getBoundingClientRect();
     const zone = resolveDropZone(
       { left: r.left, top: r.top, width: r.width, height: r.height },
-      e.clientX,
-      e.clientY,
+      x,
+      y,
     );
-    if (!zone) {
-      setProjDrop(null);
+    if (!zone) return null;
+    // 프리뷰는 host-로컬 좌표(원점 0,0)로 그린다 — 오버레이가 host 안에 absolute.
+    return { zone, hl: zoneHighlight({ left: 0, top: 0, width: r.width, height: r.height }, zone) };
+  };
+  const onProjDragOver = (e: RDragEvent<HTMLDivElement>) => {
+    if (!isProjectDrag(e)) return; // 우리 드래그 아니면 무개입(OS 파일·세션·dockview)
+    cancelProjLeaveTimer();
+    const next = projTargetAt(e.clientX, e.clientY);
+    if (!next) {
+      setProjDrop(null); // preventDefault 없이 반환 → 이 좌표는 드롭 불허(host 밖)
       return;
     }
-    // 프리뷰는 host-로컬 좌표(원점 0,0)로 그린다 — 오버레이가 host 안에 absolute.
-    const hl = zoneHighlight({ left: 0, top: 0, width: r.width, height: r.height }, zone);
+    e.preventDefault();
+    e.dataTransfer.dropEffect = "move";
+    // dragover는 초당 수십 회 — 동일 타깃이면 setState 생략(rect 4값 전부 비교, S4).
     setProjDrop((prev) =>
-      prev && prev.zone === zone && sameZoneRect(prev.hl, hl) ? prev : { zone, hl },
+      prev && prev.zone === next.zone && sameZoneRect(prev.hl, next.hl) ? prev : next,
     );
   };
   const onProjDrop = (e: RDragEvent<HTMLDivElement>) => {
     if (!isProjectDrag(e)) return;
     e.preventDefault();
+    cancelProjLeaveTimer();
     const path = e.dataTransfer.getData(PROJECT_DRAG_MIME);
     setProjDrop(null);
     if (!path) return;
     // 존은 **drop 좌표에서 재계산**한다 — 렌더 state(projDrop)에 의존하면 마지막
     // dragover 커밋 전의 drop이 직전 존으로 열린다(sessionDropZone S1과 동형).
-    const el = projDropRef.current;
-    if (!el) return;
-    const r = el.getBoundingClientRect();
-    const zone = resolveDropZone(
-      { left: r.left, top: r.top, width: r.width, height: r.height },
-      e.clientX,
-      e.clientY,
-    );
-    const placement = zone ? placementForZone(zone) : null;
+    const target = projTargetAt(e.clientX, e.clientY);
+    const placement = target ? placementForZone(target.zone) : null;
     if (!placement) return; // center/무효 = 무시(명세: 중앙 무시, 분할 아님)
     if (path === activeProject) return; // 활성=이미 주 표면 — 자기 자신 분할 무의미
     setDualProject(path, placement);
   };
   const onProjDragLeave = (e: RDragEvent<HTMLDivElement>) => {
-    // 컨테이너를 실제로 벗어날 때만 프리뷰 해제(자식으로의 진입은 무시).
+    // 컨테이너를 실제로 벗어날 때만 프리뷰 해제(자식으로의 진입은 무시). 즉시
+    // 지우지 않고 120ms 지연(S5) — 다음 dragover가 취소한다.
     const el = projDropRef.current;
     const to = e.relatedTarget;
     if (el && to instanceof Node && el.contains(to)) return;
-    setProjDrop(null);
+    cancelProjLeaveTimer();
+    projLeaveTimerRef.current = window.setTimeout(() => {
+      projLeaveTimerRef.current = null;
+      setProjDrop(null);
+    }, 120);
   };
+  // 취소 백스톱(S2): Esc·창 밖 드롭·다른 핸들러의 drop 소비(stopPropagation)는
+  // dragleave/drop을 우리에게 보장하지 않는다 — window 캡처 단계에서 정리한다.
+  // (onProjDrop은 렌더 state가 아니라 drop 좌표 재계산을 쓰므로 캡처 단계에서
+  // 먼저 지워져도 무해하다.)
+  useEffect(() => {
+    const clear = () => {
+      cancelProjLeaveTimer();
+      setProjDrop(null);
+    };
+    window.addEventListener("dragend", clear, true);
+    window.addEventListener("drop", clear, true);
+    return () => {
+      window.removeEventListener("dragend", clear, true);
+      window.removeEventListener("drop", clear, true);
+    };
+  }, []);
 
   // P3: droppedPeek 이미지의 objectURL 수명 관리 — 뷰가 교체/닫힐 때 이전
   // URL들을 revoke(누수 방지). 표시 중 URL은 절대 revoke하지 않는다(집합
@@ -1120,7 +1158,9 @@ function AppMain() {
                 P5 SurfaceShell·요청격리는 surfaceId(컴파일-고정)라 방향과 무관. */}
             <PanelGroup
               direction={dualDirection === "column" ? "vertical" : "horizontal"}
-              autoSaveId="dual-surface"
+              // 방향별 persist 버킷 — row(좌우)와 column(상하)이 서로의 비율을
+              // 뒤집어 쓰지 않게 분리한다(리뷰: 축이 바뀌면 저장 비율이 부적절).
+              autoSaveId={dualDirection === "column" ? "dual-surface-col" : "dual-surface-row"}
               className="dual-row"
             >
               {(() => {
