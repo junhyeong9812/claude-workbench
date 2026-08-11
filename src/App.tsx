@@ -285,9 +285,18 @@ function AppMain() {
     if (!isProjectDrag(e)) return;
     e.preventDefault();
     const path = e.dataTransfer.getData(PROJECT_DRAG_MIME);
-    const zone = projDrop?.zone ?? null;
     setProjDrop(null);
     if (!path) return;
+    // 존은 **drop 좌표에서 재계산**한다 — 렌더 state(projDrop)에 의존하면 마지막
+    // dragover 커밋 전의 drop이 직전 존으로 열린다(sessionDropZone S1과 동형).
+    const el = projDropRef.current;
+    if (!el) return;
+    const r = el.getBoundingClientRect();
+    const zone = resolveDropZone(
+      { left: r.left, top: r.top, width: r.width, height: r.height },
+      e.clientX,
+      e.clientY,
+    );
     const placement = zone ? placementForZone(zone) : null;
     if (!placement) return; // center/무효 = 무시(명세: 중앙 무시, 분할 아님)
     if (path === activeProject) return; // 활성=이미 주 표면 — 자기 자신 분할 무의미
