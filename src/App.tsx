@@ -1057,8 +1057,8 @@ function AppMain() {
                         className="dual-secondary-head"
                         title={`${visibleDual}\n${
                           activeSurfaceId === "secondary"
-                            ? "활성 표면 — 툴바·단축키·요청·사이드바가 이 프로젝트를 가리킵니다"
-                            : "클릭하면 이 표면이 활성이 되어 툴바·단축키·요청·사이드바가 이 프로젝트로 전환됩니다"
+                            ? "활성 표면 — 사이드바·검색이 이 프로젝트를 가리킵니다 (표면별 툴바·세션 열기는 다음 단계)"
+                            : "클릭하면 이 표면이 활성이 되어 사이드바·검색이 이 프로젝트로 전환됩니다"
                         }`}
                       >
                         <span className="dual-secondary-name">
