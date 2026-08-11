@@ -1,11 +1,14 @@
 import { describe, expect, it } from "vitest";
 import {
+  DEFAULT_PLACEMENT,
   SURFACE_TREE_VERSION,
   addSurface,
   emptyTree,
   parseSurfaceTree,
+  placementForZone,
   removeSurface,
   secondaryProject,
+  surfaceLayout,
   type SurfaceTree,
 } from "./surfaceTree";
 
@@ -41,6 +44,72 @@ describe("surfaceTree — 기본 형태", () => {
     expect(addSurface(t, null)).toEqual(emptyTree());
     expect(addSurface(t, "")).toEqual(emptyTree());
   });
+});
+
+describe("P6: 드롭 존 → 배치 매핑 (좌/우/상/하)", () => {
+  it("좌=row·before, 우=row·after, 상=column·before, 하=column·after", () => {
+    expect(placementForZone("left")).toEqual({ direction: "row", before: true });
+    expect(placementForZone("right")).toEqual({ direction: "row", before: false });
+    expect(placementForZone("above")).toEqual({ direction: "column", before: true });
+    expect(placementForZone("below")).toEqual({ direction: "column", before: false });
+  });
+  it("center·미지 존 = null(분할 아님)", () => {
+    expect(placementForZone("center")).toBeNull();
+    expect(placementForZone("bogus")).toBeNull();
+    expect(placementForZone("")).toBeNull();
+  });
+  it("우측(right) 매핑 = 기본 배치와 동일(우클릭 우측분할 보존)", () => {
+    expect(placementForZone("right")).toEqual(DEFAULT_PLACEMENT);
+  });
+});
+
+describe("P6: addSurface 배치 방향/위치 + surfaceLayout 판독", () => {
+  it("기본(placement 생략) = 우측 row·after (회귀 0)", () => {
+    const t = addSurface(emptyTree(), "/b");
+    expect(surfaceLayout(t)).toEqual({ direction: "row", before: false });
+    if (t.root.kind === "split") {
+      expect(t.root.direction).toBe("row");
+      expect(t.root.children[0]).toMatchObject({ surfaceId: "primary" });
+      expect(t.root.children[1]).toMatchObject({ surfaceId: "secondary", projectKey: "/b" });
+    }
+  });
+  it("하(column·after) = 세로 분할, secondary 뒤", () => {
+    const t = addSurface(emptyTree(), "/b", { direction: "column", before: false });
+    expect(surfaceLayout(t)).toEqual({ direction: "column", before: false });
+    expect(secondaryProject(t)).toBe("/b");
+    if (t.root.kind === "split") expect(t.root.children[1]).toMatchObject({ surfaceId: "secondary" });
+  });
+  it("좌(row·before) = secondary가 primary 앞", () => {
+    const t = addSurface(emptyTree(), "/b", { direction: "row", before: true });
+    expect(surfaceLayout(t)).toEqual({ direction: "row", before: true });
+    // 순서 무관하게 멤버십 조회는 정확.
+    expect(secondaryProject(t)).toBe("/b");
+    if (t.root.kind === "split") expect(t.root.children[0]).toMatchObject({ surfaceId: "secondary" });
+  });
+  it("상(column·before)도 secondary가 앞·세로", () => {
+    const t = addSurface(emptyTree(), "/b", { direction: "column", before: true });
+    expect(surfaceLayout(t)).toEqual({ direction: "column", before: true });
+  });
+  it("primary 단독 트리 = surfaceLayout null", () => {
+    expect(surfaceLayout(emptyTree())).toBeNull();
+  });
+});
+
+describe("P6: 방향 담은 트리 왕복 persist 무손실", () => {
+  for (const p of [
+    { direction: "row", before: false } as const,
+    { direction: "row", before: true } as const,
+    { direction: "column", before: false } as const,
+    { direction: "column", before: true } as const,
+  ]) {
+    it(`${p.direction}/${p.before ? "before" : "after"} → JSON 왕복 후 방향·멤버십 보존`, () => {
+      const orig = addSurface(emptyTree(), "/proj", p);
+      const round = parseSurfaceTree(JSON.parse(JSON.stringify(orig)), null);
+      expect(round).toEqual(orig);
+      expect(surfaceLayout(round)).toEqual(p);
+      expect(secondaryProject(round)).toBe("/proj");
+    });
+  }
 });
 
 describe("parseSurfaceTree — 마이그레이션(구→신) + 왕복 무손실", () => {
@@ -96,19 +165,23 @@ describe("parseSurfaceTree — 손상/이상치 = 기본 복원(로드 실패 �
 });
 
 describe("다운그레이드/포워드 안전 — 미래 버전 트리도 secondary 최선 복원", () => {
-  it("미래 version + 알려진 root 형태 → root 보존 채택", () => {
+  it("미래 version + 알려진 root 형태 → secondary 최선 추출(구조 그대로 채택 아님 — F3)", () => {
     const future: SurfaceTree = {
       version: 99,
       root: {
         kind: "split",
-        direction: "row",
+        direction: "column",
         children: [
           { kind: "leaf", surfaceId: "primary", projectKey: null },
           { kind: "leaf", surfaceId: "secondary", projectKey: "/future" },
         ],
       },
     };
-    expect(secondaryProject(parseSurfaceTree(future, null))).toBe("/future");
+    const r = parseSurfaceTree(future, null);
+    expect(secondaryProject(r)).toBe("/future");
+    // 미래 version은 구조를 신뢰하지 않는다: 멤버십만 건지고 현재 version·기본 배치로.
+    expect(r.version).toBe(SURFACE_TREE_VERSION);
+    expect(surfaceLayout(r)).toEqual(DEFAULT_PLACEMENT);
   });
 
   it("미래 스키마(느슨/미지 필드)라도 secondary 리프가 있으면 경로 추출", () => {
@@ -124,6 +197,34 @@ describe("다운그레이드/포워드 안전 — 미래 버전 트리도 second
       },
     };
     expect(secondaryProject(parseSurfaceTree(weird, null))).toBe("/deep");
+  });
+});
+
+describe("F3(codex P2-1): 미지 version → default/loose (그대로 채택 금지)", () => {
+  const validRoot = {
+    kind: "split",
+    direction: "column",
+    children: [
+      { kind: "leaf", surfaceId: "primary", projectKey: null },
+      { kind: "leaf", surfaceId: "secondary", projectKey: "/x" },
+    ],
+  };
+  it("현재 version + 유효 구조 → 방향까지 그대로 채택", () => {
+    const cur = { version: SURFACE_TREE_VERSION, root: validRoot };
+    const r = parseSurfaceTree(cur, null);
+    expect(secondaryProject(r)).toBe("/x");
+    expect(surfaceLayout(r)).toEqual({ direction: "column", before: false });
+  });
+  it("미지 version(2) + 유효 구조 → loose extract(방향 유실·기본 배치, 채택 아님)", () => {
+    const v2 = { version: 2, root: validRoot };
+    const r = parseSurfaceTree(v2, null);
+    expect(secondaryProject(r)).toBe("/x"); // 멤버십만 최선 추출
+    expect(r.version).toBe(SURFACE_TREE_VERSION); // v2 구조 그대로 채택 아님
+    expect(surfaceLayout(r)).toEqual(DEFAULT_PLACEMENT); // 방향 유실 → 기본
+  });
+  it("과거 version(0) + 유효 구조 → default(부활·채택 없음)", () => {
+    const v0 = { version: 0, root: validRoot };
+    expect(parseSurfaceTree(v0, null)).toEqual(emptyTree());
   });
 });
 
@@ -165,6 +266,32 @@ describe("FC(리뷰): 손상 트리가 임의 secondary를 부활시키지 못�
       metadata: { kind: "leaf", surfaceId: "secondary", projectKey: "/resurrected" },
     };
     expect(parseSurfaceTree(fixture, "/legacy")).toEqual(emptyTree());
+  });
+});
+
+describe("P6 재슬라이스: parseSurfaceTree present → 트리 정본(legacy 무시)", () => {
+  // 로드 계약(store.loadSurfaceTree)은 트리 블롭이 present면 legacy=null을 넘긴다.
+  // 화해가 사라졌으므로 present 트리는 legacy와 무관하게 자기 자신으로만 해석된다.
+  it("정상 트리(현재 version) present → 채택, 방향 보존", () => {
+    const tree = addSurface(emptyTree(), "/b", { direction: "column", before: true });
+    const round = parseSurfaceTree(JSON.parse(JSON.stringify(tree)), null);
+    expect(round).toEqual(tree);
+    expect(surfaceLayout(round)).toEqual({ direction: "column", before: true });
+  });
+
+  it("legacyMirror 잔재가 붙은 구 블롭도 그대로 채택(초과 필드 무시)", () => {
+    // 재슬라이스 이전 persist가 남긴 블롭엔 legacyMirror가 섞여 있을 수 있다.
+    // parse는 version+root만 취하므로 방향 보존·마커 무시로 정상 채택된다.
+    const tree = addSurface(emptyTree(), "/b", { direction: "column", before: false });
+    const legacyBlob = { ...tree, legacyMirror: "/stale" };
+    const r = parseSurfaceTree(legacyBlob, null);
+    expect(r).toEqual(tree);
+    expect(surfaceLayout(r)).toEqual({ direction: "column", before: false });
+  });
+
+  it("rawTree 부재(null) → legacy 마이그레이션(pre-P6 경로)", () => {
+    expect(secondaryProject(parseSurfaceTree(null, "/b"))).toBe("/b");
+    expect(parseSurfaceTree(null, null)).toEqual(emptyTree());
   });
 });
 

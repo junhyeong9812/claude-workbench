@@ -8,9 +8,11 @@ import { capTreeCache, computeTreeKeepSet, pruneTreeCache, sameEntries, underRoo
 import { setActiveSurfaceSeam, type SurfaceId } from "./surfaceContext";
 import {
   addSurface,
+  emptyTree,
   parseSurfaceTree,
   removeSurface,
   secondaryProject,
+  type SurfacePlacement,
   type SurfaceTree,
 } from "./surfaceTree";
 import { resolveVisibleDual } from "./dualSurface";
@@ -289,23 +291,62 @@ function persistPopoutGeometry(label: string, geo: PopoutGeo) {
   savePopoutGeometry(fresh);
 }
 
-/** Load the surface tree from localStorage (멀티프로젝트 P3'). FB(리뷰): the disk
- * source of truth is the **single legacy `dualProject` key** — we never read a
- * `surfaceTree` blob (그건 P6로 이연), so the two-key divergence class cannot
- * exist. parseSurfaceTree(null, legacy) builds the in-memory tree; corrupt or
- * missing legacy = 기본(primary 단독) via the recovery contract. */
-function loadSurfaceTree(): SurfaceTree {
-  return parseSurfaceTree(null, localStorage.getItem("dualProject"));
+const SURFACE_TREE_KEY = "surfaceTree";
+const LEGACY_DUAL_KEY = "dualProject";
+
+/**
+ * Load the surface tree from localStorage (멀티프로젝트 P6 — 트리 디스크 정본화,
+ * 재슬라이스).
+ *
+ * **트리 블롭(`SURFACE_TREE_KEY`) = 유일한 로드 정본.** 레거시 문자열
+ * (`LEGACY_DUAL_KEY`)은 write-only 다운그레이드 빵부스러기(구버전 앱만 읽음)라 로드
+ * 시 **비교·화해하지 않는다** — 예전 tree↔legacy 화해가 만들던 엣지 클래스(실패쓰기
+ * 오인·present "null" 부활·stale legacy 승리)를 원천 소멸시킨 재슬라이스다.
+ *
+ *  - **키 부재(`raw === null`, pre-P6 세션)** → legacy에서 1회 마이그레이션
+ *    (`parseSurfaceTree(null, legacy)`). pre-P6 세션이 남긴 유일한 표현이 legacy다.
+ *  - **키 존재(어떤 값이든)** → 트리가 정본. `JSON.parse` 후 `parseSurfaceTree(_, null)`
+ *    로 해석하고 **legacy는 무시**한다. parseSurfaceTree가 현재 version·유효 구조만
+ *    채택(방향 보존)하고, present `"null"`(→parsed null·legacy=null)·손상·미지
+ *    version은 전부 기본으로 낙하한다. JSON.parse 자체가 throw면 손상 → 기본.
+ *
+ * same-version 닫기 부활 방지는 트리만 읽어 성립한다(신버전이 트리를 최신 유지 →
+ * 닫으면 두 키 모두 제거 → 다음 로드는 키 부재 → legacy=null → 기본). cross-version
+ * 라운드트립(다운그레이드 세션 중 편집 역동기화)만 포기하며 명세 밖·희귀다. */
+export function loadSurfaceTree(): SurfaceTree {
+  const raw = localStorage.getItem(SURFACE_TREE_KEY);
+  // 키 부재(pre-P6 세션) → legacy에서 1회 마이그레이션.
+  if (raw === null) return parseSurfaceTree(null, localStorage.getItem(LEGACY_DUAL_KEY));
+  // 키 존재 → 트리가 정본. legacy 무시(화해 없음).
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return emptyTree(); // 손상 JSON → 기본(stale legacy 부활 없음).
+  }
+  return parseSurfaceTree(parsed, null);
 }
 
-/** Persist the surface tree to the **single legacy `dualProject` key** (FB, 리뷰).
- * P3'의 트리는 0~1 secondary라 legacy 문자열과 동형이므로 이 한 키가 저장 정보를
- * 전부 담는다 — 원자적(한 키·한 setItem)이고 다운그레이드가 자명하다(구버전 앱이
- * 읽는 유일 키). 방향·N-way를 담는 트리 persist는 P6로 이연. */
+/**
+ * Persist the surface tree to disk (멀티프로젝트 P6 — 재슬라이스). 트리
+ * (`SURFACE_TREE_KEY`)가 **방향까지 담는 유일 로드 정본**이고, 레거시 문자열
+ * (`LEGACY_DUAL_KEY`)은 secondary의 **write-only 다운그레이드 빵부스러기**(구버전
+ * 앱만 읽는다 — 로드 화해에 안 씀)다. 두 키를 한 함수에서 함께 기록/삭제하되 로드가
+ * 트리만 보므로 순서·정합은 무관하다. secondary 없으면(닫힘) 두 키 모두 제거 →
+ * 다음 로드는 키 부재 → legacy=null → 기본(닫힘 유지). 트리 블롭은 방향만 담고
+ * provenance 마커는 넣지 않는다(화해가 사라져 불요). */
 function persistSurfaceTree(tree: SurfaceTree) {
   const secondary = secondaryProject(tree);
-  if (secondary) localStorage.setItem("dualProject", secondary);
-  else localStorage.removeItem("dualProject");
+  // 트리 키는 **절대 제거하지 않는다** — 닫힘도 emptyTree tombstone으로 기록해
+  // "키 부재 ⟺ pre-P6"를 불변으로 유지한다(codex 최종확인: 닫기의 removeItem이
+  // 부분 실패하면 키 부재로 오인돼 stale legacy가 부활). 로드는 트리만 보므로
+  // present tombstone이 항상 legacy를 이긴다.
+  //   ⚠️ 순서 중요: tombstone setItem이 **반드시 legacy 조작보다 먼저**여야 한다.
+  //   legacy op가 먼저라면 그것이 throw할 때 tombstone이 안 써져 트리 키에 옛 분할
+  //   블롭이 남아 부활한다. setItem(tree)를 무조건 첫 줄로 둔다(테스트 (h)가 고정).
+  localStorage.setItem(SURFACE_TREE_KEY, JSON.stringify(tree)); // ① 정본(방향 포함·닫힘=emptyTree)
+  if (secondary) localStorage.setItem(LEGACY_DUAL_KEY, secondary); // ② write-only 다운그레이드 빵부스러기
+  else localStorage.removeItem(LEGACY_DUAL_KEY);
 }
 
 /** 우측(secondary) 표면이 실제로 렌더되는가 — **활성 표면 정규화의 단일 술어**
@@ -521,9 +562,10 @@ interface AppState {
    * 트리는 legacy 문자열과 동형이라 **디스크는 legacy `dualProject` 단일 키만**
    * 기록한다(FB — 분기 원천 제거·다운그레이드 자명). 트리는 메모리 정본. */
   surfaceTree: SurfaceTree;
-  /** 우측 분할 열기(path)/닫기(null) — 트리 addSurface/removeSurface로 매핑되고
-   * dualProject 미러를 갱신한 뒤 legacy `dualProject` 단일 키로 저장. */
-  setDualProject: (path: string | null) => void;
+  /** 부 표면 분할 열기(path)/닫기(null) — 트리 addSurface/removeSurface로 매핑되고
+   * dualProject 미러를 갱신한 뒤 트리(정본)+legacy 미러를 함께 저장. `placement`
+   * (P6)로 방향/위치를 정한다 — 생략 시 기본 우측(row·after, 우클릭 경로 보존). */
+  setDualProject: (path: string | null, placement?: SurfacePlacement) => void;
   /** Color theme (persisted to localStorage). Drives CSS vars + xterm palette. */
   theme: "dark" | "light";
   /** Code font size in px (terminals + editor/viewer), persisted. */
@@ -1167,11 +1209,14 @@ export const useAppStore = create<AppState>((set, get) => ({
     set((s) => ({ detachPanelRequest: { targetSurfaceId: "primary", nonce: s.detachPanelRequest.nonce + 1 } })),
   requestMemo: (surfaceId = "primary") =>
     set((s) => ({ memoRequest: bumpCounter(s.memoRequest, surfaceId) })),
-  setDualProject: (path) => {
-    // 트리가 멤버십 정본: 열기=addSurface(secondary 추가/교체), 닫기=removeSurface.
+  setDualProject: (path, placement) => {
+    // 트리가 멤버십·방향 정본: 열기=addSurface(방향·위치 = placement, 기본 우측),
+    // 닫기=removeSurface. persist = 트리(정본)+legacy 미러(다운그레이드).
     const prevSecondary = secondaryProject(get().surfaceTree);
-    const tree = path ? addSurface(get().surfaceTree, path) : removeSurface(get().surfaceTree);
-    persistSurfaceTree(tree); // legacy dualProject 단일 키만 기록(FB — 원자·다운그레이드 자명)
+    const tree = path
+      ? addSurface(get().surfaceTree, path, placement)
+      : removeSurface(get().surfaceTree);
+    persistSurfaceTree(tree); // 트리 블롭(방향 포함) + legacy 파생 미러(P6)
     const nextSecondary = secondaryProject(tree);
     set((s) => ({
       surfaceTree: tree,

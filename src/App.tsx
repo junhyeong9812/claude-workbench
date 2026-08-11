@@ -1,11 +1,18 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState, type DragEvent as RDragEvent } from "react";
 import {
   Panel,
   PanelGroup,
   PanelResizeHandle,
   type ImperativePanelHandle,
 } from "react-resizable-panels";
-import { ProjectTabs } from "./components/ProjectTabs";
+import { ProjectTabs, PROJECT_DRAG_MIME } from "./components/ProjectTabs";
+import {
+  resolveDropZone,
+  zoneHighlight,
+  sameZoneRect,
+  type DropZone,
+  type ZoneRect,
+} from "./components/sessionDropZone";
 import { FolderTree } from "./components/FolderTree";
 import { GitPanel } from "./components/GitPanel";
 import { WorktreePanel } from "./components/WorktreePanel";
@@ -45,6 +52,7 @@ import { initNotify } from "./state/notify";
 import { resolveLayerMode, devLayerMounted, shouldFlipToIntegrated } from "./state/layerRouting";
 import { resolveVisibleDual } from "./state/dualSurface";
 import { SurfaceProvider } from "./state/surfaceContext";
+import { surfaceLayout, placementForZone } from "./state/surfaceTree";
 import { SurfaceShell } from "./components/SurfaceShell";
 import {
   applyActivityPick,
@@ -209,6 +217,13 @@ function AppMain() {
   const projects = useAppStore((s) => s.projects);
   const dualProject = useAppStore((s) => s.dualProject);
   const setDualProject = useAppStore((s) => s.setDualProject);
+  // 부 표면 배치(P6) — 트리에서 읽는 방향/위치. surfaceTree 참조는 setDualProject/
+  // closeProject가 새 트리를 만들 때만 바뀌므로(그 외 상태변경엔 불변) useMemo가
+  // 트리당 1회만 surfaceLayout을 돈다(선택자 2벌 중복 계산 제거).
+  const surfaceTree = useAppStore((s) => s.surfaceTree);
+  const dualLayout = useMemo(() => surfaceLayout(surfaceTree), [surfaceTree]);
+  const dualDirection = dualLayout?.direction ?? "row";
+  const dualSecondaryBefore = dualLayout?.before ?? false;
   // **렌더는 파생값으로 그린다** (리뷰 D1): 이펙트(커밋 후) 정리에만 맡기면
   // setActive 직후 1프레임 동안 같은 프로젝트 dock 두 개가 공존한다. dualProject는
   // 이제 표면 트리(store.surfaceTree)의 secondary 멤버십 미러이고, 파생값은
@@ -238,6 +253,103 @@ function AppMain() {
   } | null>(null);
   // 드롭 처리 직렬화 — 연속 드롭이 겹쳐 절반 상태를 만들지 않게.
   const dropBusyRef = useRef(false);
+
+  // ── 프로젝트 탭 → 화면 가장자리 드롭 분할 (멀티프로젝트 P6) ──────────────
+  // 프로젝트 탭 드래그(PROJECT_DRAG_MIME)를 작업 영역(.pane-main) 가장자리에
+  // 떨구면 그 방향으로 부 표면을 연다. 존 계산은 sessionDropZone의 순수 헬퍼
+  // (resolveDropZone/zoneHighlight/sameZoneRect)를 **그대로 재사용**(수정 아님) —
+  // 좌표계 기준 = drop host(.pane-main을 채우는 상자)의 rect. 생명주기 가드는
+  // useSessionDropZone과 동형으로 갖춘다: S1(drop 좌표 재계산)·S2(취소 백스톱)·
+  // S5(dragleave 지연 클리어). center는 무시(분할 아님). 세션행·dockview 드래그는
+  // 이 MIME이 없어 무관.
+  const projDropRef = useRef<HTMLDivElement>(null);
+  const [projDrop, setProjDrop] = useState<{ zone: DropZone; hl: ZoneRect } | null>(null);
+  // dragleave 지연 클리어 타이머(S5) — WebKitGTK는 자식 경계 전이에서도
+  // relatedTarget이 null일 수 있어 즉시 지우면 60Hz 깜빡인다. 다음 dragover가
+  // 취소하고, 진짜 이탈이면 타이머가 지운다.
+  const projLeaveTimerRef = useRef<number | null>(null);
+  const cancelProjLeaveTimer = () => {
+    if (projLeaveTimerRef.current !== null) {
+      window.clearTimeout(projLeaveTimerRef.current);
+      projLeaveTimerRef.current = null;
+    }
+  };
+  const isProjectDrag = (e: RDragEvent) => e.dataTransfer.types.includes(PROJECT_DRAG_MIME);
+  /** host rect에서 존·하이라이트를 계산(dragover 프리뷰·drop 실행 공용 — S1). */
+  const projTargetAt = (x: number, y: number): { zone: DropZone; hl: ZoneRect } | null => {
+    const el = projDropRef.current;
+    if (!el) return null;
+    const r = el.getBoundingClientRect();
+    const zone = resolveDropZone(
+      { left: r.left, top: r.top, width: r.width, height: r.height },
+      x,
+      y,
+    );
+    if (!zone) return null;
+    // 프리뷰는 host-로컬 좌표(원점 0,0)로 그린다 — 오버레이가 host 안에 absolute.
+    return { zone, hl: zoneHighlight({ left: 0, top: 0, width: r.width, height: r.height }, zone) };
+  };
+  const onProjDragOver = (e: RDragEvent<HTMLDivElement>) => {
+    if (!isProjectDrag(e)) return; // 우리 드래그 아니면 무개입(OS 파일·세션·dockview)
+    cancelProjLeaveTimer();
+    const next = projTargetAt(e.clientX, e.clientY);
+    if (!next) {
+      setProjDrop(null); // preventDefault 없이 반환 → 이 좌표는 드롭 불허(host 밖)
+      return;
+    }
+    e.preventDefault();
+    // 코스메틱(Opus P3): center 존도 여기선 dropEffect="move"로 보이지만 드롭은
+    // no-op다(onProjDrop에서 placementForZone(center)===null → 무시). 시각상 큰
+    // 문제는 아니라 동작은 그대로 두고 명시만 한다.
+    e.dataTransfer.dropEffect = "move";
+    // dragover는 초당 수십 회 — 동일 타깃이면 setState 생략(rect 4값 전부 비교, S4).
+    setProjDrop((prev) =>
+      prev && prev.zone === next.zone && sameZoneRect(prev.hl, next.hl) ? prev : next,
+    );
+  };
+  const onProjDrop = (e: RDragEvent<HTMLDivElement>) => {
+    if (!isProjectDrag(e)) return;
+    e.preventDefault();
+    cancelProjLeaveTimer();
+    const path = e.dataTransfer.getData(PROJECT_DRAG_MIME);
+    setProjDrop(null);
+    if (!path) return;
+    // 존은 **drop 좌표에서 재계산**한다 — 렌더 state(projDrop)에 의존하면 마지막
+    // dragover 커밋 전의 drop이 직전 존으로 열린다(sessionDropZone S1과 동형).
+    const target = projTargetAt(e.clientX, e.clientY);
+    const placement = target ? placementForZone(target.zone) : null;
+    if (!placement) return; // center/무효 = 무시(명세: 중앙 무시, 분할 아님)
+    if (path === activeProject) return; // 활성=이미 주 표면 — 자기 자신 분할 무의미
+    setDualProject(path, placement);
+  };
+  const onProjDragLeave = (e: RDragEvent<HTMLDivElement>) => {
+    // 컨테이너를 실제로 벗어날 때만 프리뷰 해제(자식으로의 진입은 무시). 즉시
+    // 지우지 않고 120ms 지연(S5) — 다음 dragover가 취소한다.
+    const el = projDropRef.current;
+    const to = e.relatedTarget;
+    if (el && to instanceof Node && el.contains(to)) return;
+    cancelProjLeaveTimer();
+    projLeaveTimerRef.current = window.setTimeout(() => {
+      projLeaveTimerRef.current = null;
+      setProjDrop(null);
+    }, 120);
+  };
+  // 취소 백스톱(S2): Esc·창 밖 드롭·다른 핸들러의 drop 소비(stopPropagation)는
+  // dragleave/drop을 우리에게 보장하지 않는다 — window 캡처 단계에서 정리한다.
+  // (onProjDrop은 렌더 state가 아니라 drop 좌표 재계산을 쓰므로 캡처 단계에서
+  // 먼저 지워져도 무해하다.)
+  useEffect(() => {
+    const clear = () => {
+      cancelProjLeaveTimer();
+      setProjDrop(null);
+    };
+    window.addEventListener("dragend", clear, true);
+    window.addEventListener("drop", clear, true);
+    return () => {
+      window.removeEventListener("dragend", clear, true);
+      window.removeEventListener("drop", clear, true);
+    };
+  }, []);
 
   // P3: droppedPeek 이미지의 objectURL 수명 관리 — 뷰가 교체/닫힐 때 이전
   // URL들을 revoke(누수 방지). 표시 중 URL은 절대 revoke하지 않는다(집합
@@ -1022,6 +1134,16 @@ function AppMain() {
         )}
         <PanelResizeHandle className="resize-handle" />
         <Panel id="main" order={3} defaultSize={60} minSize={30} className="pane-main">
+          {/* P6 프로젝트 드롭 host — .pane-main을 채우는 드래그 수신 상자.
+              PROJECT_DRAG_MIME 드래그에만 반응(다른 드래그·평상시 무개입: 오버레이는
+              드래그 중에만·pointer-events 없음). 존 계산은 이 host의 rect 기준. */}
+          <div
+            className="main-drop-host"
+            ref={projDropRef}
+            onDragOver={onProjDragOver}
+            onDrop={onProjDrop}
+            onDragLeave={onProjDragLeave}
+          >
           {/* Both layers stay mounted; the front/back swap is z-index +
               visibility (not conditional render) so toggling modes preserves
               each view's terminal scrollback and editor tabs (불변식 ②). The
@@ -1032,32 +1154,70 @@ function AppMain() {
             {/* project-dual-surface: 주 dock + (열려 있으면) 우측 수동 dock.
                 주 Panel은 항상 마운트 — 분할 토글이 주 dock을 리마운트하지
                 않도록 조건부는 우측 쌍에만 둔다. */}
-            <PanelGroup direction="horizontal" autoSaveId="dual-surface" className="dual-row">
-              <Panel id="dual-primary" order={1} minSize={25}>
-                {/* 주 표면 컨테이너: pointerdown-capture로 이 표면의 **모든**
-                    상호작용을 잡아 활성 표면을 primary로 전환한다(P4' 포커스
-                    모델 — "마지막 클릭=활성", 스모크에서 dockview 이벤트보다
-                    견고하다고 확정). SurfaceProvider는 primary가 소유한 프로젝트
-                    (=activeProject 앵커, 활성 표면과 무관하게 안정)를 주입한다. */}
-                <div
-                  className={`surface-frame${
-                    visibleDual && activeSurfaceId === "primary" ? " surface-active" : ""
-                  }`}
-                  onPointerDownCapture={() => setActiveSurface("primary")}
-                >
-                  <SurfaceProvider surfaceId="primary" project={activeProject}>
-                    <MainArea />
-                  </SurfaceProvider>
-                </div>
-              </Panel>
-              {visibleDual && (
-                <>
-                  <PanelResizeHandle className="resize-handle" />
-                  <Panel id="dual-secondary" order={2} minSize={20} defaultSize={40}>
+            {/* P6: 방향/위치를 표면 트리에서 읽어 자유 분할한다. row=수평(좌우)·
+                column=수직(상하), secondaryBefore=부 표면이 주 표면 앞(좌/상). 주
+                Panel은 **key로 정체성 보존** — 위치가 바뀌어도(order·children 순서)
+                리마운트되지 않아 터미널 scrollback·에디터 탭이 유지된다(불변식 ②).
+                P5 SurfaceShell·요청격리는 surfaceId(컴파일-고정)라 방향과 무관. */}
+            <PanelGroup
+              direction={dualDirection === "column" ? "vertical" : "horizontal"}
+              // 방향별 persist 버킷 — row(좌우)와 column(상하)이 서로의 비율을
+              // 뒤집어 쓰지 않게 분리한다(리뷰: 축이 바뀌면 저장 비율이 부적절).
+              // 코스메틱(Opus P3): 이 버킷 분리가 도입되면서 기존 사용자의 저장된
+              // dual 분할 비율이 딱 1회 기본값으로 리셋된다(다음 드래그로 자가치유).
+              autoSaveId={dualDirection === "column" ? "dual-surface-col" : "dual-surface-row"}
+              className="dual-row"
+            >
+              {(() => {
+                const primaryPanel = (
+                  <Panel
+                    key="dual-primary"
+                    id="dual-primary"
+                    order={dualSecondaryBefore ? 2 : 1}
+                    minSize={25}
+                  >
+                    {/* 주 표면 컨테이너: pointerdown-capture로 이 표면의 **모든**
+                        상호작용을 잡아 활성 표면을 primary로 전환한다(P4' 포커스
+                        모델 — "마지막 클릭=활성"). SurfaceProvider는 primary가 소유한
+                        프로젝트(=activeProject 앵커, 활성 표면과 무관하게 안정) 주입. */}
+                    <div
+                      className={`surface-frame${
+                        visibleDual && activeSurfaceId === "primary" ? " surface-active" : ""
+                      }`}
+                      onPointerDownCapture={() => setActiveSurface("primary")}
+                    >
+                      <SurfaceProvider surfaceId="primary" project={activeProject}>
+                        <MainArea />
+                      </SurfaceProvider>
+                    </div>
+                  </Panel>
+                );
+                if (!visibleDual) return primaryPanel;
+                // F4: 방향 무관 resize-handle(width:4px·col-resize)만 주면 세로
+                // (column) PanelGroup에서 높이 0으로 접혀 상하 분할을 포인터로 못
+                // 늘린다. column일 때 resize-handle-v(height:4px·row-resize·가로 꽉참,
+                // App.css)를 얹어 세로 그룹에서 올바른 핸들이 되게 한다.
+                const handle = (
+                  <PanelResizeHandle
+                    key="dual-handle"
+                    className={`resize-handle${dualDirection === "column" ? " resize-handle-v" : ""}`}
+                  />
+                );
+                const secondaryPanel = (
+                  <Panel
+                    key="dual-secondary"
+                    id="dual-secondary"
+                    order={dualSecondaryBefore ? 1 : 2}
+                    minSize={20}
+                    defaultSize={40}
+                  >
                     {/* 부 표면 컨테이너: 같은 pointerdown-capture로 활성 표면을
-                        secondary로 전환한다(P4'). 활성일 때 surface-active 강조. */}
+                        secondary로 전환한다(P4'). 방향별 경계선 클래스로 border를
+                        올바른 변에 둔다(col=위, before=반대편). */}
                     <div
                       className={`dual-secondary${
+                        dualDirection === "column" ? " dual-secondary-col" : ""
+                      }${dualSecondaryBefore ? " dual-secondary-before" : ""}${
                         activeSurfaceId === "secondary" ? " surface-active" : ""
                       }`}
                       onPointerDownCapture={() => setActiveSurface("secondary")}
@@ -1078,7 +1238,7 @@ function AppMain() {
                         </span>
                         <button
                           className="dual-secondary-close"
-                          title="우측 분할 닫기"
+                          title="분할 닫기"
                           onClick={() => setDualProject(null)}
                         >
                           ×
@@ -1097,8 +1257,13 @@ function AppMain() {
                       </div>
                     </div>
                   </Panel>
-                </>
-              )}
+                );
+                // before = 부 표면 앞(좌/상): [부, 핸들, 주]; after: [주, 핸들, 부].
+                // key로 주 Panel 정체성이 보존돼 위치 이동이 리마운트가 아니다.
+                return dualSecondaryBefore
+                  ? [secondaryPanel, handle, primaryPanel]
+                  : [primaryPanel, handle, secondaryPanel];
+              })()}
             </PanelGroup>
           </div>
           {devMounted && activeProject && (
@@ -1138,6 +1303,22 @@ function AppMain() {
               onClose={closeGitHistoryFile}
             />
           )}
+          {/* P6 드롭 프리뷰 — 떨굴 방향의 반쪽을 하이라이트(zoneHighlight 재사용,
+              host-로컬 좌표). center는 렌더 안 함(분할 아님). */}
+          {projDrop && projDrop.zone !== "center" && (
+            <div className="dual-drop-overlay">
+              <div
+                className="dual-drop-hl"
+                style={{
+                  left: projDrop.hl.left,
+                  top: projDrop.hl.top,
+                  width: projDrop.hl.width,
+                  height: projDrop.hl.height,
+                }}
+              />
+            </div>
+          )}
+          </div>
         </Panel>
         </PanelGroup>
         </div>

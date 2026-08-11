@@ -15,26 +15,62 @@
  * **secondary 리프의 projectKey만 저장 멤버십**이다. 이 덕에 현 동작이 정확히
  * 보존된다(primary가 activeProject를 그대로 따름).
  *
- * ## 다운그레이드 안전 — 단일 키 persist (FB, 리뷰)
- * P3'의 트리는 secondary 0~1개뿐이라 정보량이 레거시 `dualProject` 문자열과
- * **동형**(direction 항상 row·ratio는 react-resizable-panels 소유·저장 정보 =
- * secondaryProject 하나)이다. 그래서 트리는 **메모리 정본**으로만 두고 디스크
- * persist는 레거시 `dualProject` 단일 키로만 한다(store.ts). 두 키의 비원자 이중
- * 기록이 만들던 영구 분기(닫은 분할 부활·다중창·다운/업그레이드 유실)가 원천
- * 소멸하고, 다운그레이드는 자명하다(구버전 앱이 읽는 유일 키를 그대로 쓴다).
- * 방향·N-way를 실제로 담는 트리 persist는 그걸 필요로 하는 P6로 이연한다.
+ * ## 디스크 정본 = 트리 블롭 하나 (멀티프로젝트 P6 — 재슬라이스)
+ * P6부터 트리는 **방향(row/column)·위치**를 담으므로 레거시 `dualProject` 문자열과
+ * 더는 동형이 아니다. 그래서 디스크 정본은 **트리 블롭 하나**(store.ts
+ * `SURFACE_TREE_KEY`)이고, 레거시 문자열(`LEGACY_DUAL_KEY`)은 **write-only 다운그레이드
+ * 빵부스러기**(구버전 앱만 읽는다)로 병기만 한다. **로드 시 두 키를 비교·화해하지
+ * 않는다** — 트리 키가 present면 트리가 정본, 부재면(pre-P6 세션) legacy에서 1회
+ * 마이그레이션. 이 단방향 규칙이 예전 tree↔legacy 화해가 만들던 엣지 클래스(실패쓰기
+ * 오인·present "null" 부활·stale legacy 승리)를 원천 소멸시킨다. cross-version
+ * 라운드트립(다운그레이드 세션 중 편집 역동기화)만 포기하며 이는 명세 밖·희귀다.
  *
- * 그럼에도 parseSurfaceTree는 트리 블롭 입력까지 완전 견고화한다(미래 P6 대비):
- * 미래(더 높은 version) 트리는 secondary를 최선 추출, 손상·예산 초과·순환은 전부
- * 기본 레이아웃(primary 단독)으로 — persist의 "로드 실패=default" 계약과 동형.
+ * parseSurfaceTree는 트리 블롭 입력을 완전 견고화한다: 현재 version·유효 구조만
+ * 채택(방향 보존), 미래(더 높은 version) 트리는 secondary 최선 추출, 손상·예산
+ * 초과·순환·미지 version은 전부 기본 레이아웃(primary 단독)으로. legacy 인자는
+ * **트리 블롭 부재(마이그레이션) 시에만** 의미가 있고, present면 호출부가 null을 넘긴다.
  */
 import type { SurfaceId } from "./surfaceContext";
 
 /** 현재 트리 스키마 버전. 필드 추가 시 올린다(구 파서는 미지 필드 무시). */
 export const SURFACE_TREE_VERSION = 1;
 
-/** 분할 방향. row=좌우(수평), column=상하(수직). P3'은 row만 실사용. */
+/** 분할 방향. row=좌우(수평), column=상하(수직). P6부터 column 실사용. */
 export type SplitDirection = "row" | "column";
+
+/**
+ * 부 표면 배치(멀티프로젝트 P6) — 자유 방향 분할.
+ * `direction` = row(좌우)·column(상하). `before` = 부 표면이 주 표면보다 **앞**
+ * (좌/상)인가. 기본 = 우측 분할(row·after) — 우클릭 "우측 분할로 열기"·기존
+ * setDualProject·기존 테스트가 그대로 성립한다(회귀 0).
+ */
+export interface SurfacePlacement {
+  direction: SplitDirection;
+  before: boolean;
+}
+
+/** 기본 배치 = 우측(row·after). 방향 인자 없이 부르면 이것 — 기존 동작 보존. */
+export const DEFAULT_PLACEMENT: SurfacePlacement = { direction: "row", before: false };
+
+/**
+ * 드롭 존(sessionDropZone `DropZone`) → 배치 매핑(P6). 좌/우=row, 상/하=column,
+ * before는 좌·상. center·미지 = null(분할 아님 — 호출부가 무시). sessionDropZone을
+ * import 하지 않으려 문자열을 받는다(순수·테스트 용이 — state→components 결합 회피).
+ */
+export function placementForZone(zone: string): SurfacePlacement | null {
+  switch (zone) {
+    case "left":
+      return { direction: "row", before: true };
+    case "right":
+      return { direction: "row", before: false };
+    case "above":
+      return { direction: "column", before: true };
+    case "below":
+      return { direction: "column", before: false };
+    default:
+      return null; // center / 미지 = 분할 아님
+  }
+}
 
 /** 리프 = 하나의 프로젝트 표면. */
 export interface SurfaceLeaf {
@@ -72,19 +108,45 @@ export function emptyTree(): SurfaceTree {
   return { version: SURFACE_TREE_VERSION, root: primaryLeaf() };
 }
 
-/** secondary 프로젝트가 담긴 row-분할 트리. */
-function treeWithSecondary(projectKey: string): SurfaceTree {
+/** secondary 프로젝트가 담긴 분할 트리(방향·위치 = placement, 기본 우측 row·after). */
+function treeWithSecondary(
+  projectKey: string,
+  placement: SurfacePlacement = DEFAULT_PLACEMENT,
+): SurfaceTree {
+  const primary = primaryLeaf();
+  const secondary: SurfaceLeaf = { kind: "leaf", surfaceId: "secondary", projectKey };
   return {
     version: SURFACE_TREE_VERSION,
     root: {
       kind: "split",
-      direction: "row",
-      children: [
-        primaryLeaf(),
-        { kind: "leaf", surfaceId: "secondary", projectKey },
-      ],
+      direction: placement.direction,
+      // before = 부 표면이 주 표면 앞(좌/상). findLeaf/secondaryProject는 순서
+      // 무관하게 secondary를 찾으므로 멤버십 조회는 그대로 성립한다.
+      children: placement.before ? [secondary, primary] : [primary, secondary],
     },
   };
+}
+
+/**
+ * 트리의 부 표면 배치(방향·위치)를 읽는다(P6 렌더용) — secondary 없으면 null.
+ * P6 트리는 root가 flat 2-child split이라 직접 자식에서 primary/secondary 인덱스를
+ * 비교한다. secondary가 더 깊이 중첩된(미래) 경우엔 방향을 못 읽어 기본(row·after)로
+ * 안전 낙하한다(멤버십은 secondaryProject가 여전히 정확).
+ */
+export function surfaceLayout(tree: SurfaceTree): SurfacePlacement | null {
+  const root = tree.root;
+  if (root.kind !== "split") return null;
+  const secIdx = root.children.findIndex(
+    (c) => c.kind === "leaf" && c.surfaceId === "secondary",
+  );
+  if (secIdx === -1) {
+    // 직접 자식에 없음 — 멤버십은 있을 수 있으나(중첩) 방향 판독 불가 → 기본.
+    return secondaryProject(tree) !== null ? { ...DEFAULT_PLACEMENT } : null;
+  }
+  const priIdx = root.children.findIndex(
+    (c) => c.kind === "leaf" && c.surfaceId === "primary",
+  );
+  return { direction: root.direction, before: priIdx !== -1 && secIdx < priIdx };
 }
 
 /**
@@ -103,9 +165,13 @@ export function secondaryProject(tree: SurfaceTree): string | null {
  * 파생(resolveVisibleDual)이 비파괴적으로 막는다. `projectKey`가 빈 값이면 제거로
  * 취급(레거시 setDualProject(null)과 동형).
  */
-export function addSurface(tree: SurfaceTree, projectKey: string | null): SurfaceTree {
+export function addSurface(
+  tree: SurfaceTree,
+  projectKey: string | null,
+  placement: SurfacePlacement = DEFAULT_PLACEMENT,
+): SurfaceTree {
   if (!projectKey) return removeSurface(tree);
-  return treeWithSecondary(projectKey);
+  return treeWithSecondary(projectKey, placement);
 }
 
 /** 우측 표면을 닫아 primary 단독으로 되돌린다. */
@@ -207,16 +273,18 @@ function extractSecondaryLoose(raw: unknown): string | null {
  *
  * 우선순위:
  *  1. `rawTree` present:
- *     a. 구조+의미 유효 → 정규화해 그대로(version 무관).
- *     b. version이 **현재보다 높을 때만** secondary 최선 추출(미래 대비).
- *     c. 그 외(현재/무버전 손상·throw) → 기본(primary 단독) — legacy 무시.
+ *     a. version === **현재와 정확히 일치** && 구조+의미 유효 → 그대로(방향 보존).
+ *     b. version이 **현재보다 높을 때만** secondary 최선 추출(미래 대비 — 구조를
+ *        그대로 신뢰하지 않는다: 미래 스키마 의미가 달라질 수 있어 멤버십만 건진다).
+ *     c. 그 외(version < 현재·미지·무버전·손상·throw) → 기본 — legacy 무시.
  *  2. `rawTree` 부재(null) → 레거시 `dualProject` 문자열로 구성(구→신 마이그레이션).
  *  3. 레거시도 없으면 → 기본.
  *
- * @param rawTree 트리 JSON을 파싱한 값(또는 null). P3'은 디스크에서 트리 블롭을
- *   읽지 않으므로(FB — 단일 legacy 키 persist) 실사용은 null이지만, 스키마의
- *   parse/validate 계약과 미래(P6) 트리 persist를 위해 완전 견고화한다.
- * @param legacyDual localStorage `"dualProject"` 문자열(구·현 표현) 또는 null.
+ * @param rawTree 트리 블롭 JSON을 파싱한 값(또는 null). P6부터 디스크 정본이라
+ *   present가 정상 경로다. 손상·예산 초과·순환·미지 version은 전부 기본으로 낙하.
+ * @param legacyDual localStorage `LEGACY_DUAL_KEY` 문자열 또는 null — **rawTree가
+ *   부재(null)일 때만** 의미(pre-P6 마이그레이션). rawTree present면 호출부가 null을
+ *   넘긴다(트리가 정본, legacy 비교 없음 — P6 재슬라이스).
  */
 export function parseSurfaceTree(rawTree: unknown, legacyDual: string | null): SurfaceTree {
   if (rawTree !== null && rawTree !== undefined) {
@@ -225,14 +293,19 @@ export function parseSurfaceTree(rawTree: unknown, legacyDual: string | null): S
       if (typeof rawTree === "object") {
         const t = rawTree as Record<string, unknown>;
         const version = typeof t.version === "number" ? t.version : null;
-        if (version !== null && isValidTree(t.root)) {
+        // 현재 버전과 **정확히 일치**할 때만 구조를 그대로 채택한다(F3 — codex P2-1).
+        // 미지 version(구조만 유효)을 그대로 믿으면 미래/과거 스키마의 의미 변화가
+        // 현재 필드 계약을 조용히 깨뜨린다("미지 version→default" 계약 위반).
+        if (version === SURFACE_TREE_VERSION && isValidTree(t.root)) {
           return { version, root: t.root as SurfaceNode };
         }
-        // 미래(더 높은 version) 스키마만 secondary 최선 추출.
+        // 미래(더 높은 version) 스키마만 secondary 최선 추출(구조 채택 아님 —
+        // 멤버십만 건져 기본 배치로 재구성).
         if (version !== null && version > SURFACE_TREE_VERSION) {
           const loose = extractSecondaryLoose(rawTree);
           if (loose) return treeWithSecondary(loose);
         }
+        // version < 현재·미지·무버전 = 아래 emptyTree()로 낙하(default 계약).
       }
     } catch {
       // 예산 초과·순환 등 어떤 throw든 손상 취급.

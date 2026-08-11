@@ -3,6 +3,12 @@ import { open } from "@tauri-apps/plugin-dialog";
 import { useAppStore } from "../state/store";
 import { TypeBadges } from "./TypeBadges";
 
+/** 프로젝트 탭 드래그 전용 MIME(멀티프로젝트 P6). 세션행
+ * (application/x-workbench-session)·dockview 내부 드래그와 상호 무간섭 —
+ * 화면 가장자리 드롭존(App)은 이 타입이 실린 드래그에만 반응한다. 탭바 내
+ * 재정렬은 draggedPath 로컬 상태로 처리(이 MIME 무관, 보존). */
+export const PROJECT_DRAG_MIME = "application/x-workbench-project";
+
 export function ProjectTabs() {
   const projects = useAppStore((s) => s.projects);
   const activeProject = useAppStore((s) => s.activeProject);
@@ -74,6 +80,8 @@ export function ProjectTabs() {
             draggable
             onDragStart={(e) => {
               setDraggedPath(p.path);
+              // 전용 MIME으로 화면 드롭존(App)이 프로젝트 드래그만 골라 반응한다(P6).
+              e.dataTransfer.setData(PROJECT_DRAG_MIME, p.path);
               // WebKitGTK only initiates a drag when dataTransfer is populated.
               e.dataTransfer.setData("text/plain", p.path);
               e.dataTransfer.effectAllowed = "move";
