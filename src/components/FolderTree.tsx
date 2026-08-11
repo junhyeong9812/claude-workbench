@@ -171,6 +171,12 @@ export function FolderTree() {
   const reloadTreeFor = useAppStore((s) => s.reloadTreeFor);
   const reloadDir = useAppStore((s) => s.reloadDir);
   const requestTerminalOpen = useAppStore((s) => s.requestTerminalOpen);
+  // C3 백그라운드 폴 정지: **활성 표면**의 트리만 4s 폴을 돌린다 — 비활성 표면은
+  // 파일워처 인터벌을 멈춰 프로젝트 N개의 폴 N배를 막는다. 활성화 시 즉시 1회
+  // 리로드로 정지 동안의 변경을 따라잡는다. (타임라인은 앱-전역 폴이라 계속 —
+  // 에이전트 진행 관찰, 확정 축.)
+  const activeSurfaceId = useAppStore((s) => s.activeSurfaceId);
+  const pollActive = surfaceId === activeSurfaceId;
 
   // 우클릭 CRUD(메뉴·입력/삭제 다이얼로그)는 공용 훅 소유 — 스터디·개발 트리와
   // 같은 코드다. 여기 남는 다이얼로그는 트리 DnD 고유의 덮어쓰기 확인 하나뿐.
@@ -223,12 +229,14 @@ export function FolderTree() {
   // Disk reload: poll **this surface's** tree (root + expanded) so external file
   // add/delete shows up on its own (manual ↻ in the toolbar bumps it too). P5:
   // reloadTreeFor(activeProject=surfaceProject) — 부 표면 트리가 전역 activeProject
-  // (주 프로젝트)를 리로드하던 2인스턴스 버그 차단. 폴 정지 게이트는 C3.
+  // (주 프로젝트)를 리로드하던 2인스턴스 버그 차단. C3: **활성 표면만** 폴한다
+  // (비활성 표면은 인터벌 없음 → N배 폴 방지). 활성화 즉시 1회 리로드로 catch-up.
   useEffect(() => {
-    if (!activeProject) return;
+    if (!activeProject || !pollActive) return;
+    void reloadTreeFor(activeProject);
     const t = setInterval(() => void reloadTreeFor(activeProject), 4000);
     return () => clearInterval(t);
-  }, [activeProject, reloadTreeFor]);
+  }, [activeProject, pollActive, reloadTreeFor]);
 
   const isExpanded = (p: string): boolean => expandedSetOf(useAppStore.getState()).has(p);
 
