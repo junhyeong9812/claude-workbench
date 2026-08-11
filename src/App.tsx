@@ -298,6 +298,9 @@ function AppMain() {
       return;
     }
     e.preventDefault();
+    // 코스메틱(Opus P3): center 존도 여기선 dropEffect="move"로 보이지만 드롭은
+    // no-op다(onProjDrop에서 placementForZone(center)===null → 무시). 시각상 큰
+    // 문제는 아니라 동작은 그대로 두고 명시만 한다.
     e.dataTransfer.dropEffect = "move";
     // dragover는 초당 수십 회 — 동일 타깃이면 setState 생략(rect 4값 전부 비교, S4).
     setProjDrop((prev) =>
@@ -1160,6 +1163,8 @@ function AppMain() {
               direction={dualDirection === "column" ? "vertical" : "horizontal"}
               // 방향별 persist 버킷 — row(좌우)와 column(상하)이 서로의 비율을
               // 뒤집어 쓰지 않게 분리한다(리뷰: 축이 바뀌면 저장 비율이 부적절).
+              // 코스메틱(Opus P3): 이 버킷 분리가 도입되면서 기존 사용자의 저장된
+              // dual 분할 비율이 딱 1회 기본값으로 리셋된다(다음 드래그로 자가치유).
               autoSaveId={dualDirection === "column" ? "dual-surface-col" : "dual-surface-row"}
               className="dual-row"
             >
