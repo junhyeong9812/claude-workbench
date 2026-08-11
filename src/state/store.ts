@@ -8,8 +8,9 @@ import { capTreeCache, computeTreeKeepSet, pruneTreeCache, sameEntries, underRoo
 import { setActiveSurfaceSeam, type SurfaceId } from "./surfaceContext";
 import {
   addSurface,
+  emptyTree,
+  parseSurfaceTree,
   removeSurface,
-  resolveSurfaceTree,
   secondaryProject,
   type SurfacePlacement,
   type SurfaceTree,
@@ -294,52 +295,51 @@ const SURFACE_TREE_KEY = "surfaceTree";
 const LEGACY_DUAL_KEY = "dualProject";
 
 /**
- * Load the surface tree from localStorage (멀티프로젝트 P6 — 트리 디스크 정본화).
+ * Load the surface tree from localStorage (멀티프로젝트 P6 — 트리 디스크 정본화,
+ * 재슬라이스).
  *
- * P6부터 트리는 **방향/위치**를 담으므로 `surfaceTree` 블롭이 디스크 정본이다.
- * 레거시 `dualProject` 문자열은 **다운그레이드용 파생 미러**(구버전 앱이 읽는 유일
- * 키)로 병행 기록된다. parseSurfaceTree가 이미: 트리 present·유효→채택(방향 보존)·
- * present-but-corrupt→기본·부재→legacy 마이그레이션(구버전에서 올라온 경우)으로
- * 견고화돼 있다.
+ * **트리 블롭(`SURFACE_TREE_KEY`) = 유일한 로드 정본.** 레거시 문자열
+ * (`LEGACY_DUAL_KEY`)은 write-only 다운그레이드 빵부스러기(구버전 앱만 읽음)라 로드
+ * 시 **비교·화해하지 않는다** — 예전 tree↔legacy 화해가 만들던 엣지 클래스(실패쓰기
+ * 오인·present "null" 부활·stale legacy 승리)를 원천 소멸시킨 재슬라이스다.
  *
- * **다운그레이드 화해(P6)**: 구버전 앱은 `dualProject`만 만질 수 있고 `surfaceTree`
- * 는 손 못 댄다(무시). 그래서 두 키가 어긋나면(구버전이 분할을 닫았거나 다른
- * 프로젝트로 바꿈) **legacy가 멤버십 정본, 트리가 방향 정본**이 되도록 단방향
- * 화해한다 — "닫힌 분할 부활"(stale 트리가 legacy null을 이김)을 원천 차단.
- * 신버전이 두 키를 동기 기록하는 정상 경로에선 항상 일치라 화해는 no-op. 화해
- * 로직 정본 = surfaceTree.resolveSurfaceTree(순수·테스트 대상). */
+ *  - **키 부재(`raw === null`, pre-P6 세션)** → legacy에서 1회 마이그레이션
+ *    (`parseSurfaceTree(null, legacy)`). pre-P6 세션이 남긴 유일한 표현이 legacy다.
+ *  - **키 존재(어떤 값이든)** → 트리가 정본. `JSON.parse` 후 `parseSurfaceTree(_, null)`
+ *    로 해석하고 **legacy는 무시**한다. parseSurfaceTree가 현재 version·유효 구조만
+ *    채택(방향 보존)하고, present `"null"`(→parsed null·legacy=null)·손상·미지
+ *    version은 전부 기본으로 낙하한다. JSON.parse 자체가 throw면 손상 → 기본.
+ *
+ * same-version 닫기 부활 방지는 트리만 읽어 성립한다(신버전이 트리를 최신 유지 →
+ * 닫으면 두 키 모두 제거 → 다음 로드는 키 부재 → legacy=null → 기본). cross-version
+ * 라운드트립(다운그레이드 세션 중 편집 역동기화)만 포기하며 명세 밖·희귀다. */
 export function loadSurfaceTree(): SurfaceTree {
-  const stored = localStorage.getItem(SURFACE_TREE_KEY);
-  const legacy = localStorage.getItem(LEGACY_DUAL_KEY);
-  // 진짜 부재(키 없음) → 레거시 마이그레이션 경로(pre-P6 세션 정상 승격).
-  if (stored === null) return resolveSurfaceTree(null, legacy);
-  let rawTree: unknown;
+  const raw = localStorage.getItem(SURFACE_TREE_KEY);
+  // 키 부재(pre-P6 세션) → legacy에서 1회 마이그레이션.
+  if (raw === null) return parseSurfaceTree(null, localStorage.getItem(LEGACY_DUAL_KEY));
+  // 키 존재 → 트리가 정본. legacy 무시(화해 없음).
+  let parsed: unknown;
   try {
-    rawTree = JSON.parse(stored);
+    parsed = JSON.parse(raw);
   } catch {
-    // 손상 블롭(문법 깨짐)은 **부재가 아니다**(F2 — codex P1-2): stale legacy를
-    // 신뢰해 닫힌 분할을 부활시키지 않도록 손상 플래그로 보수적 기본을 알린다.
-    return resolveSurfaceTree(null, legacy, true);
+    return emptyTree(); // 손상 JSON → 기본(stale legacy 부활 없음).
   }
-  return resolveSurfaceTree(rawTree, legacy);
+  return parseSurfaceTree(parsed, null);
 }
 
 /**
- * Persist the surface tree to disk (멀티프로젝트 P6). **이중 기록**이지만 P3'에서
- * 위험했던 비원자 분기와 다르다: 트리(`surfaceTree`)가 **방향까지 담는 유일 정본**
- * 이고, 레거시 문자열(`dualProject`)은 그 secondary의 **단방향 파생 미러**(다운그레이드
- * 전용)다. 한 함수·연속 setItem으로 항상 함께 기록/삭제하므로 신버전 세션에선 두 키가
- * 절대 어긋나지 않고, 어긋남은 오직 구버전 세션이 낀 뒤에만 생겨 loadSurfaceTree의
- * 화해가 흡수한다(legacy=멤버십·트리=방향). secondary 없으면 두 키 모두 제거. */
+ * Persist the surface tree to disk (멀티프로젝트 P6 — 재슬라이스). 트리
+ * (`SURFACE_TREE_KEY`)가 **방향까지 담는 유일 로드 정본**이고, 레거시 문자열
+ * (`LEGACY_DUAL_KEY`)은 secondary의 **write-only 다운그레이드 빵부스러기**(구버전
+ * 앱만 읽는다 — 로드 화해에 안 씀)다. 두 키를 한 함수에서 함께 기록/삭제하되 로드가
+ * 트리만 보므로 순서·정합은 무관하다. secondary 없으면(닫힘) 두 키 모두 제거 →
+ * 다음 로드는 키 부재 → legacy=null → 기본(닫힘 유지). 트리 블롭은 방향만 담고
+ * provenance 마커는 넣지 않는다(화해가 사라져 불요). */
 function persistSurfaceTree(tree: SurfaceTree) {
   const secondary = secondaryProject(tree);
   if (secondary) {
-    // 정본(방향 포함) + provenance 마커 `legacyMirror`(= 이 쓰기 시점의 legacy 값).
-    // 로드 시 legacyMirror ≠ 현재 legacy면 그 사이 구버전이 legacy를 바꾼 것
-    // (진짜 다운그레이드)임을 판별해 stale legacy가 valid 트리를 이기지 못하게 한다
-    // (F1 — codex P1-1). 마커는 항상 secondary와 일치(불변식).
-    localStorage.setItem(SURFACE_TREE_KEY, JSON.stringify({ ...tree, legacyMirror: secondary }));
-    localStorage.setItem(LEGACY_DUAL_KEY, secondary); // 다운그레이드 파생 미러
+    localStorage.setItem(SURFACE_TREE_KEY, JSON.stringify(tree)); // 정본(방향 포함)
+    localStorage.setItem(LEGACY_DUAL_KEY, secondary); // write-only 다운그레이드 빵부스러기
   } else {
     localStorage.removeItem(SURFACE_TREE_KEY);
     localStorage.removeItem(LEGACY_DUAL_KEY);

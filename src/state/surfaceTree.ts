@@ -15,18 +15,20 @@
  * **secondary 리프의 projectKey만 저장 멤버십**이다. 이 덕에 현 동작이 정확히
  * 보존된다(primary가 activeProject를 그대로 따름).
  *
- * ## 다운그레이드 안전 — 단일 키 persist (FB, 리뷰)
- * P3'의 트리는 secondary 0~1개뿐이라 정보량이 레거시 `dualProject` 문자열과
- * **동형**(direction 항상 row·ratio는 react-resizable-panels 소유·저장 정보 =
- * secondaryProject 하나)이다. 그래서 트리는 **메모리 정본**으로만 두고 디스크
- * persist는 레거시 `dualProject` 단일 키로만 한다(store.ts). 두 키의 비원자 이중
- * 기록이 만들던 영구 분기(닫은 분할 부활·다중창·다운/업그레이드 유실)가 원천
- * 소멸하고, 다운그레이드는 자명하다(구버전 앱이 읽는 유일 키를 그대로 쓴다).
- * 방향·N-way를 실제로 담는 트리 persist는 그걸 필요로 하는 P6로 이연한다.
+ * ## 디스크 정본 = 트리 블롭 하나 (멀티프로젝트 P6 — 재슬라이스)
+ * P6부터 트리는 **방향(row/column)·위치**를 담으므로 레거시 `dualProject` 문자열과
+ * 더는 동형이 아니다. 그래서 디스크 정본은 **트리 블롭 하나**(store.ts
+ * `SURFACE_TREE_KEY`)이고, 레거시 문자열(`LEGACY_DUAL_KEY`)은 **write-only 다운그레이드
+ * 빵부스러기**(구버전 앱만 읽는다)로 병기만 한다. **로드 시 두 키를 비교·화해하지
+ * 않는다** — 트리 키가 present면 트리가 정본, 부재면(pre-P6 세션) legacy에서 1회
+ * 마이그레이션. 이 단방향 규칙이 예전 tree↔legacy 화해가 만들던 엣지 클래스(실패쓰기
+ * 오인·present "null" 부활·stale legacy 승리)를 원천 소멸시킨다. cross-version
+ * 라운드트립(다운그레이드 세션 중 편집 역동기화)만 포기하며 이는 명세 밖·희귀다.
  *
- * 그럼에도 parseSurfaceTree는 트리 블롭 입력까지 완전 견고화한다(미래 P6 대비):
- * 미래(더 높은 version) 트리는 secondary를 최선 추출, 손상·예산 초과·순환은 전부
- * 기본 레이아웃(primary 단독)으로 — persist의 "로드 실패=default" 계약과 동형.
+ * parseSurfaceTree는 트리 블롭 입력을 완전 견고화한다: 현재 version·유효 구조만
+ * 채택(방향 보존), 미래(더 높은 version) 트리는 secondary 최선 추출, 손상·예산
+ * 초과·순환·미지 version은 전부 기본 레이아웃(primary 단독)으로. legacy 인자는
+ * **트리 블롭 부재(마이그레이션) 시에만** 의미가 있고, present면 호출부가 null을 넘긴다.
  */
 import type { SurfaceId } from "./surfaceContext";
 
@@ -278,10 +280,11 @@ function extractSecondaryLoose(raw: unknown): string | null {
  *  2. `rawTree` 부재(null) → 레거시 `dualProject` 문자열로 구성(구→신 마이그레이션).
  *  3. 레거시도 없으면 → 기본.
  *
- * @param rawTree 트리 JSON을 파싱한 값(또는 null). P3'은 디스크에서 트리 블롭을
- *   읽지 않으므로(FB — 단일 legacy 키 persist) 실사용은 null이지만, 스키마의
- *   parse/validate 계약과 미래(P6) 트리 persist를 위해 완전 견고화한다.
- * @param legacyDual localStorage `"dualProject"` 문자열(구·현 표현) 또는 null.
+ * @param rawTree 트리 블롭 JSON을 파싱한 값(또는 null). P6부터 디스크 정본이라
+ *   present가 정상 경로다. 손상·예산 초과·순환·미지 version은 전부 기본으로 낙하.
+ * @param legacyDual localStorage `LEGACY_DUAL_KEY` 문자열 또는 null — **rawTree가
+ *   부재(null)일 때만** 의미(pre-P6 마이그레이션). rawTree present면 호출부가 null을
+ *   넘긴다(트리가 정본, legacy 비교 없음 — P6 재슬라이스).
  */
 export function parseSurfaceTree(rawTree: unknown, legacyDual: string | null): SurfaceTree {
   if (rawTree !== null && rawTree !== undefined) {
@@ -312,53 +315,4 @@ export function parseSurfaceTree(rawTree: unknown, legacyDual: string | null): S
   // rawTree 부재(null) → 레거시 문자열로 구→신 마이그레이션.
   if (typeof legacyDual === "string" && legacyDual) return treeWithSecondary(legacyDual);
   return emptyTree();
-}
-
-/** 트리 블롭에 동봉된 provenance 마커 `legacyMirror`(쓰기 시점의 legacy 값 =
- * secondaryProject) 읽기. 없으면 undefined(P6-이전·손 안 탄 블롭 = 구 화해로 폴백). */
-function legacyMirrorOf(rawTree: unknown): string | undefined {
-  if (rawTree && typeof rawTree === "object") {
-    const m = (rawTree as Record<string, unknown>).legacyMirror;
-    if (typeof m === "string") return m;
-  }
-  return undefined;
-}
-
-/**
- * 디스크 로드 정본화 + 다운그레이드 화해(멀티프로젝트 P6).
- *
- * P6부터 트리 블롭(`rawTree`)이 방향까지 담는 디스크 정본이고, 레거시 문자열
- * (`legacy`)은 구버전 앱이 읽는 **파생 미러**다. 두 표현이 어긋나는 원인은 여럿이다
- * (다운그레이드 vs stale vs 실패쓰기 vs 손상). **legacyMirror provenance 마커**로
- * 구별한다(F1 — codex P1-1). persist가 트리 블롭에 `legacyMirror = 그때의 legacy`를
- * 동봉하므로:
- *  - `rawCorrupt` (블롭이 있으나 파싱 자체 실패, F2) → 블롭 **부재가 아니라 손상** →
- *    stale legacy를 신뢰하지 않고 보수적 기본(primary 단독). 부재(마이그레이션)와 구별.
- *  - `rawTree` 부재(null) → parse가 이미 legacy로 마이그레이션(정의상 일치) → 그대로.
- *  - 멤버십 일치(legacy === 트리 secondary) → 트리 정본(방향 보존).
- *  - **legacyMirror === 현재 legacy** → 그 사이 구버전이 legacy를 건드리지 않음
- *    (신버전 쓰기·무변경) → 트리 정본(방향 보존). 실패쓰기·same-version이 여기.
- *  - **legacyMirror ≠ 현재 legacy(또는 마커 부재)** → 그 사이 구버전이 legacy 변경
- *    = 진짜 다운그레이드 → legacy 멤버십 정본, 트리 방향 보존. legacy 부재면 닫힘.
- */
-export function resolveSurfaceTree(
-  rawTree: unknown,
-  legacy: string | null,
-  rawCorrupt = false,
-): SurfaceTree {
-  // 손상 블롭(파싱 실패)은 블롭 부재와 다르다(F2) — stale legacy 부활 금지, 보수적 기본.
-  if (rawCorrupt) return emptyTree();
-  const tree = parseSurfaceTree(rawTree, legacy);
-  if (rawTree === null || rawTree === undefined) return tree; // legacy 경로 = 정의상 일치
-  const treeSec = secondaryProject(tree);
-  if ((legacy || null) === (treeSec || null)) return tree; // 멤버십 일치 → 트리 정본
-  // 멤버십 불일치 → provenance 마커로 원인 판별.
-  const mirror = legacyMirrorOf(rawTree);
-  if (mirror !== undefined && mirror === legacy) {
-    // 마커 == 현재 legacy → 구버전이 legacy를 안 바꿈 → 트리를 정본으로 신뢰.
-    return tree;
-  }
-  // 마커 부재(구 블롭) 또는 마커 ≠ legacy → 구버전이 legacy 변경(다운그레이드).
-  if (!legacy) return emptyTree(); // 구버전이 닫음 → 부활 금지
-  return addSurface(emptyTree(), legacy, surfaceLayout(tree) ?? undefined); // 방향 보존
 }
