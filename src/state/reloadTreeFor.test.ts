@@ -72,3 +72,46 @@ describe("reloadTreeFor — 표면-스코프 폴 (전역 activeProject 아님)",
     expect(readDirCalls).not.toContain("/b");
   });
 });
+
+/**
+ * toggleExpandedFor 프로젝트-스코프 (P5 F2) — 부 표면 트리가 자기 프로젝트의
+ * tree_state에만 확장을 기록해야 한다. 예전 toggleExpanded는 전역 activeProject에
+ * 기록해, 부 표면(secondary) 폴더를 펼치면 주 프로젝트 tree_state가 오염되고
+ * reloadTreeFor(secondary)가 그 확장을 못 봤다(재시작 후 부 확장 소실).
+ */
+describe("toggleExpandedFor — 프로젝트-스코프 확장 (2인스턴스 격리)", () => {
+  beforeEach(() => {
+    localStorage.clear();
+    useAppStore.setState({
+      activeProject: "/a", // 전역 활성은 /a
+      projects: [mkProject("/a", []), mkProject("/b", [])] as never,
+    });
+  });
+
+  const expandedOf = (project: string): string[] =>
+    useAppStore.getState().projects.find((p) => p.path === project)?.tree_state.expanded ?? [];
+
+  it("toggleExpandedFor('/b', dir)는 /b의 tree_state에만 기록(주 /a 무영향)", () => {
+    useAppStore.getState().toggleExpandedFor("/b", "/b/lib");
+    expect(expandedOf("/b")).toContain("/b/lib");
+    expect(expandedOf("/a")).toEqual([]); // 주 프로젝트 오염 없음
+  });
+
+  it("접기도 그 프로젝트에만 — 두 프로젝트가 서로의 확장을 안 건드린다", () => {
+    const g = useAppStore.getState();
+    g.toggleExpandedFor("/a", "/a/src");
+    g.toggleExpandedFor("/b", "/b/lib");
+    expect(expandedOf("/a")).toEqual(["/a/src"]);
+    expect(expandedOf("/b")).toEqual(["/b/lib"]);
+    // /b 접기 → /a 확장 온전.
+    useAppStore.getState().toggleExpandedFor("/b", "/b/lib");
+    expect(expandedOf("/b")).toEqual([]);
+    expect(expandedOf("/a")).toEqual(["/a/src"]);
+  });
+
+  it("toggleExpanded(레거시)는 전역 activeProject(/a)로 위임", () => {
+    useAppStore.getState().toggleExpanded("/a/src");
+    expect(expandedOf("/a")).toContain("/a/src");
+    expect(expandedOf("/b")).toEqual([]);
+  });
+});

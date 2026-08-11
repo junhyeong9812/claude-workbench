@@ -621,8 +621,12 @@ interface AppState {
   /** Subscribe to cross-window `project-sync` events; returns an unlisten fn.
    * Both the main window and popout windows call this (review R0-4). */
   initProjectSync: () => Promise<UnlistenFn>;
-  /** Expand/collapse a directory for the active project. */
+  /** Expand/collapse a directory for the active project (= toggleExpandedFor의
+   * 활성 프로젝트 위임 — 하위호환). */
   toggleExpanded: (dirPath: string) => void;
+  /** Expand/collapse a directory for a **specific project** (P5 F2 — 부 표면
+   * 트리가 자기 프로젝트의 tree_state에만 기록하게). */
+  toggleExpandedFor: (project: string | null, dirPath: string) => void;
   /** Lazily load a directory's children via the backend. */
   loadChildren: (dirPath: string) => Promise<void>;
   /** Force re-read a directory (after create/delete) — bypasses the cache. */
@@ -1304,12 +1308,16 @@ export const useAppStore = create<AppState>((set, get) => ({
     saveStudyView(get());
   },
 
-  toggleExpanded: (dirPath) => {
+  toggleExpanded: (dirPath) => get().toggleExpandedFor(get().activeProject, dirPath),
+  toggleExpandedFor: (project, dirPath) => {
+    if (!project) return;
     // expanded는 항상 **새 배열**로 교체한다 — expandedSetOf의 identity 메모
-    // 계약(in-place push/splice 금지, treeSelectors 참조).
+    // 계약(in-place push/splice 금지, treeSelectors 참조). P5 F2: **인자 project**의
+    // tree_state에만 기록 → 부 표면 확장이 주 프로젝트 확장을 오염시키지 않고,
+    // reloadTreeFor(project)가 자기 확장 dir를 정확히 본다.
     set((s) => ({
       projects: s.projects.map((p) => {
-        if (p.path !== s.activeProject) return p;
+        if (p.path !== project) return p;
         const expanded = p.tree_state.expanded;
         const next = expanded.includes(dirPath)
           ? expanded.filter((d) => d !== dirPath)

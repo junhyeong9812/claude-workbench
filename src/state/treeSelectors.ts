@@ -18,22 +18,30 @@ interface TreeStateSlice {
 }
 
 const EMPTY_EXPANDED: string[] = [];
-let memoArr: readonly string[] = EMPTY_EXPANDED;
-let memoSet: ReadonlySet<string> = new Set();
+const EMPTY_SET: ReadonlySet<string> = new Set();
+/** 프로젝트별 배열-identity 메모 (P5 F2 — 두 표면이 서로 다른 프로젝트 트리를
+ * 동시에 조회하므로 단일 홀더는 서로를 thrash한다). key=프로젝트 경로. */
+const expandedMemo = new Map<string, { arr: readonly string[]; set: ReadonlySet<string> }>();
 
-/** 활성 프로젝트의 expanded 목록을 lookup Set으로 (배열 identity 메모 — 같은
- * 배열이면 같은 Set 인스턴스). 셀렉터 안에서 매 store set마다 호출돼도 toggle
- * 시에만 재구축된다.
- * 계약: expanded 배열은 **절대 in-place 변경 금지**(toggleExpanded는 항상 새
+/** **한 프로젝트의** expanded 목록을 lookup Set으로 (배열 identity 메모 — 같은
+ * 배열이면 같은 Set 인스턴스). `project` 생략 시 활성 프로젝트(하위호환). 셀렉터
+ * 안에서 매 store set마다 호출돼도 toggle 시에만 재구축된다.
+ *
+ * **P5 F2**: 프로젝트를 인자로 받는다 — FolderTree가 자기 표면 프로젝트를 넘겨
+ * 각 트리가 **자기 프로젝트의** 확장 상태를 읽는다(부 표면 확장이 주 프로젝트
+ * 확장을 오염시키지 않게).
+ * 계약: expanded 배열은 **절대 in-place 변경 금지**(toggleExpandedFor는 항상 새
  * 배열 생성) — push 한 줄이면 이 메모가 조용히 stale해진다(리뷰 P3). */
-export function expandedSetOf(s: TreeStateSlice): ReadonlySet<string> {
-  const arr =
-    s.projects.find((p) => p.path === s.activeProject)?.tree_state.expanded ?? EMPTY_EXPANDED;
-  if (arr !== memoArr) {
-    memoArr = arr;
-    memoSet = new Set(arr);
-  }
-  return memoSet;
+export function expandedSetOf(s: TreeStateSlice, project?: string | null): ReadonlySet<string> {
+  const proj = project === undefined ? s.activeProject : project;
+  if (proj == null) return EMPTY_SET;
+  const arr = s.projects.find((p) => p.path === proj)?.tree_state.expanded ?? EMPTY_EXPANDED;
+  if (arr === EMPTY_EXPANDED) return EMPTY_SET;
+  const cached = expandedMemo.get(proj);
+  if (cached && cached.arr === arr) return cached.set;
+  const set = new Set(arr);
+  expandedMemo.set(proj, { arr, set });
+  return set;
 }
 
 /** 두 read_dir 결과의 전 필드 동일성 (표시에 쓰이는 필드 전부). */

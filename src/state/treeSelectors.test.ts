@@ -27,6 +27,17 @@ describe("expandedSetOf", () => {
     expect(expandedSetOf(state(["/proj/a"], "/nope")).has("/proj/a")).toBe(false);
   });
 
+  it("project 인자 — 활성이 아닌 프로젝트의 확장도 읽는다(P5 F2)", () => {
+    // 활성은 /proj지만 /other의 확장을 명시 조회.
+    const s = state(["/proj/a"], "/proj");
+    expect(expandedSetOf(s, "/other").has("/other/x")).toBe(true);
+    expect(expandedSetOf(s, "/other").has("/proj/a")).toBe(false);
+    // 같은 s로 두 프로젝트를 조회해도 서로 thrash 없이 각자 정답.
+    expect(expandedSetOf(s, "/proj").has("/proj/a")).toBe(true);
+    expect(expandedSetOf(s, "/other").has("/other/x")).toBe(true);
+    expect(expandedSetOf(s, null).has("/proj/a")).toBe(false); // null → 빈 셋
+  });
+
   it("같은 배열 identity → 같은 Set 인스턴스(메모), 새 배열 → 재구축", () => {
     const s = state(["/proj/a"]);
     const first = expandedSetOf(s);
