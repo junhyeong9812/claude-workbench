@@ -5,6 +5,7 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 import type { ITheme } from "@xterm/xterm";
 import type { DirEntry, Project, ProjectType, SshConnection, WorkspaceState } from "../types";
 import { capTreeCache, computeTreeKeepSet, pruneTreeCache, sameEntries, underRoot } from "./treeSelectors";
+import { activeSurfaceId, type SurfaceId } from "./surfaceContext";
 import { basename } from "../utils/path";
 
 /** Clamp a font size to the allowed range (also normalizes NaN). */
@@ -273,11 +274,24 @@ interface AppState {
   /** A file opened from the commit-files sidebar, shown as a peek-style view over
    * the main area (file content at the commit + diff toggle), or null. Transient. */
   gitHistoryFile: { root: string; commit: string; path: string } | null;
+  /**
+   * ── 요청버스 표면 라우팅 (멀티프로젝트 P2) ─────────────────────────────
+   * 아래 표면-라우팅 슬롯들은 각자 `targetSurfaceId`(발행 시점의 활성 표면 id,
+   * `activeSurfaceId()`가 stamp)를 실어 나른다. 소비자(MainArea)는 자기
+   * `useSurfaceId()`와 `targetSurfaceId`가 일치할 때만 소비한다. P2에서는
+   * `activeSurfaceId()`가 항상 "primary"이고 소비 표면도 primary 하나뿐이라
+   * 완전 무동작이다 — P4'가 `activeSurfaceId()`를 실제 활성 표면으로 교체하면
+   * 이 버스 전체가 그 표면으로 라우팅된다(소비부 무변경, seam은 그 함수 하나).
+   *
+   * 표면 단위가 아니라 **세션 단위**인 요청(`claudeInjectRequest`/`Acks`·
+   * `devReviewQueue`·`focusSessionRequest` — uuid/프로젝트로 짝지어 어느 표면이든
+   * 그 세션을 찾아가는 것)은 이 라우팅 대상이 **아니다**(P2 범위 밖).
+   * ──────────────────────────────────────────────────────────────────── */
   /** A request to open a file in the editor (consumed by MainArea, which owns the
-   * dockview api), or null. Transient. */
-  editorOpenRequest: string | null;
+   * dockview api), or null. Transient. `targetSurfaceId`로 라우팅(P2). */
+  editorOpenRequest: { path: string; targetSurfaceId: SurfaceId } | null;
   /** A request to open a diff panel (consumed by MainArea), or null. Transient. */
-  diffRequest: DiffSpec | null;
+  diffRequest: (DiffSpec & { targetSurfaceId: SurfaceId }) | null;
   /** A request to open a new Claude session bound to `project` (consumed by
    * MainArea, which owns the dockview api), or null. Transient — used by the
    * worktree panel's one-click "Claude 열기" and review mode (`seed`/`title`:
@@ -293,6 +307,8 @@ interface AppState {
      * surfaces that inherit the last-used options (worktree, review). */
     model?: string;
     effort?: string;
+    /** 표면 라우팅 키(P2) — 발행 시점의 활성 표면. */
+    targetSurfaceId: SurfaceId;
   } | null;
   /**
    * A request to open a new **codex** session bound to `project` (consumed by
@@ -304,7 +320,7 @@ interface AppState {
    * codex가 절대 쓰지 않을 필드를 계속 지나치게 된다. 두 요청은 각자 작고
    * 각자 완결이다.
    */
-  codexOpenRequest: { project: string; model?: string; effort?: string } | null;
+  codexOpenRequest: { project: string; model?: string; effort?: string; targetSurfaceId: SurfaceId } | null;
   /** Inject a prompt into an already-live Claude session (dev mode's 확인 button
    * re-uses the project's dev session). Matched by session uuid in ClaudeTermPanel.
    *
@@ -346,7 +362,7 @@ interface AppState {
    * project's entries, in order; other projects' entries never block it. */
   devReviewQueue: Array<{ id: string; project: string; prompt: string }>;
   /** Build/test runner: open a terminal panel that runs `cmd` (consumed by MainArea). */
-  runRequest: { project: string; cmd: string; title: string } | null;
+  runRequest: { project: string; cmd: string; title: string; targetSurfaceId: SurfaceId } | null;
   /** 트리 폴더 우클릭 "여기서 터미널 열기" → 그 폴더 cwd의 일반 터미널 탭.
    *
    * 소비자는 **화면 앞에 있는 dock 하나**다 — 통합=MainArea(주 surface)·개발=
@@ -354,33 +370,36 @@ interface AppState {
    * (스터디 모드는 MainArea 자체가 언마운트, 개발/통합은 레이어 게이트) 요청
    * 하나가 두 dock에 열리지 않는다. `nonce`는 같은 폴더를 연달아 열어도 효과가
    * 다시 발화하게 한다. */
-  terminalOpenRequest: { cwd: string; title: string; nonce: number } | null;
+  terminalOpenRequest: { cwd: string; title: string; nonce: number; targetSurfaceId: SurfaceId } | null;
   /** Bumped to ask MainArea to focus the active dockview panel (Ctrl+B from the
-   * already-focused tree toggles focus back to the open tab). A counter so every
-   * press re-fires even when the value would otherwise be unchanged. */
-  focusMainRequest: number;
+   * already-focused tree toggles focus back to the open tab). `nonce` counter so
+   * every press re-fires even when the value would otherwise be unchanged.
+   * `targetSurfaceId`로 라우팅(P2 — 활성 표면의 MainArea만 소비). */
+  focusMainRequest: { targetSurfaceId: SurfaceId; nonce: number };
   /** Request MainArea activate the Claude panel for a session uuid (the toolbar
    * attention roll-up's cycle-click). `nonce` re-fires the effect even when the
    * same uuid is requested twice in a row. Transient. No-op if that session has
    * no panel in this window's dock (another window's session). */
   focusSessionRequest: { uuid: string; nonce: number } | null;
   /** App-toolbar "+ Terminal" click → MainArea toggles its terminal menu (the
-   * menu/dialog UI stays in MainArea, which owns the dockview api). Counter so
-   * every press re-fires. Transient. */
-  termMenuRequest: number;
-  /** App-toolbar "+ Claude" click → MainArea opens its session picker. Counter. */
-  claudePickerRequest: number;
+   * menu/dialog UI stays in MainArea, which owns the dockview api). `nonce`
+   * counter so every press re-fires. `targetSurfaceId`로 라우팅(P2). Transient. */
+  termMenuRequest: { targetSurfaceId: SurfaceId; nonce: number };
+  /** App-toolbar "+ Claude" click → MainArea opens its session picker. `nonce`
+   * counter. `targetSurfaceId`로 라우팅(P2). */
+  claudePickerRequest: { targetSurfaceId: SurfaceId; nonce: number };
   /** App-toolbar "⤢ 분리" click → MainArea pops the active panel out to a new
-   * window. Counter. Consumed only while the integrated layer is front. */
-  detachPanelRequest: number;
+   * window. `nonce` counter. `targetSurfaceId`로 라우팅(P2). Consumed only while
+   * the integrated layer is front. */
+  detachPanelRequest: { targetSurfaceId: SurfaceId; nonce: number };
   /** App-toolbar "메모" click (and the session picker's memo row) → MainArea
-   * opens this project's memo panel. Counter. Consumed only while the integrated
-   * layer is front. */
-  memoRequest: number;
+   * opens this project's memo panel. `nonce` counter. `targetSurfaceId`로
+   * 라우팅(P2). Consumed only while the integrated layer is front. */
+  memoRequest: { targetSurfaceId: SurfaceId; nonce: number };
   /** 아카이브 "이어서" — resume a saved session in the main dock, pinned to its
    * own `project` (no activeProject switch; MainArea consumes without a project
    * gate and clears with null). Already-open session → activate that panel. */
-  sessionResumeRequest: { uuid: string; project: string; title: string; nonce: number } | null;
+  sessionResumeRequest: { uuid: string; project: string; title: string; nonce: number; targetSurfaceId: SurfaceId } | null;
   /** 우측 분할 surface에 열린 프로젝트 경로 (null=닫힘). 수동적 dock —
    * 전역 요청 버스는 주(좌) surface만 소비한다. localStorage 복원(project-
    * dual-surface). App이 activeProject와의 충돌·닫힌 프로젝트를 정리한다. */
@@ -693,12 +712,12 @@ export const useAppStore = create<AppState>((set, get) => ({
   devReviewQueue: [],
   runRequest: null,
   terminalOpenRequest: null,
-  focusMainRequest: 0,
+  focusMainRequest: { targetSurfaceId: activeSurfaceId(), nonce: 0 },
   focusSessionRequest: null,
-  termMenuRequest: 0,
-  claudePickerRequest: 0,
-  detachPanelRequest: 0,
-  memoRequest: 0,
+  termMenuRequest: { targetSurfaceId: activeSurfaceId(), nonce: 0 },
+  claudePickerRequest: { targetSurfaceId: activeSurfaceId(), nonce: 0 },
+  detachPanelRequest: { targetSurfaceId: activeSurfaceId(), nonce: 0 },
+  memoRequest: { targetSurfaceId: activeSurfaceId(), nonce: 0 },
   sessionResumeRequest: null,
   dualProject: localStorage.getItem("dualProject") || null,
   theme: (localStorage.getItem("theme") as "dark" | "light") || "dark",
@@ -885,10 +904,17 @@ export const useAppStore = create<AppState>((set, get) => ({
   openGitHistoryFile: (root, commit, path) =>
     set({ gitHistoryFile: { root, commit, path } }),
   closeGitHistoryFile: () => set({ gitHistoryFile: null }),
-  requestEditorOpen: (path) => set({ editorOpenRequest: path }),
-  requestDiff: (spec) => set({ diffRequest: spec }),
-  requestClaudeOpen: (req) => set({ claudeOpenRequest: req }),
-  requestCodexOpen: (req) => set({ codexOpenRequest: req }),
+  // 요청버스 발행부는 발행 시점의 활성 표면 id(`activeSurfaceId()`)를 라우팅 키로
+  // stamp한다(P2). P2에서는 항상 "primary"라 무동작 — 발행부(버튼) 호출부는
+  // 무변경이고, 이 setter 하나가 표면 키를 실어 준다(발행 계약의 seam).
+  requestEditorOpen: (path) =>
+    set({ editorOpenRequest: path === null ? null : { path, targetSurfaceId: activeSurfaceId() } }),
+  requestDiff: (spec) =>
+    set({ diffRequest: spec === null ? null : { ...spec, targetSurfaceId: activeSurfaceId() } }),
+  requestClaudeOpen: (req) =>
+    set({ claudeOpenRequest: req === null ? null : { ...req, targetSurfaceId: activeSurfaceId() } }),
+  requestCodexOpen: (req) =>
+    set({ codexOpenRequest: req === null ? null : { ...req, targetSurfaceId: activeSurfaceId() } }),
   requestClaudeInject: (req) => set({ claudeInjectRequest: req }),
   reportClaudeInjectAck: (ack) =>
     set((s) => ({
@@ -903,22 +929,28 @@ export const useAppStore = create<AppState>((set, get) => ({
     })),
   consumeDevReview: (id) =>
     set((s) => ({ devReviewQueue: s.devReviewQueue.filter((r) => r.id !== id) })),
-  requestRun: (req) => set({ runRequest: req }),
+  requestRun: (req) =>
+    set({ runRequest: req === null ? null : { ...req, targetSurfaceId: activeSurfaceId() } }),
   requestTerminalOpen: (req) =>
     set((s) => ({
       terminalOpenRequest: req
-        ? { ...req, nonce: (s.terminalOpenRequest?.nonce ?? 0) + 1 }
+        ? { ...req, nonce: (s.terminalOpenRequest?.nonce ?? 0) + 1, targetSurfaceId: activeSurfaceId() }
         : null,
     })),
-  requestFocusMain: () => set((s) => ({ focusMainRequest: s.focusMainRequest + 1 })),
+  requestFocusMain: () =>
+    set((s) => ({ focusMainRequest: { targetSurfaceId: activeSurfaceId(), nonce: s.focusMainRequest.nonce + 1 } })),
   requestFocusSession: (uuid) =>
     set((s) => ({
       focusSessionRequest: { uuid, nonce: (s.focusSessionRequest?.nonce ?? 0) + 1 },
     })),
-  requestTermMenu: () => set((s) => ({ termMenuRequest: s.termMenuRequest + 1 })),
-  requestClaudePicker: () => set((s) => ({ claudePickerRequest: s.claudePickerRequest + 1 })),
-  requestDetachPanel: () => set((s) => ({ detachPanelRequest: s.detachPanelRequest + 1 })),
-  requestMemo: () => set((s) => ({ memoRequest: s.memoRequest + 1 })),
+  requestTermMenu: () =>
+    set((s) => ({ termMenuRequest: { targetSurfaceId: activeSurfaceId(), nonce: s.termMenuRequest.nonce + 1 } })),
+  requestClaudePicker: () =>
+    set((s) => ({ claudePickerRequest: { targetSurfaceId: activeSurfaceId(), nonce: s.claudePickerRequest.nonce + 1 } })),
+  requestDetachPanel: () =>
+    set((s) => ({ detachPanelRequest: { targetSurfaceId: activeSurfaceId(), nonce: s.detachPanelRequest.nonce + 1 } })),
+  requestMemo: () =>
+    set((s) => ({ memoRequest: { targetSurfaceId: activeSurfaceId(), nonce: s.memoRequest.nonce + 1 } })),
   setDualProject: (path) => {
     if (path) localStorage.setItem("dualProject", path);
     else localStorage.removeItem("dualProject");
@@ -928,7 +960,7 @@ export const useAppStore = create<AppState>((set, get) => ({
     set((s) =>
       req === null
         ? { sessionResumeRequest: null }
-        : { sessionResumeRequest: { ...req, nonce: (s.sessionResumeRequest?.nonce ?? 0) + 1 } },
+        : { sessionResumeRequest: { ...req, nonce: (s.sessionResumeRequest?.nonce ?? 0) + 1, targetSurfaceId: activeSurfaceId() } },
     ),
   setTheme: (theme) => set({ theme }),
   setFontSize: (n) => set({ fontSize: clampFontSize(n) }),
