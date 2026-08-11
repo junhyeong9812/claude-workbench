@@ -84,26 +84,14 @@ export function activeSurfaceId(): SurfaceId {
 }
 
 /** 활성 표면 seam 홀더를 갱신한다(**store의 setActiveSurface 전용**). React 상태와
- * 별개로 imperative 발행 경로가 읽는 최신값 — 둘은 setActiveSurface가 함께 쓴다. */
+ * 별개로 이 값을 읽는 최신값 — 둘은 setActiveSurface가 함께 쓴다.
+ *
+ * **P4' 범위 축소(정지 규칙, 라우팅 5라운드)**: 요청버스 목적지 라우팅은 P4'에서
+ * 제외됐다 — 모든 요청은 항상 **primary(가시)**로 발행되고(store 발행부 상수),
+ * MainArea 소비는 pre-P4'(isPrimary/targetSurfaceId) 그대로다. 따라서 이 seam
+ * (활성 표면 id)은 지금 라우팅에 쓰이지 **않고**, 활성 표면 추적/표시(사이드바
+ * 반영·시각)의 상태 원본은 store.activeSurfaceId다. seam은 P5(표면-로컬 툴바·
+ * 소비자)가 목적지 라우팅을 표면-로컬로 되살릴 때를 위한 dormant 접점으로 남긴다. */
 export function setActiveSurfaceSeam(id: SurfaceId): void {
   activeSurfaceHolder = id;
-}
-
-/**
- * 표면 라우팅 **소비 판정** — fault-tolerant 소비자(리뷰 재슬라이스, 4라운드
- * 정지 규칙). 요청은 자기 타깃 표면이 소비하되, **primary가 "비가시 타깃" 요청의
- * catch-all 소비자**다. primary는 항상 마운트/가시이므로 어떤 전이 인터리빙(발행
- * 후 소비 전 타깃 숨김)에도 요청이 **구조적으로 유실 불가**해진다.
- *
- * @param target 요청의 targetSurfaceId(발행 시점 활성 표면).
- * @param mine 이 소비자(MainArea)의 표면 id.
- * @param targetVisible 그 target 표면이 지금 실제로 렌더/가시인가(primary=항상 true·
- *   secondary=store `secondaryIsVisible`). 호출부가 계산해 넘긴다.
- *
- * **exactly-once**: target 가시 → 그 표면이 매칭 소비(primary fallback 조건 false).
- * target 비가시 → 그 표면은 마운트 안 돼 소비 불가이고 primary만 소비. 두 경우 모두
- * 정확히 1회(object 슬롯은 consume 시 null, counter 슬롯은 nonce dedup이 최종 보증).
- */
-export function consumesRequest(target: SurfaceId, mine: SurfaceId, targetVisible: boolean): boolean {
-  return target === mine || (mine === "primary" && !targetVisible);
 }

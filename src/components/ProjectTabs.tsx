@@ -12,14 +12,9 @@ export function ProjectTabs() {
   const reorderProject = useAppStore((s) => s.reorderProject);
   const dualProject = useAppStore((s) => s.dualProject);
   const setDualProject = useAppStore((s) => s.setDualProject);
-  // 활성 표면(P4') — 프로젝트 열기·전환은 활성 표면 컨텍스트에서 동작한다:
-  // 활성=secondary면 좌측(primary) 앵커 대신 우측 표면 프로젝트를 바꾼다.
-  const activeSurfaceId = useAppStore((s) => s.activeSurfaceId);
-  const toSecondary = activeSurfaceId === "secondary";
-  // 탭 클릭(전환) 라우팅: 활성=secondary면 우측 표면 프로젝트를 그 탭으로.
-  const switchTo = (path: string) =>
-    toSecondary ? setDualProject(path) : setActive(path);
-  // 탭 우클릭 컨텍스트 메뉴 (project-dual-surface 진입점).
+  // 탭 우클릭 컨텍스트 메뉴 (project-dual-surface 진입점). 우측 표면에 프로젝트를
+  // 싣는 유일 경로 = 이 메뉴의 "우측 분할로 열기"(setDualProject, P3'). 탭 클릭은
+  // 항상 좌측(primary) 전환 — 활성 표면으로의 열기/전환(목적지 라우팅)은 P5.
   const [ctxMenu, setCtxMenu] = useState<{ path: string; x: number; y: number } | null>(null);
   // 리사이즈 시 클램프 재계산 대신 닫기(D6) + Escape 닫기.
   useEffect(() => {
@@ -52,9 +47,7 @@ export function ProjectTabs() {
     try {
       const selected = await open({ directory: true, multiple: false });
       if (typeof selected === "string") {
-        // 활성 표면 컨텍스트로 연다(P4') — 활성=secondary면 우측 표면에 싣고
-        // 좌측 앵커는 유지.
-        await addProject(selected, toSecondary ? { surface: "secondary" } : undefined);
+        await addProject(selected);
       }
     } catch (err) {
       console.error("folder picker failed", err);
@@ -99,7 +92,7 @@ export function ProjectTabs() {
               setDraggedPath(null);
               setOverPath(null);
             }}
-            onClick={() => switchTo(p.path)}
+            onClick={() => setActive(p.path)}
             onContextMenu={(e) => {
               e.preventDefault();
               setCtxMenu({ path: p.path, x: e.clientX, y: e.clientY });

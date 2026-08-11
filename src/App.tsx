@@ -217,10 +217,10 @@ function AppMain() {
     activeProject,
     projects.map((p) => p.path),
   );
-  // 활성 표면의 프로젝트(P4' alias) — 조정 소비자(사이드바·헤더·새 세션·검색)가
-  // 읽는다. 활성=secondary이고 우측 표면이 실제 보일 때만 그 프로젝트, 그 외에는
-  // primary 앵커(activeProject). visibleDual이 null(닫힘/hydration 전/동일 겹침)
-  // 이면 primary로 폴백 — 유령 프로젝트를 가리키지 않는다.
+  // 활성 표면의 프로젝트(P4' 범위 축소 — **표시 전용**). 사이드바·헤더·검색이 이
+  // 값을 읽어 활성 표면을 반영한다(라우팅 아님 — 요청/새 세션/실행/메모는 항상
+  // primary=activeProject로 발행). 활성=secondary이고 우측 표면이 실제 보일 때만 그
+  // 프로젝트, 그 외(닫힘/hydration 전/겹침 숨김)엔 primary 폴백(유령 프로젝트 방지).
   const activeSurfaceProject =
     activeSurfaceId === "secondary" && visibleDual ? visibleDual : activeProject;
   // P3'(리뷰): dual 정리 이펙트 **전부 제거**. 멤버십은 이제 store가 정본으로
@@ -717,16 +717,15 @@ function AppMain() {
                   float
                   triggerRef={agentOptsBtnRef}
                   disabledReason={
-                    activeSurfaceProject ? undefined : "프로젝트를 연 뒤 세션을 시작할 수 있습니다"
+                    activeProject ? undefined : "프로젝트를 연 뒤 세션을 시작할 수 있습니다"
                   }
                   onClose={() => setAgentOptsOpen(false)}
                   onStart={(agent, opts) => {
                     setAgentOptsOpen(false);
-                    // 새 세션은 **활성 표면**의 프로젝트로 연다(P4') — 요청버스
-                    // seam이 targetSurfaceId를 활성 표면으로 stamp하고, req.project
-                    // 가 그 표면의 surfaceProject와 일치해야 소비된다.
-                    if (!activeSurfaceProject) return;
-                    const req = { project: activeSurfaceProject, ...spawnOptionFields(opts) };
+                    // 새 세션은 primary(activeProject)에 연다 — 요청버스는 항상
+                    // primary로 발행된다(P4' 범위 축소; 활성 secondary에 열기는 P5).
+                    if (!activeProject) return;
+                    const req = { project: activeProject, ...spawnOptionFields(opts) };
                     if (agent === "codex") requestCodexOpen(req);
                     else requestClaudeOpen(req);
                   }}
@@ -750,18 +749,18 @@ function AppMain() {
               title={
                 layerMode === "dev"
                   ? "메모는 통합 모드에서 사용할 수 있습니다"
-                  : !activeSurfaceProject
+                  : !activeProject
                     ? "메모는 프로젝트를 연 뒤 사용할 수 있습니다"
                     : "이 프로젝트의 메모장 열기 (자동 저장 · 프로젝트당 1개)"
               }
-              disabled={layerMode === "dev" || !activeSurfaceProject}
+              disabled={layerMode === "dev" || !activeProject}
               onClick={() => requestMemo()}
             >
               <span className="toolbar-ico">▤</span> 메모
             </button>
           </div>
         )}
-        <RunMenu project={activeSurfaceProject} />
+        <RunMenu />
         <div
           className="appearance-menu"
           ref={appearanceRef}

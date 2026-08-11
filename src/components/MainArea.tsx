@@ -8,8 +8,8 @@ import "dockview-react/dist/styles/dockview.css";
 import { resolveCloseRequest } from "./sessionClose";
 import { CloseSessionModal } from "./CloseSessionModal";
 import { emit, listen } from "@tauri-apps/api/event";
-import { useAppStore, secondaryIsVisible } from "../state/store";
-import { useSurfaceProject, useSurfaceId, consumesRequest, type SurfaceId } from "../state/surfaceContext";
+import { useAppStore } from "../state/store";
+import { useSurfaceProject, useSurfaceId } from "../state/surfaceContext";
 import { useClaudeUi } from "../state/claudeUi";
 import { recallArea, forgetArea, type PanelArea } from "../state/panelFocus";
 import { isTransferring } from "../state/panelTransfer";
@@ -95,35 +95,18 @@ export function MainArea({
   const isPrimary = !secondary;
   const surfaceProject = useSurfaceProject();
   // 이 표면의 id — 요청버스 소비 게이트가 이 값과 요청의 `targetSurfaceId`가
-  // 일치할 때만 소비한다(P2 라우팅). **P4'**: 활성 표면 seam이 켜져 부 표면도
-  // 자기로 라우팅된 요청을 소비한다(spec §2 불변식 완화: "활성 표면이 조작
-  // 소유"). 프로젝트 매칭은 전역 activeProject가 아니라 surfaceProject(표면-로컬)
-  // 로 한다 — 아래 각 소비 이펙트 참조. 단 **구조적 isPrimary 게이트**(창당 1개
-  // window 리스너·창 수명·closeRequest 백스톱·focusSession 조정자·창 분리 드래그)
-  // 는 라우팅이 아니라 "창당 단일 소유"라 그대로 주 표면에 둔다.
+  // 일치할 때만 소비한다(P2). 지금은 발행이 항상 "primary"를 실어 주고 소비
+  // 표면도 primary 하나뿐이라, 종전 `isPrimary` 게이트와 결과가 동일(무동작).
+  // (구조적 isPrimary 게이트 — window 리스너·창 수명·closeRequest 백스톱·
+  // focusSession 조정자 — 는 요청버스 라우팅이 아니므로 그대로 둔다.)
   const mySurfaceId = useSurfaceId();
-  // 우측 표면이 실제로 렌더/가시인가(store 단일 술어 — 멤버십·겹침·dev 오버레이).
-  const secondaryVisible = useAppStore((s) => secondaryIsVisible(s));
-  // **표면 라우팅 소비 판정 (리뷰 재슬라이스 — fault-tolerant 소비자)**: 요청은
-  // 자기 타깃 표면이 소비하되, **primary가 비가시 타깃의 catch-all 소비자**다.
-  // primary는 항상 마운트/가시이므로, secondary 타깃인데 secondary가 (어떤 전이
-  // 인터리빙으로든) 숨겨졌으면 primary가 대신 소비 → 요청이 **구조적으로 유실 불가**.
-  // 이중 소비 방지: 타깃 가시 → 그 표면이 매칭 소비(primary fallback 조건 false),
-  // 타깃 비가시 → 그 표면은 마운트 안 돼 소비 불가 → primary만 소비(정확히 1회).
-  // 단일 슬롯(consume 시 null)이 exactly-once를 최종 보증한다.
-  const consumesReq = (target: SurfaceId): boolean =>
-    consumesRequest(target, mySurfaceId, target === "primary" ? true : secondaryVisible);
   const surfaceKey = isPrimary ? "primary" : "secondary";
   const theme = useAppStore((s) => s.theme);
   const projects = useAppStore((s) => s.projects);
   const projectModes = useAppStore((s) => s.projectModes);
   // MainArea is now always mounted (behind the dev layer when in dev mode), so
   // it must only consume main-area requests while it is the front layer.
-  // 레이어(통합/개발)는 **표면-로컬**이다(P4'): 주 표면은 자기 프로젝트
-  // (surfaceProject===activeProject)의 모드로, 부 표면은 dev 레이어 오버레이가
-  // 없으므로 항상 "integrated"로 둔다 — 이로써 주가 dev 모드여도 부는 자기로
-  // 라우팅된 요청을 정상 소비한다(전역 activeProject 모드에 묶이지 않음).
-  const layerMode = isPrimary ? resolveLayerMode(projectModes, surfaceProject) : "integrated";
+  const layerMode = resolveLayerMode(projectModes, activeProject);
   const editorOpenRequest = useAppStore((s) => s.editorOpenRequest);
   const requestEditorOpen = useAppStore((s) => s.requestEditorOpen);
   const diffRequest = useAppStore((s) => s.diffRequest);
@@ -152,21 +135,10 @@ export function MainArea({
   // "+ Claude" 저장 세션 피커 — 상태·조회·표시는 SessionPicker 소유 (P5 F-b).
   // 여는 트리거(툴바 요청 버스)와 드롭 취소는 여기 남아 setPicker/openPicker만
   // 부른다.
-  //
-  // **P4' 슬롯 분류(리뷰 G2 + codex 감사 폴백)**: 이 피커 UI는 주 표면
-  // `.main-menus`에만 렌더된다(아래 isPrimary 게이트). 그래서 `claudePicker`
-  // 요청은 **항상 primary**로 라우팅되고(store), 피커는 자기 표면-로컬 프로젝트·
-  // dock(surfaceProject·apiRef)으로 조회·열기를 한다 = **주 표면에서 조회·오픈**.
-  // 즉 활성=secondary라도 툴바 피커는 primary dock에 연다(항상 보이는 dock —
-  // **무음 유실 0**). "활성 표면에 툴바 피커로 열기"는 표면별 툴바를 세우는 **P5**
-  // 몫이다(primary-렌더 피커가 secondary dock을 조작하는 크로스-표면 배관은
-  // surface-local 설계를 3번째로 되짜는 churn이라 정지 규칙에 따라 이연). 반면
-  // **dock-패널 요청**(새 세션·터미널·resume·diff·메모 등)은 팝오버 없이 활성
-  // 표면 MainArea가 소비해 그 dock에 열리므로 **활성 표면을 따른다**(무음 유실 0).
   const picker = useSessionPicker({
     isPrimary,
-    // 피커는 표면-로컬 프로젝트로 (P1). 주 표면에서 surfaceProject===activeProject.
-    // (P4' 폴백: 툴바 피커는 primary 전용이라 여기 primary의 프로젝트가 조회 기준.)
+    // 피커는 표면-로컬 프로젝트로 (P1) — 주 표면에서 surfaceProject===activeProject라
+    // 무동작이고, 부 표면에서는 피커가 비활성(isPrimary 게이트)이라 무해.
     activeProject: surfaceProject,
     getApi: () => apiRef.current,
   });
@@ -417,7 +389,7 @@ export function MainArea({
   useEffect(() => {
     if (!integratedIsFront(layerMode)) return; // dev layer's request — leave it
     if (!editorOpenRequest) return;
-    if (!consumesReq(editorOpenRequest.targetSurfaceId)) return; // 표면 라우팅 + primary catch-all
+    if (editorOpenRequest.targetSurfaceId !== mySurfaceId) return; // 표면 라우팅(P2): 내 표면 것만
     const api = apiRef.current;
     if (!api) return; // dock not ready (mount/project switch) — keep the request
     const path = editorOpenRequest.path;
@@ -435,7 +407,7 @@ export function MainArea({
       console.error("editorOpen failed; keeping request", err);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [editorOpenRequest, apiReady, activeProject, layerMode, secondaryVisible]);
+  }, [editorOpenRequest, apiReady, activeProject, layerMode]);
 
   // Open a diff panel (changed file or commit) when requested from the Git panel.
   // (통합·개발 두 레이어가 동시 마운트되므로 앞 레이어인 통합 모드일 때만 소비한다 —
@@ -445,7 +417,7 @@ export function MainArea({
     if (!diffRequest) return;
     // 라우팅 키는 여기서 벗겨내 spec(DiffSpec)만 패널 params로 흘려보낸다(P2).
     const { targetSurfaceId, ...spec } = diffRequest;
-    if (!consumesReq(targetSurfaceId)) return; // 표면 라우팅 + primary catch-all
+    if (targetSurfaceId !== mySurfaceId) return; // 표면 라우팅(P2): 내 표면 것만
     const api = apiRef.current;
     if (!api) return;
     requestDiff(null);
@@ -466,7 +438,7 @@ export function MainArea({
       params: { kind: "diff", ...spec },
     });
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [diffRequest, activeProject, layerMode, secondaryVisible]);
+  }, [diffRequest, activeProject, layerMode]);
 
   // Open a new Claude session bound to a specific project when requested (the
   // worktree panel's one-click "Claude 열기"). A fresh loadSessionId seeds a new
@@ -477,13 +449,13 @@ export function MainArea({
   useEffect(() => {
     if (!integratedIsFront(layerMode)) return; // dev layer in front — leave the request
     if (!claudeOpenRequest) return;
-    if (!consumesReq(claudeOpenRequest.targetSurfaceId)) return; // 표면 라우팅 + primary catch-all
+    if (claudeOpenRequest.targetSurfaceId !== mySurfaceId) return; // 표면 라우팅(P2): 내 표면 것만
     const { project, seed, title: reqTitle, referencePanelId, model, effort } = claudeOpenRequest;
-    // 매칭 소비(내 표면 타깃)일 때만 표면-로컬 anti-stale: 프로젝트 전환 중 아직
-    // 안 바뀐 옛 마운트가 엉뚱한 dock에 열지 않게(codex P1). **catch-all 폴백**
-    // (primary가 숨은 secondary 타깃을 대신 소비)에선 이 가드를 건너뛴다 — req.project
-    // (그 세션의 원 프로젝트)로 primary dock에 연다(항상 보임 · 세션은 자기 cwd에 pin).
-    if (claudeOpenRequest.targetSurfaceId === mySurfaceId && project !== surfaceProject) return;
+    // Only THIS project's mount may consume the request (MainArea is keyed by
+    // activeProject): otherwise a not-yet-switched old mount would add the Claude
+    // panel to the wrong project's dock (codex P1). Keep the request until the
+    // worktree's mount is active.
+    if (project !== activeProject) return;
     const api = apiRef.current;
     if (!api) return; // dock not ready (project-switch remount) — keep the request; apiReady re-runs this
     requestClaudeOpen(null); // consume only once we can actually act
@@ -500,7 +472,7 @@ export function MainArea({
         : {}),
     });
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [claudeOpenRequest, apiReady, surfaceProject, layerMode, secondaryVisible]);
+  }, [claudeOpenRequest, apiReady, activeProject, layerMode]);
 
   // 새 codex 세션 요청 소비 (툴바 옵션 팝오버). claude 쪽과 같은 keep-until-
   // actionable 규칙을 따르되(부 surface 비소비 · 앞 레이어일 때만 · 이 프로젝트의
@@ -510,10 +482,9 @@ export function MainArea({
   useEffect(() => {
     if (!integratedIsFront(layerMode)) return;
     if (!codexOpenRequest) return;
-    if (!consumesReq(codexOpenRequest.targetSurfaceId)) return; // 표면 라우팅 + primary catch-all
+    if (codexOpenRequest.targetSurfaceId !== mySurfaceId) return; // 표면 라우팅(P2): 내 표면 것만
     const { project, model, effort } = codexOpenRequest;
-    // 매칭 소비일 때만 anti-stale(폴백은 req.project로 primary dock에 연다).
-    if (codexOpenRequest.targetSurfaceId === mySurfaceId && project !== surfaceProject) return;
+    if (project !== activeProject) return;
     const api = apiRef.current;
     if (!api) return;
     requestCodexOpen(null);
@@ -524,7 +495,7 @@ export function MainArea({
       ...(effort ? { effort } : {}),
     });
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [codexOpenRequest, apiReady, surfaceProject, layerMode, secondaryVisible]);
+  }, [codexOpenRequest, apiReady, activeProject, layerMode]);
 
   // (개발 세션 ✓확인/🧪 소비는 DevView로 이관됨 — 통합 dock 안에 "개발 세션"
   // 부분 패널을 끼워 넣던 옛 경로는 제거. 이제 EditorPanel이 dev 레이어를 전면
@@ -536,9 +507,8 @@ export function MainArea({
   useEffect(() => {
     if (!integratedIsFront(layerMode)) return; // dev layer in front — leave the request
     if (!runRequest) return;
-    if (!consumesReq(runRequest.targetSurfaceId)) return; // 표면 라우팅 + primary catch-all
-    // 매칭 소비일 때만 anti-stale(폴백은 req.project cwd로 primary dock에 연다).
-    if (runRequest.targetSurfaceId === mySurfaceId && runRequest.project !== surfaceProject) return;
+    if (runRequest.targetSurfaceId !== mySurfaceId) return; // 표면 라우팅(P2): 내 표면 것만
+    if (runRequest.project !== activeProject) return;
     const api = apiRef.current;
     if (!api) return; // dock not ready — keep the request; apiReady re-runs
     requestRun(null);
@@ -548,7 +518,7 @@ export function MainArea({
       cwd: runRequest.project,
     });
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [runRequest, apiReady, surfaceProject, layerMode, secondaryVisible]);
+  }, [runRequest, apiReady, activeProject, layerMode]);
 
   // 트리 "여기서 터미널 열기": 그 폴더를 cwd로 하는 일반 터미널 탭. 통합 레이어가
   // 앞일 때만 소비한다 — 개발 레이어가 앞이면 DevView가, 스터디 모드면
@@ -556,7 +526,7 @@ export function MainArea({
   useEffect(() => {
     if (!integratedIsFront(layerMode)) return;
     if (!terminalOpenRequest) return;
-    if (!consumesReq(terminalOpenRequest.targetSurfaceId)) return; // 표면 라우팅 + primary catch-all
+    if (terminalOpenRequest.targetSurfaceId !== mySurfaceId) return; // 표면 라우팅(P2): 내 표면 것만
     const api = apiRef.current;
     if (!api) return; // dock not ready — keep the request; apiReady re-runs
     // 소비(clear)는 패널이 실제로 열린 뒤 — 실패하면 요청을 남겨 다음 발화에
@@ -570,7 +540,7 @@ export function MainArea({
       console.error("terminalOpen failed; keeping request", err);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [terminalOpenRequest, apiReady, layerMode, secondaryVisible]);
+  }, [terminalOpenRequest, apiReady, layerMode]);
 
   // 고아 closeRequest 백스톱 (리뷰 D3): 어느 surface도 패널을 소유하지 않으면
   // (전이 타이밍·이미 닫힌 패널) 요청이 영구 잔류해 ×가 먹통이 된다 — 주
@@ -733,26 +703,22 @@ export function MainArea({
   const memoRequest = useAppStore((s) => s.memoRequest);
   const memoHandledRef = useRef(memoRequest.nonce);
   useEffect(() => {
-    // catch-all(카운터 슬롯): emit 시점 판정만 — secondaryVisible을 deps에 넣지
-    // 않아 재발화 이중 소비가 없다. 타깃 가시면 그 표면이 nonce 소비, 비가시면
-    // primary가 대신 소비(무손실). 타깃 소비 표면이 nonce로 dedup(아래).
-    if (!consumesReq(memoRequest.targetSurfaceId)) return;
+    if (memoRequest.targetSurfaceId !== mySurfaceId) return; // 표면 라우팅(P2)
     if (memoRequest.nonce === memoHandledRef.current) return;
     memoHandledRef.current = memoRequest.nonce;
     if (!integratedIsFront(layerMode)) return;
     const api = apiRef.current;
-    if (!api || !surfaceProject) return; // 표면-로컬 메모(P4')
+    if (!api || !activeProject) return;
     setTermMenu(false);
     setPicker(null);
-    openProjectMemo(api, surfaceProject);
+    openProjectMemo(api, activeProject);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [memoRequest]);
 
   const detachPanelRequest = useAppStore((s) => s.detachPanelRequest);
   const detachHandledRef = useRef(detachPanelRequest.nonce);
   useEffect(() => {
-    // catch-all(카운터 슬롯) — memo와 동일: emit 시점 판정, 재발화 이중 없음.
-    if (!consumesReq(detachPanelRequest.targetSurfaceId)) return;
+    if (detachPanelRequest.targetSurfaceId !== mySurfaceId) return; // 표면 라우팅(P2)
     if (detachPanelRequest.nonce === detachHandledRef.current) return;
     detachHandledRef.current = detachPanelRequest.nonce;
     // Only the front (integrated) dock detaches — the App button is disabled in
@@ -798,16 +764,14 @@ export function MainArea({
   useEffect(() => {
     if (!integratedIsFront(layerMode)) return;
     if (!sessionResumeRequest) return;
-    if (!consumesReq(sessionResumeRequest.targetSurfaceId)) return; // 표면 라우팅 + primary catch-all
+    if (sessionResumeRequest.targetSurfaceId !== mySurfaceId) return; // 표면 라우팅(P2): 내 표면 것만
     const api = apiRef.current;
     if (!api) return; // dock not ready — keep the request; apiReady re-runs
     const { uuid, project, title } = sessionResumeRequest;
     requestSessionResume(null); // consume only once we can actually act
-    // 폴백이면 세션 원 project로 primary dock에 연다(openOrActivateSession은 전
-    // surface 중복 조회 후 미존재 시 project-pin 오픈 — 항상 보이는 dock, 무손실).
     openOrActivateSession({ uuid, project, title });
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [sessionResumeRequest, apiReady, layerMode, secondaryVisible]);
+  }, [sessionResumeRequest, apiReady, layerMode]);
 
   // ---- 세션 드래그 배치 (spec task 03) — 훅으로 이관 (P5 F-a) --------------
   const {

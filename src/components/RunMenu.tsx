@@ -9,11 +9,8 @@ import type { RunTarget } from "../types";
  * A polyglot repo shows one row per tool. Detection is read-only; running just
  * types the command into a terminal (the user sees full output + can re-run).
  */
-/** `project`는 **활성 표면**의 프로젝트(P4') — 툴바가 활성 표면을 따르므로
- * App이 activeSurfaceProject를 주입한다. 요청버스 seam이 targetSurfaceId를 활성
- * 표면으로 stamp하고, 이 project가 그 표면의 surfaceProject와 일치해야 소비된다. */
-export function RunMenu({ project }: { project: string | null }) {
-  const activeProject = project;
+export function RunMenu() {
+  const activeProject = useAppStore((s) => s.activeProject);
   const requestRun = useAppStore((s) => s.requestRun);
   const [targets, setTargets] = useState<RunTarget[]>([]);
   const [open, setOpen] = useState(false);
