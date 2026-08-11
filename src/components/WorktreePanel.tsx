@@ -54,6 +54,9 @@ export function WorktreePanel() {
   // 모든 버튼마다 팝오버가 붙는다(표면 11곳). 옵션은 주 표면(툴바·피커) 두 곳에서만
   // 고르고, 나머지는 그 선택을 따라간다.
   const openClaude = async (path: string) => {
+    // P5 경계: openClaude는 **본질 primary 액션** — 워크트리를 프로젝트로 추가하며
+    // activeProject(=primary)를 전환하므로, 부 사이드바에서 눌러도 primary에 연다
+    // (detach·SSH primary-only와 동류 — 무음 유실 아님). 부 표면 라우팅은 P6.
     await addProject(path);
     requestClaudeOpen({ project: path, ...spawnOptionFields(loadAgentOptions("claude")) });
   };

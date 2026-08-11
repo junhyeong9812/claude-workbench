@@ -110,6 +110,8 @@ export function CommitFilesSidebar() {
     // Claude session to its right — genuine side-by-side. The diff panel id
     // mirrors MainArea's dedupe key (`diff:<cwd>:<hash>`). Close the history
     // overlay so the dockview panels are visible.
+    // P5 경계: 전역 CommitFilesSidebar(git-history 오버레이는 앱-전역 단일 인프라)
+    // → 리뷰 diff/Claude가 primary dock에 열린다. 표면-지역화는 P6.
     requestDiff({ title: `diff ${commit.slice(0, 8)}`, cwd: root, hash: commit });
     requestClaudeOpen({
       project: root,

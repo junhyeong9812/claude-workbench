@@ -130,6 +130,8 @@ export function FilePeekViewer({
           e.stopPropagation();
           if (path && !memory) {
             // 드롭된 메모리 파일은 디스크 경로가 없다 — 에디터 열기 비활성.
+            // P5 경계: 전역 peek 오버레이(앱-전역 단일 인프라) → primary editor.
+            // 표면-지역화는 드래그 자유분할(P6)에서 함께.
             requestEditorOpen(path);
             onClose();
           }
