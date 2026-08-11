@@ -40,14 +40,17 @@ describe("store: setDualProject → 트리 + 이중 기록", () => {
     expect(localStorage.getItem("dualProject")).toBe("/b");
   });
 
-  it("닫기: primary 단독 + 두 키 모두 제거(구버전 앱도 닫힘 반영)", () => {
+  it("닫기: primary 단독 + emptyTree tombstone 기록(키 부재 아님) + legacy 제거", () => {
     useAppStore.getState().setDualProject("/b");
     useAppStore.getState().setDualProject(null);
     const s = useAppStore.getState();
     expect(s.dualProject).toBeNull();
     expect(secondaryProject(s.surfaceTree)).toBeNull();
     expect(localStorage.getItem("dualProject")).toBeNull();
-    expect(localStorage.getItem("surfaceTree")).toBeNull();
+    // 트리 키는 emptyTree tombstone으로 남는다(removeItem 아님) — "키 부재 ⟺ pre-P6"
+    // 불변 유지(닫기 removeItem 부분실패 시 stale legacy 부활 차단).
+    expect(localStorage.getItem("surfaceTree")).not.toBeNull();
+    expect(secondaryProject(loadSurfaceTree())).toBeNull();
   });
 
   it("방향(placement) 열기: 트리 블롭에 direction 보존 (하=column)", () => {
@@ -133,10 +136,20 @@ describe("loadSurfaceTree — 트리 블롭 유일 정본(P6 재슬라이스, �
     useAppStore.getState().setDualProject(null);
   });
 
-  it("(g) 닫기: 두 키 제거 → 키 부재 → 기본(primary 단독)", () => {
+  it("(g) 닫기: emptyTree tombstone(키 present) → 로드 기본(primary 단독)", () => {
     useAppStore.getState().setDualProject("/b");
     useAppStore.getState().setDualProject(null);
-    expect(localStorage.getItem("surfaceTree")).toBeNull();
+    expect(localStorage.getItem("surfaceTree")).not.toBeNull(); // tombstone(removeItem 아님)
+    expect(secondaryProject(loadSurfaceTree())).toBeNull();
+  });
+
+  it("(h) 닫기 부분실패(tombstone 기록·legacy 제거 실패로 stale 잔존) → 기본(부활 없음)", () => {
+    // codex 최종확인: 닫기가 emptyTree tombstone은 기록했으나 legacy 제거가
+    // 실패/중단돼 stale로 남은 상황. 트리 키가 present(tombstone)라 로드는 legacy를
+    // 읽지 않는다 → /b 부활 없음. (예전 removeItem 방식은 여기서 /b를 부활시켰다.)
+    useAppStore.getState().setDualProject("/b");
+    useAppStore.getState().setDualProject(null);
+    localStorage.setItem("dualProject", "/b"); // 제거 실패 흉내 — stale legacy 잔존
     expect(secondaryProject(loadSurfaceTree())).toBeNull();
   });
 

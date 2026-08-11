@@ -337,13 +337,13 @@ export function loadSurfaceTree(): SurfaceTree {
  * provenance 마커는 넣지 않는다(화해가 사라져 불요). */
 function persistSurfaceTree(tree: SurfaceTree) {
   const secondary = secondaryProject(tree);
-  if (secondary) {
-    localStorage.setItem(SURFACE_TREE_KEY, JSON.stringify(tree)); // 정본(방향 포함)
-    localStorage.setItem(LEGACY_DUAL_KEY, secondary); // write-only 다운그레이드 빵부스러기
-  } else {
-    localStorage.removeItem(SURFACE_TREE_KEY);
-    localStorage.removeItem(LEGACY_DUAL_KEY);
-  }
+  // 트리 키는 **절대 제거하지 않는다** — 닫힘도 emptyTree tombstone으로 기록해
+  // "키 부재 ⟺ pre-P6"를 불변으로 유지한다(codex 최종확인: 닫기의 removeItem이
+  // 부분 실패하면 키 부재로 오인돼 stale legacy가 부활). 로드는 트리만 보므로
+  // present tombstone이 항상 legacy를 이긴다 — 두 키 쓰기 순서·부분실패 무관.
+  localStorage.setItem(SURFACE_TREE_KEY, JSON.stringify(tree)); // 정본(방향 포함·닫힘=emptyTree)
+  if (secondary) localStorage.setItem(LEGACY_DUAL_KEY, secondary); // write-only 다운그레이드 빵부스러기
+  else localStorage.removeItem(LEGACY_DUAL_KEY);
 }
 
 /** 우측(secondary) 표면이 실제로 렌더되는가 — **활성 표면 정규화의 단일 술어**
