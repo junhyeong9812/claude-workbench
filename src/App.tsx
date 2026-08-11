@@ -1188,7 +1188,16 @@ function AppMain() {
                   </Panel>
                 );
                 if (!visibleDual) return primaryPanel;
-                const handle = <PanelResizeHandle key="dual-handle" className="resize-handle" />;
+                // F4: 방향 무관 resize-handle(width:4px·col-resize)만 주면 세로
+                // (column) PanelGroup에서 높이 0으로 접혀 상하 분할을 포인터로 못
+                // 늘린다. column일 때 resize-handle-v(height:4px·row-resize·가로 꽉참,
+                // App.css)를 얹어 세로 그룹에서 올바른 핸들이 되게 한다.
+                const handle = (
+                  <PanelResizeHandle
+                    key="dual-handle"
+                    className={`resize-handle${dualDirection === "column" ? " resize-handle-v" : ""}`}
+                  />
+                );
                 const secondaryPanel = (
                   <Panel
                     key="dual-secondary"
