@@ -77,8 +77,14 @@ import "./App.css";
  *   자연폭 962 = 모드seg 147 + 세션그룹 346 + 실행 59 + 테마 56 + 롤업 69 +
  *   제목 214 + gap 50 + padding 20.
  *   제목은 flex:1 min-width:0 이라 0까지 줄어든다 → 962-214 = 748 이 "아무것도
- *   안 잘리는" 하한. 그 아래에서 세션/실행 클러스터(346)를 "⋯"(30)로 접으면
- *   ~430 까지 버틴다. 다시 그 아래에서 모드 seg(147)를 select(65)로 접는다. */
+ *   안 잘리는" 하한. 그 아래에서 **세션 클러스터**(346 = 터미널·에이전트·▾·
+ *   분리·메모)를 "⋯"(30)로 접으면 ~430 까지 버틴다. 다시 그 아래에서 모드
+ *   seg(147)를 select(65)로 접는다.
+ *   ⚠ 접히는 것은 `.toolbar-group` 안뿐이다 — RunMenu(59)는 이 클러스터 **밖**
+ *   이라 접기 대상이 아니다(표시 조건이 다르다: 클러스터는 mode==="workspace"
+ *   에서만 렌더되는데 실행 메뉴는 모드와 무관하게 프로젝트만 있으면 뜬다.
+ *   안으로 넣으면 그 조건이 바뀌어 기능 변경이 된다 — spec ④). 위 산식은 실행
+ *   59를 접기 대상에서 뺀 값이므로 임계 자체는 그대로다. */
 const TOOLBAR_GROUP_COLLAPSE = 750;
 const TOOLBAR_MODE_COLLAPSE = 430;
 
@@ -810,7 +816,7 @@ function AppMain() {
             <CollapsibleControls
               threshold={TOOLBAR_GROUP_COLLAPSE}
               host=".toolbar"
-              label="세션/실행 더 보기"
+              label="세션 도구 더 보기"
               moreClassName="toolbar-btn"
             >
             <button
