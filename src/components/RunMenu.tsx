@@ -73,7 +73,9 @@ export function RunMenu() {
   };
 
   return (
-    <div className="run-menu" ref={ref}>
+    /* data-keep-menu: 이 메뉴가 오버플로("⋯") 안으로 접혔을 때, 트리거를 누르는
+       동안 부모 메뉴가 닫히지 않게 한다(닫히면 드롭다운까지 언마운트된다). */
+    <div className="run-menu" ref={ref} data-keep-menu="">
       <button
         ref={btnRef}
         className="toolbar-btn"
