@@ -547,6 +547,159 @@ body {
   }
 }
 
+/* B1: per-project session-status badge — mounted on each project tab and on the
+   secondary surface header. Rolls the per-session attention up to the owning
+   project: a count + ▾ list of the in-progress sessions, with a running
+   rectangle-border motion while any session is working ("진행 중" cue). */
+.tab-status {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+}
+.tab-status-badge {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  height: 16px;
+  padding: 0 5px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg);
+  color: var(--fg);
+  font-size: 11px;
+  line-height: 1;
+  cursor: pointer;
+  overflow: hidden; /* clip the running ring to the badge box */
+}
+.tab-status-badge:hover {
+  background: var(--bg-hover);
+}
+.tab-status-count {
+  font-variant-numeric: tabular-nums;
+}
+.tab-status-caret {
+  font-size: 8px;
+  color: var(--fg-dim);
+}
+/* Priority tint of the badge border (blocked > done-unseen > working). The
+   running ring adds motion on top for the working case. */
+.tab-status-badge.is-blocked {
+  border-color: color-mix(in srgb, var(--st-fail) 55%, var(--border));
+}
+.tab-status-badge.is-done {
+  border-color: color-mix(in srgb, var(--st-info) 55%, var(--border));
+}
+.tab-status-badge.is-working {
+  border-color: color-mix(in srgb, var(--st-ok) 55%, var(--border));
+}
+/* Running rectangle-border motion: a conic gradient rotates inside a rounded-rect
+   ring mask (center punched out via the padding + mask-composite recipe), so a
+   bright arc travels around the badge border without spinning the box itself. */
+.tab-status-ring {
+  position: absolute;
+  inset: 0;
+  padding: 1.2px; /* ring thickness */
+  border-radius: 8px;
+  overflow: hidden;
+  pointer-events: none;
+  -webkit-mask:
+    linear-gradient(#000 0 0) content-box,
+    linear-gradient(#000 0 0);
+  -webkit-mask-composite: xor;
+  mask:
+    linear-gradient(#000 0 0) content-box,
+    linear-gradient(#000 0 0);
+  mask-composite: exclude;
+}
+.tab-status-spin {
+  position: absolute;
+  /* oversize + centered so the rotating gradient always covers the badge corners */
+  inset: -60%;
+  background: conic-gradient(
+    from 0deg,
+    transparent 0 60%,
+    var(--st-ok) 80%,
+    var(--accent-bright) 92%,
+    transparent 100%
+  );
+  animation: tab-status-spin 1.3s linear infinite;
+}
+@keyframes tab-status-spin {
+  to {
+    transform: rotate(1turn);
+  }
+}
+/* ▾ dropdown: the project's in-progress sessions (label · status). */
+.tab-status-pop {
+  position: absolute;
+  top: calc(100% + 4px);
+  left: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  min-width: 168px;
+  max-width: 300px;
+  max-height: 260px;
+  overflow-y: auto;
+  padding: 3px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.32);
+  z-index: var(--z-dropdown);
+}
+.tab-status-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  width: 100%;
+  padding: 4px 6px;
+  border: none;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--fg);
+  font-size: 12px;
+  text-align: left;
+  cursor: pointer;
+}
+.tab-status-row:hover {
+  background: var(--bg-hover);
+}
+.tab-status-dot {
+  flex: none;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+}
+.tab-status-dot.is-blocked {
+  background: var(--st-fail);
+}
+.tab-status-dot.is-done {
+  background: var(--st-info);
+}
+.tab-status-dot.is-working {
+  background: var(--st-ok);
+}
+.tab-status-row-name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.tab-status-row-state {
+  color: var(--fg-dim);
+  font-size: 11px;
+  white-space: nowrap;
+}
+@media (prefers-reduced-motion: reduce) {
+  /* Drop the traveling-light ring; the static is-working border tint remains. */
+  .tab-status-ring {
+    display: none;
+  }
+}
+
 .toolbar-title {
   color: var(--fg-dim);
   font-size: 12px;
