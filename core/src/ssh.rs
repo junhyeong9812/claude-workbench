@@ -1415,4 +1415,39 @@ W8CkSL2Yx++XP/fxFe/RAAAAD210LXRlc3QtaG9zdGtleQECAwQFBg==\n\
         );
     }
 
+    /// **Unknown** extended-data type (anything but ext==1/stderr). The contract
+    /// is "fold into stdout" — nothing is silently dropped — so the bytes must
+    /// surface in the shared scrollback, and never on the stderr side channel.
+    #[derive(Clone)]
+    struct ExecUnknownExtHandler;
+    impl russh::server::Handler for ExecUnknownExtHandler {
+        type Error = russh::Error;
+        async fn auth_password(&mut self, _u: &str, p: &str) -> Result<russh::server::Auth, Self::Error> {
+            Ok(if p == "testpass" { russh::server::Auth::Accept } else { russh::server::Auth::reject() })
+        }
+        async fn channel_open_session(&mut self, _c: russh::Channel<russh::server::Msg>, _s: &mut russh::server::Session) -> Result<bool, Self::Error> {
+            Ok(true)
+        }
+        async fn exec_request(&mut self, channel: russh::ChannelId, _data: &[u8], session: &mut russh::server::Session) -> Result<(), Self::Error> {
+            session.channel_success(channel)?;
+            // ext=2 is not SSH_EXTENDED_DATA_STDERR — an unknown stream type.
+            session.extended_data(channel, 2, russh::CryptoVec::from(&b"unknown-ext-payload\n"[..]))?;
+            session.exit_status_request(channel, 0)?;
+            session.eof(channel)?;
+            session.close(channel)?;
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn inprocess_exec_folds_unknown_ext_into_stdout() {
+        let out = drive_exec(ExecUnknownExtHandler, "weird-ext", "exec_unknown_ext", |_, _| {});
+        assert!(
+            out.stdout.windows(19).any(|w| w == b"unknown-ext-payload"),
+            "unknown extended data must fold into stdout (zero silent drops), got: {:?}",
+            String::from_utf8_lossy(&out.stdout)
+        );
+        assert!(out.stderr.is_empty(), "unknown ext is not stderr");
+        assert_eq!(out.exit, Some((Some(0), None)));
+    }
 }
