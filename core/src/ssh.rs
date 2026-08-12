@@ -38,6 +38,17 @@ const INPUT_QUEUE: usize = 512;
 /// Each input message is written to the channel in chunks this size, so one large
 /// paste can't monopolize the select loop and starve output polling (review D3).
 const WRITE_CHUNK: usize = 8192;
+/// Depth (messages) of the **exec** event queue (stderr chunks + the terminal
+/// event). Bounded so a remote command flooding stderr can't grow memory without
+/// limit before a consumer drains it (review F1 — was unbounded = memory DoS).
+/// The send side blocks on a full queue (`send().await`), which stops the channel
+/// read loop and back-pressures the remote — the exec analogue of the local
+/// scrollback's bounded ring. 256 chunks bounds the buffer to a few MB (russh
+/// data chunks are ≤ the negotiated max packet, ~32 KB) — the same order as the
+/// 1 MB stdout scrollback — while absorbing normal bursty stderr without
+/// throttling. The queue is cancellable via the outer `select!`, so a stalled
+/// consumer never blocks teardown.
+const EXEC_EVENT_QUEUE: usize = 256;
 /// Idle timeout for the connection (also bounds a hung connect/auth).
 const INACTIVITY_SECS: u64 = 0; // 0 = disabled; keepalive handled below.
 const KEEPALIVE_SECS: u64 = 30;
@@ -55,6 +66,12 @@ pub enum AuthMethod {
 /// Everything needed to open a remote session (no secrets persisted here — the
 /// Tauri layer assembles this transiently, sourcing passwords from the keychain
 /// in phase 2).
+///
+/// Note (review P3): adding a required field to this struct is a non-additive
+/// change for a struct-literal caller. It is fine here because `core` is an
+/// **internal crate** (the only caller is `src-tauri`, updated in lockstep); if
+/// this were ever published, switch to a builder / `#[non_exhaustive]` so new
+/// fields don't break downstream literals.
 pub struct SshConfig {
     pub host: String,
     pub port: u16,
@@ -83,10 +100,16 @@ pub enum ExecEvent {
     /// The remote command finished. `code` is the exit status (`None` if the
     /// server sent no exit-status, e.g. death by signal); `signal` names the
     /// terminating signal when the command was killed (abnormal termination).
+    /// This is the **normal** terminal event.
     Exit {
         code: Option<u32>,
         signal: Option<String>,
     },
+    /// The exec could not run to a normal exit — the server **rejected** the exec
+    /// request, or the request could not be sent. This is a terminal event too:
+    /// a consumer always receives exactly one of `Exit` / `Error`, never a silent
+    /// end (review F4 — the exec channel's "always terminal" contract).
+    Error(String),
 }
 
 /// The user's verdict on an unknown host key.
@@ -122,9 +145,11 @@ pub enum SshStatus {
 pub struct SshChannels {
     pub prompt_rx: mpsc::UnboundedReceiver<HostKeyChallenge>,
     pub status_rx: mpsc::UnboundedReceiver<SshStatus>,
-    /// Exec-mode side channel (stderr + exit status). Stays silent for the
+    /// Exec-mode side channel (stderr + terminal event). Stays silent for the
     /// interactive shell path; only an [`SshConfig::exec`] session emits on it.
-    pub exec_rx: mpsc::UnboundedReceiver<ExecEvent>,
+    /// **Bounded** (`EXEC_EVENT_QUEUE`): the sender blocks when full, so a stalled
+    /// consumer back-pressures the remote instead of growing memory (review F1).
+    pub exec_rx: mpsc::Receiver<ExecEvent>,
 }
 
 /// Manager-held handles for a live SSH session.
@@ -132,6 +157,12 @@ pub struct SshHandle {
     input_tx: mpsc::Sender<Vec<u8>>,
     size_tx: watch::Sender<(u16, u16)>,
     cancel_tx: watch::Sender<bool>,
+    /// Signals a one-shot stdin **half-close** (EOF) for an exec session — flushes
+    /// pending input, then sends `channel.eof()` so a stdin-reading remote command
+    /// (e.g. `cat`) can finish (review F2). Distinct from [`cancel`], which aborts
+    /// the whole session; this only closes the input direction. No effect on the
+    /// interactive shell path (its loop ignores this watch).
+    close_stdin_tx: watch::Sender<bool>,
     join: Option<JoinHandle<()>>,
 }
 
@@ -155,6 +186,14 @@ impl SshHandle {
     /// Signal cancellation — drops every pending await on the session thread.
     pub fn cancel(&self) {
         let _ = self.cancel_tx.send(true);
+    }
+
+    /// Half-close stdin on an **exec** session: the session flushes any queued
+    /// input, then sends channel EOF so a stdin-reading remote command can reach
+    /// its exit (review F2). Idempotent; a no-op on the interactive shell path.
+    /// This is *not* cancellation — the command keeps running until it exits.
+    pub fn close_stdin(&self) {
+        let _ = self.close_stdin_tx.send(true);
     }
 
     /// Join the session thread (call after [`cancel`]). Idempotent.
@@ -192,7 +231,9 @@ pub(crate) fn spawn_ssh(
     let (cancel_tx, cancel_rx) = watch::channel(false);
     let (prompt_tx, prompt_rx) = mpsc::unbounded_channel::<HostKeyChallenge>();
     let (status_tx, status_rx) = mpsc::unbounded_channel::<SshStatus>();
-    let (exec_tx, exec_rx) = mpsc::unbounded_channel::<ExecEvent>();
+    // Bounded so stderr can't accumulate without limit (review F1).
+    let (exec_tx, exec_rx) = mpsc::channel::<ExecEvent>(EXEC_EVENT_QUEUE);
+    let (close_stdin_tx, close_stdin_rx) = watch::channel(false);
 
     let join = thread::spawn(move || {
         // current-thread runtime is enough (one connection per thread) but it
@@ -217,7 +258,7 @@ pub(crate) fn spawn_ssh(
             };
             let mut cancel_rx = cancel_rx;
             tokio::select! {
-                res = run(&config, &shared, &known_hosts_path, &prompt_tx, &status_tx, &exec_tx, input_rx, size_rx) => {
+                res = run(&config, &shared, &known_hosts_path, &prompt_tx, &status_tx, &exec_tx, input_rx, size_rx, close_stdin_rx) => {
                     if let Err(reason) = res {
                         let _ = status_tx.send(SshStatus::Failed(reason));
                     }
@@ -232,6 +273,7 @@ pub(crate) fn spawn_ssh(
             input_tx,
             size_tx,
             cancel_tx,
+            close_stdin_tx,
             join: Some(join),
         },
         SshChannels {
@@ -251,9 +293,10 @@ async fn run(
     known_hosts_path: &PathBuf,
     prompt_tx: &mpsc::UnboundedSender<HostKeyChallenge>,
     status_tx: &mpsc::UnboundedSender<SshStatus>,
-    exec_tx: &mpsc::UnboundedSender<ExecEvent>,
+    exec_tx: &mpsc::Sender<ExecEvent>,
     mut input_rx: mpsc::Receiver<Vec<u8>>,
     mut size_rx: watch::Receiver<(u16, u16)>,
+    close_stdin_rx: watch::Receiver<bool>,
 ) -> Result<(), String> {
     let _ = status_tx.send(SshStatus::Connecting);
 
@@ -286,8 +329,20 @@ async fn run(
     // separate code path and returns here, so the interactive pty+shell block
     // below stays untouched (regression 0). `None` falls through to the shell.
     if let Some(command) = &config.exec {
-        return run_exec(channel, command, shared, status_tx, exec_tx, input_rx).await;
+        return run_exec(
+            channel,
+            command,
+            shared,
+            status_tx,
+            exec_tx,
+            input_rx,
+            close_stdin_rx,
+        )
+        .await;
     }
+    // Shell path does not use the stdin half-close seam (it stays open for the
+    // life of the interactive session); drop the receiver explicitly.
+    drop(close_stdin_rx);
 
     let (cols, rows) = *size_rx.borrow();
     // want_reply=true so a server that *rejects* the PTY surfaces as a
@@ -355,29 +410,42 @@ async fn run(
 ///   byte contract as local PTYs and the interactive shell, so existing
 ///   consumers render it unchanged;
 /// - **stderr** (`ChannelMsg::ExtendedData`, `ext == 1`) → [`ExecEvent::Stderr`],
-///   kept separate for structured consumers (R1+ stream-json);
-/// - **exit status / signal** → captured and delivered as a final
-///   [`ExecEvent::Exit`] on channel close.
+///   kept separate for structured consumers (R1+ stream-json), with back-pressure
+///   (bounded queue, blocking send — review F1);
+/// - **exit status / signal** → captured and delivered as a terminal
+///   [`ExecEvent::Exit`]; a rejected/failed exec yields [`ExecEvent::Error`] —
+///   either way the consumer always receives exactly one terminal event (F4).
 ///
-/// No PTY is requested (non-TTY). stdin is still wired (input → `channel.data`)
-/// so the seam is a complete bidirectional command channel for R1; the shell
-/// resize path does not apply here.
+/// No PTY is requested (non-TTY). stdin is wired (input → `channel.data`) and can
+/// be half-closed via `close_stdin_rx` so a stdin-reading command (`cat`) can
+/// finish (F2). The shell resize path does not apply here.
+///
+/// Ordering (review F2/F3/F4):
+/// - `Ready` is emitted only after the server **accepts** the exec (`Success`) —
+///   `exec()` merely queues the request in russh 0.54, so signalling earlier would
+///   report a not-yet-running (or about-to-be-rejected) command as ready;
+/// - a server `Eof` closes only the data direction; the exit-status/signal may
+///   still arrive **before** `Close`, so we keep draining past `Eof` and break
+///   only on `Close`/end-of-stream.
 async fn run_exec(
     channel: russh::Channel<client::Msg>,
     command: &str,
     shared: &Arc<Shared>,
     status_tx: &mpsc::UnboundedSender<SshStatus>,
-    exec_tx: &mpsc::UnboundedSender<ExecEvent>,
+    exec_tx: &mpsc::Sender<ExecEvent>,
     mut input_rx: mpsc::Receiver<Vec<u8>>,
+    mut close_stdin_rx: watch::Receiver<bool>,
 ) -> Result<(), String> {
     // want_reply=true so a server that rejects the exec surfaces as
     // `ChannelMsg::Failure` we can act on (mirrors the pty/shell rationale).
-    channel
-        .exec(true, command.as_bytes().to_vec())
-        .await
-        .map_err(|_| "failed to start remote command".to_string())?;
-
-    let _ = status_tx.send(SshStatus::Ready);
+    // NOTE: `exec()` only *queues* the request (russh 0.54); acceptance arrives
+    // later as `ChannelMsg::Success`, so we do NOT signal `Ready` here (F4).
+    if channel.exec(true, command.as_bytes().to_vec()).await.is_err() {
+        let msg = "failed to start remote command".to_string();
+        // Transmission failure is still a terminal outcome for the consumer (F4).
+        let _ = exec_tx.send(ExecEvent::Error(msg.clone())).await;
+        return Err(msg);
+    }
 
     let mut channel = channel;
     // Same outbound back-pressure discipline as the shell loop (one WRITE_CHUNK
@@ -385,39 +453,92 @@ async fn run_exec(
     let mut pending: Vec<u8> = Vec::new();
     let mut exit_code: Option<u32> = None;
     let mut exit_signal: Option<String> = None;
+    let mut started = false; // exec accepted (Success seen) -> Ready emitted once
+    let mut stdout_done = false; // server sent Eof: no more stdout, stop stdin too
+    let mut close_requested = false; // caller asked to half-close stdin
+    let mut eof_sent = false; // channel.eof() already delivered
     loop {
+        // Once the caller half-closed stdin, flush everything still queued (the
+        // caller enqueues all input *before* signalling close, so a non-blocking
+        // drain captures it) and send channel EOF so a stdin-reading command can
+        // finish (F2). Done inline so the flush is guaranteed to precede EOF.
+        if close_requested && !eof_sent {
+            while let Ok(more) = input_rx.try_recv() {
+                pending.extend_from_slice(&more);
+            }
+            let mut off = 0;
+            while off < pending.len() {
+                let end = (off + WRITE_CHUNK).min(pending.len());
+                if channel.data(&pending[off..end]).await.is_err() {
+                    break;
+                }
+                off = end;
+            }
+            pending.clear();
+            let _ = channel.eof().await;
+            eof_sent = true;
+        }
         tokio::select! {
             msg = channel.wait() => match msg {
                 // stdout — shared byte pipeline (unchanged output contract).
                 Some(ChannelMsg::Data { ref data }) => shared.emit(data),
                 // Extended data: ext==1 is stderr (SSH_EXTENDED_DATA_STDERR) — kept
                 // separate. Any other (unknown) extended type folds into stdout so
-                // nothing is silently dropped.
+                // nothing is silently dropped. The bounded, blocking send is the
+                // back-pressure: if the consumer stalls, this await stalls the read
+                // loop and the remote is throttled (F1). A dropped receiver ends
+                // the send (ignored — nobody is consuming).
                 Some(ChannelMsg::ExtendedData { ref data, ext }) => {
                     if ext == 1 {
-                        let _ = exec_tx.send(ExecEvent::Stderr(data.to_vec()));
+                        let _ = exec_tx.send(ExecEvent::Stderr(data.to_vec())).await;
                     } else {
                         shared.emit(data);
                     }
                 }
-                // Capture terminal disposition; the channel then EOFs/closes.
+                // exec accepted: only now is the command actually running (F4).
+                Some(ChannelMsg::Success) => {
+                    if !started {
+                        started = true;
+                        let _ = status_tx.send(SshStatus::Ready);
+                    }
+                }
+                // The server rejected the exec request — deliver a terminal Error
+                // so the consumer always sees a terminating event (F4), never a
+                // silent early return.
+                Some(ChannelMsg::Failure) => {
+                    let msg = "server rejected the exec request".to_string();
+                    let _ = exec_tx.send(ExecEvent::Error(msg.clone())).await;
+                    return Err(msg);
+                }
+                // Capture terminal disposition. These may arrive AFTER Eof and
+                // before Close, so we record and keep draining (F3).
                 Some(ChannelMsg::ExitStatus { exit_status }) => exit_code = Some(exit_status),
                 Some(ChannelMsg::ExitSignal { ref signal_name, .. }) => {
-                    exit_signal = Some(format!("{signal_name:?}"));
+                    exit_signal = Some(sig_name(signal_name));
                 }
-                // The server rejected the exec request.
-                Some(ChannelMsg::Failure) => {
-                    return Err("server rejected the exec request".into());
-                }
-                // Command finished / stream ended.
-                Some(ChannelMsg::Eof) | Some(ChannelMsg::Close) | None => break,
+                // Eof closes only the data direction — NOT the channel. The
+                // exit-status/signal can still be in flight before Close, so we
+                // stop stdin (no more output to react to) but keep draining (F3).
+                Some(ChannelMsg::Eof) => stdout_done = true,
+                // Channel fully closed / stream ended — done.
+                Some(ChannelMsg::Close) | None => break,
                 Some(_) => {}
             },
-            inp = input_rx.recv(), if pending.is_empty() => match inp {
+            inp = input_rx.recv(), if pending.is_empty() && !close_requested && !stdout_done => match inp {
                 Some(bytes) => pending = bytes,
                 None => break, // all input senders dropped (teardown)
             },
-            _ = std::future::ready(()), if !pending.is_empty() => {
+            changed = close_stdin_rx.changed(), if !close_requested => match changed {
+                // Caller requested a stdin half-close; the flush+EOF happens at the
+                // top of the next loop turn.
+                Ok(()) => {
+                    if *close_stdin_rx.borrow() {
+                        close_requested = true;
+                    }
+                }
+                Err(_) => break, // SshHandle dropped -> teardown
+            },
+            _ = std::future::ready(()), if !pending.is_empty() && !close_requested && !stdout_done => {
                 let take = pending.len().min(WRITE_CHUNK);
                 if channel.data(&pending[..take]).await.is_err() {
                     break;
@@ -428,11 +549,38 @@ async fn run_exec(
     }
     // Always deliver a terminal Exit event so a consumer can distinguish clean
     // exit, non-zero exit, and signal death (None/None = ended without a status).
-    let _ = exec_tx.send(ExecEvent::Exit {
-        code: exit_code,
-        signal: exit_signal,
-    });
+    let _ = exec_tx
+        .send(ExecEvent::Exit {
+            code: exit_code,
+            signal: exit_signal,
+        })
+        .await;
     Ok(())
+}
+
+/// Canonical short name for a terminating signal. russh's `Sig::name()` accessor
+/// is private, so we match the variants ourselves and map the standard signals to
+/// their canonical names (`TERM`, `KILL`, …); a server-specific `Custom` keeps its
+/// raw string. Keeps the exec `Exit` event stable for a structured consumer (R1
+/// stream-json) instead of leaking Rust's `Debug` form, e.g. `Custom("FOO")`
+/// (review F5).
+fn sig_name(sig: &russh::Sig) -> String {
+    use russh::Sig;
+    match sig {
+        Sig::ABRT => "ABRT".into(),
+        Sig::ALRM => "ALRM".into(),
+        Sig::FPE => "FPE".into(),
+        Sig::HUP => "HUP".into(),
+        Sig::ILL => "ILL".into(),
+        Sig::INT => "INT".into(),
+        Sig::KILL => "KILL".into(),
+        Sig::PIPE => "PIPE".into(),
+        Sig::QUIT => "QUIT".into(),
+        Sig::SEGV => "SEGV".into(),
+        Sig::TERM => "TERM".into(),
+        Sig::USR1 => "USR1".into(),
+        Sig::Custom(name) => name.clone(),
+    }
 }
 
 /// Run the configured auth method, mapping failures to distinct user-safe
@@ -883,14 +1031,32 @@ W8CkSL2Yx++XP/fxFe/RAAAAD210LXRlc3QtaG9zdGtleQECAwQFBg==\n\
         }
     }
 
-    /// Drive an exec session against `ExecHandler`: accept the host key, wait for
-    /// Ready, then collect stderr bytes + the terminal Exit event. Returns the
-    /// stdout scrollback, the collected stderr, and the exit (code, signal).
-    fn run_exec_session(
-        command: &str,
-        tag: &str,
-    ) -> (Vec<u8>, Vec<u8>, Option<u32>, Option<String>) {
-        let port = serve_once(ExecHandler);
+    /// Outcome collected from driving an exec session end-to-end.
+    #[derive(Default)]
+    struct ExecOutcome {
+        stdout: Vec<u8>,
+        stderr: Vec<u8>,
+        /// The terminal `Exit` event (code, signal), if that's how it ended.
+        exit: Option<(Option<u32>, Option<String>)>,
+        /// The terminal `Error` event message, if the exec failed/was rejected.
+        error: Option<String>,
+        /// Whether the session ever reported `Ready` (exec accepted).
+        ready: bool,
+        /// A `Failed` status reason, if the status stream surfaced one.
+        failed: Option<String>,
+    }
+
+    /// Connect an exec session to `handler`, auto-accepting the host key, and pump
+    /// status + exec events until a **terminal** exec event (`Exit` or `Error`) or
+    /// timeout. `on_ready` runs exactly once, right after the session reports
+    /// `Ready` — used to write stdin and half-close it. Generic over the server
+    /// handler so each test can vary server behavior (EOF ordering, rejection, …).
+    fn drive_exec<H, F>(handler: H, command: &str, tag: &str, on_ready: F) -> ExecOutcome
+    where
+        H: russh::server::Handler + Send + 'static,
+        F: FnOnce(&SessionManager, crate::session::SessionId),
+    {
+        let port = serve_once(handler);
         let mgr = SessionManager::new();
         let cfg = SshConfig {
             host: "127.0.0.1".into(),
@@ -901,38 +1067,43 @@ W8CkSL2Yx++XP/fxFe/RAAAAD210LXRlc3QtaG9zdGtleQECAwQFBg==\n\
         };
         let (id, mut chans) = mgr.create_ssh(cfg, temp_known_hosts(tag), 80, 24, None);
 
-        // Accept the first-seen host key (TOFU) and wait for Ready.
-        let mut ready = false;
+        let mut out = ExecOutcome::default();
+        let mut on_ready = Some(on_ready);
+        let mut terminal = false;
         let deadline = Instant::now() + Duration::from_millis(8000);
-        while Instant::now() < deadline && !ready {
+        while Instant::now() < deadline && !terminal {
+            // Accept the first-seen host key (TOFU).
             if let Ok(ch) = chans.prompt_rx.try_recv() {
                 let _ = ch.reply.send(HostKeyDecision::Accept);
             }
             match chans.status_rx.try_recv() {
-                Ok(SshStatus::Ready) => ready = true,
-                Ok(SshStatus::Failed(r)) => panic!("exec connect failed: {r}"),
+                Ok(SshStatus::Ready) => {
+                    out.ready = true;
+                    if let Some(f) = on_ready.take() {
+                        f(&mgr, id);
+                    }
+                }
+                Ok(SshStatus::Failed(r)) => out.failed = Some(r),
                 _ => {}
             }
-            thread::sleep(Duration::from_millis(20));
-        }
-        assert!(ready, "exec session never became ready");
-
-        // Collect exec-channel events until the terminal Exit (or timeout).
-        let mut stderr: Vec<u8> = Vec::new();
-        let mut exit: Option<(Option<u32>, Option<String>)> = None;
-        let deadline = Instant::now() + Duration::from_millis(6000);
-        while Instant::now() < deadline && exit.is_none() {
             match chans.exec_rx.try_recv() {
-                Ok(ExecEvent::Stderr(b)) => stderr.extend_from_slice(&b),
-                Ok(ExecEvent::Exit { code, signal }) => exit = Some((code, signal)),
-                Err(mpsc::error::TryRecvError::Empty) => thread::sleep(Duration::from_millis(10)),
+                Ok(ExecEvent::Stderr(b)) => out.stderr.extend_from_slice(&b),
+                Ok(ExecEvent::Exit { code, signal }) => {
+                    out.exit = Some((code, signal));
+                    terminal = true;
+                }
+                Ok(ExecEvent::Error(e)) => {
+                    out.error = Some(e);
+                    terminal = true;
+                }
                 Err(mpsc::error::TryRecvError::Disconnected) => break,
+                Err(mpsc::error::TryRecvError::Empty) => {}
             }
+            thread::sleep(Duration::from_millis(5));
         }
-        let (buf, _) = mgr.snapshot(id).unwrap();
-        mgr.remove(id).unwrap();
-        let (code, signal) = exit.expect("exec must deliver a terminal Exit event");
-        (buf, stderr, code, signal)
+        out.stdout = mgr.snapshot(id).map(|(b, _)| b).unwrap_or_default();
+        let _ = mgr.remove(id);
+        out
     }
 
     /// Exec channel: stdout rides the shared scrollback, stderr comes through the
@@ -940,29 +1111,28 @@ W8CkSL2Yx++XP/fxFe/RAAAAD210LXRlc3QtaG9zdGtleQECAwQFBg==\n\
     /// status is recovered.
     #[test]
     fn inprocess_exec_splits_stdout_stderr_and_recovers_exit() {
-        let (stdout, stderr, code, signal) = run_exec_session("run-ok", "exec_ok");
+        let out = drive_exec(ExecHandler, "run-ok", "exec_ok", |_, _| {});
         assert!(
-            stdout.windows(9).any(|w| w == b"OUT:hello"),
+            out.stdout.windows(9).any(|w| w == b"OUT:hello"),
             "stdout must ride the shared scrollback, got: {:?}",
-            String::from_utf8_lossy(&stdout)
+            String::from_utf8_lossy(&out.stdout)
         );
         assert!(
-            stderr.windows(8).any(|w| w == b"ERR:oops"),
+            out.stderr.windows(8).any(|w| w == b"ERR:oops"),
             "stderr must arrive on the exec channel"
         );
         assert!(
-            !stdout.windows(8).any(|w| w == b"ERR:oops"),
+            !out.stdout.windows(8).any(|w| w == b"ERR:oops"),
             "stderr must NOT pollute the stdout scrollback (stream separation)"
         );
-        assert_eq!(code, Some(0), "clean exit status recovered");
-        assert_eq!(signal, None, "no signal on a normal exit");
+        assert_eq!(out.exit, Some((Some(0), None)), "clean exit status recovered");
     }
 
     /// A non-zero exit status is recovered verbatim (abnormal termination).
     #[test]
     fn inprocess_exec_recovers_nonzero_exit() {
-        let (_stdout, _stderr, code, signal) = run_exec_session("run-fail", "exec_fail");
-        assert_eq!(code, Some(3), "non-zero exit status recovered");
-        assert_eq!(signal, None);
+        let out = drive_exec(ExecHandler, "run-fail", "exec_fail", |_, _| {});
+        assert_eq!(out.exit, Some((Some(3), None)), "non-zero exit status recovered");
     }
+
 }
