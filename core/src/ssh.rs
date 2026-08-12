@@ -320,9 +320,14 @@ async fn run(
     // R0 exec seam: a `Some(command)` config runs a non-TTY remote command on a
     // separate code path and returns here, so the interactive pty+shell block
     // below stays untouched (regression 0). `None` falls through to the shell.
-    // The exec path is **output-only** and never reads `input_rx` (dropped on this
-    // branch); remote stdin is R1's job (see `SshConfig::exec`).
+    // The exec path is **output-only** and never reads `input_rx`; remote stdin is
+    // R1's job (see `SshConfig::exec`).
     if let Some(command) = &config.exec {
+        // Drop the receiver *before* running, so `SessionManager::write()` on an
+        // exec session fails immediately (closed channel) instead of silently
+        // buffering up to the channel capacity and reporting `Ok` — a caller
+        // would otherwise believe input reached the remote (codex audit P2).
+        drop(input_rx);
         return run_exec(channel, command, shared, status_tx, exec_tx).await;
     }
 
@@ -1103,6 +1108,27 @@ W8CkSL2Yx++XP/fxFe/RAAAAD210LXRlc3QtaG9zdGtleQECAwQFBg==\n\
         assert!(out.ready, "exec accepted -> Ready");
         assert!(out.stderr.is_empty(), "no stderr for a silent command");
         assert_eq!(out.exit, Some((Some(0), None)), "silent command still yields a terminal Exit");
+    }
+
+    /// R0's exec path is **output-only**, so writing to an exec session must fail
+    /// *immediately* rather than buffering silently and reporting `Ok` — a caller
+    /// that got `Ok` would believe the bytes reached the remote (codex audit P2).
+    /// Remote stdin arrives in R1 via channel halves / a writer task.
+    ///
+    /// The flood handler makes this decisive: it queues more stderr than
+    /// `EXEC_EVENT_QUEUE`, so the sender is still blocked on back-pressure when
+    /// `on_ready` runs. The session is therefore provably **alive** at the moment
+    /// we write — without that, a write could error merely because the command had
+    /// already finished, and the test would pass with or without the fix.
+    #[test]
+    fn inprocess_exec_session_rejects_write() {
+        let handler = ExecStderrFloodHandler { chunks: EXEC_EVENT_QUEUE + 10 };
+        let out = drive_exec(handler, "flood", "exec_nowrite", |mgr, id| {
+            assert_eq!(mgr.is_alive(id), Some(true), "command still streaming — session alive");
+            assert!(mgr.write(id, b"x").is_err(), "write to an output-only exec session must error");
+        });
+        assert!(out.ready, "rejecting writes does not disturb the exec itself");
+        assert_eq!(out.exit.map(|(c, _)| c), Some(Some(0)), "command still terminates normally");
     }
 
     /// A command that writes **only stderr** (no stdout) — stderr must arrive on
