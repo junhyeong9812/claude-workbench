@@ -375,31 +375,6 @@ impl SessionManager {
         }
     }
 
-    /// Half-close **stdin** for a remote SSH exec session: flush any queued input,
-    /// then send channel EOF so a stdin-reading remote command (e.g. `cat`) can
-    /// reach its exit (review F2). Distinct from [`kill`], which cancels the whole
-    /// session; this only closes the input direction and lets the command finish.
-    ///
-    /// Only meaningful for an SSH exec session; a local PTY has no such half-close
-    /// seam, so this errors for `Transport::Local` (and for a dead/unknown session)
-    /// rather than silently succeeding. R1 calls this to end a one-shot command.
-    ///
-    /// Mirrors [`write`]/[`kill`]: an unknown session and a **dead** session both
-    /// error, and the underlying [`SshHandle::close_stdin`] failure (session thread
-    /// already gone) is propagated rather than swallowed — so a caller never gets a
-    /// spurious `Ok` for a session that can't actually be half-closed (review P2).
-    pub fn close_stdin(&self, id: SessionId) -> Result<(), String> {
-        let map = self.sessions_lock();
-        let s = map.get(&id).ok_or("no such session")?;
-        if !s.shared.alive.load(Ordering::SeqCst) {
-            return Err("session is dead".into());
-        }
-        match &s.transport {
-            Transport::Ssh(h) => h.close_stdin(),
-            Transport::Local { .. } => Err("stdin half-close is only supported for ssh sessions".into()),
-        }
-    }
-
     /// Resize the PTY. A 0-dimension (hidden panel) is a harmless no-op; an
     /// unknown session errors (spec #4).
     pub fn resize(&self, id: SessionId, cols: u16, rows: u16) -> Result<(), String> {
