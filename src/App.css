@@ -3060,10 +3060,20 @@ body {
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+/* 제목 접기는 **혼잡한 헤드에만** 건다. `.claudeterm-pane-head` 는 세션 헤드
+   말고도 타임라인(360px)·서브에이전트(300px)·상세 뷰어(하한 240)·타임라인 peek
+   에도 쓰이는데, 그 칼럼들은 창이 아무리 넓어도 컨테이너 폭이 560 미만이라
+   제목이 **상시** 사라졌다(실측 1400px 창: "타임라인" w317.88→none, 그 칼럼의
+   × 버튼이 space-between 항목 하나만 남아 x333.88→8 로 점프). 명세 ②(넓은 폭 =
+   base 동일) 위반이라 별도 container-name 으로 규칙 적용 범위를 좁힌다 —
+   `--busy` 가 붙은 헤드에서만 질의가 성립하고, 좁은 칼럼 헤드는 base 그대로다. */
+.claudeterm-pane-head--busy {
+  container-name: pane-head-busy;
+}
 /* 제목 → 보조 버튼 → seg 순으로 접는다(spec ②). 첫 단계: 컨트롤 클러스터가 더는
    못 줄어드는 폭에서 제목이 자리를 완전히 비운다(0폭 말줄임 + 8px gap 회수).
    560 = 일반 에이전트 헤드 컨트롤 실측 528 + padding 16 + gap 8. */
-@container pane-head (max-width: 560px) {
+@container pane-head-busy (max-width: 560px) {
   .claudeterm-pane-head-title {
     display: none;
   }

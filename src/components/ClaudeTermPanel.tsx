@@ -2070,8 +2070,11 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
   // 3뷰 중 무엇을 보고 있든 [적용]·[codex 검증]·모델·뷰 전환은 늘 손에 닿아야
   // 하는데, 원래 자리는 터미널 창(뷰 하나)의 안쪽이기 때문이다.
   // 좁아지면 제목 → 보조 버튼("⋯") → seg(select) 순으로 접힌다(반응형 1차).
+  // `--busy` = 8~12개 컨트롤이 한 줄에 눌리는 **이 헤드에만** 제목 접기 규칙을
+  // 건다는 표시다(타임라인 360·서브에이전트 300·상세 뷰어 240 같은 고정 좁은
+  // 칼럼 헤드는 같은 클래스를 쓰지만 접을 게 없다 — 접으면 넓은 폭 회귀).
   const paneHead = (
-        <div className="claudeterm-pane-head">
+        <div className="claudeterm-pane-head claudeterm-pane-head--busy">
           <span className="claudeterm-pane-head-title">
             에이전트 — {(props.params.title as string) ?? "터미널"}
           </span>
