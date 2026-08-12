@@ -230,6 +230,37 @@ describe("CollapsibleSeg / CollapsibleControls", () => {
     expect(document.querySelector(".nested-pop")).not.toBeNull();
   });
 
+  /* 비활성 항목 계약 — 리뷰 P2.
+     disabled 항목도 role=menu 안에서는 menuitem 이어야 스크린 리더가 목록을 온전히
+     읽는다. 그리고 **전부 비활성**인 실제 상태(App.tsx 아카이브 그룹)에서 포커스가
+     "⋯"에 남으면 메뉴의 ↑↓·Tab·Escape 핸들러가 아예 안 도는 죽은 메뉴가 된다. */
+  it("전부 비활성이어도 롤은 붙고 포커스는 메뉴가 받는다", () => {
+    restore = stubWidth(400);
+    act(() => {
+      root.render(
+        <div>
+          <CollapsibleControls threshold={560} label="추가 컨트롤">
+            <button className="a" disabled>
+              아카이브
+            </button>
+            <button className="b" disabled>
+              시드 재주입
+            </button>
+          </CollapsibleControls>
+        </div>,
+      );
+    });
+    const more = host.querySelector("button.collapse-more") as HTMLButtonElement;
+    act(() => more.click());
+    const menu = document.querySelector(".collapse-menu") as HTMLElement;
+    const a = menu.querySelector("button.a") as HTMLButtonElement;
+    const b = menu.querySelector("button.b") as HTMLButtonElement;
+    expect(a.getAttribute("role")).toBe("menuitem");
+    expect(b.getAttribute("role")).toBe("menuitem");
+    // 활성 항목이 없으니 메뉴 컨테이너가 포커스를 갖는다(키보드 핸들러 생존).
+    expect(document.activeElement).toBe(menu);
+  });
+
   it("⋯ 메뉴는 role=menu 계약대로 포커스를 관리한다(menuitem·첫 항목·↑↓·Tab 순환)", () => {
     restore = stubWidth(400);
     act(() => {

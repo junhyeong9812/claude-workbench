@@ -155,11 +155,18 @@ export function CollapsibleSeg({
  * (하위 팝오버)은 포함되지 않는다. disabled는 건너뛴다(포커스 못 받는다).
  */
 function menuItems(menu: HTMLElement | null): HTMLElement[] {
+  return menuNodes(menu).filter((el) => !(el as HTMLButtonElement).disabled);
+}
+
+/**
+ * 메뉴 안의 **모든** 항목 후보(비활성 포함). `role="menuitem"`은 이쪽에 붙인다 —
+ * 비활성 항목도 `role=menu` 안에서는 menuitem이어야 스크린 리더가 목록을 온전히
+ * 읽는다. 포커스 이동 대상은 활성만이라 두 목록을 분리한다(리뷰 P2).
+ */
+function menuNodes(menu: HTMLElement | null): HTMLElement[] {
   if (!menu) return [];
   const sel = "button, select, a[href], [tabindex]:not([tabindex='-1'])";
-  return [...menu.querySelectorAll<HTMLElement>(sel)].filter(
-    (el) => !(el as HTMLButtonElement).disabled,
-  );
+  return [...menu.querySelectorAll<HTMLElement>(sel)];
 }
 
 /**
@@ -242,9 +249,14 @@ export function CollapsibleControls({
   // 되므로(포털→인라인은 재마운트) 정리할 잔재가 없다.
   useLayoutEffect(() => {
     if (!open) return;
+    // 롤은 비활성 포함 전부에, 포커스는 활성 항목에만(리뷰 P2). 활성이 하나도
+    // 없으면 메뉴 컨테이너 자신에 포커스를 둬 ↑↓·Tab·Escape 핸들러가 계속 동작
+    // 하게 한다 — 그러지 않으면 포커스가 "⋯"에 남아 메뉴가 키보드에 죽는다.
+    for (const el of menuNodes(popRef.current)) {
+      if (!el.hasAttribute("role")) el.setAttribute("role", "menuitem");
+    }
     const items = menuItems(popRef.current);
-    for (const el of items) if (!el.hasAttribute("role")) el.setAttribute("role", "menuitem");
-    items[0]?.focus();
+    (items[0] ?? popRef.current)?.focus();
   }, [open]);
 
   /** 닫으면서 "⋯"로 포커스를 되돌린다 — 단 항목이 포커스를 이미 다른 곳으로
@@ -278,6 +290,9 @@ export function CollapsibleControls({
                 className="collapse-menu"
                 data-popover-layer=""
                 role="menu"
+                // 활성 항목이 하나도 없을 때 이 컨테이너가 포커스를 받아 키보드
+                // 핸들러(↑↓·Tab·Escape)를 살린다. 순서 탐색엔 안 걸린다(-1).
+                tabIndex={-1}
                 aria-label={label}
                 style={{
                   left: pos?.left ?? 0,
