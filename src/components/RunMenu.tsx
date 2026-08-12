@@ -83,9 +83,14 @@ export function RunMenu() {
         onClick={() => setOpen((o) => !o)}
       >
         {/* 라벨만 별도 span — 아주 좁은 표면에서는 @container 규칙이 이걸 숨겨
-            아이콘만 남긴다(반응형 1차). "▶ "는 텍스트 노드 그대로라 넓은 폭
-            렌더는 변하지 않는다. */}
-        ▶ <span className="toolbar-label">실행</span>
+            아이콘만 남긴다(반응형 1차). 바깥 span 으로 한 번 더 싸는 이유: 이
+            버튼은 inline-flex(gap 5px)라 "▶ " 를 텍스트 노드로 두면 **익명 flex
+            아이템**이 하나 더 생겨 넓은 폭 폭이 59.42→61.11 로 늘었다(회귀).
+            전체를 한 span 에 담으면 flex 아이템은 하나뿐이고, 안쪽은 평범한
+            인라인 흐름이라 "▶ 실행" 과 픽셀 동일하다. */}
+        <span>
+          ▶<span className="toolbar-label"> 실행</span>
+        </span>
       </button>
       {open &&
         createPortal(
