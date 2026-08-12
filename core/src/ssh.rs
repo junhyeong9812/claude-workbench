@@ -184,6 +184,12 @@ pub struct SshHandle {
     size_tx: watch::Sender<(u16, u16)>,
     cancel_tx: watch::Sender<bool>,
     join: Option<JoinHandle<()>>,
+    /// `true` for an [`SshConfig::exec`] session, which has **no remote stdin**.
+    /// Decided at handle creation so `send_input` rejects from the very first
+    /// call — dropping the receiver alone would only take effect once connect,
+    /// auth and channel-open finished, leaving an early window where writes were
+    /// accepted and then discarded (codex final audit P2).
+    output_only: bool,
 }
 
 impl SshHandle {
@@ -191,6 +197,9 @@ impl SshHandle {
     /// or a closed session it returns an error instead of growing memory (D2).
     pub fn send_input(&self, data: &[u8]) -> Result<(), String> {
         use mpsc::error::TrySendError;
+        if self.output_only {
+            return Err("exec session has no stdin (output-only; R1 owns remote input)".into());
+        }
         match self.input_tx.try_send(data.to_vec()) {
             Ok(()) => Ok(()),
             Err(TrySendError::Full(_)) => Err("ssh input buffer full".into()),
@@ -238,6 +247,9 @@ pub(crate) fn spawn_ssh(
     cols: u16,
     rows: u16,
 ) -> (SshHandle, SshChannels) {
+    // Read before `config` moves into the session thread: an exec session is
+    // output-only, and the handle must know that from its first moment.
+    let output_only = config.exec.is_some();
     let (input_tx, input_rx) = mpsc::channel::<Vec<u8>>(INPUT_QUEUE);
     let (size_tx, size_rx) = watch::channel((cols.max(1), rows.max(1)));
     let (cancel_tx, cancel_rx) = watch::channel(false);
@@ -285,6 +297,7 @@ pub(crate) fn spawn_ssh(
             size_tx,
             cancel_tx,
             join: Some(join),
+            output_only,
         },
         SshChannels {
             prompt_rx,
@@ -1162,6 +1175,27 @@ W8CkSL2Yx++XP/fxFe/RAAAAD210LXRlc3QtaG9zdGtleQECAwQFBg==\n\
     /// `on_ready` runs. The session is therefore provably **alive** at the moment
     /// we write — without that, a write could error merely because the command had
     /// already finished, and the test would pass with or without the fix.
+    /// The rejection must hold from the handle's *first moment* — before connect,
+    /// auth or the host-key answer. Dropping the input receiver alone only takes
+    /// effect once channel-open finishes, so writes in that early window were
+    /// accepted and silently discarded (codex final audit P2). No server is even
+    /// needed: an unreachable port keeps the session in connect while we write.
+    #[test]
+    fn exec_session_rejects_write_before_ready() {
+        let mgr = SessionManager::new();
+        let cfg = SshConfig {
+            host: "127.0.0.1".into(),
+            port: 1, // nothing listens — the session stays in connect/auth
+            username: "tester".into(),
+            auth: AuthMethod::Password("testpass".into()),
+            exec: Some("irrelevant".into()),
+        };
+        let (id, _chans) = mgr.create_ssh(cfg, temp_known_hosts("exec_early_write"), 80, 24, None);
+        // Immediately, with no status observed yet.
+        assert!(mgr.write(id, b"x").is_err(), "exec session rejects stdin before Ready too");
+        let _ = mgr.remove(id);
+    }
+
     #[test]
     fn inprocess_exec_session_rejects_write() {
         let handler = ExecStderrFloodHandler { chunks: EXEC_EVENT_QUEUE + 10 };
