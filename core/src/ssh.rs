@@ -86,8 +86,10 @@ pub struct SshConfig {
     /// R1's job, not hardcoded here.
     ///
     /// **R0 is an output-only exec.** There is no remote stdin here: an exec
-    /// session's channel loop only *reads* (stdout/stderr/exit). Feeding a remote
-    /// command's stdin — bidirectional streaming and stdin half-close (EOF) for a
+    /// session's channel loop only *reads* (stdout/stderr/exit), and the write
+    /// direction is half-closed (**EOF**) the moment the exec is accepted, so a
+    /// command that reads stdin terminates instead of waiting forever. Feeding
+    /// actual bytes to a remote command's stdin — bidirectional streaming for a
     /// long-lived `remote claude` — is **R1's** job, built on channel halves or a
     /// dedicated writer task. A single `select!` cannot independently poll russh
     /// read + write (the write side parks on send-window back-pressure that only an
@@ -404,14 +406,18 @@ async fn run(
 ///   either way the consumer always receives exactly one terminal event (F4).
 ///
 /// **Output-only** (R0): no PTY is requested (non-TTY), and no stdin is wired —
-/// the loop only *reads* the channel (stdout / stderr / exit). Remote stdin
-/// (bidirectional streaming + half-close/EOF for a long-lived `remote claude`) is
-/// **R1's** job, built on channel halves or a dedicated writer task; a single
-/// `select!` cannot independently poll russh read + write without risking the
-/// send-window deadlock, which is why R0 carries no write side at all (codex
-/// review loop 3; see the log's stop-rule entry). Because the loop has a single
-/// await source (`channel.wait()`), there is no `select!` here and the whole
-/// deadlock class (write-window back-pressure) is structurally absent.
+/// the loop only *reads* the channel (stdout / stderr / exit). "No stdin" is
+/// signalled explicitly: the write direction is **half-closed (EOF) as soon as
+/// the exec is accepted**, so a command that reads stdin sees end-of-input and
+/// exits instead of blocking forever. Feeding actual bytes to a remote command's
+/// stdin (bidirectional streaming for a long-lived `remote claude`) is **R1's**
+/// job, built on channel halves or a dedicated writer task; a single `select!`
+/// cannot independently poll russh read + write without risking the send-window
+/// deadlock, which is why R0 carries no write side at all (codex review loop 3;
+/// see the log's stop-rule entry). Because the loop has a single await source
+/// (`channel.wait()`), there is no `select!` here and the whole deadlock class
+/// (write-window back-pressure) is structurally absent — the one-shot `eof()` is
+/// a control message, not a windowed data write (see the `Success` arm).
 ///
 /// Ordering (review F3/F4):
 /// - `Ready` is emitted only after the server **accepts** the exec (`Success`) —
@@ -465,6 +471,23 @@ async fn run_exec(
             Some(ChannelMsg::Success) => {
                 if !started {
                     started = true;
+                    // Half-close the write direction immediately: an output-only
+                    // exec has no stdin, and a remote command that *reads* stdin
+                    // (`cat`, anything waiting on EOF) would otherwise block
+                    // forever — never exiting, so `wait()` never yields a status
+                    // and the "exactly one terminal event" contract breaks
+                    // silently while the thread and TCP connection stay pinned.
+                    // "No stdin" must therefore be sent as *EOF*, not as silence.
+                    //
+                    // Safe w.r.t. the write-window deadlock class this path was
+                    // re-sliced to remove: `Channel::eof()` is `send_msg`
+                    // (russh 0.54.5 `channels/mod.rs:347` → `:360`), a plain
+                    // bounded send onto the session's control queue (capacity 10,
+                    // at most our own one in-flight message). It never consults
+                    // `window_size`, unlike `data()`, which goes through
+                    // `ChannelTx::poll_write` and parks until a WINDOW_ADJUST that
+                    // only an interleaved read can deliver.
+                    let _ = channel.eof().await;
                     let _ = status_tx.send(SshStatus::Ready);
                 }
             }
@@ -1336,6 +1359,59 @@ W8CkSL2Yx++XP/fxFe/RAAAAD210LXRlc3QtaG9zdGtleQECAwQFBg==\n\
             stderr_total,
             chunks * 8,
             "every stderr byte must survive back-pressure (bounded queue blocks, never drops)"
+        );
+    }
+
+    /// A remote command that **reads stdin** and only finishes on EOF (`cat`,
+    /// and every streaming consumer R1 will run). The server here mirrors that:
+    /// it acknowledges the exec but sends **no** exit-status until the client
+    /// half-closes its write direction (`channel_eof`).
+    ///
+    /// Without the client's post-`Success` `channel.eof()`, remote stdin stays
+    /// open forever: no exit-status is ever sent, `wait()` never returns a
+    /// terminal message, and the "exactly one terminal event" contract breaks
+    /// *silently* while the session thread and TCP connection stay pinned. The
+    /// test then fails on the deadline with `exit == None`.
+    #[derive(Clone)]
+    struct ExecWaitsForStdinEofHandler;
+    impl russh::server::Handler for ExecWaitsForStdinEofHandler {
+        type Error = russh::Error;
+        async fn auth_password(&mut self, _u: &str, p: &str) -> Result<russh::server::Auth, Self::Error> {
+            Ok(if p == "testpass" { russh::server::Auth::Accept } else { russh::server::Auth::reject() })
+        }
+        async fn channel_open_session(&mut self, _c: russh::Channel<russh::server::Msg>, _s: &mut russh::server::Session) -> Result<bool, Self::Error> {
+            Ok(true)
+        }
+        async fn exec_request(&mut self, channel: russh::ChannelId, _data: &[u8], session: &mut russh::server::Session) -> Result<(), Self::Error> {
+            session.channel_success(channel)?;
+            // Running, but blocked on stdin: NO exit-status, NO eof, NO close.
+            session.data(channel, russh::CryptoVec::from(&b"reading-stdin\n"[..]))?;
+            Ok(())
+        }
+        async fn channel_eof(&mut self, channel: russh::ChannelId, session: &mut russh::server::Session) -> Result<(), Self::Error> {
+            // Client half-closed its write side -> our "command" sees EOF and exits.
+            session.data(channel, russh::CryptoVec::from(&b"saw-eof\n"[..]))?;
+            session.exit_status_request(channel, 0)?;
+            session.eof(channel)?;
+            session.close(channel)?;
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn inprocess_exec_sends_stdin_eof_so_stdin_readers_terminate() {
+        let out = drive_exec(ExecWaitsForStdinEofHandler, "cat", "exec_stdin_eof", |_, _| {});
+        assert!(out.ready, "exec accepted -> Ready");
+        assert_eq!(
+            out.exit,
+            Some((Some(0), None)),
+            "an output-only exec must half-close stdin so an EOF-waiting command exits \
+             (None here = the client never sent EOF and the command hung until the deadline)"
+        );
+        assert!(
+            out.stdout.windows(7).any(|w| w == b"saw-eof"),
+            "the remote must observe our stdin EOF, got: {:?}",
+            String::from_utf8_lossy(&out.stdout)
         );
     }
 
