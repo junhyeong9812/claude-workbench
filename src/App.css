@@ -312,6 +312,71 @@ body {
   color: #ffffff;
 }
 
+/* ---- 반응형 접기 (CollapsibleControls / CollapsibleSeg — 반응형 1차 인프라 B) ----
+   래퍼는 박스를 만들지 않는다: 펼친 상태의 자식들이 부모 flex 행에 그대로 참여해야
+   넓은 폭 렌더가 base와 픽셀 동일하다(gap·정렬 불변). */
+.collapse-host {
+  display: contents;
+}
+/* 접혔을 때의 "⋯" — 호출자가 그 행의 버튼 어휘(.toolbar-btn·.claudeterm-head-btn)를
+   추가 클래스로 얹으면 그쪽이 이긴다(뒤에 정의된 규칙 우선). */
+.collapse-more {
+  flex: 0 0 auto;
+  padding: 1px 8px;
+  font: inherit;
+  font-size: 0.95em;
+  line-height: 1.4;
+  color: var(--fg-dim);
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  cursor: pointer;
+}
+.collapse-more:hover {
+  background: var(--bg-hover);
+  color: var(--fg);
+}
+/* seg를 대체하는 select — 세그 버튼군보다 훨씬 좁다(실측: 뷰 169→66, 모델 107→55). */
+.collapse-select {
+  flex: 0 0 auto;
+  max-width: 140px;
+  padding: 1px 4px;
+  font: inherit;
+  font-size: 0.95em;
+  color: var(--fg);
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  cursor: pointer;
+}
+/* 오버플로 메뉴 — body 포털 + fixed(좌표는 useAnchoredPosition). */
+.collapse-menu {
+  position: fixed;
+  z-index: var(--z-dropdown);
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 4px;
+  min-width: 160px;
+  max-width: 320px;
+  padding: 6px;
+  overflow-y: auto;
+  background: var(--bg-alt);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.4);
+}
+/* 세로 메뉴 안에서는 원래 가로 묶음들도 한 줄씩 차지한다. */
+.collapse-menu .seg,
+.collapse-menu .agent-opt-menu,
+.collapse-menu .run-menu {
+  display: flex;
+  justify-content: center;
+}
+.collapse-menu button {
+  justify-content: center;
+}
+
 /* 새 세션 옵션 팝오버 (에이전트 · 모델 · 강도). 두 앵커를 쓴다: 툴바에서는
    버튼 아래로 띄우고(.agent-opt-pop-float), 세션 피커 안에서는 새 세션 행
    바로 밑에 흐름으로 붙는다(피커 자체가 이미 떠 있는 패널이라 이중 부양이
