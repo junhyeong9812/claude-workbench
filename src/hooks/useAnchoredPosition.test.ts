@@ -64,14 +64,27 @@ describe("computeAnchoredPosition", () => {
     expect(p.top).toBe(576); // 700 - gap(4) - 120
   });
 
-  it("위아래 모두 부족하면 뒤집지 않고 아래로 클램프한다", () => {
-    const p = computeAnchoredPosition(
-      { left: 100, right: 140, top: 60, bottom: 90 },
-      { width: 200, height: 260 },
-      { width: 1000, height: 300 },
-    );
-    // openUp 조건(위 여유 > margin) 불만족 → 아래 배치 후 vh - h - margin 클램프
-    expect(p.top).toBe(36); // 300 - 260 - 4
+  /* 아래 202 / 위 52 — 어느 쪽에도 260이 통째로 안 들어간다. 예전에는 아래로 두고
+     `vh - h - margin`(=36)으로 클램프해 **트리거(60~90)를 통째로 덮었다**. 넓은
+     쪽(아래)에 붙이고 그 공간으로 높이를 제한하는 것이 옳다. */
+  it("어느 쪽에도 다 안 들어가면 넓은 쪽에 붙이고 트리거를 덮지 않는다", () => {
+    const anchor = { left: 100, right: 140, top: 60, bottom: 90 };
+    const p = computeAnchoredPosition(anchor, { width: 200, height: 260 }, { width: 1000, height: 300 });
+    expect(p.top).toBe(94); // bottom(90) + gap(4) — 트리거 아래에서 시작
+    expect(p.top).toBeGreaterThanOrEqual(anchor.bottom);
+    expect(p.maxHeight).toBe(202); // 300 - 4 - 94 = 아래 가용 공간
+  });
+
+  /* 위 392 / 아래 68, 팝오버 420 — 부분 높이 flip. 전체가 들어갈 때만 뒤집던
+     조건에서는 아래로 두고 top=76 으로 클램프돼 트리거(400~424)를 덮었다. */
+  it("부분 높이여도 위가 더 넓으면 위로 뒤집는다(트리거를 덮지 않는다)", () => {
+    const anchor = { left: 100, right: 140, top: 400, bottom: 424 };
+    const p = computeAnchoredPosition(anchor, { width: 200, height: 420 }, { width: 1000, height: 500 }, {
+      maxHeight: 420,
+    });
+    expect(p.maxHeight).toBe(392); // 위 가용 공간 = 400 - 4 - 4
+    expect(p.top).toBe(4); // 400 - 4 - 392
+    expect(p.top + p.maxHeight).toBeLessThanOrEqual(anchor.top); // 트리거 위에서 끝난다
   });
 
   it("maxHeight 는 상한과 잔여 공간 중 작은 쪽, 단 minHeight 아래로는 안 간다", () => {

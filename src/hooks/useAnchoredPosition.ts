@@ -9,8 +9,9 @@ import { useLayoutEffect, useState, type RefObject } from "react";
  * 잘려 사실상 안 열리던 문제를 같은 방식으로 푼다:
  *
  *  1. 좌우: 트리거 좌변(또는 우변) 정렬 후 뷰포트 안으로 클램프
- *  2. 상하: 기본은 트리거 아래. 아래 공간이 모자라고 위가 더 넉넉하면 위로 뒤집는다
- *  3. 잔여 높이에 맞춘 `maxHeight`(콘텐츠가 길면 팝오버 내부 스크롤)
+ *  2. 상하: 기본은 트리거 아래. 아래가 모자라면 **가용 공간이 큰 쪽**으로 간다
+ *     (한쪽에 다 안 들어가도 — 트리거를 덮느니 좁은 쪽을 스크롤시킨다)
+ *  3. 그쪽 가용 공간에 맞춘 `maxHeight`(콘텐츠가 길면 팝오버 내부 스크롤)
  *  4. 측정 전(`null`)에는 호출자가 `visibility:hidden`으로 첫 프레임 깜빡임을 막는다
  *  5. scroll(캡처)·resize·팝오버 자체 크기 변화(ResizeObserver)에 재계산
  *
@@ -77,12 +78,23 @@ export function computeAnchoredPosition(
   const wanted = opts.align === "end" ? anchor.right - w : anchor.left;
   const left = Math.max(margin, Math.min(wanted, vw - w - margin));
 
-  // 세로: 기본 아래. 아래가 모자라고 위가 넉넉하면 위로 뒤집는다(하단 표면).
+  // 세로: 기본 아래. **가용 공간이 큰 쪽**을 고르고 그 공간으로 높이를 제한한다.
+  // (전에는 "위에 전체 높이가 들어갈 때만" 뒤집어서, 양쪽 다 모자라면 아래로 두고
+  //  vh-h-margin 으로 클램프 → 팝오버가 트리거를 덮었다. maxHeight 상한이 260에서
+  //  420으로 올라간 팝오버 4종에서 발동 확률이 커진 실결함이다.)
   const below = anchor.bottom + gap;
-  const openUp = below + h > vh - margin && anchor.top - gap - h > margin;
-  const top = Math.max(margin, Math.min(openUp ? anchor.top - gap - h : below, vh - h - margin));
+  const spaceBelow = vh - margin - below;
+  const spaceAbove = anchor.top - gap - margin;
+  const openUp = spaceBelow < h && spaceAbove > spaceBelow;
+  const space = openUp ? spaceAbove : spaceBelow;
+  // 실제로 그려질 높이 — 가용 공간을 넘지 않는다(넘치면 내부 스크롤). 단 minHeight
+  // 아래로는 줄이지 않는다(그 경우는 아래의 클램프가 화면 안으로 밀어 넣는다).
+  const drawn = Math.max(minHeight, Math.min(h, space));
+  const top = openUp
+    ? Math.max(margin, anchor.top - gap - drawn)
+    : Math.max(margin, Math.min(below, vh - drawn - margin));
 
-  const maxHeight = Math.max(minHeight, Math.min(capHeight, vh - top - margin));
+  const maxHeight = Math.max(minHeight, Math.min(capHeight, space));
   return { left, top, maxHeight };
 }
 
