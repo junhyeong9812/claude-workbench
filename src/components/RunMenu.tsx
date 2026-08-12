@@ -82,7 +82,10 @@ export function RunMenu() {
         aria-expanded={open}
         onClick={() => setOpen((o) => !o)}
       >
-        ▶ 실행
+        {/* 라벨만 별도 span — 아주 좁은 표면에서는 @container 규칙이 이걸 숨겨
+            아이콘만 남긴다(반응형 1차). "▶ "는 텍스트 노드 그대로라 넓은 폭
+            렌더는 변하지 않는다. */}
+        ▶ <span className="toolbar-label">실행</span>
       </button>
       {open &&
         createPortal(

@@ -30,6 +30,7 @@ import { SearchPanel } from "./components/SearchPanel";
 import { RunMenu } from "./components/RunMenu";
 import { AgentOptionsPopover } from "./components/AgentOptionsPopover";
 import { spawnOptionFields } from "./state/agentOptions";
+import { CollapsibleControls, CollapsibleSeg } from "./components/CollapsibleControls";
 import { StudyView } from "./components/StudyView";
 import { PopoutWorkbench } from "./components/PopoutWorkbench";
 import { DropZoneWindow } from "./components/DropZoneWindow";
@@ -70,6 +71,16 @@ import {
   type SidebarView,
 } from "./state/sidebarView";
 import "./App.css";
+
+/* ---- 상단 툴바 접기 임계 (반응형 1차) ----
+ * host = `.toolbar` border-box 폭. 헤드리스 Chrome + 실 App.css 실측:
+ *   자연폭 962 = 모드seg 147 + 세션그룹 346 + 실행 59 + 테마 56 + 롤업 69 +
+ *   제목 214 + gap 50 + padding 20.
+ *   제목은 flex:1 min-width:0 이라 0까지 줄어든다 → 962-214 = 748 이 "아무것도
+ *   안 잘리는" 하한. 그 아래에서 세션/실행 클러스터(346)를 "⋯"(30)로 접으면
+ *   ~430 까지 버틴다. 다시 그 아래에서 모드 seg(147)를 select(65)로 접는다. */
+const TOOLBAR_GROUP_COLLAPSE = 750;
+const TOOLBAR_MODE_COLLAPSE = 430;
 
 /** 사이드바 탭 5종의 표시 메타 — 액티비티 바와 반쪽 헤더 seg가 공유한다. */
 const SIDE_TABS = [
@@ -766,42 +777,42 @@ function AppMain() {
           같은 앱-전역 요소는 컨텍스트를 읽지 않아 무해. */}
       <SurfaceProvider surfaceId="primary" project={activeProject}>
       <div className="toolbar">
-        <div className="seg" role="group" aria-label="화면 모드">
-          <button
-            className={`seg-item${segMode === "study" ? " seg-on" : ""}`}
-            aria-pressed={segMode === "study"}
-            title="스터디 모드 — 두 폴더 나란히 읽기/학습"
-            onClick={() => pickSegMode("study")}
-          >
-            스터디
-          </button>
-          <button
-            className={`seg-item${segMode === "integrated" ? " seg-on" : ""}`}
-            aria-pressed={segMode === "integrated"}
-            title="통합 모드 — 기본 워크스페이스"
-            onClick={() => pickSegMode("integrated")}
-          >
-            통합
-          </button>
-          <button
-            className={`seg-item${segMode === "dev" ? " seg-on" : ""}`}
-            aria-pressed={segMode === "dev"}
-            title={
-              activeProject
+        {/* 화면 모드 3택. 툴바가 아주 좁아지면(<430px) select로 접힌다 — 접기
+            우선순위상 제목·세션 클러스터 다음이다(반응형 1차). */}
+        <CollapsibleSeg
+          threshold={TOOLBAR_MODE_COLLAPSE}
+          host=".toolbar"
+          tag="div"
+          items={[
+            { id: "study", label: "스터디", title: "스터디 모드 — 두 폴더 나란히 읽기/학습" },
+            { id: "integrated", label: "통합", title: "통합 모드 — 기본 워크스페이스" },
+            {
+              id: "dev",
+              label: "개발",
+              title: activeProject
                 ? "개발 모드 — 트리 파일이 에디터 탭+개발 세션(우측) 레이아웃으로 열립니다 (현재 프로젝트에만 적용)"
-                : "개발 모드는 프로젝트를 연 뒤 선택할 수 있습니다"
-            }
-            disabled={!activeProject}
-            onClick={() => pickSegMode("dev")}
-          >
-            개발
-          </button>
-        </div>
+                : "개발 모드는 프로젝트를 연 뒤 선택할 수 있습니다",
+              disabled: !activeProject,
+            },
+          ]}
+          value={segMode}
+          onChange={(v) => pickSegMode(v as "study" | "integrated" | "dev")}
+          ariaLabel="화면 모드"
+          selectTitle="화면 모드 — 스터디 · 통합 · 개발"
+        />
         {mode === "workspace" && (
           <div className="toolbar-group" role="group" aria-label="세션/실행">
             {/* 세 버튼 모두 dev 레이어에서는 disabled — 변경 전에도 이 버튼들은
                 통합 레이어 안에 있어 dev 모드에선 접근 불가였다(동작 보존, 리뷰
                 A3: 소비자가 projectModes를 조용히 플립하지 않는다). */}
+            {/* 좁아지면(<750px) 이 클러스터 전체가 "⋯" 하나로 접힌다 — 우측 끝의
+                attention 롤업이 먼저 잘리던 순서를 뒤집는다(반응형 1차). */}
+            <CollapsibleControls
+              threshold={TOOLBAR_GROUP_COLLAPSE}
+              host=".toolbar"
+              label="세션/실행 더 보기"
+              moreClassName="toolbar-btn"
+            >
             <button
               className="toolbar-btn"
               title={
@@ -814,7 +825,9 @@ function AppMain() {
             >
               <span className="toolbar-ico">▣</span> 터미널 <span className="toolbar-caret">▾</span>
             </button>
-            <div className="agent-opt-menu">
+            {/* data-keep-menu: "⋯"로 접혔을 때, 이 안의 ▾가 자기 팝오버를 여는
+                동안 부모 오버플로 메뉴가 닫히지 않게 한다(반응형 1차). */}
+            <div className="agent-opt-menu" data-keep-menu="">
               <button
                 className="toolbar-btn"
                 title={
@@ -889,6 +902,7 @@ function AppMain() {
             >
               <span className="toolbar-ico">▤</span> 메모
             </button>
+            </CollapsibleControls>
           </div>
         )}
         <RunMenu />

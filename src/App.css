@@ -266,6 +266,21 @@ body {
   border-color: var(--accent-bright);
 }
 
+/* 버튼 라벨(글리프와 분리) — 아주 좁은 컨테이너에서는 라벨만 숨겨 아이콘
+   버튼이 된다. 규칙은 컨테이너별로 켠다(메인 툴바는 켜지 않는다 — 거기서는
+   클러스터가 통째로 "⋯"로 접히는 편이 낫다). */
+.toolbar-label {
+  display: inline;
+}
+/* 부 표면은 태생이 좁다(분할에 따라 창의 1/4까지) — 실측 라벨 포함 content-box
+   301 → 아이콘만 160. `container-type: inline-size` 질의는 **content box** 기준
+   이므로(padding 12 제외) 자연폭 301에 슬랙 ~10을 더한 312에서 라벨을 접는다. */
+@container surface-toolbar (max-width: 312px) {
+  .toolbar-label {
+    display: none;
+  }
+}
+
 /* Button glyph accents (restyle: text icons, no icon font). */
 .toolbar-ico {
   font-size: 11px;
