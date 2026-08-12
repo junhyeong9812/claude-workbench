@@ -18,6 +18,22 @@ import { useLayoutEffect, useState, type RefObject } from "react";
  * (단위 테스트가 DOM 없이 경계를 검증한다).
  */
 
+/**
+ * 포털 팝오버 레이어 표시. 포털은 DOM 조상 관계를 끊으므로 "바깥 클릭" 판정이
+ * `contains`만으로는 **다른 팝오버 위 클릭까지 바깥으로 본다** — 오버플로 메뉴
+ * 안에서 연 하위 팝오버(에이전트 옵션·실행 메뉴)를 누르는 순간 부모 메뉴가 닫혀
+ * 하위 팝오버까지 언마운트되는 문제. 포털 레이어에 이 속성을 달아두고, 다층
+ * 메뉴는 이 속성이 붙은 조상 안의 클릭을 바깥으로 세지 않는다.
+ */
+export const POPOVER_LAYER_ATTR = "data-popover-layer";
+
+/** 클릭 대상이 어떤 포털 팝오버 레이어 안인가. */
+export function isInPopoverLayer(node: EventTarget | null): boolean {
+  const el =
+    node instanceof Element ? node : node instanceof Node ? node.parentElement : null;
+  return !!el?.closest(`[${POPOVER_LAYER_ATTR}]`);
+}
+
 export type AnchorBox = { left: number; right: number; top: number; bottom: number };
 export type AnchoredPos = { left: number; top: number; maxHeight: number };
 

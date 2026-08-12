@@ -1,5 +1,7 @@
 import { useEffect, useRef, useState } from "react";
+import { createPortal } from "react-dom";
 import { invoke } from "@tauri-apps/api/core";
+import { useAnchoredPosition } from "../hooks/useAnchoredPosition";
 import { useAppStore } from "../state/store";
 import { useSurfaceProject, useSurfaceId } from "../state/surfaceContext";
 import type { RunTarget } from "../types";
@@ -19,6 +21,15 @@ export function RunMenu() {
   const [targets, setTargets] = useState<RunTarget[]>([]);
   const [open, setOpen] = useState(false);
   const ref = useRef<HTMLDivElement>(null);
+  const btnRef = useRef<HTMLButtonElement>(null);
+  const popRef = useRef<HTMLDivElement>(null);
+  // 드롭다운은 body 포털 + fixed + 뷰포트 클램프(반응형 1차) — 좁은 표면 우측이나
+  // `overflow:hidden` 조상(부 표면 셸) 안에서도 잘리거나 화면 밖으로 나가지 않는다.
+  // 실측 min-width 260 · 이전 CSS 상한(60vh)을 대체하는 420 상한.
+  const pos = useAnchoredPosition(open, btnRef, popRef, {
+    fallbackWidth: 260,
+    maxHeight: 420,
+  });
 
   // Re-detect whenever the active project changes. Clear the old targets + close
   // the menu *first*, so a click during detection can't run the previous
@@ -40,11 +51,15 @@ export function RunMenu() {
     };
   }, [activeProject]);
 
-  // Close the dropdown on an outside click.
+  // Close the dropdown on an outside click. 드롭다운이 포털로 body에 있으므로
+  // 트리거(ref)뿐 아니라 팝오버(popRef)도 "안쪽"으로 세야 한다.
   useEffect(() => {
     if (!open) return;
     const onDoc = (e: MouseEvent) => {
-      if (ref.current && !ref.current.contains(e.target as Node)) setOpen(false);
+      const t = e.target as Node;
+      if (ref.current?.contains(t)) return;
+      if (popRef.current?.contains(t)) return;
+      setOpen(false);
     };
     document.addEventListener("mousedown", onDoc);
     return () => document.removeEventListener("mousedown", onDoc);
@@ -59,11 +74,29 @@ export function RunMenu() {
 
   return (
     <div className="run-menu" ref={ref}>
-      <button className="toolbar-btn" title="빌드/테스트 실행" onClick={() => setOpen((o) => !o)}>
+      <button
+        ref={btnRef}
+        className="toolbar-btn"
+        title="빌드/테스트 실행"
+        aria-haspopup="menu"
+        aria-expanded={open}
+        onClick={() => setOpen((o) => !o)}
+      >
         ▶ 실행
       </button>
-      {open && (
-        <div className="run-dropdown">
+      {open &&
+        createPortal(
+        <div
+          ref={popRef}
+          className="run-dropdown"
+          data-popover-layer=""
+          style={{
+            left: pos?.left ?? 0,
+            top: pos?.top ?? 0,
+            maxHeight: pos?.maxHeight,
+            visibility: pos ? "visible" : "hidden",
+          }}
+        >
           {targets.map((t) => (
             <div key={t.kind} className="run-group">
               <div className="run-group-head">{t.kind}</div>
@@ -80,8 +113,9 @@ export function RunMenu() {
               {!t.test && !t.build && <div className="run-item run-empty">실행 가능한 명령 없음</div>}
             </div>
           ))}
-        </div>
-      )}
+        </div>,
+          document.body,
+        )}
     </div>
   );
 }

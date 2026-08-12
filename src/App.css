@@ -332,12 +332,13 @@ body {
   background: var(--bg-alt);
   border-bottom: 1px solid var(--border);
 }
+/* 부양 변형은 body 포털 + fixed 다(반응형 1차 인프라 C) — left/top/max-height는
+   useAnchoredPosition이 인라인으로 준다(뷰포트 클램프 · 아래 공간 부족 시 위로
+   뒤집기). top:100%/left:0/margin-top 은 그래서 없다(좌표를 두 번 더하면 어긋난다). */
 .agent-opt-pop-float {
-  position: absolute;
-  top: 100%;
-  left: 0;
+  position: fixed;
   z-index: var(--z-dropdown);
-  margin-top: 4px;
+  overflow-y: auto;
   min-width: 250px;
   border: 1px solid var(--border);
   border-radius: 8px;
@@ -404,12 +405,11 @@ body {
 .appearance-menu {
   position: relative;
 }
+/* body 포털 + fixed (반응형 1차) — 좌표는 useAnchoredPosition 인라인. */
 .appearance-pop {
-  position: absolute;
-  top: 100%;
-  left: 0;
+  position: fixed;
   z-index: var(--z-dropdown);
-  margin-top: 4px;
+  overflow-y: auto;
   display: flex;
   flex-direction: column;
   gap: 10px;
@@ -4836,15 +4836,12 @@ body {
   position: relative;
   display: inline-block;
 }
+/* body 포털 + fixed (반응형 1차) — 좌표·높이 상한은 useAnchoredPosition 인라인. */
 .run-dropdown {
-  position: absolute;
-  top: 100%;
-  left: 0;
+  position: fixed;
   z-index: var(--z-dropdown);
-  margin-top: 4px;
   min-width: 260px;
   max-width: min(420px, 90vw);
-  max-height: 60vh;
   overflow-y: auto;
   background: var(--bg);
   border: 1px solid var(--border);

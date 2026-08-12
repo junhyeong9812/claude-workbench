@@ -1,4 +1,6 @@
 import { useEffect, useMemo, useRef, useState, type DragEvent as RDragEvent } from "react";
+import { createPortal } from "react-dom";
+import { useAnchoredPosition } from "./hooks/useAnchoredPosition";
 import {
   Panel,
   PanelGroup,
@@ -713,16 +715,24 @@ function AppMain() {
   useEffect(() => {
     if (appearanceOpen) appearancePopRef.current?.focus();
   }, [appearanceOpen]);
+  // 팝오버는 body 포털 + fixed(반응형 1차)라 트리거 컨테이너 밖에 있다 — 바깥
+  // 클릭 판정에 팝오버 자신도 "안쪽"으로 넣지 않으면 열자마자 닫힌다.
   useEffect(() => {
     if (!appearanceOpen) return;
     const onDoc = (e: MouseEvent) => {
-      if (appearanceRef.current && !appearanceRef.current.contains(e.target as Node)) {
-        setAppearanceOpen(false);
-      }
+      const t = e.target as Node;
+      if (appearanceRef.current?.contains(t)) return;
+      if (appearancePopRef.current?.contains(t)) return;
+      setAppearanceOpen(false);
     };
     document.addEventListener("mousedown", onDoc);
     return () => document.removeEventListener("mousedown", onDoc);
   }, [appearanceOpen]);
+  // 좌표·높이 상한(뷰포트 클램프 · 아래 공간 부족 시 위로 뒤집기). 실측 자연폭 250.
+  const appearancePos = useAnchoredPosition(appearanceOpen, appearanceBtnRef, appearancePopRef, {
+    fallbackWidth: 250,
+    maxHeight: 420,
+  });
   // Font-size input draft: null follows the store; committed on Enter/blur.
   // Only a plain integer commits — empty/whitespace/hex/decimal drafts revert
   // to the previous value (review A1: Number("") is 0, not NaN, so an
@@ -904,13 +914,21 @@ function AppMain() {
           >
             <span className="toolbar-ico">◐</span> 테마
           </button>
-          {appearanceOpen && (
+          {appearanceOpen &&
+            createPortal(
             <div
               className="appearance-pop"
+              data-popover-layer=""
               role="dialog"
               aria-label="테마 설정"
               tabIndex={-1}
               ref={appearancePopRef}
+              style={{
+                left: appearancePos?.left ?? 0,
+                top: appearancePos?.top ?? 0,
+                maxHeight: appearancePos?.maxHeight,
+                visibility: appearancePos ? "visible" : "hidden",
+              }}
             >
               <div className="appearance-row">
                 <span className="appearance-label">테마</span>
@@ -986,8 +1004,9 @@ function AppMain() {
                   title="터미널 색상 · 세션 알림 — 터미널 탭 안의 ⚙과 같은 설정입니다"
                 />
               </div>
-            </div>
-          )}
+            </div>,
+              document.body,
+            )}
         </div>
         <ToolbarRollup />
         <span className="toolbar-title">
