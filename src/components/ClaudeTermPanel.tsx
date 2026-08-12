@@ -19,6 +19,7 @@ import "@xterm/xterm/css/xterm.css";
 import { useAppStore } from "../state/store";
 import { xtermTheme } from "./xtermTheme";
 import { TermSettingsButton } from "./TermSettingsButton";
+import { CollapsibleControls, CollapsibleSeg } from "./CollapsibleControls";
 import { recallArea, rememberArea, type PanelArea } from "../state/panelFocus";
 import { openArgs, paramsAfterOpen } from "../state/claudeTermParams";
 import { getCurrentWindow } from "@tauri-apps/api/window";
@@ -1977,11 +1978,103 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
     setDetailRetry((r) => r + 1);
   };
 
+  /* ---- 반응형 접기 임계 (반응형 1차) ----
+   * host = `.claudeterm-pane-head` 의 border-box 폭. 값은 헤드리스 Chrome +
+   * 실 App.css로 잰 자연폭에서 나온다(measure 하네스):
+   *   - 정리 세션 헤드 컨트롤 686px + 좌우 padding 16 + 제목 gap 8 = 710
+   *     → 710 미만이면 제목을 0으로 줄여도 컨트롤이 잘리기 시작한다.
+   *   - 뷰 seg 169 / 모델 seg 107 → select 66 / 55 (합 −155)
+   *   - 일반 에이전트 헤드 컨트롤 528 + 16 + 8 = 552
+   * 실제 앱은 WebKitGTK라 폰트 폭이 미세하게 다를 수 있어 각 임계에 ~10px 슬랙을 준다.
+   */
+  const HEAD_SEG_COLLAPSE = 720; // seg → select
+  const HEAD_MORE_COLLAPSE = 560; // 보조 버튼군 → "⋯"
+  const HEAD_HOST = ".claudeterm-pane-head";
+
+  // 정리 세션 뷰/모델 세그 — 개별 title은 세그 버튼에만 실린다(select는 하나뿐이라
+  // 묶음 설명을 준다).
+  const refineViewItems = REFINE_VIEWS.map((v) => ({
+    id: v.id,
+    label: v.label,
+    title:
+      v.id === "memo"
+        ? "초안을 길게 쓰는 곳 — 자동 저장되고, 닫을 때 아카이브에 함께 남습니다"
+        : v.id === "timeline"
+          ? "정리 대화의 변경 타임라인"
+          : "정리 세션의 claude 터미널 (숨어 있는 동안에도 계속 돌아갑니다)",
+  }));
+  const refineModelItems = REFINE_MODELS.map((m) => ({
+    id: m.id,
+    label: m.label,
+    title: "정리 세션을 띄울 모델 — 스폰 이후에는 세션을 다시 시작해야 바뀝니다",
+  }));
+
+  // "⋯"로 접히는 **보조** 버튼군 — 접기 우선순위 최하위인 것만 넣는다.
+  // [적용]·[codex 검증]·미러 배지·서브에이전트 배지는 넣지 않는다(핵심 액션·알림).
+  // 비어 있으면 아예 감싸지 않는다(빈 ⋯ 방지).
+  const showPeekButtons = !isRefine && !!peekUuid;
+  const overflowButtons = [
+    showPeekButtons && (
+      <button
+        key="tl"
+        className="claudeterm-head-btn"
+        title="이 세션의 타임라인을 오른쪽에 임시 패널로 엽니다 (같은 세션은 1개 · 앱을 다시 켜면 복원되지 않습니다)"
+        onClick={() =>
+          openTimelinePeek(props.containerApi, {
+            sourcePanelId: props.api.id,
+            uuid: peekUuid!,
+            project: props.params.project ?? useAppStore.getState().activeProject ?? null,
+            title: (props.params.title as string) ?? "세션",
+          })
+        }
+      >
+        ⧉ 타임라인
+      </button>
+    ),
+    showPeekButtons && (
+      <button
+        key="refine"
+        className="claudeterm-head-btn"
+        title="프롬프트 정리 세션을 오른쪽에 엽니다 — 대화로 다듬은 뒤 [적용]하면 이 세션 입력창에 채워집니다 (자동 제출 없음 · 앱을 다시 켜면 복원되지 않습니다)"
+        onClick={() => void openRefinePanel(loadLastRefineModel())}
+      >
+        ✏ 프롬프트 정리
+      </button>
+    ),
+    lastSeed && (
+      <button
+        key="seed"
+        className="claudeterm-head-btn"
+        title="시드 프롬프트를 현재 세션에 다시 보냅니다 (자동 주입이 빗나갔을 때)"
+        onClick={() => void reinjectSeed(lastSeed)}
+      >
+        시드 재주입
+      </button>
+    ),
+    /* 아카이브는 정리 세션에 없다 — 스크래치 세션을 아카이브하면 격리해 둔
+       전사가 그대로 지식베이스로 들어간다(spec ④ 금지영역). */
+    !isRefine && (
+      <button
+        key="archive"
+        className="claudeterm-head-btn"
+        title="세션 아카이브: JSONL 원본 + 책(book.html) + 요약 + 지식(issue/method/domain) 추출 — 세션은 종료되지 않고 계속 사용 가능"
+        disabled={archiveBusy || !props.params.sessionUuid}
+        onClick={archiveSession}
+      >
+        {archiveBusy ? "아카이브 중…" : "아카이브"}
+      </button>
+    ),
+  ].filter(Boolean);
+
   // 툴바(제목 + 컨트롤). 정리 세션에서는 이 줄이 **패널 맨 위**로 올라간다 —
   // 3뷰 중 무엇을 보고 있든 [적용]·[codex 검증]·모델·뷰 전환은 늘 손에 닿아야
   // 하는데, 원래 자리는 터미널 창(뷰 하나)의 안쪽이기 때문이다.
+  // 좁아지면 제목 → 보조 버튼("⋯") → seg(select) 순으로 접힌다(반응형 1차).
+  // `--busy` = 8~12개 컨트롤이 한 줄에 눌리는 **이 헤드에만** 제목 접기 규칙을
+  // 건다는 표시다(타임라인 360·서브에이전트 300·상세 뷰어 240 같은 고정 좁은
+  // 칼럼 헤드는 같은 클래스를 쓰지만 접을 게 없다 — 접으면 넓은 폭 회귀).
   const paneHead = (
-        <div className="claudeterm-pane-head">
+        <div className="claudeterm-pane-head claudeterm-pane-head--busy">
           <span className="claudeterm-pane-head-title">
             에이전트 — {(props.params.title as string) ?? "터미널"}
           </span>
@@ -2042,25 +2135,15 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
             )}
             {isRefine && (
               <>
-                <span className="seg" role="group" aria-label="정리 패널 뷰">
-                  {REFINE_VIEWS.map((v) => (
-                    <button
-                      key={v.id}
-                      className={`seg-item${refineView === v.id ? " seg-on" : ""}`}
-                      aria-pressed={refineView === v.id}
-                      title={
-                        v.id === "memo"
-                          ? "초안을 길게 쓰는 곳 — 자동 저장되고, 닫을 때 아카이브에 함께 남습니다"
-                          : v.id === "timeline"
-                            ? "정리 대화의 변경 타임라인"
-                            : "정리 세션의 claude 터미널 (숨어 있는 동안에도 계속 돌아갑니다)"
-                      }
-                      onClick={() => setRefineView(v.id)}
-                    >
-                      {v.label}
-                    </button>
-                  ))}
-                </span>
+                <CollapsibleSeg
+                  threshold={HEAD_SEG_COLLAPSE}
+                  host={HEAD_HOST}
+                  items={refineViewItems}
+                  value={refineView}
+                  onChange={(id) => setRefineView(id as RefineView)}
+                  ariaLabel="정리 패널 뷰"
+                  selectTitle="정리 패널에서 볼 뷰 — 메모(초안) · 타임라인 · 터미널"
+                />
                 <button
                   className="claudeterm-head-btn"
                   disabled={sendReason !== null}
@@ -2069,19 +2152,15 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
                 >
                   {sending ? "보내는 중…" : "보내기"}
                 </button>
-                <span className="seg" role="group" aria-label="정리 세션 모델">
-                  {REFINE_MODELS.map((m) => (
-                    <button
-                      key={m.id}
-                      className={`seg-item${refineModel === m.id ? " seg-on" : ""}`}
-                      aria-pressed={refineModel === m.id}
-                      title="정리 세션을 띄울 모델 — 스폰 이후에는 세션을 다시 시작해야 바뀝니다"
-                      onClick={() => chooseRefineModel(m.id)}
-                    >
-                      {m.label}
-                    </button>
-                  ))}
-                </span>
+                <CollapsibleSeg
+                  threshold={HEAD_SEG_COLLAPSE}
+                  host={HEAD_HOST}
+                  items={refineModelItems}
+                  value={refineModel}
+                  onChange={(id) => chooseRefineModel(id as RefineModel)}
+                  ariaLabel="정리 세션 모델"
+                  selectTitle="정리 세션을 띄울 모델 — 스폰 이후에는 세션을 다시 시작해야 바뀝니다"
+                />
                 <button
                   className="claudeterm-head-btn"
                   disabled={applyReason !== null}
@@ -2107,51 +2186,17 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
                 </button>
               </>
             )}
-            {!isRefine && peekUuid && (
-              <button
-                className="claudeterm-head-btn"
-                title="이 세션의 타임라인을 오른쪽에 임시 패널로 엽니다 (같은 세션은 1개 · 앱을 다시 켜면 복원되지 않습니다)"
-                onClick={() =>
-                  openTimelinePeek(props.containerApi, {
-                    sourcePanelId: props.api.id,
-                    uuid: peekUuid,
-                    project: props.params.project ?? useAppStore.getState().activeProject ?? null,
-                    title: (props.params.title as string) ?? "세션",
-                  })
-                }
+            {/* 타임라인 · 프롬프트 정리 · 시드 재주입 · 아카이브 — 좁아지면 "⋯"
+                하나로 접힌다(overflowButtons에서 조건부로 조립). */}
+            {overflowButtons.length > 0 && (
+              <CollapsibleControls
+                threshold={HEAD_MORE_COLLAPSE}
+                host={HEAD_HOST}
+                label="세션 도구 더 보기"
+                moreClassName="claudeterm-head-btn"
               >
-                ⧉ 타임라인
-              </button>
-            )}
-            {!isRefine && peekUuid && (
-              <button
-                className="claudeterm-head-btn"
-                title="프롬프트 정리 세션을 오른쪽에 엽니다 — 대화로 다듬은 뒤 [적용]하면 이 세션 입력창에 채워집니다 (자동 제출 없음 · 앱을 다시 켜면 복원되지 않습니다)"
-                onClick={() => void openRefinePanel(loadLastRefineModel())}
-              >
-                ✏ 프롬프트 정리
-              </button>
-            )}
-            {lastSeed && (
-              <button
-                className="claudeterm-head-btn"
-                title="시드 프롬프트를 현재 세션에 다시 보냅니다 (자동 주입이 빗나갔을 때)"
-                onClick={() => void reinjectSeed(lastSeed)}
-              >
-                시드 재주입
-              </button>
-            )}
-            {/* 아카이브는 정리 세션에 없다 — 스크래치 세션을 아카이브하면 격리해
-                둔 전사가 그대로 지식베이스로 들어간다(spec ④ 금지영역). */}
-            {!isRefine && (
-              <button
-                className="claudeterm-head-btn"
-                title="세션 아카이브: JSONL 원본 + 책(book.html) + 요약 + 지식(issue/method/domain) 추출 — 세션은 종료되지 않고 계속 사용 가능"
-                disabled={archiveBusy || !props.params.sessionUuid}
-                onClick={archiveSession}
-              >
-                {archiveBusy ? "아카이브 중…" : "아카이브"}
-              </button>
+                {overflowButtons}
+              </CollapsibleControls>
             )}
             {/* 이 패널도 xterm을 직접 띄우고 termColors를 그대로 적용한다
                 (TerminalPanel과 같은 xtermTheme 구독). 색상 설정이 툴바에서

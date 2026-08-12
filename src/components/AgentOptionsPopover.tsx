@@ -1,5 +1,7 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState, type CSSProperties } from "react";
+import { createPortal } from "react-dom";
 import { EffortSelect, ModelSelect } from "./AgentOptionFields";
+import { useAnchoredPosition } from "../hooks/useAnchoredPosition";
 import {
   AGENT_CHOICES,
   loadAgentOptions,
@@ -18,11 +20,14 @@ import {
  * 클릭(그냥 "+ 만들기")은 마지막 설정을 그대로 재사용하고, 이 팝오버는 그
  * 설정을 바꾸고 싶을 때만 연다.
  *
- * 렌더는 상태 플래그 + 인라인이다(코드베이스에 createPortal 사용처 0건 — 모든
- * 팝오버가 이 관례를 따른다). **배치만** 호출자 소유다(툴바=절대, 피커=흐름 —
- * 앵커가 달라 한쪽은 반드시 틀린다). 반대로 **포커스·닫힘 계약은 여기 한 곳에
- * 모은다**: 호출자마다 따로 두면 두 벌이 갈라지고, 팝오버가 Escape를 삼키면
- * (stopPropagation) 호출자 쪽 복원 코드는 영영 돌지 않는다.
+ * **배치만** 호출자 소유다(툴바=포털 부양, 피커=흐름 — 앵커가 달라 한쪽은 반드시
+ * 틀린다). 반대로 **포커스·닫힘 계약은 여기 한 곳에 모은다**: 호출자마다 따로 두면
+ * 두 벌이 갈라지고, 팝오버가 Escape를 삼키면 (stopPropagation) 호출자 쪽 복원
+ * 코드는 영영 돌지 않는다.
+ *
+ * float 변형은 body 포털 + `position:fixed` + 뷰포트 클램프다(반응형 1차 —
+ * useAnchoredPosition). 이전엔 트리거 기준 `absolute; left:0`이라 (a)좁은 표면
+ * 우측에서 화면 밖으로 나갔고 (b)`overflow:hidden` 조상(부 표면 셸)에 잘렸다.
  *
  * 계약:
  * - 열릴 때 첫 컨트롤로 1회 포커스 이동
@@ -49,6 +54,13 @@ export function AgentOptionsPopover({
   onClose: () => void;
 }) {
   const popRef = useRef<HTMLDivElement>(null);
+  // triggerRef 가 없을 때(피커 흐름 배치) 훅에 넘길 안정 ref — float일 때만 쓰인다.
+  const noAnchorRef = useRef<HTMLElement>(null);
+  // 실측 자연폭 250(min-width) · 내용 3행+푸터라 260이면 스크롤이 안 생긴다.
+  const pos = useAnchoredPosition(float, triggerRef ?? noAnchorRef, popRef, {
+    fallbackWidth: 250,
+    maxHeight: 420,
+  });
 
   // 열릴 때 1회만 첫 컨트롤로. 콜백 ref로 하면 매 렌더 재실행되어 사용자가
   // select를 고르는 도중 포커스를 훔친다(외관 팝오버 A10의 교훈).
@@ -84,12 +96,25 @@ export function AgentOptionsPopover({
     onStart(agent, opts);
   };
 
-  return (
+  // 계측 전(pos=null)엔 숨겨 좌상단 깜빡임 방지(useAnchoredPosition 계약).
+  const floatStyle: CSSProperties | undefined = float
+    ? {
+        left: pos?.left ?? 0,
+        top: pos?.top ?? 0,
+        maxHeight: pos?.maxHeight,
+        visibility: pos ? "visible" : "hidden",
+      }
+    : undefined;
+
+  const body = (
     <div
       ref={popRef}
       className={`agent-opt-pop${float ? " agent-opt-pop-float" : ""}`}
       role="dialog"
       aria-label="새 세션 옵션"
+      // = POPOVER_LAYER_ATTR (다층 메뉴의 바깥클릭 판정 제외 표식)
+      data-popover-layer={float ? "" : undefined}
+      style={floatStyle}
       onKeyDown={(e) => {
         if (e.key !== "Escape") return;
         // 삼키는 것이 의도다 — 피커 안에서는 Escape가 피커 전체를 닫는 키라,
@@ -157,4 +182,8 @@ export function AgentOptionsPopover({
       </div>
     </div>
   );
+
+  // 포털은 DOM만 옮기고 React 트리 이벤트(Escape 버블·호출자 onKeyDown)는 그대로
+  // 유지한다. 바깥 클릭 판정은 native 리스너 + popRef.contains 라 포털이어도 성립.
+  return float ? createPortal(body, document.body) : body;
 }
