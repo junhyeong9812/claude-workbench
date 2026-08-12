@@ -1,5 +1,7 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useRef, useState } from "react";
+import { createPortal } from "react-dom";
 import { useAppStore } from "../state/store";
+import { findSessionPanel } from "../state/surfaceRegistry";
 import {
   useClaudeStatus,
   projectAttention,
@@ -47,16 +49,25 @@ export function ProjectStatusBadge({ project }: { project: string }) {
   const requestFocusSession = useAppStore((s) => s.requestFocusSession);
   const [open, setOpen] = useState(false);
   const rootRef = useRef<HTMLDivElement>(null);
+  const btnRef = useRef<HTMLButtonElement>(null);
+  const popRef = useRef<HTMLDivElement>(null);
+  // F1: 포털 드롭다운의 fixed 좌표(트리거 rect 기준 계산 + 뷰포트 클램프). null =
+  // 아직 미계측(첫 레이아웃 패스 전) → visibility:hidden 으로 깜빡임 방지.
+  const [pos, setPos] = useState<{ left: number; top: number; maxHeight: number } | null>(null);
 
   const roll = projectAttention(entries, project, projectOfSession, labelOfSession);
   const active = hasProjectAttention(roll);
 
   // Close the dropdown on outside click / Escape. Also fold it when the project
-  // goes quiet (no active sessions) so a stale list can't linger.
+  // goes quiet (no active sessions) so a stale list can't linger. 포털 pop은
+  // rootRef 밖(document.body)에 있으므로 popRef도 함께 검사한다(F1).
   useEffect(() => {
     if (!open) return;
     const onDoc = (e: MouseEvent) => {
-      if (rootRef.current && !rootRef.current.contains(e.target as Node)) setOpen(false);
+      const t = e.target as Node;
+      if (rootRef.current?.contains(t)) return;
+      if (popRef.current?.contains(t)) return;
+      setOpen(false);
     };
     const onKey = (e: KeyboardEvent) => {
       if (e.key === "Escape") setOpen(false);
@@ -71,6 +82,48 @@ export function ProjectStatusBadge({ project }: { project: string }) {
   useEffect(() => {
     if (!active && open) setOpen(false);
   }, [active, open]);
+
+  // F1(codex P2-1 + P2-3): 드롭다운을 body 포털 + position:fixed 레이어로 띄운다.
+  // 배지가 보조 표면 조상 `.dual-secondary{overflow:hidden}`에 클리핑돼 secondary
+  // 헤더에서 사실상 안 열리던 문제와, left:0 고정이라 우측 탭·하단 표면에서 화면
+  // 밖으로 나가던 문제를 함께 해소한다 — 트리거 rect 기준으로 아래(공간 없으면
+  // 위) 배치 + 뷰포트 클램프(tab-ctx-menu의 Math.max(0,Math.min(...)) 클램프 계열).
+  useLayoutEffect(() => {
+    if (!open) {
+      setPos(null);
+      return;
+    }
+    const compute = () => {
+      const btn = btnRef.current;
+      if (!btn) return;
+      const pop = popRef.current;
+      const r = btn.getBoundingClientRect();
+      const GAP = 4;
+      const MARGIN = 4;
+      const vw = window.innerWidth;
+      const vh = window.innerHeight;
+      const w = pop?.offsetWidth ?? 200;
+      const h = Math.min(pop?.scrollHeight ?? 260, 260);
+      // 가로: 트리거 좌변 정렬, 뷰포트 안으로 클램프(우측 탭·좁은 창에서 화면 밖 방지).
+      const left = Math.max(MARGIN, Math.min(r.left, vw - w - MARGIN));
+      // 세로: 기본 아래. 아래 공간이 부족하고 위가 더 넉넉하면 위로 뒤집는다(하단 표면).
+      const below = r.bottom + GAP;
+      const openUp = below + h > vh - MARGIN && r.top - GAP - h > MARGIN;
+      let top = openUp ? r.top - GAP - h : below;
+      top = Math.max(MARGIN, Math.min(top, vh - h - MARGIN));
+      // 남은 세로 공간에 맞춘 상한(콘텐츠가 길면 내부 스크롤 — overflow-y:auto).
+      const maxHeight = Math.max(80, Math.min(260, vh - top - MARGIN));
+      setPos({ left, top, maxHeight });
+    };
+    compute();
+    // fixed 레이어라 스크롤/리사이즈로 트리거가 움직이면 위치를 다시 계산한다.
+    window.addEventListener("scroll", compute, true);
+    window.addEventListener("resize", compute);
+    return () => {
+      window.removeEventListener("scroll", compute, true);
+      window.removeEventListener("resize", compute);
+    };
+  }, [open]);
 
   if (!active) return null;
 
@@ -87,8 +140,9 @@ export function ProjectStatusBadge({ project }: { project: string }) {
   return (
     <div className="tab-status" ref={rootRef}>
       <button
+        ref={btnRef}
         type="button"
-        className={`tab-status-badge is-${kind}${running ? " is-running" : ""}`}
+        className={`tab-status-badge is-${kind}`}
         aria-haspopup="menu"
         aria-expanded={open}
         aria-label={title}
@@ -111,38 +165,64 @@ export function ProjectStatusBadge({ project }: { project: string }) {
           </span>
         )}
       </button>
-      {open && (
-        <div className="tab-status-pop" role="menu" aria-label={`${project} 진행 중 세션`}>
-          {roll.sessions.map((s) => {
-            const skind =
-              s.status === "blocked" ? "blocked" : s.unseen ? "done" : "working";
-            const label = s.label?.trim() || s.uuid.slice(0, 8);
-            const statusText = s.status === "blocked" || s.status === "working"
-              ? STATUS_TEXT[s.status]
-              : s.unseen
-                ? "완료 · 미확인"
-                : STATUS_TEXT.idle;
-            return (
-              <button
-                key={s.uuid}
-                type="button"
-                role="menuitem"
-                className="tab-status-row"
-                title={`${label} — ${statusText}`}
-                onClick={(e) => {
-                  e.stopPropagation();
-                  setOpen(false);
-                  requestFocusSession(s.uuid);
-                }}
-              >
-                <span className={`tab-status-dot is-${skind}`} aria-hidden="true" />
-                <span className="tab-status-row-name">{label}</span>
-                <span className="tab-status-row-state">{statusText}</span>
-              </button>
-            );
-          })}
-        </div>
-      )}
+      {open &&
+        createPortal(
+          <div
+            ref={popRef}
+            className="tab-status-pop"
+            role="menu"
+            aria-label={`${project} 진행 중 세션`}
+            style={{
+              left: pos?.left ?? 0,
+              top: pos?.top ?? 0,
+              maxHeight: pos?.maxHeight,
+              // 계측 전(pos=null)엔 숨겨 좌상단 깜빡임 방지 — useLayoutEffect가
+              // paint 전에 좌표를 채운다.
+              visibility: pos ? "visible" : "hidden",
+            }}
+          >
+            {roll.sessions.map((s) => {
+              const skind =
+                s.status === "blocked" ? "blocked" : s.unseen ? "done" : "working";
+              const label = s.label?.trim() || s.uuid.slice(0, 8);
+              const statusText = s.status === "blocked" || s.status === "working"
+                ? STATUS_TEXT[s.status]
+                : s.unseen
+                  ? "완료 · 미확인"
+                  : STATUS_TEXT.idle;
+              return (
+                <button
+                  key={s.uuid}
+                  type="button"
+                  role="menuitem"
+                  className="tab-status-row"
+                  title={`${label} — ${statusText}`}
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    setOpen(false);
+                    // F2(codex P2-2): 이 세션 패널이 이 창 어느 표면 dock에도 없으면
+                    // (비활성 프로젝트 — primary MainArea가 activeProject로 key돼 그
+                    // dock이 마운트 안 됨) 먼저 그 프로젝트를 primary로 활성화해 dock을
+                    // 띄운다. 그래야 뒤이은 requestFocusSession의 findSessionPanel이
+                    // 패널을 찾는다. 이미 어느 표면(primary·secondary)에 열려 있으면
+                    // 활성화를 건너뛴다 — 부 표면 세션을 괜히 primary로 끌어오지 않는다.
+                    if (!findSessionPanel(s.uuid)) {
+                      const st = useAppStore.getState();
+                      if (st.projects.some((p) => p.path === project)) st.setActive(project);
+                      else void st.addProject(project);
+                    }
+                    requestFocusSession(s.uuid);
+                  }}
+                >
+                  <span className={`tab-status-dot is-${skind}`} aria-hidden="true" />
+                  <span className="tab-status-row-name">{label}</span>
+                  <span className="tab-status-row-state">{statusText}</span>
+                </button>
+              );
+            })}
+          </div>,
+          document.body,
+        )}
     </div>
   );
 }
