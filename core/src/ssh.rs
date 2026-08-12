@@ -1135,4 +1135,314 @@ W8CkSL2Yx++XP/fxFe/RAAAAD210LXRlc3QtaG9zdGtleQECAwQFBg==\n\
         assert_eq!(out.exit, Some((Some(3), None)), "non-zero exit status recovered");
     }
 
+    /// A command that produces **no output** at all must still deliver a terminal
+    /// Exit (the seam never hangs waiting for bytes that never come).
+    #[derive(Clone)]
+    struct ExecNoOutputHandler;
+    impl russh::server::Handler for ExecNoOutputHandler {
+        type Error = russh::Error;
+        async fn auth_password(&mut self, _u: &str, p: &str) -> Result<russh::server::Auth, Self::Error> {
+            Ok(if p == "testpass" { russh::server::Auth::Accept } else { russh::server::Auth::reject() })
+        }
+        async fn channel_open_session(&mut self, _c: russh::Channel<russh::server::Msg>, _s: &mut russh::server::Session) -> Result<bool, Self::Error> {
+            Ok(true)
+        }
+        async fn exec_request(&mut self, channel: russh::ChannelId, _data: &[u8], session: &mut russh::server::Session) -> Result<(), Self::Error> {
+            session.channel_success(channel)?;
+            // No stdout, no stderr — just exit 0 and close.
+            session.exit_status_request(channel, 0)?;
+            session.eof(channel)?;
+            session.close(channel)?;
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn inprocess_exec_no_output_still_terminates() {
+        let out = drive_exec(ExecNoOutputHandler, "silent", "exec_silent", |_, _| {});
+        assert!(out.ready, "exec accepted -> Ready");
+        assert!(out.stderr.is_empty(), "no stderr for a silent command");
+        assert_eq!(out.exit, Some((Some(0), None)), "silent command still yields a terminal Exit");
+    }
+
+    /// A command that writes **only stderr** (no stdout) — stderr must arrive on
+    /// the exec channel and the exit be recovered, with an empty scrollback.
+    #[derive(Clone)]
+    struct ExecStderrOnlyHandler;
+    impl russh::server::Handler for ExecStderrOnlyHandler {
+        type Error = russh::Error;
+        async fn auth_password(&mut self, _u: &str, p: &str) -> Result<russh::server::Auth, Self::Error> {
+            Ok(if p == "testpass" { russh::server::Auth::Accept } else { russh::server::Auth::reject() })
+        }
+        async fn channel_open_session(&mut self, _c: russh::Channel<russh::server::Msg>, _s: &mut russh::server::Session) -> Result<bool, Self::Error> {
+            Ok(true)
+        }
+        async fn exec_request(&mut self, channel: russh::ChannelId, _data: &[u8], session: &mut russh::server::Session) -> Result<(), Self::Error> {
+            session.channel_success(channel)?;
+            session.extended_data(channel, 1, russh::CryptoVec::from(&b"only-stderr\n"[..]))?;
+            session.exit_status_request(channel, 0)?;
+            session.eof(channel)?;
+            session.close(channel)?;
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn inprocess_exec_stderr_only() {
+        let out = drive_exec(ExecStderrOnlyHandler, "err", "exec_erronly", |_, _| {});
+        assert!(
+            out.stderr.windows(11).any(|w| w == b"only-stderr"),
+            "stderr-only output must arrive on the exec channel"
+        );
+        assert!(
+            !out.stdout.windows(11).any(|w| w == b"only-stderr"),
+            "stderr must not leak into stdout"
+        );
+        assert_eq!(out.exit, Some((Some(0), None)));
+    }
+
+    /// Death by signal: no exit-status, an exit-signal instead. The signal name
+    /// must be the canonical short form (F5), never a Rust `Debug` rendering.
+    #[derive(Clone)]
+    struct ExecSignalHandler;
+    impl russh::server::Handler for ExecSignalHandler {
+        type Error = russh::Error;
+        async fn auth_password(&mut self, _u: &str, p: &str) -> Result<russh::server::Auth, Self::Error> {
+            Ok(if p == "testpass" { russh::server::Auth::Accept } else { russh::server::Auth::reject() })
+        }
+        async fn channel_open_session(&mut self, _c: russh::Channel<russh::server::Msg>, _s: &mut russh::server::Session) -> Result<bool, Self::Error> {
+            Ok(true)
+        }
+        async fn exec_request(&mut self, channel: russh::ChannelId, _data: &[u8], session: &mut russh::server::Session) -> Result<(), Self::Error> {
+            session.channel_success(channel)?;
+            // Killed by SIGTERM: exit-signal, no exit-status.
+            session.exit_signal_request(channel, russh::Sig::TERM, false, "terminated", "")?;
+            session.eof(channel)?;
+            session.close(channel)?;
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn inprocess_exec_reports_signal_death() {
+        let out = drive_exec(ExecSignalHandler, "killme", "exec_signal", |_, _| {});
+        let (code, signal) = out.exit.expect("signal death still yields a terminal Exit");
+        assert_eq!(code, None, "no exit-status when killed by a signal");
+        assert_eq!(signal.as_deref(), Some("TERM"), "canonical signal name, not Debug form");
+    }
+
+    /// EOF arrives BEFORE the exit-status (data direction closes, then the server
+    /// reports the status, then closes). This is the case a naive `break`-on-EOF
+    /// loop loses (review F3). The server here deliberately orders
+    /// data → eof → exit-status → close.
+    #[derive(Clone)]
+    struct ExecEofBeforeExitHandler;
+    impl russh::server::Handler for ExecEofBeforeExitHandler {
+        type Error = russh::Error;
+        async fn auth_password(&mut self, _u: &str, p: &str) -> Result<russh::server::Auth, Self::Error> {
+            Ok(if p == "testpass" { russh::server::Auth::Accept } else { russh::server::Auth::reject() })
+        }
+        async fn channel_open_session(&mut self, _c: russh::Channel<russh::server::Msg>, _s: &mut russh::server::Session) -> Result<bool, Self::Error> {
+            Ok(true)
+        }
+        async fn exec_request(&mut self, channel: russh::ChannelId, _data: &[u8], session: &mut russh::server::Session) -> Result<(), Self::Error> {
+            session.channel_success(channel)?;
+            session.data(channel, russh::CryptoVec::from(&b"payload\n"[..]))?;
+            // Order that breaks a break-on-EOF client: EOF first, status AFTER.
+            session.eof(channel)?;
+            session.exit_status_request(channel, 42)?;
+            session.close(channel)?;
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn inprocess_exec_recovers_exit_status_sent_after_eof() {
+        let out = drive_exec(ExecEofBeforeExitHandler, "eof-first", "exec_eof_first", |_, _| {});
+        assert!(
+            out.stdout.windows(7).any(|w| w == b"payload"),
+            "stdout emitted before EOF must still be captured"
+        );
+        assert_eq!(
+            out.exit,
+            Some((Some(42), None)),
+            "exit-status sent AFTER eof must be drained (not reported as None)"
+        );
+    }
+
+    /// The server REJECTS the exec (channel_failure). The consumer must receive a
+    /// terminal `Error`, never a silent end (review F4).
+    #[derive(Clone)]
+    struct ExecRejectHandler;
+    impl russh::server::Handler for ExecRejectHandler {
+        type Error = russh::Error;
+        async fn auth_password(&mut self, _u: &str, p: &str) -> Result<russh::server::Auth, Self::Error> {
+            Ok(if p == "testpass" { russh::server::Auth::Accept } else { russh::server::Auth::reject() })
+        }
+        async fn channel_open_session(&mut self, _c: russh::Channel<russh::server::Msg>, _s: &mut russh::server::Session) -> Result<bool, Self::Error> {
+            Ok(true)
+        }
+        async fn exec_request(&mut self, channel: russh::ChannelId, _data: &[u8], session: &mut russh::server::Session) -> Result<(), Self::Error> {
+            // Reject the exec — the client must surface this as a terminal Error.
+            session.channel_failure(channel)?;
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn inprocess_exec_rejection_yields_terminal_error() {
+        let out = drive_exec(ExecRejectHandler, "denied", "exec_reject", |_, _| {});
+        assert!(!out.ready, "a rejected exec must NOT report Ready");
+        assert!(out.exit.is_none(), "a rejected exec is not a normal Exit");
+        assert!(
+            out.error.is_some(),
+            "a rejected exec must deliver a terminal ExecEvent::Error"
+        );
+    }
+
+    /// stdin wiring + half-close: the server echoes accumulated stdin back as
+    /// stdout only once the client sends channel EOF, then exits. Proves
+    /// `close_stdin` flushes queued input and delivers EOF so a stdin-reading
+    /// command can finish (review F2). Without the half-close the server would
+    /// wait forever and the test would time out with no Exit.
+    struct StdinEchoHandler {
+        collected: Vec<u8>,
+    }
+    impl russh::server::Handler for StdinEchoHandler {
+        type Error = russh::Error;
+        async fn auth_password(&mut self, _u: &str, p: &str) -> Result<russh::server::Auth, Self::Error> {
+            Ok(if p == "testpass" { russh::server::Auth::Accept } else { russh::server::Auth::reject() })
+        }
+        async fn channel_open_session(&mut self, _c: russh::Channel<russh::server::Msg>, _s: &mut russh::server::Session) -> Result<bool, Self::Error> {
+            Ok(true)
+        }
+        async fn exec_request(&mut self, channel: russh::ChannelId, _data: &[u8], session: &mut russh::server::Session) -> Result<(), Self::Error> {
+            // Accept, then wait for stdin + EOF (do NOT exit yet).
+            session.channel_success(channel)?;
+            Ok(())
+        }
+        async fn data(&mut self, _channel: russh::ChannelId, data: &[u8], _session: &mut russh::server::Session) -> Result<(), Self::Error> {
+            self.collected.extend_from_slice(data);
+            Ok(())
+        }
+        async fn channel_eof(&mut self, channel: russh::ChannelId, session: &mut russh::server::Session) -> Result<(), Self::Error> {
+            // Client half-closed stdin -> echo what we got, report exit, close.
+            let echoed = russh::CryptoVec::from(self.collected.clone());
+            session.data(channel, echoed)?;
+            session.exit_status_request(channel, 0)?;
+            session.eof(channel)?;
+            session.close(channel)?;
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn inprocess_exec_stdin_then_close_reaches_exit() {
+        let out = drive_exec(
+            StdinEchoHandler { collected: Vec::new() },
+            "cat",
+            "exec_stdin_close",
+            |mgr, id| {
+                // Feed stdin, then half-close it — the server only finishes on EOF.
+                mgr.write(id, b"piped-input\n").unwrap();
+                mgr.close_stdin(id).unwrap();
+            },
+        );
+        assert!(
+            out.stdout.windows(11).any(|w| w == b"piped-input"),
+            "stdin must be delivered and echoed back as stdout, got: {:?}",
+            String::from_utf8_lossy(&out.stdout)
+        );
+        assert_eq!(
+            out.exit,
+            Some((Some(0), None)),
+            "close_stdin -> channel EOF -> the stdin-reading command reaches its exit"
+        );
+    }
+
+    /// `close_stdin` on a **local** PTY session errors (the half-close seam is
+    /// ssh-exec-only), and on an unknown session errors — never panics.
+    #[test]
+    fn close_stdin_rejects_non_ssh_sessions() {
+        let mgr = SessionManager::new();
+        assert!(mgr.close_stdin(999_999).is_err(), "unknown session errors");
+        let id = mgr
+            .create(Some(vec!["/bin/sh".into(), "-c".into(), "sleep 1".into()]), None, 80, 24)
+            .unwrap();
+        assert!(mgr.close_stdin(id).is_err(), "local pty has no stdin half-close");
+        let _ = mgr.remove(id);
+    }
+
+    /// Large / bursty stderr under back-pressure: a slow consumer must still
+    /// receive **every** stderr byte in order (the bounded queue blocks the sender
+    /// rather than dropping), and the terminal Exit must arrive last (review F1).
+    #[derive(Clone)]
+    struct ExecStderrFloodHandler {
+        chunks: usize,
+    }
+    impl russh::server::Handler for ExecStderrFloodHandler {
+        type Error = russh::Error;
+        async fn auth_password(&mut self, _u: &str, p: &str) -> Result<russh::server::Auth, Self::Error> {
+            Ok(if p == "testpass" { russh::server::Auth::Accept } else { russh::server::Auth::reject() })
+        }
+        async fn channel_open_session(&mut self, _c: russh::Channel<russh::server::Msg>, _s: &mut russh::server::Session) -> Result<bool, Self::Error> {
+            Ok(true)
+        }
+        async fn exec_request(&mut self, channel: russh::ChannelId, _data: &[u8], session: &mut russh::server::Session) -> Result<(), Self::Error> {
+            session.channel_success(channel)?;
+            // Many stderr chunks, more than the bounded EXEC_EVENT_QUEUE, so the
+            // client's sender blocks (back-pressure) while a slow consumer drains.
+            for _ in 0..self.chunks {
+                session.extended_data(channel, 1, russh::CryptoVec::from(&b"XXXXXXXX"[..]))?;
+            }
+            session.exit_status_request(channel, 0)?;
+            session.eof(channel)?;
+            session.close(channel)?;
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn inprocess_exec_stderr_backpressure_lossless() {
+        // More chunks than EXEC_EVENT_QUEUE (256) so back-pressure actually engages.
+        let chunks = EXEC_EVENT_QUEUE * 3;
+        let port = serve_once(ExecStderrFloodHandler { chunks });
+        let mgr = SessionManager::new();
+        let cfg = SshConfig {
+            host: "127.0.0.1".into(),
+            port,
+            username: "tester".into(),
+            auth: AuthMethod::Password("testpass".into()),
+            exec: Some("flood".into()),
+        };
+        let (id, mut chans) = mgr.create_ssh(cfg, temp_known_hosts("exec_flood"), 80, 24, None);
+
+        // Deliberately slow consumer: sleep between drains so the sender must block
+        // on the bounded queue. All bytes must still arrive, in order, then Exit.
+        let mut stderr_total = 0usize;
+        let mut exit: Option<(Option<u32>, Option<String>)> = None;
+        let deadline = Instant::now() + Duration::from_millis(15000);
+        while Instant::now() < deadline && exit.is_none() {
+            if let Ok(ch) = chans.prompt_rx.try_recv() {
+                let _ = ch.reply.send(HostKeyDecision::Accept);
+            }
+            let _ = chans.status_rx.try_recv();
+            match chans.exec_rx.try_recv() {
+                Ok(ExecEvent::Stderr(b)) => stderr_total += b.len(),
+                Ok(ExecEvent::Exit { code, signal }) => exit = Some((code, signal)),
+                Ok(ExecEvent::Error(e)) => panic!("unexpected exec error: {e}"),
+                Err(mpsc::error::TryRecvError::Disconnected) => break,
+                Err(mpsc::error::TryRecvError::Empty) => {}
+            }
+            // Slow drain -> forces the bounded queue full -> exercises back-pressure.
+            thread::sleep(Duration::from_millis(1));
+        }
+        let _ = mgr.remove(id);
+        assert_eq!(exit, Some((Some(0), None)), "flood still ends with a clean Exit");
+        assert_eq!(
+            stderr_total,
+            chunks * 8,
+            "every stderr byte must survive back-pressure (bounded queue blocks, never drops)"
+        );
+    }
 }
