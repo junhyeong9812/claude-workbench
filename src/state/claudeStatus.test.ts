@@ -16,6 +16,10 @@ import {
   statusOf,
   scanBottomForPrompt,
   shouldShowRollup,
+  projectAttention,
+  hasProjectAttention,
+  projectOfSession,
+  labelOfSession,
   useClaudeStatus,
   type ActivityItem,
   type AttentionEvent,
@@ -866,5 +870,93 @@ describe("makeScanGate (S1)", () => {
     // A genuinely-empty restored screen is now a valid verdict (clears a stale
     // blocked signal instead of leaving it sticky).
     expect(g.admit(false)).toBe(true);
+  });
+});
+
+// --- B1: per-project roll-up ---------------------------------------------------
+
+describe("projectAttention (B1 per-project roll-up)", () => {
+  type E = { status: SessionStatus; unseen: boolean };
+  const e = (status: SessionStatus, unseen = false): E => ({ status, unseen });
+  // projectOf/labelOf injected (pure) — no module maps involved.
+  const projectOf = (m: Record<string, string>) => (u: string) => m[u];
+  const labelOf = (m: Record<string, string>) => (u: string) => m[u];
+
+  it("counts working/blocked/done-unseen for the matching project only", () => {
+    const entries: Record<string, E> = {
+      a: e("working"),
+      b: e("blocked"),
+      c: e("idle", true), // done-unseen
+      d: e("idle"), // idle-seen — excluded
+      x: e("working"), // other project — excluded
+    };
+    const pmap = { a: "/p1", b: "/p1", c: "/p1", d: "/p1", x: "/p2" };
+    const r = projectAttention(entries, "/p1", projectOf(pmap));
+    expect(r.working).toBe(1);
+    expect(r.blocked).toBe(1);
+    expect(r.doneUnseen).toBe(1);
+    // idle-seen (d) and the other-project session (x) are not listed.
+    expect(r.sessions.map((s) => s.uuid).sort()).toEqual(["a", "b", "c"]);
+  });
+
+  it("hasProjectAttention is false when the project is all idle-seen / empty", () => {
+    const entries: Record<string, E> = { a: e("idle"), b: e("working") };
+    const pmap = { a: "/p1", b: "/p2" };
+    // /p1 has only an idle-seen session → no badge.
+    expect(hasProjectAttention(projectAttention(entries, "/p1", projectOf(pmap)))).toBe(false);
+    // an unknown project → no badge.
+    expect(hasProjectAttention(projectAttention(entries, "/none", projectOf(pmap)))).toBe(false);
+    // /p2 has a working session → badge.
+    expect(hasProjectAttention(projectAttention(entries, "/p2", projectOf(pmap)))).toBe(true);
+  });
+
+  it("carries the session label when labelOf resolves it, else leaves it undefined", () => {
+    const entries: Record<string, E> = { a: e("working"), b: e("blocked") };
+    const pmap = { a: "/p1", b: "/p1" };
+    const lmap = { a: "타임라인 정리" };
+    const r = projectAttention(entries, "/p1", projectOf(pmap), labelOf(lmap));
+    const byId = Object.fromEntries(r.sessions.map((s) => [s.uuid, s.label]));
+    expect(byId.a).toBe("타임라인 정리");
+    expect(byId.b).toBeUndefined();
+  });
+
+  it("integrates with the store: registerSession records project+label, remove clears them", () => {
+    const S2 = useClaudeStatus;
+    for (const uuid of Object.keys(S2.getState().entries)) S2.getState().remove(uuid);
+    S2.getState().registerSession("s1", 7001, "/proj/alpha", "세션 하나");
+    S2.getState().registerSession("s2", 7002, "/proj/alpha");
+    S2.getState().registerSession("s3", 7003, "/proj/beta");
+    expect(projectOfSession("s1")).toBe("/proj/alpha");
+    expect(labelOfSession("s1")).toBe("세션 하나");
+    expect(projectOfSession("s3")).toBe("/proj/beta");
+
+    S2.getState().updateFromTimeline("s1", { activity: "working", questionBlocked: false, seenNow: false });
+    S2.getState().updateFromTimeline("s2", { activity: "working", questionBlocked: true, seenNow: false });
+    S2.getState().updateFromTimeline("s3", { activity: "working", questionBlocked: false, seenNow: false });
+
+    const alpha = projectAttention(S2.getState().entries, "/proj/alpha", projectOfSession, labelOfSession);
+    expect(alpha.sessions.map((s) => s.uuid).sort()).toEqual(["s1", "s2"]);
+    expect(alpha.working).toBe(1); // s1
+    expect(alpha.blocked).toBe(1); // s2 (open question)
+    expect(alpha.sessions.find((s) => s.uuid === "s1")?.label).toBe("세션 하나");
+
+    const beta = projectAttention(S2.getState().entries, "/proj/beta", projectOfSession, labelOfSession);
+    expect(beta.sessions.map((s) => s.uuid)).toEqual(["s3"]);
+
+    S2.getState().remove("s1");
+    expect(projectOfSession("s1")).toBeUndefined();
+    expect(labelOfSession("s1")).toBeUndefined();
+    const alpha2 = projectAttention(S2.getState().entries, "/proj/alpha", projectOfSession, labelOfSession);
+    expect(alpha2.sessions.map((s) => s.uuid)).toEqual(["s2"]);
+  });
+
+  it("does not overwrite a known project/label when a later re-register omits them", () => {
+    const S2 = useClaudeStatus;
+    for (const uuid of Object.keys(S2.getState().entries)) S2.getState().remove(uuid);
+    S2.getState().registerSession("r1", 7101, "/proj/keep", "제목");
+    S2.getState().registerSession("r1", 7102); // new PTY id, no project/label
+    expect(projectOfSession("r1")).toBe("/proj/keep");
+    expect(labelOfSession("r1")).toBe("제목");
+    S2.getState().remove("r1");
   });
 });
