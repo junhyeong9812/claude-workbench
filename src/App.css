@@ -353,9 +353,11 @@ body {
 .collapse-host {
   display: contents;
 }
-/* 접혔을 때의 "⋯" — 호출자가 그 행의 버튼 어휘(.toolbar-btn·.claudeterm-head-btn)를
-   추가 클래스로 얹으면 그쪽이 이긴다(뒤에 정의된 규칙 우선). */
-.collapse-more {
+/* 접혔을 때의 "⋯". 기본 모습은 `:where()`로 **특이도 0**에 둔다 — 호출자가 그 행의
+   버튼 어휘(.toolbar-btn·.claudeterm-head-btn)를 추가 클래스로 얹으면 정의 순서와
+   무관하게 항상 그쪽이 이겨서, ⋯가 그 행의 다른 버튼과 같은 높이·모서리로 보인다.
+   (그냥 `.collapse-more`로 두면 시트 안에서 뒤에 정의된 쪽이 이겨 행마다 갈린다.) */
+:where(.collapse-more) {
   flex: 0 0 auto;
   padding: 1px 8px;
   font: inherit;
@@ -367,7 +369,7 @@ body {
   border-radius: 4px;
   cursor: pointer;
 }
-.collapse-more:hover {
+:where(.collapse-more):hover {
   background: var(--bg-hover);
   color: var(--fg);
 }
