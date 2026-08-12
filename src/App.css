@@ -136,12 +136,21 @@ body {
   align-items: stretch;
   overflow-x: auto;
   overflow-y: hidden;
-  /* 넘칠 때만 뜨는 스크롤바를 얇게 — 36px 줄에서 두꺼운 막대는 탭을 눌러버린다.
-     미지원 엔진은 이 선언을 그냥 무시한다. */
-  scrollbar-width: thin;
+  /* 스크롤바는 **숨긴다**(스크롤 자체는 살아 있다 — 휠/트랙패드 가로 스크롤).
+     얇게(thin)만 해도 막대가 36px 행의 콘텐츠 높이를 잠식해(실측 −10px) 탭이
+     눌리고, 그 바닥에 붙는 `.tab-active` 2px 밑줄이 행 바닥에서 10px 떠올랐다
+     (넘칠 때만 — 넘치지 않으면 그대로라 더 헷갈린다). 밑줄 위치가 활성 탭의
+     유일한 표시라 자리를 지키는 쪽을 택했다. */
+  scrollbar-width: none;
   background: var(--bg-alt);
   border-bottom: 1px solid var(--border);
   min-height: 36px;
+}
+
+/* WebKit(실제 런타임 WebKitGTK)은 scrollbar-width 를 무시할 수 있어 같은 뜻을
+   한 번 더 말한다 — 둘 다 "자리를 차지하지 않는다"는 같은 결과를 낸다. */
+.tabbar::-webkit-scrollbar {
+  display: none;
 }
 
 .tab {
