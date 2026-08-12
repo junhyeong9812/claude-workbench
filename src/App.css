@@ -818,9 +818,11 @@ body {
   text-overflow: ellipsis;
   white-space: nowrap;
 }
-/* 더 좁아지면 제목은 아예 자리를 비운다(빈 말줄임 + 10px gap 회수). */
+/* 더 좁아지면 제목은 아예 자리를 비운다(빈 말줄임 + 10px gap 회수).
+   `:not(:only-child)` — 팝아웃 창의 툴바는 제목 **하나뿐**이라, 거기서 숨기면
+   그 창의 유일한 정보(공유 활성 프로젝트)가 사라진다. */
 @container toolbar (max-width: 430px) {
-  .toolbar-title {
+  .toolbar-title:not(:only-child) {
     display: none;
   }
 }
