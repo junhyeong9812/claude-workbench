@@ -157,11 +157,13 @@ pub struct SshHandle {
     input_tx: mpsc::Sender<Vec<u8>>,
     size_tx: watch::Sender<(u16, u16)>,
     cancel_tx: watch::Sender<bool>,
-    /// Signals a one-shot stdin **half-close** (EOF) for an exec session — flushes
-    /// pending input, then sends `channel.eof()` so a stdin-reading remote command
-    /// (e.g. `cat`) can finish (review F2). Distinct from [`cancel`], which aborts
-    /// the whole session; this only closes the input direction. No effect on the
-    /// interactive shell path (its loop ignores this watch).
+    /// Signals a one-shot stdin **half-close** (EOF) for an exec session. The loop
+    /// stops accepting new input, drains whatever is already queued *interleaved
+    /// with output reads* (so it can't deadlock — review P1), then sends
+    /// `channel.eof()` so a stdin-reading remote command (e.g. `cat`) can finish
+    /// (review F2). Distinct from [`cancel`], which aborts the whole session; this
+    /// only closes the input direction. No effect on the interactive shell path
+    /// (its loop ignores this watch).
     close_stdin_tx: watch::Sender<bool>,
     join: Option<JoinHandle<()>>,
 }
@@ -188,12 +190,19 @@ impl SshHandle {
         let _ = self.cancel_tx.send(true);
     }
 
-    /// Half-close stdin on an **exec** session: the session flushes any queued
-    /// input, then sends channel EOF so a stdin-reading remote command can reach
-    /// its exit (review F2). Idempotent; a no-op on the interactive shell path.
+    /// Half-close stdin on an **exec** session: the session drains any queued
+    /// input (interleaved with output reads), then sends channel EOF so a
+    /// stdin-reading remote command can reach its exit (review F2). Idempotent.
     /// This is *not* cancellation — the command keeps running until it exits.
-    pub fn close_stdin(&self) {
-        let _ = self.close_stdin_tx.send(true);
+    ///
+    /// Returns `Err` when the session thread is already gone (its
+    /// `close_stdin_rx` dropped), so a caller half-closing a dead session sees a
+    /// failure instead of a silent success (review P2). A no-op on the
+    /// interactive shell path (whose loop dropped the receiver at start).
+    pub fn close_stdin(&self) -> Result<(), String> {
+        self.close_stdin_tx
+            .send(true)
+            .map_err(|_| "ssh session is closed".to_string())
     }
 
     /// Join the session thread (call after [`cancel`]). Idempotent.
@@ -340,9 +349,12 @@ async fn run(
         )
         .await;
     }
-    // Shell path does not use the stdin half-close seam (it stays open for the
-    // life of the interactive session); drop the receiver explicitly.
-    drop(close_stdin_rx);
+    // Shell path does not use the stdin half-close seam (stdin stays open for the
+    // life of the interactive session). We deliberately keep `close_stdin_rx`
+    // alive (rather than dropping it) so that a `close_stdin()` on an interactive
+    // shell session stays a benign no-op returning `Ok` — dropping the receiver
+    // here would instead make the watch `send` fail and report a spurious error.
+    let _close_stdin_rx = close_stdin_rx;
 
     let (cols, rows) = *size_rx.borrow();
     // want_reply=true so a server that *rejects* the PTY surfaces as a
@@ -427,6 +439,22 @@ async fn run(
 /// - a server `Eof` closes only the data direction; the exit-status/signal may
 ///   still arrive **before** `Close`, so we keep draining past `Eof` and break
 ///   only on `Close`/end-of-stream.
+///
+/// Half-close is a **state machine inside the select loop**, never a synchronous
+/// pre-flush (review P1-deadlock). When the caller signals `close_stdin`:
+/// 1. `input_rx.close()` blocks any further producer sends, so the queue can't
+///    keep growing (an unbounded `try_recv` drain against a live writer would
+///    never terminate);
+/// 2. the loop keeps draining the already-queued input **one `WRITE_CHUNK` per
+///    turn, fairly interleaved with output reads** — this is what avoids the
+///    deadlock: a remote that writes stdout while reading stdin fills both SSH
+///    windows, and only the interleaved output read releases the back-pressure
+///    that lets our `channel.data()` make progress. A synchronous flush that
+///    drains all of stdin before reading any output parks russh's connection
+///    loop (its per-channel buffer fills) so the window-adjust that would unblock
+///    our write never arrives — a hang;
+/// 3. `channel.eof()` is sent **once**, only after the queue is fully drained
+///    (`input_rx` returned `None`) and the backlog flushed.
 async fn run_exec(
     channel: russh::Channel<client::Msg>,
     command: &str,
@@ -456,25 +484,17 @@ async fn run_exec(
     let mut started = false; // exec accepted (Success seen) -> Ready emitted once
     let mut stdout_done = false; // server sent Eof: no more stdout, stop stdin too
     let mut close_requested = false; // caller asked to half-close stdin
+    let mut input_done = false; // input_rx drained to None (senders gone / closed)
     let mut eof_sent = false; // channel.eof() already delivered
     loop {
-        // Once the caller half-closed stdin, flush everything still queued (the
-        // caller enqueues all input *before* signalling close, so a non-blocking
-        // drain captures it) and send channel EOF so a stdin-reading command can
-        // finish (F2). Done inline so the flush is guaranteed to precede EOF.
-        if close_requested && !eof_sent {
-            while let Ok(more) = input_rx.try_recv() {
-                pending.extend_from_slice(&more);
-            }
-            let mut off = 0;
-            while off < pending.len() {
-                let end = (off + WRITE_CHUNK).min(pending.len());
-                if channel.data(&pending[off..end]).await.is_err() {
-                    break;
-                }
-                off = end;
-            }
-            pending.clear();
+        // Send our stdin EOF exactly once — but only after the caller half-closed
+        // AND every queued input byte has been drained (`input_done`) and flushed
+        // (`pending` empty). This is a single non-blocking call at a quiescent
+        // point in the loop, NOT a synchronous pre-flush: the draining itself
+        // happens through the interleaved select branches below, so output reads
+        // keep releasing window back-pressure and the write never deadlocks
+        // (review P1-deadlock / F2).
+        if close_requested && input_done && pending.is_empty() && !eof_sent {
             let _ = channel.eof().await;
             eof_sent = true;
         }
@@ -524,21 +544,45 @@ async fn run_exec(
                 Some(ChannelMsg::Close) | None => break,
                 Some(_) => {}
             },
-            inp = input_rx.recv(), if pending.is_empty() && !close_requested && !stdout_done => match inp {
+            // Pull the next input chunk when the backlog is empty and stdin is
+            // still live (not yet drained, output still open). After a half-close
+            // this keeps running — `input_rx.close()` lets buffered messages drain
+            // and then yields `None`, which is how we learn the queue is empty.
+            inp = input_rx.recv(), if pending.is_empty() && !input_done && !stdout_done => match inp {
                 Some(bytes) => pending = bytes,
-                None => break, // all input senders dropped (teardown)
+                // Senders gone, or `input_rx.close()` drained after a half-close.
+                // If nobody asked to half-close, all producers dropping is a
+                // teardown; otherwise it just marks the queue drained so EOF fires.
+                None => {
+                    if close_requested {
+                        input_done = true;
+                    } else {
+                        break;
+                    }
+                }
             },
             changed = close_stdin_rx.changed(), if !close_requested => match changed {
-                // Caller requested a stdin half-close; the flush+EOF happens at the
-                // top of the next loop turn.
+                // Caller requested a stdin half-close. Close the receiver so no
+                // further producer can grow the queue (an unbounded drain against a
+                // live writer would never finish — review P1), then let the recv
+                // branch drain whatever is already buffered; EOF is sent at the top
+                // of the loop once drained + flushed.
                 Ok(()) => {
                     if *close_stdin_rx.borrow() {
                         close_requested = true;
+                        input_rx.close();
                     }
                 }
                 Err(_) => break, // SshHandle dropped -> teardown
             },
-            _ = std::future::ready(()), if !pending.is_empty() && !close_requested && !stdout_done => {
+            // Flush ONE chunk of the backlog per turn, fairly interleaved with the
+            // output reads above (select! picks among ready branches). Bounding the
+            // write to a single chunk guarantees `channel.wait()` keeps getting
+            // turns, so a stdin-reading command whose stdout floods the SSH window
+            // can never park the loop in a blocked `channel.data()` (review
+            // P1-deadlock). Runs across the half-close too, unlike the old
+            // synchronous pre-flush.
+            _ = std::future::ready(()), if !pending.is_empty() && !stdout_done => {
                 let take = pending.len().min(WRITE_CHUNK);
                 if channel.data(&pending[..take]).await.is_err() {
                     break;
@@ -1444,5 +1488,147 @@ W8CkSL2Yx++XP/fxFe/RAAAAD210LXRlc3QtaG9zdGtleQECAwQFBg==\n\
             chunks * 8,
             "every stderr byte must survive back-pressure (bounded queue blocks, never drops)"
         );
+    }
+
+    /// Bidirectional pressure + half-close: the server floods stdout **while** the
+    /// client pushes a large stdin, then reports exit only on the client's EOF.
+    /// This is the deadlock regression (review P1): a `close_stdin` that flushes
+    /// all of stdin synchronously (exhausting the send window) before reading any
+    /// output parks russh's connection loop (its per-channel buffer fills), so the
+    /// window-adjust that would unblock the write never arrives — a hang. The
+    /// interleaved select loop must instead drive both directions and terminate.
+    /// A deadline guard turns a deadlock into a failed assertion, not an infinite
+    /// hang. It also proves the drain terminates after `input_rx.close()` even
+    /// though the queue held a large payload.
+    #[derive(Clone)]
+    struct ExecBidiFloodHandler {
+        out_chunks: usize,
+    }
+    impl russh::server::Handler for ExecBidiFloodHandler {
+        type Error = russh::Error;
+        async fn auth_password(&mut self, _u: &str, p: &str) -> Result<russh::server::Auth, Self::Error> {
+            Ok(if p == "testpass" { russh::server::Auth::Accept } else { russh::server::Auth::reject() })
+        }
+        async fn channel_open_session(&mut self, _c: russh::Channel<russh::server::Msg>, _s: &mut russh::server::Session) -> Result<bool, Self::Error> {
+            Ok(true)
+        }
+        async fn exec_request(&mut self, channel: russh::ChannelId, _data: &[u8], session: &mut russh::server::Session) -> Result<(), Self::Error> {
+            session.channel_success(channel)?;
+            // Flood stdout (each chunk == the 32 KB max packet). More than the
+            // client's 100-slot channel buffer, so a client that stops reading to
+            // flush stdin fills that buffer and parks the connection loop.
+            let chunk = vec![b'O'; 32768];
+            for _ in 0..self.out_chunks {
+                session.data(channel, russh::CryptoVec::from(chunk.clone()))?;
+            }
+            // Do NOT exit yet — wait for the client's stdin EOF (channel_eof).
+            Ok(())
+        }
+        async fn data(&mut self, _channel: russh::ChannelId, _data: &[u8], _session: &mut russh::server::Session) -> Result<(), Self::Error> {
+            // Absorb stdin; russh adjusts the client's send window as we consume it.
+            Ok(())
+        }
+        async fn channel_eof(&mut self, channel: russh::ChannelId, session: &mut russh::server::Session) -> Result<(), Self::Error> {
+            session.exit_status_request(channel, 0)?;
+            session.eof(channel)?;
+            session.close(channel)?;
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn inprocess_exec_stdin_output_close_no_deadlock() {
+        // 200 stdout chunks (~6.4 MB) >> the 100-slot channel buffer, and ~3 MB of
+        // stdin >> the 2 MB send window: both windows must fill, so only correct
+        // interleaving completes. The old synchronous flush deadlocks here.
+        let port = serve_once(ExecBidiFloodHandler { out_chunks: 200 });
+        let mgr = SessionManager::new();
+        let cfg = SshConfig {
+            host: "127.0.0.1".into(),
+            port,
+            username: "tester".into(),
+            auth: AuthMethod::Password("testpass".into()),
+            exec: Some("bidi".into()),
+        };
+        let (id, mut chans) = mgr.create_ssh(cfg, temp_known_hosts("exec_bidi"), 80, 24, None);
+
+        let mut ready = false;
+        let mut fed = false;
+        let mut exit: Option<(Option<u32>, Option<String>)> = None;
+        // Generous deadline: ~9 MB over in-process loopback is sub-second normally,
+        // but CI can be slow. A deadlock is caught as `exit == None` at the end.
+        let deadline = Instant::now() + Duration::from_millis(20000);
+        while Instant::now() < deadline && exit.is_none() {
+            if let Ok(ch) = chans.prompt_rx.try_recv() {
+                let _ = ch.reply.send(HostKeyDecision::Accept);
+            }
+            match chans.status_rx.try_recv() {
+                Ok(SshStatus::Ready) => ready = true,
+                Ok(SshStatus::Failed(r)) => panic!("ssh connect failed: {r}"),
+                _ => {}
+            }
+            if ready && !fed {
+                fed = true;
+                // One large stdin message (>2 MB) queued as a single mpsc item,
+                // then half-close. The drain must flush it, interleaved with the
+                // stdout flood, and reach EOF -> exit.
+                let big = vec![b'i'; 3 * 1024 * 1024];
+                mgr.write(id, &big).unwrap();
+                mgr.close_stdin(id).unwrap();
+            }
+            match chans.exec_rx.try_recv() {
+                Ok(ExecEvent::Exit { code, signal }) => exit = Some((code, signal)),
+                Ok(ExecEvent::Error(e)) => panic!("unexpected exec error: {e}"),
+                Ok(ExecEvent::Stderr(_)) => {}
+                Err(mpsc::error::TryRecvError::Disconnected) => break,
+                Err(mpsc::error::TryRecvError::Empty) => {}
+            }
+            thread::sleep(Duration::from_millis(2));
+        }
+        let _ = mgr.remove(id);
+        assert!(ready, "exec must become ready");
+        assert_eq!(
+            exit,
+            Some((Some(0), None)),
+            "bidirectional stdin+output with close_stdin must terminate (no deadlock) and recover the exit"
+        );
+    }
+
+    /// `close_stdin` on a **dead** SSH session must error (not silently succeed),
+    /// matching `write`/`kill` on a dead session (review P2). Drives a one-shot
+    /// exec to completion, waits until the session is dead, then half-closes.
+    #[test]
+    fn inprocess_exec_close_stdin_on_dead_session_errors() {
+        let port = serve_once(ExecHandler); // ExecHandler exits immediately
+        let mgr = SessionManager::new();
+        let cfg = SshConfig {
+            host: "127.0.0.1".into(),
+            port,
+            username: "tester".into(),
+            auth: AuthMethod::Password("testpass".into()),
+            exec: Some("run-ok".into()),
+        };
+        let (id, mut chans) = mgr.create_ssh(cfg, temp_known_hosts("exec_dead_close"), 80, 24, None);
+
+        // Accept the host key and let the command run to completion (-> dead).
+        let deadline = Instant::now() + Duration::from_millis(8000);
+        let mut dead = false;
+        while Instant::now() < deadline && !dead {
+            if let Ok(ch) = chans.prompt_rx.try_recv() {
+                let _ = ch.reply.send(HostKeyDecision::Accept);
+            }
+            let _ = chans.status_rx.try_recv();
+            let _ = chans.exec_rx.try_recv();
+            if mgr.is_alive(id) == Some(false) {
+                dead = true;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(dead, "exec session should finish and become dead");
+        assert!(
+            mgr.close_stdin(id).is_err(),
+            "close_stdin on a dead ssh session must error, not silently succeed (P2)"
+        );
+        let _ = mgr.remove(id);
     }
 }
