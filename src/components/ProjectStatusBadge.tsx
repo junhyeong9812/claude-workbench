@@ -119,9 +119,15 @@ export function ProjectStatusBadge({ project }: { project: string }) {
     // fixed 레이어라 스크롤/리사이즈로 트리거가 움직이면 위치를 다시 계산한다.
     window.addEventListener("scroll", compute, true);
     window.addEventListener("resize", compute);
+    // 열린 채로 세션 목록이 늘거나 줄어(라벨 길이 변화 포함) 팝업 크기가 바뀌면
+    // 이전 크기 기준 left/top이 어긋나 클램프가 다시 깨질 수 있다 — 팝업 자체
+    // 크기 변화도 관측해 재계산한다(codex 후점검 P3).
+    const ro = new ResizeObserver(compute);
+    if (popRef.current) ro.observe(popRef.current);
     return () => {
       window.removeEventListener("scroll", compute, true);
       window.removeEventListener("resize", compute);
+      ro.disconnect();
     };
   }, [open]);
 
