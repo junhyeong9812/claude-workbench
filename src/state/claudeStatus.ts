@@ -523,7 +523,12 @@ const uuidToNumeric = new Map<string, number>();
  * registration, and registration always precedes the session's first `entries`
  * write, so the project roll-up selector — which recomputes whenever the reactive
  * `entries` change (add / status / remove) — reads a stable, already-populated
- * value. No new poll or backend touch: this is a pure front-end derivation. */
+ * value. No new poll or backend touch: this is a pure front-end derivation.
+ *
+ * 알려진 경미 한계(codex 부기 — 동작 변경 아님): (1) `uuidToLabel`은 registerSession
+ * 시점 제목으로 고정이라 **탭 rename 경로와 미연결** — 드롭다운 이름에 옛 제목이
+ * 남을 수 있다. (2) 두 맵은 비반응 plain Map이라 값이 바뀌어도 즉시 재렌더를
+ * 보장하지 않는다(다음 reactive `entries` 쓰기에 편승해 갱신). */
 const uuidToProject = new Map<string, string>();
 const uuidToLabel = new Map<string, string>();
 
@@ -800,7 +805,15 @@ export const useClaudeStatus = create<StatusStore>((set, get) => {
       // numeric id or a uuid re-registered under a new id can't leave a dangling
       // reverse entry that resolves the wrong session (S6).
       const staleUuid = numericToUuid.get(numericId);
-      if (staleUuid !== undefined && staleUuid !== uuid) uuidToNumeric.delete(staleUuid);
+      if (staleUuid !== undefined && staleUuid !== uuid) {
+        uuidToNumeric.delete(staleUuid);
+        // F3(codex P3): numericId를 새 uuid가 재사용하면 옛 uuid의 롤업 차원
+        // (project·label)도 함께 버린다 — 수명 일원화. 안 그러면
+        // projectOfSession(staleUuid)/labelOfSession(staleUuid)이 영구 잔존해
+        // 어느 세션도 소유하지 않는 고아가 남는다.
+        uuidToProject.delete(staleUuid);
+        uuidToLabel.delete(staleUuid);
+      }
       const staleNumeric = uuidToNumeric.get(uuid);
       if (staleNumeric !== undefined && staleNumeric !== numericId) numericToUuid.delete(staleNumeric);
       numericToUuid.set(numericId, uuid);

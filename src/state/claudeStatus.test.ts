@@ -959,4 +959,21 @@ describe("projectAttention (B1 per-project roll-up)", () => {
     expect(labelOfSession("r1")).toBe("제목");
     S2.getState().remove("r1");
   });
+
+  it("F3: reusing a numeric id for a new uuid clears the old uuid's project/label (no orphan)", () => {
+    const S2 = useClaudeStatus;
+    for (const uuid of Object.keys(S2.getState().entries)) S2.getState().remove(uuid);
+    S2.getState().registerSession("old", 5000, "/proj/old", "옛 세션");
+    expect(projectOfSession("old")).toBe("/proj/old");
+    expect(labelOfSession("old")).toBe("옛 세션");
+    // numericId 5000이 새 uuid로 재사용된다 (옛 세션 종료 후 PTY id 재활용).
+    S2.getState().registerSession("new", 5000, "/proj/new", "새 세션");
+    // 옛 uuid의 롤업 차원이 완전히 정리됨 — projectOfSession(old)이 고아로 안 남는다.
+    expect(projectOfSession("old")).toBeUndefined();
+    expect(labelOfSession("old")).toBeUndefined();
+    // 새 uuid가 정상 소유.
+    expect(projectOfSession("new")).toBe("/proj/new");
+    expect(labelOfSession("new")).toBe("새 세션");
+    S2.getState().remove("new");
+  });
 });
