@@ -276,6 +276,67 @@ export function nextCycleTarget(
   return uuids[(i + 1) % uuids.length];
 }
 
+// --- B1: per-project roll-up of live sessions --------------------------------
+
+/** One live session in a project's roll-up list (the ▾ dropdown rows). */
+export interface ProjectSession {
+  uuid: string;
+  status: SessionStatus;
+  unseen: boolean;
+  /** Tab title if known (labelOfSession), else the caller falls back to uuid. */
+  label?: string;
+}
+
+/** A project's rolled-up session attention. `working`/`blocked`/`doneUnseen`
+ * count the active sessions by kind; `sessions` lists them (attention states
+ * only — idle-seen never appears), in the entries' insertion order. */
+export interface ProjectAttention {
+  working: number;
+  blocked: number;
+  doneUnseen: number;
+  sessions: ProjectSession[];
+}
+
+/**
+ * Roll up a single project's live sessions from the per-uuid `entries` (B1).
+ *
+ * A session contributes only when its owning project (`projectOf(uuid)`) equals
+ * `project` AND it is in an attention state — working (a turn/tool in flight),
+ * blocked (input needed), or done-unseen (finished, not yet looked at). Idle-seen
+ * sessions (`attentionOf === 0`) are dropped: a project with only quiet sessions
+ * shows no badge (mirrors `shouldShowRollup`).
+ *
+ * Pure: `projectOf`/`labelOf` are injected so this is unit-testable without the
+ * module maps. Production callers pass `projectOfSession` / `labelOfSession`.
+ */
+export function projectAttention(
+  entries: Record<string, { status: SessionStatus; unseen: boolean }>,
+  project: string,
+  projectOf: (uuid: string) => string | undefined,
+  labelOf?: (uuid: string) => string | undefined,
+): ProjectAttention {
+  let working = 0;
+  let blocked = 0;
+  let doneUnseen = 0;
+  const sessions: ProjectSession[] = [];
+  for (const [uuid, e] of Object.entries(entries)) {
+    if (projectOf(uuid) !== project) continue;
+    const a = attentionOf(e.status, e.unseen);
+    if (a === 0) continue; // idle-seen — not an attention state
+    if (a === 3) blocked++;
+    else if (a === 2) doneUnseen++;
+    else working++;
+    sessions.push({ uuid, status: e.status, unseen: e.unseen, label: labelOf?.(uuid) });
+  }
+  return { working, blocked, doneUnseen, sessions };
+}
+
+/** Does this project have any live session worth a badge? (Both zero-across →
+ * nothing to render — same contract as {@link shouldShowRollup}.) */
+export function hasProjectAttention(r: ProjectAttention): boolean {
+  return r.working > 0 || r.blocked > 0 || r.doneUnseen > 0;
+}
+
 /** One session's tracked state. `status`/`unseen` are the display fields; the
  * rest are internal bookkeeping the actions maintain. */
 export interface SessionEntry {
@@ -454,6 +515,33 @@ const numericToUuid = new Map<number, string>();
 /** Reverse of `numericToUuid`, so `remove(uuid)` can drop both directions. */
 const uuidToNumeric = new Map<string, number>();
 
+/** uuid → owning project path (cwd), and uuid → session label (tab title). Both
+ * are recorded at `registerSession` (the panel knows its project + title there —
+ * ClaudeTermPanel) and cleared at `remove`. These are the **project roll-up**
+ * dimension the per-uuid `entries` lack (B1). They are deliberately plain module
+ * maps, not reactive store state: a session's project/label never change after
+ * registration, and registration always precedes the session's first `entries`
+ * write, so the project roll-up selector — which recomputes whenever the reactive
+ * `entries` change (add / status / remove) — reads a stable, already-populated
+ * value. No new poll or backend touch: this is a pure front-end derivation.
+ *
+ * 알려진 경미 한계(codex 부기 — 동작 변경 아님): (1) `uuidToLabel`은 registerSession
+ * 시점 제목으로 고정이라 **탭 rename 경로와 미연결** — 드롭다운 이름에 옛 제목이
+ * 남을 수 있다. (2) 두 맵은 비반응 plain Map이라 값이 바뀌어도 즉시 재렌더를
+ * 보장하지 않는다(다음 reactive `entries` 쓰기에 편승해 갱신). */
+const uuidToProject = new Map<string, string>();
+const uuidToLabel = new Map<string, string>();
+
+/** The project (cwd) that owns session `uuid`, or undefined if unregistered. */
+export function projectOfSession(uuid: string): string | undefined {
+  return uuidToProject.get(uuid);
+}
+
+/** The display label (tab title) of session `uuid`, or undefined. */
+export function labelOfSession(uuid: string): string | undefined {
+  return uuidToLabel.get(uuid);
+}
+
 /** Resolve a numeric session id to its uuid (global listener reverse lookup). */
 export function lookupSessionUuid(numericId: number): string | undefined {
   return numericToUuid.get(numericId);
@@ -510,8 +598,10 @@ interface StatusStore {
   /** Panel unmounted / session ended — drop the entry and any hold timer. */
   remove: (uuid: string) => void;
   /** Map a session's numeric id ↔ uuid so the global listener can resolve its
-   * `claude-timeline` events. Idempotent; the mapping outlives a panel unmount. */
-  registerSession: (uuid: string, numericId: number) => void;
+   * `claude-timeline` events. Idempotent; the mapping outlives a panel unmount.
+   * `project`/`label` (optional, B1) record the owning project + tab title for
+   * the per-project roll-up — additive, no effect on existing badge behavior. */
+  registerSession: (uuid: string, numericId: number, project?: string, label?: string) => void;
   /** A panel mounted for `uuid` — it now owns timeline/seen updates (global skips). */
   attachPanel: (uuid: string) => void;
   /** A panel for `uuid` unmounted (tab switch). Only decrements the attach count;
@@ -683,6 +773,9 @@ export const useClaudeStatus = create<StatusStore>((set, get) => {
 
     remove: (uuid) => {
       clearHold(uuid);
+      // B1: drop the roll-up dimension too (session gone → no project/label).
+      uuidToProject.delete(uuid);
+      uuidToLabel.delete(uuid);
       const numericId = uuidToNumeric.get(uuid);
       // Only drop the reverse (numeric→uuid) mapping if it still points at THIS
       // uuid — a stale close for a reused numeric id must not unmap the session
@@ -707,16 +800,28 @@ export const useClaudeStatus = create<StatusStore>((set, get) => {
       if (prevEntry) emitAttention({ uuid, prev: attentionSignals(prevEntry), next: null, origin: "live" });
     },
 
-    registerSession: (uuid, numericId) => {
+    registerSession: (uuid, numericId, project, label) => {
       // Evict stale mappings on either side before (re)binding, so a reused
       // numeric id or a uuid re-registered under a new id can't leave a dangling
       // reverse entry that resolves the wrong session (S6).
       const staleUuid = numericToUuid.get(numericId);
-      if (staleUuid !== undefined && staleUuid !== uuid) uuidToNumeric.delete(staleUuid);
+      if (staleUuid !== undefined && staleUuid !== uuid) {
+        uuidToNumeric.delete(staleUuid);
+        // F3(codex P3): numericId를 새 uuid가 재사용하면 옛 uuid의 롤업 차원
+        // (project·label)도 함께 버린다 — 수명 일원화. 안 그러면
+        // projectOfSession(staleUuid)/labelOfSession(staleUuid)이 영구 잔존해
+        // 어느 세션도 소유하지 않는 고아가 남는다.
+        uuidToProject.delete(staleUuid);
+        uuidToLabel.delete(staleUuid);
+      }
       const staleNumeric = uuidToNumeric.get(uuid);
       if (staleNumeric !== undefined && staleNumeric !== numericId) numericToUuid.delete(staleNumeric);
       numericToUuid.set(numericId, uuid);
       uuidToNumeric.set(uuid, numericId);
+      // B1 roll-up dimension (additive). Only overwrite when a value is supplied,
+      // so a later re-register that omits them can't wipe a known project/label.
+      if (project !== undefined && project !== null) uuidToProject.set(uuid, project);
+      if (label) uuidToLabel.set(uuid, label);
     },
 
     attachPanel: (uuid) => {

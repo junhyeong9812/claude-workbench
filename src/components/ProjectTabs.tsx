@@ -2,6 +2,7 @@ import { useEffect, useState, type DragEvent } from "react";
 import { open } from "@tauri-apps/plugin-dialog";
 import { useAppStore } from "../state/store";
 import { TypeBadges } from "./TypeBadges";
+import { ProjectStatusBadge } from "./ProjectStatusBadge";
 
 /** 프로젝트 탭 드래그 전용 MIME(멀티프로젝트 P6). 세션행
  * (application/x-workbench-session)·dockview 내부 드래그와 상호 무간섭 —
@@ -118,6 +119,8 @@ export function ProjectTabs() {
           >
             <span className="tab-name">{p.name}</span>
             <TypeBadges types={p.project_types} />
+            {/* B1: 이 프로젝트의 진행 중 세션 롤업 배지 (진행 중일 때만 렌더). */}
+            <ProjectStatusBadge project={p.path} />
             <button
               className="tab-close"
               title="Close project"

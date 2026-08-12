@@ -54,6 +54,7 @@ import { resolveVisibleDual } from "./state/dualSurface";
 import { SurfaceProvider } from "./state/surfaceContext";
 import { surfaceLayout, placementForZone } from "./state/surfaceTree";
 import { SurfaceShell } from "./components/SurfaceShell";
+import { ProjectStatusBadge } from "./components/ProjectStatusBadge";
 import {
   applyActivityPick,
   applyTabPick,
@@ -1233,6 +1234,8 @@ function AppMain() {
                         <span className="dual-secondary-name">
                           {projects.find((p) => p.path === visibleDual)?.name ?? visibleDual}
                         </span>
+                        {/* B1: 이 표면(부)이 소유한 프로젝트의 진행 중 세션 롤업. */}
+                        <ProjectStatusBadge project={visibleDual} />
                         <span className="dual-secondary-hint">
                           {activeSurfaceId === "secondary" ? "활성" : "보조"}
                         </span>

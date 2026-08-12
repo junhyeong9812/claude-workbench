@@ -1187,7 +1187,17 @@ export function ClaudeTermPanel(props: IDockviewPanelProps<ClaudeTermParams>) {
           // backgrounded (unmounted) tab, and mark it attached so the global
           // listener defers to this panel's own (accurate-seenNow) updates (P3).
           attachedUuid = opened.session_uuid;
-          useClaudeStatus.getState().registerSession(opened.session_uuid, opened.id);
+          // B1: record the owning project + tab title so the per-project roll-up
+          // (badge / ▾ list) can group this session. `project` is this panel's
+          // cwd (resolved above); the title falls back in the roll-up to the uuid.
+          useClaudeStatus
+            .getState()
+            .registerSession(
+              opened.session_uuid,
+              opened.id,
+              project ?? undefined,
+              (props.params.title as string | undefined) ?? undefined,
+            );
           useClaudeStatus.getState().attachPanel(opened.session_uuid);
           // Audit gap: the mount-time markSeenIfLooking ran before statusUuidRef was
           // set (uuid null → no-op), so an initially active+focused panel would set
