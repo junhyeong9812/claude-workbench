@@ -1,5 +1,6 @@
-import { useEffect, useLayoutEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
+import { useAnchoredPosition } from "../hooks/useAnchoredPosition";
 import { useAppStore } from "../state/store";
 import { findSessionPanel } from "../state/surfaceRegistry";
 import {
@@ -53,7 +54,10 @@ export function ProjectStatusBadge({ project }: { project: string }) {
   const popRef = useRef<HTMLDivElement>(null);
   // F1: 포털 드롭다운의 fixed 좌표(트리거 rect 기준 계산 + 뷰포트 클램프). null =
   // 아직 미계측(첫 레이아웃 패스 전) → visibility:hidden 으로 깜빡임 방지.
-  const [pos, setPos] = useState<{ left: number; top: number; maxHeight: number } | null>(null);
+  // 계산·구독은 useAnchoredPosition 단일 출처(반응형 1차 인프라 C) — 기본값이
+  // 이 배지가 쓰던 값(gap/margin 4 · maxHeight 260 · minHeight 80 · fallback
+  // 200×260)과 같아 동작은 그대로다.
+  const pos = useAnchoredPosition(open, btnRef, popRef);
 
   const roll = projectAttention(entries, project, projectOfSession, labelOfSession);
   const active = hasProjectAttention(roll);
@@ -82,54 +86,6 @@ export function ProjectStatusBadge({ project }: { project: string }) {
   useEffect(() => {
     if (!active && open) setOpen(false);
   }, [active, open]);
-
-  // F1(codex P2-1 + P2-3): 드롭다운을 body 포털 + position:fixed 레이어로 띄운다.
-  // 배지가 보조 표면 조상 `.dual-secondary{overflow:hidden}`에 클리핑돼 secondary
-  // 헤더에서 사실상 안 열리던 문제와, left:0 고정이라 우측 탭·하단 표면에서 화면
-  // 밖으로 나가던 문제를 함께 해소한다 — 트리거 rect 기준으로 아래(공간 없으면
-  // 위) 배치 + 뷰포트 클램프(tab-ctx-menu의 Math.max(0,Math.min(...)) 클램프 계열).
-  useLayoutEffect(() => {
-    if (!open) {
-      setPos(null);
-      return;
-    }
-    const compute = () => {
-      const btn = btnRef.current;
-      if (!btn) return;
-      const pop = popRef.current;
-      const r = btn.getBoundingClientRect();
-      const GAP = 4;
-      const MARGIN = 4;
-      const vw = window.innerWidth;
-      const vh = window.innerHeight;
-      const w = pop?.offsetWidth ?? 200;
-      const h = Math.min(pop?.scrollHeight ?? 260, 260);
-      // 가로: 트리거 좌변 정렬, 뷰포트 안으로 클램프(우측 탭·좁은 창에서 화면 밖 방지).
-      const left = Math.max(MARGIN, Math.min(r.left, vw - w - MARGIN));
-      // 세로: 기본 아래. 아래 공간이 부족하고 위가 더 넉넉하면 위로 뒤집는다(하단 표면).
-      const below = r.bottom + GAP;
-      const openUp = below + h > vh - MARGIN && r.top - GAP - h > MARGIN;
-      let top = openUp ? r.top - GAP - h : below;
-      top = Math.max(MARGIN, Math.min(top, vh - h - MARGIN));
-      // 남은 세로 공간에 맞춘 상한(콘텐츠가 길면 내부 스크롤 — overflow-y:auto).
-      const maxHeight = Math.max(80, Math.min(260, vh - top - MARGIN));
-      setPos({ left, top, maxHeight });
-    };
-    compute();
-    // fixed 레이어라 스크롤/리사이즈로 트리거가 움직이면 위치를 다시 계산한다.
-    window.addEventListener("scroll", compute, true);
-    window.addEventListener("resize", compute);
-    // 열린 채로 세션 목록이 늘거나 줄어(라벨 길이 변화 포함) 팝업 크기가 바뀌면
-    // 이전 크기 기준 left/top이 어긋나 클램프가 다시 깨질 수 있다 — 팝업 자체
-    // 크기 변화도 관측해 재계산한다(codex 후점검 P3).
-    const ro = new ResizeObserver(compute);
-    if (popRef.current) ro.observe(popRef.current);
-    return () => {
-      window.removeEventListener("scroll", compute, true);
-      window.removeEventListener("resize", compute);
-      ro.disconnect();
-    };
-  }, [open]);
 
   if (!active) return null;
 
@@ -171,6 +127,10 @@ export function ProjectStatusBadge({ project }: { project: string }) {
           </span>
         )}
       </button>
+      {/* F1(codex P2-1 + P2-3): 드롭다운을 body 포털 + position:fixed 레이어로 띄운다.
+          배지가 보조 표면 조상 `.dual-secondary{overflow:hidden}`에 클리핑돼 secondary
+          헤더에서 사실상 안 열리던 문제와, left:0 고정이라 우측 탭·하단 표면에서 화면
+          밖으로 나가던 문제를 함께 해소한다(좌표 = useAnchoredPosition). */}
       {open &&
         createPortal(
           <div
