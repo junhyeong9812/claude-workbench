@@ -136,6 +136,9 @@ body {
   align-items: stretch;
   overflow-x: auto;
   overflow-y: hidden;
+  /* 넘칠 때만 뜨는 스크롤바를 얇게 — 36px 줄에서 두꺼운 막대는 탭을 눌러버린다.
+     미지원 엔진은 이 선언을 그냥 무시한다. */
+  scrollbar-width: thin;
   background: var(--bg-alt);
   border-bottom: 1px solid var(--border);
   min-height: 36px;
