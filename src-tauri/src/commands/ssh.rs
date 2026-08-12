@@ -99,6 +99,9 @@ pub fn ssh_create(
         port,
         username,
         auth,
+        // Interactive shell path (unchanged). The R0 exec channel is a core-level
+        // seam with no front wiring yet (R1 owns the remote-command entrypoint).
+        exec: None,
     };
     let known_hosts = ssh_known_hosts_path(&app)?;
     let seed = persist_key
