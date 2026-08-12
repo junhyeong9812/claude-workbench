@@ -230,4 +230,47 @@ describe("CollapsibleSeg / CollapsibleControls", () => {
     expect(document.querySelector(".nested-pop")).not.toBeNull();
   });
 
+  it("⋯ 메뉴는 role=menu 계약대로 포커스를 관리한다(menuitem·첫 항목·↑↓·Tab 순환)", () => {
+    restore = stubWidth(400);
+    act(() => {
+      root.render(
+        <div>
+          <CollapsibleControls threshold={560} label="추가 컨트롤">
+            <button className="a">아카이브</button>
+            <button className="b">시드 재주입</button>
+          </CollapsibleControls>
+        </div>,
+      );
+    });
+    const more = host.querySelector("button.collapse-more") as HTMLButtonElement;
+    act(() => more.click());
+    const menu = document.querySelector(".collapse-menu") as HTMLElement;
+    const a = menu.querySelector("button.a") as HTMLButtonElement;
+    const b = menu.querySelector("button.b") as HTMLButtonElement;
+
+    expect([a.getAttribute("role"), b.getAttribute("role")]).toEqual(["menuitem", "menuitem"]);
+    expect(document.activeElement).toBe(a); // 열면 첫 항목
+
+    const key = (k: string, shift = false) =>
+      act(() => {
+        (document.activeElement as HTMLElement).dispatchEvent(
+          new KeyboardEvent("keydown", { key: k, shiftKey: shift, bubbles: true }),
+        );
+      });
+    key("ArrowDown");
+    expect(document.activeElement).toBe(b);
+    key("ArrowDown"); // 순환
+    expect(document.activeElement).toBe(a);
+    key("ArrowUp");
+    expect(document.activeElement).toBe(b);
+    key("Tab"); // 문서 끝으로 새지 않고 메뉴 안을 돈다
+    expect(document.activeElement).toBe(a);
+    key("Tab", true);
+    expect(document.activeElement).toBe(b);
+
+    // 항목 실행으로 닫으면 포커스는 "⋯"로 돌아온다(Escape 경로와 동일).
+    act(() => b.click());
+    expect(document.querySelector(".collapse-menu")).toBeNull();
+    expect(document.activeElement).toBe(more);
+  });
 });

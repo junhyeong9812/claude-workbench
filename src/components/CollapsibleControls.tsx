@@ -151,6 +151,18 @@ export function CollapsibleSeg({
 /* ------------------------------------------------------------------ */
 
 /**
+ * 메뉴 안에서 포커스를 받을 수 있는 항목들 — **실제 DOM 자손만**이라 중첩 포털
+ * (하위 팝오버)은 포함되지 않는다. disabled는 건너뛴다(포커스 못 받는다).
+ */
+function menuItems(menu: HTMLElement | null): HTMLElement[] {
+  if (!menu) return [];
+  const sel = "button, select, a[href], [tabindex]:not([tabindex='-1'])";
+  return [...menu.querySelectorAll<HTMLElement>(sel)].filter(
+    (el) => !(el as HTMLButtonElement).disabled,
+  );
+}
+
+/**
  * 보조 버튼 묶음. host가 좁으면 "⋯" 하나로 접고, 원래 자식들을 포털 메뉴에
  * 세로로 담는다(자식 엘리먼트 그대로 — 핸들러·상태 전부 보존).
  *
@@ -168,6 +180,9 @@ export function CollapsibleSeg({
  *    생성 불가). 판정 기준을 "내 메뉴 DOM 안인가"로 바꾸면 중첩 포털은 자연히
  *    제외된다.
  *  - Escape → 닫으면서 "⋯"로 포커스 복귀. 넓어지면 자동으로 닫는다.
+ *
+ * 키보드(role=menu 계약): 열면 첫 항목에 포커스, ↑↓/Home/End로 이동, Tab은 메뉴
+ * 안을 순환한다(포털이 body 끝이라 그냥 두면 Tab이 문서 끝으로 샌다).
  */
 export function CollapsibleControls({
   threshold,
@@ -221,6 +236,25 @@ export function CollapsibleControls({
     };
   }, [open]);
 
+  // role=menu 계약: 자식은 호출자가 준 임의 엘리먼트라 롤을 prop으로 못 받는다 →
+  // 열릴 때 실제 DOM에서 항목을 찾아 menuitem을 붙이고 첫 항목으로 포커스를 옮긴다
+  // (호출자가 이미 role을 지정했으면 건드리지 않는다). 닫히면 이 노드들은 언마운트
+  // 되므로(포털→인라인은 재마운트) 정리할 잔재가 없다.
+  useLayoutEffect(() => {
+    if (!open) return;
+    const items = menuItems(popRef.current);
+    for (const el of items) if (!el.hasAttribute("role")) el.setAttribute("role", "menuitem");
+    items[0]?.focus();
+  }, [open]);
+
+  /** 닫으면서 "⋯"로 포커스를 되돌린다 — 단 항목이 포커스를 이미 다른 곳으로
+   *  옮겼으면(패널 열기 등) 뺏지 않는다. */
+  const closeAndRestore = () => {
+    const keepFocus = !popRef.current?.contains(document.activeElement);
+    setOpen(false);
+    if (!keepFocus) btnRef.current?.focus();
+  };
+
   return (
     <span className="collapse-host" ref={ref}>
       {narrow ? (
@@ -257,7 +291,24 @@ export function CollapsibleControls({
                   if (!popRef.current?.contains(t)) return;
                   // 자기 팝오버를 여는 트리거(메뉴 안)는 눌러도 메뉴를 유지한다.
                   if ((t as Element).closest?.("[data-keep-menu]")) return;
-                  setOpen(false);
+                  closeAndRestore();
+                }}
+                onKeyDown={(e) => {
+                  // 중첩 포털에서 올라온 키는 그쪽 팝오버가 소유한다(실제 DOM 기준).
+                  if (!popRef.current?.contains(e.target as Node)) return;
+                  const items = menuItems(popRef.current);
+                  if (items.length === 0) return;
+                  const idx = items.indexOf(document.activeElement as HTMLElement);
+                  const move = (next: number) => {
+                    e.preventDefault();
+                    items[((next % items.length) + items.length) % items.length].focus();
+                  };
+                  if (e.key === "ArrowDown") move(idx + 1);
+                  else if (e.key === "ArrowUp") move(idx - 1);
+                  else if (e.key === "Home") move(0);
+                  else if (e.key === "End") move(items.length - 1);
+                  // Tab이 문서 끝(포털은 body 마지막 자식)으로 새지 않게 순환시킨다.
+                  else if (e.key === "Tab") move(e.shiftKey ? idx - 1 : idx + 1);
                 }}
               >
                 {children}
