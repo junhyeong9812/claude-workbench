@@ -8,7 +8,8 @@
  *      **동작(onChange·자식 핸들러)은 그대로**다.
  */
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { act } from "react";
+import { act, useState } from "react";
+import { createPortal } from "react-dom";
 import { createRoot, type Root } from "react-dom/client";
 
 import { CollapsibleControls, CollapsibleSeg, shouldCollapse } from "./CollapsibleControls";
@@ -162,7 +163,71 @@ describe("CollapsibleSeg / CollapsibleControls", () => {
     const inner = menu.querySelector("button.a") as HTMLButtonElement;
     act(() => inner.click());
     expect(clicked).toBe(1);
-    // 항목을 누르면 메뉴는 닫힌다.
+    // 자기 메뉴 DOM 안의 평범한 항목을 누르면 실행된 것이므로 닫힌다.
     expect(document.querySelector(".collapse-menu")).toBeNull();
   });
+
+  /* 다층(중첩 포털) 계약 — 리뷰 F1.
+     이전 테스트는 "항목을 누르면 닫힌다"만 검사해, **하위 팝오버 포털의 클릭까지
+     닫아버리는** 동작을 계약으로 못 박았다(그래서 green을 통과해 결함이 들어왔다).
+     React 포털은 DOM이 아니라 React 트리로 이벤트를 버블시키므로 아래 시나리오가
+     실제 앱(접힌 툴바 → 에이전트 ▾ → 옵션 팝오버)과 동형이다. */
+  it("메뉴 안에서 연 중첩 포털 팝오버를 눌러도 메뉴는 닫히지 않는다", () => {
+    restore = stubWidth(400);
+    let started = 0;
+
+    /** 메뉴 안의 트리거(data-keep-menu) + body로 나가는 팝오버 = 앱의 ▾ 구조. */
+    function NestedTrigger() {
+      const [popOpen, setPopOpen] = useState(false);
+      return (
+        <div className="agent-opt-menu" data-keep-menu="">
+          <button className="trig" onClick={() => setPopOpen((v) => !v)}>
+            ▾
+          </button>
+          {popOpen &&
+            createPortal(
+              <div className="nested-pop" data-popover-layer="">
+                <button className="start" onClick={() => (started += 1)}>
+                  시작
+                </button>
+              </div>,
+              document.body,
+            )}
+        </div>
+      );
+    }
+
+    act(() => {
+      root.render(
+        <div>
+          <CollapsibleControls threshold={560} label="추가 컨트롤">
+            <NestedTrigger />
+          </CollapsibleControls>
+        </div>,
+      );
+    });
+    const more = host.querySelector("button.collapse-more") as HTMLButtonElement;
+    act(() => more.click());
+    expect(document.querySelector(".collapse-menu")).not.toBeNull();
+
+    // ① 메뉴 안의 트리거(▾) — data-keep-menu라 메뉴는 유지되고 팝오버가 열린다.
+    const trig = document.querySelector(".collapse-menu button.trig") as HTMLButtonElement;
+    act(() => trig.click());
+    expect(document.querySelector(".collapse-menu")).not.toBeNull();
+    const pop = document.querySelector(".nested-pop") as HTMLElement;
+    expect(pop).not.toBeNull();
+    // 팝오버는 메뉴 **DOM** 밖(body 직속)이다 — closest('[data-keep-menu]')는 못 찾는다.
+    expect(document.querySelector(".collapse-menu")!.contains(pop)).toBe(false);
+
+    // ② 그 팝오버 안 클릭(mousedown+click 둘 다 실제 경로) — 메뉴가 살아 있어야 한다.
+    const start = pop.querySelector("button.start") as HTMLButtonElement;
+    act(() => {
+      start.dispatchEvent(new MouseEvent("mousedown", { bubbles: true }));
+      start.click();
+    });
+    expect(started).toBe(1);
+    expect(document.querySelector(".collapse-menu")).not.toBeNull();
+    expect(document.querySelector(".nested-pop")).not.toBeNull();
+  });
+
 });

@@ -158,8 +158,15 @@ export function CollapsibleSeg({
  *  - 바깥 클릭 → 닫힘. 단 **다른 포털 팝오버 안**(`data-popover-layer`)은 바깥이
  *    아니다 — 메뉴 안에서 연 하위 팝오버(에이전트 옵션)를 누르는 순간 부모 메뉴가
  *    닫혀 그 팝오버까지 사라지는 것을 막는다.
- *  - 메뉴 안 클릭 → 실행됐다고 보고 닫힘. `data-keep-menu` 조상이 있으면 유지
- *    (자체 팝오버를 여는 트리거).
+ *  - **자기 메뉴 DOM 안** 클릭 → 실행됐다고 보고 닫힘. `data-keep-menu` 조상이
+ *    있으면 유지(자체 팝오버를 여는 트리거).
+ *  - 그 밖의 클릭(= 이 메뉴가 React 트리로 품고 있는 **중첩 포털**에서 올라온 것)
+ *    → 무시. React 포털 이벤트는 DOM이 아니라 React 트리로 버블하므로 body에 나가
+ *    있는 하위 팝오버의 클릭도 이 핸들러에 도달한다. `closest()`는 실제 DOM을
+ *    타므로 그 안에서는 `data-keep-menu`를 찾지 못해, 첫 클릭에 부모 메뉴가 닫히고
+ *    하위 팝오버까지 언마운트됐다(리뷰 F1 — 접힌 툴바에서 모델/강도 지정 세션
+ *    생성 불가). 판정 기준을 "내 메뉴 DOM 안인가"로 바꾸면 중첩 포털은 자연히
+ *    제외된다.
  *  - Escape → 닫으면서 "⋯"로 포커스 복귀. 넓어지면 자동으로 닫는다.
  */
 export function CollapsibleControls({
@@ -245,7 +252,11 @@ export function CollapsibleControls({
                   visibility: pos ? "visible" : "hidden",
                 }}
                 onClick={(e) => {
-                  if ((e.target as Element).closest?.("[data-keep-menu]")) return;
+                  const t = e.target as Node;
+                  // 중첩 포털에서 React 트리로 올라온 클릭 = 내 메뉴 DOM 밖 → 무시.
+                  if (!popRef.current?.contains(t)) return;
+                  // 자기 팝오버를 여는 트리거(메뉴 안)는 눌러도 메뉴를 유지한다.
+                  if ((t as Element).closest?.("[data-keep-menu]")) return;
                   setOpen(false);
                 }}
               >
