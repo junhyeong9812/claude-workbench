@@ -117,9 +117,17 @@ pub enum ExecEvent {
         signal: Option<String>,
     },
     /// The exec could not run to a normal exit — the server **rejected** the exec
-    /// request, or the request could not be sent. This is a terminal event too:
-    /// a consumer always receives exactly one of `Exit` / `Error`, never a silent
-    /// end (review F4 — the exec channel's "always terminal" contract).
+    /// request, or the request could not be sent. This is a terminal event too.
+    ///
+    /// **Contract (review F4), scoped:** *once the exec request has been sent*,
+    /// a consumer receives exactly one of `Exit` / `Error`, never a silent end.
+    /// The scope matters for a state machine built on top (R1): a session that
+    /// dies **before** the exec is requested — connect / auth / host-key
+    /// rejection / `channel_open` failure, or a cancel-teardown at any point —
+    /// emits **zero** `ExecEvent`s. There the consumer's signal is `exec_rx`
+    /// closing (all senders dropped) together with [`SshStatus::Failed`] /
+    /// [`SshStatus::Closed`] — so "no terminal event" must be treated as a
+    /// legitimate end state, not as a still-running command.
     Error(String),
 }
 
@@ -160,6 +168,13 @@ pub struct SshChannels {
     /// interactive shell path; only an [`SshConfig::exec`] session emits on it.
     /// **Bounded** (`EXEC_EVENT_QUEUE`): the sender blocks when full, so a stalled
     /// consumer back-pressures the remote instead of growing memory (review F1).
+    ///
+    /// **Hold it only if you drain it.** Because the queue is bounded and the
+    /// send side blocks, a receiver that is kept alive but never polled stalls the
+    /// exec read loop entirely — including **stdout**, which rides `Shared::emit`
+    /// and would otherwise look unrelated. Either consume it or drop it; the
+    /// current `src-tauri` shell path drops it immediately, which is why an
+    /// unsubscribed session cannot stall.
     pub exec_rx: mpsc::Receiver<ExecEvent>,
 }
 
@@ -403,7 +418,11 @@ async fn run(
 ///   (bounded queue, blocking send — review F1);
 /// - **exit status / signal** → captured and delivered as a terminal
 ///   [`ExecEvent::Exit`]; a rejected/failed exec yields [`ExecEvent::Error`] —
-///   either way the consumer always receives exactly one terminal event (F4).
+///   either way, **once the exec request has been sent**, the consumer receives
+///   exactly one terminal event (F4). Before that point (connect/auth/host-key/
+///   `channel_open` failure, or cancellation) this function is never reached and
+///   *no* `ExecEvent` is produced at all — the consumer learns of the outcome
+///   from `exec_rx` closing plus [`SshStatus::Failed`]/[`SshStatus::Closed`].
 ///
 /// **Output-only** (R0): no PTY is requested (non-TTY), and no stdin is wired —
 /// the loop only *reads* the channel (stdout / stderr / exit). "No stdin" is
