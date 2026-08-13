@@ -708,9 +708,15 @@ impl Host {
             };
             // A snapshot is the authority: replace rather than merge, so a
             // session whose items were pruned on the daemon does not keep a
-            // ghost copy here.
-            sess.items = items;
-            sess.turns = turns;
+            // ghost copy here. **Except** when the daemon says it left the body
+            // out: that is a statement about the message, not about the
+            // session, and taking it as "the body is empty" wipes whatever the
+            // stream already delivered — every gap would blank a finished
+            // session's timeline under the viewer reading it.
+            if !items_omitted {
+                sess.items = items;
+                sess.turns = turns;
+            }
             sess.model = model;
             sess.last_usage = last_usage;
             sess.body_omitted = items_omitted;

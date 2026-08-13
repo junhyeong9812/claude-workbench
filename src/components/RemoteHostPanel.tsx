@@ -9,15 +9,20 @@
  * 새 UI 어휘를 만들지 않았다: 알림 줄은 정리 패널·시드 배너와 같은
  * `claudeterm-refine-note`, 행·배지는 사이드바 패널들이 쓰는 클래스를 쓴다.
  */
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { useAppStore } from "../state/store";
 import {
+  countsLabel,
   noticeBadge,
   phaseLabel,
+  pickTimeline,
   resumeLabel,
+  shouldFetchBody,
+  staleSeenHosts,
   useRemoteHosts,
   type RemoteHostSnapshot,
+  type RemoteLiveTimeline,
   type RemoteSessionMeta,
 } from "../state/remoteHosts";
 import { AGENT_BADGE, KIND_LABEL } from "./TimelineView";
@@ -34,9 +39,17 @@ function ts(ms: number): string {
   }
 }
 
+/** "마지막 프레임 N초 전" — 화면이 얼마나 낡았는지. */
+function ageLabel(atMs: number | null): string | null {
+  if (!atMs) return null;
+  const secs = Math.max(0, Math.round((Date.now() - atMs) / 1000));
+  if (secs < 60) return `마지막 프레임 ${secs}초 전`;
+  return `마지막 프레임 ${Math.round(secs / 60)}분 전`;
+}
+
 export function RemoteHostPanel() {
   const connections = useAppStore((s) => s.savedConnections);
-  const { hosts, live, refresh } = useRemoteHosts();
+  const { hosts, live, fetched, fetching, fetchError, fetchBody, refresh } = useRemoteHosts();
   const [connecting, setConnecting] = useState(false);
   const [pick, setPick] = useState<string>("");
   const [cwcd, setCwcd] = useState("");
@@ -47,6 +60,19 @@ export function RemoteHostPanel() {
 
   const attached = useMemo(() => new Set(hosts.map((h) => h.host_id)), [hosts]);
   const candidates = connections.filter((c) => !attached.has(c.id));
+
+  // 다시 붙은 호스트는 알림 seq 가 1부터 다시 시작한다(새 Host 객체). 옛
+  // 연결의 "여기까지 봤다"를 그대로 두면 새 연결의 알림이 전부 걸러져
+  // **알림 채널이 통째로 죽는다** — 갭도 데몬 재시작도 안 보인다.
+  useEffect(() => {
+    const stale = staleSeenHosts(hosts, seen);
+    if (stale.length === 0) return;
+    setSeen((s) => {
+      const next = { ...s };
+      for (const id of stale) delete next[id];
+      return next;
+    });
+  }, [hosts, seen]);
 
   async function connect() {
     const conn = connections.find((c) => c.id === pick);
@@ -146,6 +172,10 @@ export function RemoteHostPanel() {
           key={h.host_id}
           host={h}
           live={live}
+          fetched={fetched}
+          fetching={fetching}
+          fetchError={fetchError}
+          onFetch={(id) => fetchBody(h.host_id, id)}
           seenSeq={seen[h.host_id] ?? 0}
           onSeen={() =>
             setSeen((s) => ({
@@ -165,6 +195,10 @@ export function RemoteHostPanel() {
 function HostCard({
   host,
   live,
+  fetched,
+  fetching,
+  fetchError,
+  onFetch,
   seenSeq,
   onSeen,
   openIds,
@@ -172,7 +206,11 @@ function HostCard({
   onDisconnect,
 }: {
   host: RemoteHostSnapshot;
-  live: Map<number, import("../state/remoteHosts").RemoteLiveTimeline>;
+  live: Map<number, RemoteLiveTimeline>;
+  fetched: Map<number, RemoteLiveTimeline>;
+  fetching: ReadonlySet<number>;
+  fetchError: Record<number, string>;
+  onFetch: (id: number) => void;
   seenSeq: number;
   onSeen: () => void;
   openIds: Record<number, boolean>;
@@ -181,6 +219,7 @@ function HostCard({
 }) {
   const badge = noticeBadge(host.notices, seenSeq);
   const resume = resumeLabel(host.resume);
+  const age = ageLabel(host.last_frame_at_ms);
   return (
     <section className="remote-host">
       <header className="remote-host-head">
@@ -210,6 +249,8 @@ function HostCard({
             커서 <code>{host.cursor}</code>
           </span>
         ) : null}
+        {age ? <span className="remote-age">{age}</span> : null}
+        {host.running != null ? <span>실행 중 {host.running}</span> : null}
         {host.attempts > 1 ? <span>접속 시도 {host.attempts}회</span> : null}
       </div>
 
@@ -245,6 +286,10 @@ function HostCard({
             key={s.id}
             s={s}
             live={live.get(s.id)}
+            fetched={fetched.get(s.id)}
+            fetching={fetching.has(s.id)}
+            fetchError={fetchError[s.id]}
+            onFetch={() => onFetch(s.id)}
             open={!!openIds[s.id]}
             onToggle={() => onToggle(s.id)}
           />
@@ -257,18 +302,39 @@ function HostCard({
 function SessionRow({
   s,
   live,
+  fetched,
+  fetching,
+  fetchError,
+  onFetch,
   open,
   onToggle,
 }: {
   s: RemoteSessionMeta;
-  live: import("../state/remoteHosts").RemoteLiveTimeline | undefined;
+  live: RemoteLiveTimeline | undefined;
+  fetched: RemoteLiveTimeline | undefined;
+  fetching: boolean;
+  fetchError: string | undefined;
+  onFetch: () => void;
   open: boolean;
   onToggle: () => void;
 }) {
-  const items = live?.items ?? [];
-  const turns = live?.turns ?? [];
-  const model = live?.model ?? s.model;
-  const ctx = live?.ctxTokens ?? s.ctx_tokens;
+  const shown = pickTimeline(live, fetched);
+  const items = shown?.items ?? [];
+  const turns = shown?.turns ?? [];
+  const model = shown?.model ?? s.model;
+  const ctx = shown?.ctxTokens ?? s.ctx_tokens;
+  const recoverable = shouldFetchBody(s, shown);
+
+  // 펼치면 가져온다. 데몬은 끝난 세션의 본문을 스냅샷에 싣지 않고
+  // (`items_omitted`) 앞으로도 이벤트를 내지 않으므로, 자동 조회가 없으면
+  // 사용자는 "따로 가져올 수 있습니다"라는 문장만 읽고 아무것도 못 본다.
+  // 보관 기간이 지나면 데몬이 NotFound 로 답하고, 그 사유가 화면에 뜬다.
+  useEffect(() => {
+    if (open && recoverable && !fetching && fetchError === undefined) onFetch();
+    // onFetch 는 호출마다 새 클로저라 의존성에서 뺀다(넣으면 매 렌더 재조회).
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [open, recoverable, fetching, fetchError]);
+
   return (
     <li className={`remote-session${s.closed ? " remote-session-closed" : ""}`}>
       <button type="button" className="remote-session-head" onClick={onToggle}>
@@ -276,9 +342,7 @@ function SessionRow({
         <span className="remote-agent">{s.agent}</span>
         <span className="remote-session-name">{s.label || s.session_id.slice(0, 8)}</span>
         <span className={`remote-state remote-state-${s.state}`}>{s.state}</span>
-        <span className="remote-counts">
-          턴 {Math.max(s.turns, turns.length)} · 항목 {Math.max(s.items, items.length)}
-        </span>
+        <span className="remote-counts">{countsLabel(s, shown)}</span>
       </button>
       <div className="remote-session-sub">
         <code title={s.cwd}>{s.cwd}</code>
@@ -291,10 +355,21 @@ function SessionRow({
       </div>
       {open ? (
         <div className="remote-timeline">
-          {s.body_omitted && items.length === 0 ? (
+          {fetching ? <p className="remote-empty">원격에서 본문을 가져오는 중…</p> : null}
+          {fetchError ? (
             <p className="remote-empty">
-              끝난 세션이라 본문이 스냅샷에 실리지 않았습니다 — 데몬이 아직 갖고 있으면 원격에서
-              따로 가져올 수 있습니다.
+              본문을 가져오지 못했습니다 — {fetchError}
+              <button type="button" className="remote-fetch" onClick={onFetch}>
+                다시 시도
+              </button>
+            </p>
+          ) : null}
+          {recoverable && !fetching && !fetchError ? (
+            <p className="remote-empty">
+              끝난 세션이라 본문이 스냅샷에 실리지 않았습니다({s.timeline_len}개).
+              <button type="button" className="remote-fetch" onClick={onFetch}>
+                원격에서 가져오기
+              </button>
             </p>
           ) : null}
           {turns.map(([n, text]) => (
@@ -310,7 +385,7 @@ function SessionRow({
               <span className="remote-item-status">{AGENT_BADGE[it.agent_status] ?? ""}</span>
             </p>
           ))}
-          {items.length === 0 && turns.length === 0 && !s.body_omitted ? (
+          {items.length === 0 && turns.length === 0 && !recoverable && !fetching ? (
             <p className="remote-empty">아직 받은 타임라인이 없습니다.</p>
           ) : null}
         </div>

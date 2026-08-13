@@ -59,6 +59,8 @@ export interface RemoteSessionMeta {
   signal: string | null;
   adopted: string | null;
   body_omitted: boolean;
+  /** 데몬이 이 세션에 대해 갖고 있는 아이템 수(헤더). "본문 생략됨"과 "항목 0"의 차이. */
+  timeline_len: number;
   turns: number;
   items: number;
   model: string | null;
@@ -85,6 +87,10 @@ export interface RemoteHostSnapshot {
   cursor: string | null;
   last_error: string | null;
   attempts: number;
+  /** 아무 프레임이나 마지막으로 도착한 시각(워크벤치 시계, ms). */
+  last_frame_at_ms: number | null;
+  /** 데몬이 마지막 하트비트에서 알린 실행 중 세션 수. */
+  running: number | null;
   sessions: RemoteSessionMeta[];
   notices: RemoteNotice[];
 }
@@ -119,6 +125,117 @@ export function resumeLabel(resume: RemoteResume | null): string | null {
 /** 아직 안 본 알림 — `seq`는 호스트 안에서 단조라 마지막 본 값 하나로 충분하다. */
 export function unseenNotices(notices: readonly RemoteNotice[], seenSeq: number): RemoteNotice[] {
   return notices.filter((n) => n.seq > seenSeq);
+}
+
+/**
+ * 저장해 둔 "여기까지 봤다"가 **이 연결의 것이 아닌** 호스트들.
+ *
+ * `seq`가 호스트 안에서 단조인 것은 맞지만 그건 **한 Host 객체 안에서**다.
+ * 다시 붙으면(`Registry::attach` 마다 새 Host) 카운터가 1부터 다시 시작하는데,
+ * 화면이 들고 있는 seen 은 옛 연결의 큰 값이라 새 연결의 알림 전부가 "이미
+ * 본 것"으로 걸러진다 — 갭·데몬 재시작·읽지 못한 줄까지 통째로 안 보인다.
+ * 알림 채널이 조용히 죽는 것이 이 단계에서 가장 나쁜 실패다.
+ *
+ * 판정은 epoch 비교가 아니라 **되감김 자체**다: 같은 데몬에 다시 붙어도
+ * (epoch 동일) 카운터는 리셋되므로 epoch 로는 못 잡는다.
+ */
+export function staleSeenHosts(
+  hosts: readonly RemoteHostSnapshot[],
+  seen: Readonly<Record<string, number>>,
+): string[] {
+  return hosts
+    .filter((h) => {
+      const mine = seen[h.host_id] ?? 0;
+      if (mine === 0) return false;
+      const newest = h.notices.length ? h.notices[h.notices.length - 1].seq : 0;
+      return mine > newest;
+    })
+    .map((h) => h.host_id);
+}
+
+/**
+ * 접힌 행의 "턴 N · 항목 M".
+ *
+ * 끝난 세션은 데몬이 본문을 스냅샷에 싣지 않는다 — 그때 로컬 개수(0)를 그대로
+ * 보이면 **"아무 일도 없었다"로 읽힌다**. 데몬이 헤더에 실어 보내는
+ * `timeline_len`이 정확히 그 혼동을 막으려고 있는 값이라 그것을 쓴다.
+ */
+export function countsLabel(
+  s: Pick<RemoteSessionMeta, "turns" | "items" | "body_omitted" | "timeline_len">,
+  live?: Pick<RemoteLiveTimeline, "items" | "turns">,
+): string {
+  const turns = Math.max(s.turns, live?.turns.length ?? 0);
+  const items = Math.max(s.items, live?.items.length ?? 0);
+  if (items === 0 && s.body_omitted && s.timeline_len > 0) {
+    return `턴 ${turns} · 본문 생략됨 · ${s.timeline_len}개`;
+  }
+  return `턴 ${turns} · 항목 ${items}`;
+}
+
+/** 펼쳤을 때 원격에서 본문을 가져와야 하나 (본문이 없고 데몬은 갖고 있다). */
+export function shouldFetchBody(
+  s: Pick<RemoteSessionMeta, "body_omitted" | "timeline_len">,
+  live: RemoteLiveTimeline | undefined,
+): boolean {
+  if (live && (live.items.length > 0 || live.turns.length > 0)) return false;
+  return s.body_omitted || s.timeline_len > 0;
+}
+
+/** `remote_timeline` 응답 — 백엔드 `RemoteTimeline`. */
+export interface RemoteTimelineReply {
+  session_id: string;
+  total: number;
+  items: TimelineItem[];
+  turns: [number, string][];
+  model: string | null;
+  last_usage: { input: number; output: number; cache_read: number; cache_creation: number } | null;
+}
+
+/** 회수한 본문 → 라이브 타임라인 (순수). 라이브 payload 와 같은 모양으로 만든다. */
+export function fetchedToLive(r: RemoteTimelineReply): RemoteLiveTimeline {
+  const u = r.last_usage;
+  return {
+    items: [...r.items].sort((a, b) => a.seq - b.seq),
+    turns: r.turns ?? [],
+    model: r.model ?? null,
+    ctxTokens: u ? u.input + u.cache_read + u.cache_creation : 0,
+  };
+}
+
+/**
+ * 화면에 그릴 타임라인 — 스트림이 준 것이 있으면 그것, 없으면 회수해 온 본문.
+ *
+ * 회수본을 라이브가 **비어 있을 때만** 쓰는 것이 핵심이다: 끝난 세션은 갭 뒤
+ * 스냅샷마다 빈 payload 가 다시 오는데, 그걸 그대로 쓰면 사용자가 방금 일부러
+ * 가져온 본문이 사라진다.
+ */
+export function pickTimeline(
+  live: RemoteLiveTimeline | undefined,
+  fetched: RemoteLiveTimeline | undefined,
+): RemoteLiveTimeline | undefined {
+  if (live && (live.items.length > 0 || live.turns.length > 0)) return live;
+  return fetched ?? live;
+}
+
+/**
+ * 늦게 도착한 seed 를 지금 상태에 합친다 — **이미 라이브 이벤트가 채운 항목은
+ * 절대 덮지 않는다**(CAS).
+ *
+ * seed 는 커맨드 왕복이라 그 사이에 도착한 이벤트보다 항상 낡았다. 리스너를
+ * 먼저 달고 seed 를 나중에 부어야 유실이 없는데, 그 순서면 seed 가 새 것을
+ * 덮을 수 있다 — `livened` 가 그걸 막는다.
+ */
+export function mergeSeed(
+  current: ReadonlyMap<number, RemoteLiveTimeline>,
+  seed: readonly { id: number; live: RemoteLiveTimeline }[],
+  livened: ReadonlySet<number>,
+): Map<number, RemoteLiveTimeline> {
+  const next = new Map(current);
+  for (const s of seed) {
+    if (livened.has(s.id)) continue; // 이벤트가 이미 더 새 것을 넣었다
+    next.set(s.id, s.live);
+  }
+  return next;
 }
 
 /** 이 호스트가 지금 사용자에게 알릴 게 있나 (배지 판정). */
@@ -165,12 +282,19 @@ export function toLiveTimeline(e: ClaudeTimelineEvent): RemoteLiveTimeline {
 export function useRemoteHosts(pollMs = 700): {
   hosts: RemoteHostSnapshot[];
   live: Map<number, RemoteLiveTimeline>;
+  fetched: Map<number, RemoteLiveTimeline>;
+  fetching: ReadonlySet<number>;
+  fetchError: Record<number, string>;
+  fetchBody: (hostId: string, id: number) => void;
   refresh: () => void;
 } {
   const [hosts, setHosts] = useState<RemoteHostSnapshot[]>([]);
   const [live, setLive] = useState<Map<number, RemoteLiveTimeline>>(new Map());
-  const liveRef = useRef(live);
-  liveRef.current = live;
+  const [fetched, setFetched] = useState<Map<number, RemoteLiveTimeline>>(new Map());
+  const [fetching, setFetching] = useState<Set<number>>(new Set());
+  const [fetchError, setFetchError] = useState<Record<number, string>>({});
+  /** 이번 마운트에서 **라이브 이벤트가** 채운 id — 늦은 seed 가 덮지 못하게. */
+  const livenedRef = useRef<Set<number>>(new Set());
 
   const refresh = useCallback(() => {
     void invoke<RemoteHostSnapshot[]>("remote_hosts")
@@ -186,19 +310,49 @@ export function useRemoteHosts(pollMs = 700): {
     return () => window.clearInterval(t);
   }, [refresh, pollMs]);
 
+  const fetchBody = useCallback((hostId: string, id: number) => {
+    setFetching((prev) => {
+      if (prev.has(id)) return prev;
+      const next = new Set(prev);
+      next.add(id);
+      return next;
+    });
+    void invoke<RemoteTimelineReply>("remote_timeline", { hostId, id })
+      .then((r) => {
+        setFetched((prev) => new Map(prev).set(id, fetchedToLive(r)));
+        setFetchError((prev) => {
+          if (!(id in prev)) return prev;
+          const next = { ...prev };
+          delete next[id];
+          return next;
+        });
+      })
+      .catch((e) => {
+        setFetchError((prev) => ({
+          ...prev,
+          [id]: String((e as { message?: string })?.message ?? e),
+        }));
+      })
+      .finally(() => {
+        setFetching((prev) => {
+          const next = new Set(prev);
+          next.delete(id);
+          return next;
+        });
+      });
+  }, []);
+
   useEffect(() => {
     let disposed = false;
     let un: UnlistenFn | undefined;
     let unClosed: UnlistenFn | undefined;
     void (async () => {
+      // 리스너 **먼저**. 이벤트는 이미 붙어 있는 리스너에게만 가므로, seed 를
+      // 먼저 받으면 그 왕복 동안의 이벤트가 통째로 사라진다.
       un = await listen<ClaudeTimelineEvent>("claude-timeline", (e) => {
         if (!isRemoteId(e.payload.id)) return; // 로컬 세션 — 이 패널의 것이 아니다
-        setLive((prev) => {
-          const next = new Map(prev);
-          next.set(e.payload.id, toLiveTimeline(e.payload));
-          liveRef.current = next;
-          return next;
-        });
+        livenedRef.current.add(e.payload.id);
+        setLive((prev) => new Map(prev).set(e.payload.id, toLiveTimeline(e.payload)));
       });
       unClosed = await listen<number>("claude-session-closed", (e) => {
         // 종료 표시는 스냅샷의 `closed`가 갖는다. 여기서는 아무것도 지우지
@@ -211,7 +365,22 @@ export function useRemoteHosts(pollMs = 700): {
         unClosed?.();
         un = undefined;
         unClosed = undefined;
+        return;
       }
+      // …그리고 **그 다음에** 지금 상태를 받아 빈 자리만 채운다. 탭을 떠났다
+      // 돌아온 패널은 그동안의 이벤트를 전부 놓쳤고, 끝난 세션은 앞으로도
+      // 이벤트를 내지 않는다 — seed 가 없으면 영구 빈 화면이다.
+      const seed = await invoke<ClaudeTimelineEvent[]>("remote_timelines").catch(
+        () => [] as ClaudeTimelineEvent[],
+      );
+      if (disposed) return;
+      setLive((prev) =>
+        mergeSeed(
+          prev,
+          seed.filter((p) => isRemoteId(p.id)).map((p) => ({ id: p.id, live: toLiveTimeline(p) })),
+          livenedRef.current,
+        ),
+      );
     })();
     return () => {
       disposed = true;
@@ -220,5 +389,5 @@ export function useRemoteHosts(pollMs = 700): {
     };
   }, [refresh]);
 
-  return { hosts, live, refresh };
+  return { hosts, live, fetched, fetching, fetchError, fetchBody, refresh };
 }
