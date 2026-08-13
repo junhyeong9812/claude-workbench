@@ -391,6 +391,12 @@ pub fn remote_attach(
             }
         });
     }
+    // Whichever of the two relays below gets to the end first is the one that
+    // speaks, and the other stays quiet: a terminal that stopped once must not
+    // be reported as having stopped twice, and the *first* reason is the real
+    // one (the connection failing is why the exec never ran, not the reverse).
+    let said = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
     // `exec_rx` is bounded and its sender blocks: held-but-undrained, it would
     // stall the read loop and, on a duplex session, the write direction with it.
     // Drained here so the exit is *said* — a terminal that stops because the
@@ -398,6 +404,7 @@ pub fn remote_attach(
     {
         let app = app.clone();
         let host = host_id.clone();
+        let said = Arc::clone(&said);
         let mut exec_rx = channels.exec_rx;
         std::thread::spawn(move || {
             let mut stderr = String::new();
@@ -409,35 +416,83 @@ pub fn remote_attach(
                         }
                     }
                     core_lib::ssh::ExecEvent::Exit { code, signal } => {
-                        let _ = app.emit(
-                            "remote-terminal-ended",
-                            RemoteTerminalEnded {
-                                id: local_id,
-                                host_id: host.clone(),
-                                code,
-                                signal,
-                                detail: stderr.trim().to_string(),
-                            },
+                        emit_terminal_ended(
+                            &app,
+                            &said,
+                            local_id,
+                            &host,
+                            code,
+                            signal,
+                            stderr.trim(),
                         );
                     }
                     core_lib::ssh::ExecEvent::Error(msg) => {
-                        let _ = app.emit(
-                            "remote-terminal-ended",
-                            RemoteTerminalEnded {
-                                id: local_id,
-                                host_id: host.clone(),
-                                code: None,
-                                signal: None,
-                                detail: msg,
-                            },
-                        );
+                        emit_terminal_ended(&app, &said, local_id, &host, None, None, &msg);
                     }
                 }
             }
         });
     }
-    let _ = channels.status_rx;
+    // The connection's own lifecycle, which the exec channel cannot report:
+    // connect, auth, host-key and channel-open failures all happen *before*
+    // there is an exec, and the contract for that case is **zero** `ExecEvent`s.
+    // Dropped, as this was, they left the one symptom the whole path exists to
+    // avoid — an empty black window that says nothing and never will, until the
+    // user types into it and is told the session is dead.
+    //
+    // `Closed` also lands here (the link went away with no exec verdict). It
+    // gets a sentence rather than a bare phase because at this point the panel's
+    // only other information is that its terminal went quiet.
+    {
+        let app = app.clone();
+        let host = host_id.clone();
+        let said = Arc::clone(&said);
+        let mut status_rx = channels.status_rx;
+        std::thread::spawn(move || {
+            while let Some(s) = status_rx.blocking_recv() {
+                let detail = match s {
+                    core_lib::ssh::SshStatus::Connecting | core_lib::ssh::SshStatus::Ready => {
+                        continue
+                    }
+                    core_lib::ssh::SshStatus::Failed(reason) => {
+                        format!("원격 호스트에 연결하지 못했습니다: {reason}")
+                    }
+                    core_lib::ssh::SshStatus::Closed => {
+                        "원격 호스트와의 연결이 끊어졌습니다.".to_string()
+                    }
+                };
+                emit_terminal_ended(&app, &said, local_id, &host, None, None, &detail);
+            }
+        });
+    }
     Ok(local_id)
+}
+
+/// Say once that a remote terminal is over. See the `said` flag in
+/// [`remote_attach`]: two relays watch two different ways for it to end, and a
+/// panel that is told twice would report the second, vaguer reason.
+fn emit_terminal_ended(
+    app: &AppHandle,
+    said: &Arc<std::sync::atomic::AtomicBool>,
+    id: u64,
+    host_id: &str,
+    code: Option<u32>,
+    signal: Option<String>,
+    detail: &str,
+) {
+    if said.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        return;
+    }
+    let _ = app.emit(
+        "remote-terminal-ended",
+        RemoteTerminalEnded {
+            id,
+            host_id: host_id.to_string(),
+            code,
+            signal,
+            detail: detail.to_string(),
+        },
+    );
 }
 
 /// Why a remote terminal stopped. Its own event kind because there is no other

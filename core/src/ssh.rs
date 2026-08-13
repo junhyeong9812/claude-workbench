@@ -917,6 +917,60 @@ mod tests {
         assert!(mgr.is_alive(id).is_none(), "session gone after remove");
     }
 
+    /// **An exec that never starts says nothing on the exec channel.**
+    ///
+    /// This is the contract a remote terminal is built on top of, and the reason
+    /// `remote_attach` has to listen to `status_rx`: connect, auth, host-key and
+    /// channel-open all fail *before* there is an exec, so `ExecEvent` — the
+    /// stream the terminal watches for "it ended, and here is why" — stays
+    /// completely empty. A consumer that drops the status stream (as
+    /// `remote_attach` did) therefore has no way at all to learn that the
+    /// connection failed, and shows an empty black terminal forever.
+    #[test]
+    fn a_connection_that_fails_before_exec_is_silent_on_the_exec_channel() {
+        let mgr = SessionManager::new();
+        let cfg = SshConfig {
+            // No listener here — the connection is refused before any channel.
+            host: "127.0.0.1".into(),
+            port: 1,
+            username: "nobody".into(),
+            auth: AuthMethod::Password("nopass".into()),
+            exec: Some(ExecSpec::output_only("cwcd attach 1:k1")),
+        };
+        let (id, mut chans) = mgr.create_ssh(cfg, temp_known_hosts("execsilent"), 80, 24, None);
+
+        let mut failure = None;
+        let deadline = Instant::now() + Duration::from_millis(3000);
+        while Instant::now() < deadline && failure.is_none() {
+            match chans.status_rx.try_recv() {
+                Ok(SshStatus::Failed(why)) => failure = Some(why),
+                Ok(SshStatus::Closed) => failure = Some("closed".into()),
+                Ok(_) => {}
+                Err(mpsc::error::TryRecvError::Empty) => thread::sleep(Duration::from_millis(10)),
+                Err(mpsc::error::TryRecvError::Disconnected) => break,
+            }
+        }
+        assert!(
+            failure.is_some(),
+            "the status stream is the only witness to a failure before exec"
+        );
+        // And the exec channel — the one a terminal listens to — said nothing.
+        let mut exec_events = Vec::new();
+        while let Ok(e) = chans.exec_rx.try_recv() {
+            exec_events.push(match e {
+                ExecEvent::Stderr(b) => format!("stderr {} bytes", b.len()),
+                ExecEvent::Exit { code, signal } => format!("exit {code:?}/{signal:?}"),
+                ExecEvent::Error(m) => format!("error {m}"),
+            });
+        }
+        assert!(
+            exec_events.is_empty(),
+            "a failure before exec must produce no ExecEvent (that is why the status \
+             stream cannot be dropped): {exec_events:?}"
+        );
+        let _ = mgr.remove(id);
+    }
+
     /// Unknown-id SSH-path ops never panic (transport-agnostic contract).
     #[test]
     fn unknown_ssh_session_ops_error_not_panic() {
