@@ -1315,11 +1315,15 @@ mod tests {
         assert!(ct.chars().all(|c| c == '가'), "truncation must not split a character");
     }
 
-    /// The `claude-timeline` payload the frontend reads has one shape. This
-    /// pins the remote producer's key set against a copy of the local
-    /// producer's (`ClaudeTimelinePayload`, src-tauri/.../claude/timeline.rs) —
-    /// if a field is ever added there, this fails rather than the remote panel
-    /// quietly rendering with a missing field.
+    /// The key set this crate promises, pinned as a literal.
+    ///
+    /// This is **not** the check that the two producers agree: `core` cannot see
+    /// `ClaudeTimelinePayload` (it lives in `src-tauri`, which depends on this
+    /// crate, not the other way round), so a field added there would sail past
+    /// anything written here. That comparison is derived from the producer type
+    /// itself, in `src-tauri/.../claude/timeline.rs`
+    /// (`the_remote_payload_has_the_same_shape_as_this_one`). What this one is
+    /// good for is catching an accidental rename *on this side*.
     #[test]
     fn remote_payload_shape() {
         let p = RemoteTimelinePayload {
