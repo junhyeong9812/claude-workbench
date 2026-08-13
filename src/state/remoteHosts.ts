@@ -481,6 +481,25 @@ export function shouldSendRemoteResize(last: TermSize | null, next: TermSize): b
   return true;
 }
 
+/**
+ * 원격 리사이즈의 기준선 — **보낸 것이 아니라 확인된 것**.
+ *
+ * `acked` 는 데몬이 답한 크기, `inFlight` 는 답을 기다리는 요청이다. 둘을 나눠
+ * 두는 이유가 이 함수의 전부다:
+ *
+ * - 요청을 보내면서 곧바로 "마지막 크기"를 그 값으로 적으면, **실패한 리사이즈가
+ *   그 크기를 영구히 봉인한다** — 사용자가 창을 되돌려 같은 크기로 맞춰도
+ *   중복이라며 걸러지고, 원격 pty 는 틀린 크기에 남는다. 실패는 `acked` 를
+ *   건드리지 않으므로 다음 시도가 다시 나간다.
+ * - 답을 기다리는 동안 같은 크기가 또 멎어도 왕복을 두 번 하지는 않는다.
+ */
+export function nextRemoteResize(
+  state: { acked: TermSize | null; inFlight: TermSize | null },
+  next: TermSize,
+): boolean {
+  return shouldSendRemoteResize(state.inFlight ?? state.acked, next);
+}
+
 /** 흔한 신호의 이름 — 숫자만 보이면 사용자가 무엇이 전달됐는지 알 수 없다. */
 const SIGNAL_NAMES: Record<number, string> = {
   1: "SIGHUP",

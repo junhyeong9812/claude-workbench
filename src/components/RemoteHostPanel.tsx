@@ -47,8 +47,8 @@ import {
   resumeLabel,
   seenKey,
   seenSeqOf,
+  nextRemoteResize,
   shouldFetchBody,
-  shouldSendRemoteResize,
   spawnRequest,
   staleSeenKeys,
   useRemoteHosts,
@@ -61,6 +61,7 @@ import {
   type RemoteLiveTimeline,
   type RemoteSessionMeta,
   type RemoteTerminalEnded,
+  type TermSize,
 } from "../state/remoteHosts";
 import { decodePtyData, ptyEventName, pushPendingCapped } from "./pty";
 import { errText } from "../utils/error";
@@ -913,18 +914,41 @@ function RemoteTerminalView({
     });
 
     // 크기는 두 곳으로. 로컬은 매번(장부일 뿐이라 싸다), 원격 pty 는 멎은 뒤 한 번.
-    let lastSent: { cols: number; rows: number } | null = null;
+    //
+    // 기준선은 **데몬이 답한 크기**다(`nextRemoteResize`). 보낸 값을 곧바로
+    // 기준으로 적으면 실패한 리사이즈가 그 크기를 봉인하고, 늦게 도착한 옛 답이
+    // 새 답을 덮는다 — `seq` 가 그 두 번째를 막는다.
+    const resize: { acked: TermSize | null; inFlight: TermSize | null } = {
+      acked: null,
+      inFlight: null,
+    };
+    let resizeSeq = 0;
     let settle: number | undefined;
     const onResize = term.onResize(() => {
       const size = { cols: term.cols, rows: term.rows };
       invoke("terminal_resize", { id: localId, cols: size.cols, rows: size.rows }).catch(() => {});
       window.clearTimeout(settle);
       settle = window.setTimeout(() => {
-        if (disposed || !shouldSendRemoteResize(lastSent, size)) return;
-        lastSent = size;
-        invoke("remote_resize", { hostId, id: remoteId, cols: size.cols, rows: size.rows }).catch(
-          (e) => setError(errText(e, "원격 화면 크기를 바꾸지 못했습니다.")),
-        );
+        if (disposed || !nextRemoteResize(resize, size)) return;
+        const mine = ++resizeSeq;
+        resize.inFlight = size;
+        invoke<TermSize>("remote_resize", {
+          hostId,
+          id: remoteId,
+          cols: size.cols,
+          rows: size.rows,
+        })
+          .then((got) => {
+            if (mine !== resizeSeq) return; // 더 새 요청이 떠 있다 — 그 답이 정본
+            resize.inFlight = null;
+            // 요청이 아니라 **답**. 데몬이 조정했다면 화면은 그 값을 기준으로
+            // 다음을 판단해야 한다.
+            resize.acked = got;
+          })
+          .catch((e) => {
+            if (mine === resizeSeq) resize.inFlight = null;
+            if (!disposed) setError(errText(e, "원격 화면 크기를 바꾸지 못했습니다."));
+          });
       }, REMOTE_RESIZE_DEBOUNCE_MS);
     });
 

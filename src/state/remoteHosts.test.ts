@@ -18,6 +18,7 @@ import {
   seenKey,
   seenSeqOf,
   shouldFetchBody,
+  nextRemoteResize,
   shouldSendRemoteResize,
   signalLabel,
   spawnRequest,
@@ -504,6 +505,27 @@ describe("원격 pty 크기 보내기", () => {
     // 레이아웃이 준 소수·NaN 은 pty 크기가 아니다.
     expect(shouldSendRemoteResize(null, { cols: 80.5, rows: 24 })).toBe(false);
     expect(shouldSendRemoteResize(null, { cols: Number.NaN, rows: 24 })).toBe(false);
+  });
+
+  it("**실패한** 리사이즈가 그 크기를 봉인하지 않는다 — 기준은 확인된 크기다", () => {
+    // 보낸 값을 곧바로 "마지막"으로 적으면, 실패해도 같은 크기가 영원히 중복
+    // 취급된다: 사용자가 창을 되돌려 맞춰도 안 나가고 원격 pty 는 틀린 채 남는다.
+    const failed = { acked: null, inFlight: null };
+    expect(nextRemoteResize(failed, { cols: 100, rows: 30 })).toBe(true);
+    // 답을 기다리는 동안 같은 크기가 또 멎어도 왕복을 두 번 하지는 않는다.
+    const waiting = { acked: null, inFlight: { cols: 100, rows: 30 } };
+    expect(nextRemoteResize(waiting, { cols: 100, rows: 30 })).toBe(false);
+    expect(nextRemoteResize(waiting, { cols: 101, rows: 30 })).toBe(true);
+    // 확인된 크기와 같으면 보내지 않는다.
+    const settled = { acked: { cols: 100, rows: 30 }, inFlight: null };
+    expect(nextRemoteResize(settled, { cols: 100, rows: 30 })).toBe(false);
+    expect(nextRemoteResize(settled, { cols: 100, rows: 31 })).toBe(true);
+    // 데몬이 **조정한** 크기가 기준이 된다: 100x30 을 청했는데 90x30 이 왔다면
+    // 다음에 100x30 이 다시 멎었을 때 그것은 새 요청이다.
+    const clamped = { acked: { cols: 90, rows: 30 }, inFlight: null };
+    expect(nextRemoteResize(clamped, { cols: 100, rows: 30 })).toBe(true);
+    // 퇴화 크기 백스톱은 그대로 통과한다.
+    expect(nextRemoteResize(settled, { cols: 2, rows: 1 })).toBe(false);
   });
 });
 
