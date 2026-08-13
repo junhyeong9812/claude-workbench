@@ -48,6 +48,7 @@ import {
   seenKey,
   seenSeqOf,
   nextRemoteResize,
+  shouldAutoFetchBody,
   shouldFetchBody,
   spawnRequest,
   staleSeenKeys,
@@ -101,7 +102,21 @@ interface AttachedTerm {
 
 export function RemoteHostPanel() {
   const connections = useAppStore((s) => s.savedConnections);
-  const { hosts, live, fetched, fetching, fetchError, fetchBody, refresh } = useRemoteHosts();
+  const {
+    hosts,
+    live,
+    fetched,
+    fetching,
+    attempted,
+    fetchError,
+    hostsError,
+    hostsAt,
+    streamError,
+    seedError,
+    fetchBody,
+    retryStream,
+    refresh,
+  } = useRemoteHosts();
   const [connecting, setConnecting] = useState(false);
   const [pick, setPick] = useState<string>("");
   const [cwcd, setCwcd] = useState("");
@@ -132,6 +147,44 @@ export function RemoteHostPanel() {
   }, []);
   /** attach 세대 — 왕복 중에 다른 attach 나 닫기가 끼어들었는지. */
   const attachSeq = useRef(0);
+
+  /**
+   * 로컬 세션 id → 그 원격 터미널이 멈춘 이유. **패널이** 들고 있다.
+   *
+   * 터미널 컴포넌트가 마운트한 뒤에 구독하면 늦는다: connect/auth/exec 이 빨리
+   * 실패하면 `remote-terminal-ended` 는 `remote_attach` 가 **돌아오기 전에**
+   * 발행되고, Tauri 이벤트에는 replay 가 없어 사유가 영구 유실된다 — 화면에는 빈
+   * 터미널만 남는다. 그래서 구독을 패널 마운트로 끌어올리고(그래서 어떤 attach
+   * 보다도 먼저다), `attach` 는 이 구독이 실제로 걸린 뒤에야 요청을 보낸다.
+   * 늦게 마운트한 터미널 뷰는 여기 적힌 값을 읽는다(= 늦게 붙어도 사유를 얻는다).
+   */
+  const [endedById, setEndedById] = useState<Record<number, string>>({});
+  const [endedError, setEndedError] = useState<string | null>(null);
+  /** 구독이 걸렸다는 사실 자체 — `attach` 가 이것을 기다린다. */
+  const endedReady = useRef<Promise<void> | null>(null);
+  useEffect(() => {
+    let disposed = false;
+    let un: UnlistenFn | undefined;
+    endedReady.current = (async () => {
+      try {
+        un = await listen<RemoteTerminalEnded>("remote-terminal-ended", (e) => {
+          setEndedById((m) => ({ ...m, [e.payload.id]: endedReason(e.payload) }));
+        });
+        if (disposed) {
+          un?.();
+          un = undefined;
+        }
+      } catch (e) {
+        // 구독 실패를 잡지 않으면 unhandled rejection 하나와 조용한 검은 상자만
+        // 남는다 — 이 이벤트가 애초에 없애려던 바로 그 화면이다(R18).
+        setEndedError(errText(e, "원격 터미널 종료 사유를 구독하지 못했습니다."));
+      }
+    })();
+    return () => {
+      disposed = true;
+      un?.();
+    };
+  }, []);
   // 패널이 사라질 때 SSH exec 채널을 남기지 않는다. **원격 세션은 죽지 않는다** —
   // 닫는 것은 이 관찰 창(로컬 세션)뿐이고, 에이전트는 데몬이 계속 소유한다.
   useEffect(
@@ -150,7 +203,17 @@ export function RemoteHostPanel() {
     // 세대를 올려, 왕복 중인 attach 가 돌아와 방금 닫은 창을 되살리지 않게.
     attachSeq.current += 1;
     const t = termRef.current;
-    if (t) invoke("terminal_close", { id: t.localId }).catch(() => {});
+    if (t) {
+      invoke("terminal_close", { id: t.localId }).catch(() => {});
+      // 사용자가 읽고 닫은 사유는 여기서 치운다(로컬 id 는 재사용되지 않으므로
+      // 다음 터미널과 겹칠 일이 없다 — 남겨 두면 쌓이기만 한다).
+      setEndedById((m) => {
+        if (!(t.localId in m)) return m;
+        const next = { ...m };
+        delete next[t.localId];
+        return next;
+      });
+    }
     putTerm(null);
   }, [putTerm]);
 
@@ -165,6 +228,9 @@ export function RemoteHostPanel() {
       // 끝날 때까지 남는다.
       const mine = ++attachSeq.current;
       try {
+        // 종료 사유 구독이 **걸린 뒤에** 요청한다. 빠른 실패는 attach 응답보다
+        // 먼저 이벤트를 내고, Tauri 이벤트는 replay 되지 않는다.
+        await endedReady.current;
         // 처음 크기는 짐작이고, 첫 정착 크기가 곧바로 로컬·원격 양쪽을 고친다.
         const localId = await invoke<number>("remote_attach", {
           hostId,
@@ -310,6 +376,37 @@ export function RemoteHostPanel() {
             </button>
           </div>
         ) : null}
+        {hostsError ? (
+          <div className="claudeterm-refine-note" role="alert">
+            호스트 목록을 읽지 못했습니다 — {hostsError}
+            {hostsAt ? ` (마지막으로 읽은 시각 ${ts(hostsAt)} — 아래 내용은 그때 것입니다)` : ""}
+            <button type="button" className="remote-fetch" onClick={refresh}>
+              다시 시도
+            </button>
+          </div>
+        ) : null}
+        {streamError ? (
+          <div className="claudeterm-refine-note" role="alert">
+            원격 이벤트를 받지 못하고 있습니다 — {streamError}
+            <button type="button" className="remote-fetch" onClick={retryStream}>
+              다시 시도
+            </button>
+          </div>
+        ) : null}
+        {seedError ? (
+          <div className="claudeterm-refine-note" role="alert">
+            지금 상태를 받아오지 못했습니다 — {seedError} (끝난 세션은 이벤트를 내지 않으므로 이대로면
+            빈 화면입니다)
+            <button type="button" className="remote-fetch" onClick={retryStream}>
+              다시 시도
+            </button>
+          </div>
+        ) : null}
+        {endedError ? (
+          <div className="claudeterm-refine-note" role="alert">
+            원격 터미널 종료 사유를 구독하지 못했습니다 — {endedError}
+          </div>
+        ) : null}
         {connections.length === 0 ? (
           <p className="remote-empty">
             저장된 SSH 연결이 없습니다. 터미널 ＋ 메뉴에서 SSH로 한 번 접속해 두면 여기에 나옵니다
@@ -328,6 +425,7 @@ export function RemoteHostPanel() {
             live={live}
             fetched={fetched}
             fetching={fetching}
+            attempted={attempted}
             fetchError={fetchError}
             onFetch={(id) => fetchBody(h.host_id, id)}
             seenSeq={seenSeqOf(h, seen)}
@@ -356,6 +454,7 @@ export function RemoteHostPanel() {
           remoteId={term.remoteId}
           localId={term.localId}
           sessionKey={term.sessionKey}
+          ended={endedById[term.localId] ?? null}
           onClose={closeTerm}
         />
       ) : null}
@@ -368,6 +467,7 @@ function HostCard({
   live,
   fetched,
   fetching,
+  attempted,
   fetchError,
   onFetch,
   seenSeq,
@@ -386,6 +486,7 @@ function HostCard({
   live: Map<number, RemoteLiveTimeline>;
   fetched: Map<number, RemoteLiveTimeline>;
   fetching: ReadonlySet<number>;
+  attempted: ReadonlySet<number>;
   fetchError: Record<number, string>;
   onFetch: (id: number) => void;
   seenSeq: number;
@@ -484,6 +585,7 @@ function HostCard({
             live={live.get(s.id)}
             fetched={fetched.get(s.id)}
             fetching={fetching.has(s.id)}
+            attempted={attempted.has(s.id)}
             fetchError={fetchError[s.id]}
             onFetch={() => onFetch(s.id)}
             open={!!openIds[s.id]}
@@ -505,6 +607,7 @@ function SessionRow({
   live,
   fetched,
   fetching,
+  attempted,
   fetchError,
   onFetch,
   open,
@@ -519,6 +622,8 @@ function SessionRow({
   live: RemoteLiveTimeline | undefined;
   fetched: RemoteLiveTimeline | undefined;
   fetching: boolean;
+  /** 이 세션에 대해 회수를 **시도한 적이 있나** — 자동 회수는 한 번뿐이다(R1). */
+  attempted: boolean;
   fetchError: string | undefined;
   onFetch: () => void;
   open: boolean;
@@ -539,16 +644,26 @@ function SessionRow({
   const model = shown?.model ?? s.model;
   const ctx = shown?.ctxTokens ?? s.ctx_tokens;
   const recoverable = shouldFetchBody(s, shown);
+  // 자동 회수는 **세션당 한 번**이다. 회수가 성공했는데 본문이 비면(끝났지만
+  // 아무것도 하지 않은 세션) `recoverable` 은 계속 true 라, "내용이 비었나"로
+  // 재시도를 정하면 effect 가 무한히 재발화하며 매 회차가 새 SSH 연결이 된다.
+  // 판정의 축은 내용이 아니라 **시도**다(R1).
+  const autoFetch = shouldAutoFetchBody(s, shown, {
+    attempted,
+    fetching,
+    failed: fetchError !== undefined,
+  });
 
-  // 펼치면 가져온다. 데몬은 끝난 세션의 본문을 스냅샷에 싣지 않고
+  // 펼치면 한 번 가져온다. 데몬은 끝난 세션의 본문을 스냅샷에 싣지 않고
   // (`items_omitted`) 앞으로도 이벤트를 내지 않으므로, 자동 조회가 없으면
   // 사용자는 "따로 가져올 수 있습니다"라는 문장만 읽고 아무것도 못 본다.
   // 보관 기간이 지나면 데몬이 NotFound 로 답하고, 그 사유가 화면에 뜬다.
+  // 그 뒤의 재시도는 아래 버튼 — 사용자가 누를 때만 나간다.
   useEffect(() => {
-    if (open && recoverable && !fetching && fetchError === undefined) onFetch();
+    if (open && autoFetch) onFetch();
     // onFetch 는 호출마다 새 클로저라 의존성에서 뺀다(넣으면 매 렌더 재조회).
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [open, recoverable, fetching, fetchError]);
+  }, [open, autoFetch]);
 
   return (
     <li className={`remote-session${s.closed ? " remote-session-closed" : ""}`}>
@@ -791,18 +906,27 @@ function RemoteTerminalView({
   remoteId,
   localId,
   sessionKey,
+  ended,
   onClose,
 }: {
   hostId: string;
   remoteId: number;
   localId: number;
   sessionKey: string;
+  /** 이 터미널이 멈춘 이유 — 패널이 구독해 둔 것(늦게 마운트해도 읽는다). */
+  ended: string | null;
   onClose: () => void;
 }) {
   const hostRef = useRef<HTMLDivElement | null>(null);
   const termRef = useRef<Terminal | null>(null);
-  const [ended, setEnded] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  /** 같은 사유를 두 번 찍지 않는다(리렌더마다 한 줄씩 늘지 않게). */
+  const saidRef = useRef<string | null>(null);
+  useEffect(() => {
+    if (!ended || saidRef.current === ended) return;
+    saidRef.current = ended;
+    termRef.current?.write(`\r\n\x1b[2m[${ended}]\x1b[0m\r\n`);
+  }, [ended]);
 
   const theme = useAppStore((s) => s.theme);
   const termColors = useAppStore((s) => s.termColors);
@@ -839,7 +963,6 @@ function RemoteTerminalView({
 
     let disposed = false;
     let unOutput: UnlistenFn | undefined;
-    let unEnded: UnlistenFn | undefined;
     let ready = false;
     let lastApplied = 0;
     let pendingTotal = 0;
@@ -855,22 +978,26 @@ function RemoteTerminalView({
     void (async () => {
       // 구독 **먼저** — 스냅샷 왕복 동안 나온 바이트는 이벤트로만 오고, 스냅샷에는
       // 없다(로컬 터미널과 같은 계약).
-      unOutput = await listen<TerminalOutputEvent>(ptyEventName(localId), (e) => {
-        if (!ready) {
-          const r = pushPendingCapped(pending, e.payload, pendingTotal);
-          pendingTotal = r.total;
-          pendingDropped ||= r.dropped;
-        } else applyLive(e.payload);
-      });
-      unEnded = await listen<RemoteTerminalEnded>("remote-terminal-ended", (e) => {
-        if (e.payload.id !== localId) return;
-        const reason = endedReason(e.payload);
-        if (!disposed) term.write(`\r\n\x1b[2m[${reason}]\x1b[0m\r\n`);
-        setEnded(reason);
-      });
+      //
+      // 종료 사유(`remote-terminal-ended`)는 여기서 구독하지 않는다: 이 컴포넌트는
+      // `remote_attach` 가 **돌아온 뒤에야** 마운트되므로, 빠른 실패의 사유는 이미
+      // 지나갔다(R3). 패널이 마운트 때 구독해 두고 `ended` 로 내려 준다.
+      try {
+        unOutput = await listen<TerminalOutputEvent>(ptyEventName(localId), (e) => {
+          if (!ready) {
+            const r = pushPendingCapped(pending, e.payload, pendingTotal);
+            pendingTotal = r.total;
+            pendingDropped ||= r.dropped;
+          } else applyLive(e.payload);
+        });
+      } catch (e) {
+        // 구독이 실패하면 스냅샷 단계까지 가더라도 이후 출력이 한 바이트도 오지
+        // 않는다 — 멈춘 화면을 살아 있는 것으로 보이게 두지 않는다(R18).
+        if (!disposed) setError(errText(e, "터미널 출력을 구독하지 못했습니다."));
+        return;
+      }
       if (disposed) {
         unOutput?.();
-        unEnded?.();
         return;
       }
       try {
@@ -969,7 +1096,6 @@ function RemoteTerminalView({
       onData.dispose();
       onResize.dispose();
       unOutput?.();
-      unEnded?.();
       term.dispose();
       termRef.current = null;
     };

@@ -428,6 +428,10 @@ pub struct Host {
     /// inside one epoch would silently rewind the stream on the next resume, and
     /// nothing else in the protocol would report it.
     cursor: Option<Cursor>,
+    /// Set when a frame was lost **here** (dropped or unreadable). While it is
+    /// set the cursor is neither handed out nor advanced — see
+    /// [`Self::on_local_loss`].
+    resync_required: bool,
     resume: Option<ResumeOutcome>,
     last_error: Option<String>,
     attempts: u32,
@@ -461,6 +465,7 @@ impl Host {
             daemon: None,
             epoch: None,
             cursor: None,
+            resync_required: false,
             resume: None,
             last_error: None,
             attempts: 0,
@@ -482,7 +487,14 @@ impl Host {
 
     /// The cursor to resume from, if any. Handed to `cwcd stream --cursor`
     /// verbatim; it is the daemon's own string.
+    ///
+    /// `None` while a resync is owed ([`Self::on_local_loss`]): a position that
+    /// is past a hole in this state is worse than no position at all, because
+    /// handing it back tells the daemon the missing events were delivered.
     pub fn cursor(&self) -> Option<&str> {
+        if self.resync_required {
+            return None;
+        }
         self.cursor.as_ref().map(Cursor::as_str)
     }
 
@@ -504,6 +516,11 @@ impl Host {
     /// idempotently and looks like nothing happened. A new epoch is a different
     /// stream and is taken as-is (`on_hello` clears the cursor for it anyway).
     fn advance_cursor(&mut self, next: &Cursor) {
+        // A hole was punched in this state; every position after it is a claim
+        // this workbench cannot back up. Held until a snapshot rebuilds it.
+        if self.resync_required {
+            return;
+        }
         if let Some(cur) = &self.cursor {
             if cur.epoch() == next.epoch() && next.seq() < cur.seq() {
                 let (from, to) = (cur.to_string(), next.to_string());
@@ -577,7 +594,10 @@ impl Host {
             phase: self.phase,
             daemon: self.daemon.clone(),
             resume: self.resume.clone(),
-            cursor: self.cursor.as_ref().map(Cursor::to_string),
+            // What the next attach would resume from — `None` while a resync is
+            // owed, so the screen and the transport never disagree about
+            // whether this connection has a position it can stand behind.
+            cursor: self.cursor().map(str::to_string),
             last_error: self.last_error.clone(),
             attempts: self.attempts,
             last_frame_at_ms: self.last_frame_at_ms,
@@ -636,15 +656,43 @@ impl Host {
         }
     }
 
-    /// A line the decoder could not read at all. Reported, and the cursor is
-    /// deliberately left where it was.
+    /// A line the decoder could not read at all.
     pub fn on_undecodable(&mut self, reason: String) {
         self.last_frame_at_ms = Some((self.now_ms)());
+        self.on_local_loss(format!("데몬이 보낸 줄을 읽지 못했습니다 — {reason}"));
+    }
+
+    /// A frame that was lost **on this side** — dropped by the reader for being
+    /// over-long, or unreadable by the decoder — promoted to a gap.
+    ///
+    /// The daemon's own [`Gap`] and this one are the same event seen from two
+    /// ends: some events did not reach this state, and nothing but a fresh
+    /// snapshot can say what they were. So it takes the same path — the position
+    /// stops being committed ([`Self::cursor`] answers `None` until a snapshot
+    /// rebuilds the world), which is what turns a permanent silent loss into a
+    /// reconnect that fixes itself.
+    ///
+    /// The cost is stated rather than hidden: while a resync is owed, a
+    /// reconnect starts from *now* instead of resuming, so events that happen
+    /// between the two attaches are not replayed. That is the trade the
+    /// protocol already makes for a daemon-side gap, and it is strictly better
+    /// than the alternative it replaces — resuming past the hole, which told the
+    /// daemon those events were delivered.
+    pub fn on_local_loss(&mut self, message: impl Into<String>) {
+        let message = message.into();
+        self.resync_required = true;
+        self.resume = Some(ResumeOutcome::Gap { message: message.clone() });
         self.push_notice(
             NoticeLevel::Warn,
-            format!("데몬이 보낸 줄을 읽지 못했습니다 — {reason}"),
+            format!("{message} — 이어받지 않고 전체 상태를 다시 받습니다."),
             None,
         );
+    }
+
+    /// Whether this state is known to be missing something a snapshot must
+    /// rebuild. While it is `true` the cursor is not handed out and not moved.
+    pub fn needs_resync(&self) -> bool {
+        self.resync_required
     }
 
     fn report_unknown(&mut self, tag: String, message: String) {
@@ -794,6 +842,10 @@ impl Host {
             out.push(Emit::Closed { id: gone.id });
         }
         self.sessions = kept;
+        // A snapshot **is** the resync: it carries the whole world, so whatever
+        // was lost locally is either back or gone on the daemon too, and the
+        // position it comes with is trustworthy again.
+        self.resync_required = false;
         self.advance_cursor(&s.cursor);
         out
     }
@@ -1217,6 +1269,67 @@ mod tests {
         h.on_undecodable("not JSON".into());
         assert_eq!(h.last_frame_at_ms(), Some(5_000));
         assert_eq!(h.snapshot().last_frame_at_ms, Some(5_000));
+    }
+
+    /// **A line lost on this side is a gap like any other.**
+    ///
+    /// A line the reader dropped (too long) or the decoder could not read might
+    /// have been a `session_spawned`, a delta — or a whole snapshot. Nothing
+    /// says which, and a warning does not bring it back: while the cursor went
+    /// on advancing past the hole, the daemon considered those events delivered
+    /// and a reconnect resumed *after* them, so the loss was permanent and
+    /// invisible. Promoted to the consumer's own gap, it takes the path the
+    /// protocol already has for loss — hold the position, ask for a fresh
+    /// stream, be rebuilt by the snapshot that follows one.
+    #[test]
+    fn a_line_lost_on_this_side_holds_the_cursor_and_asks_to_be_rebuilt() {
+        let mut h = host();
+        h.apply(hello("e1", r#"{"kind":"fresh"}"#)).unwrap();
+        h.apply(spawned(1, "e1", "k1", "u1")).unwrap();
+        assert_eq!(h.cursor(), Some("e1:1"));
+        assert!(!h.needs_resync());
+
+        h.on_undecodable("not JSON".into());
+
+        assert!(h.needs_resync(), "an unreadable line is a gap, not a shrug");
+        assert_eq!(
+            h.cursor(),
+            None,
+            "resuming past the hole is what made the loss permanent — the next attach must be fresh"
+        );
+        assert_eq!(h.snapshot().cursor, None, "and the screen must say the same thing");
+        assert!(
+            matches!(h.snapshot().resume, Some(ResumeOutcome::Gap { .. })),
+            "the user sees the same 'being rebuilt' state a daemon-side gap produces"
+        );
+        assert!(h.snapshot().notices.iter().any(|n| n.level == NoticeLevel::Warn));
+
+        // A late event on the dying attach must not commit a position past the
+        // loss either — the abort is the transport's job, this is the belt.
+        h.apply(spawned(5, "e1", "k2", "u2")).unwrap();
+        assert_eq!(h.cursor(), None, "nothing may be committed past a hole");
+
+        // The resync is what clears it: a snapshot is the whole world, so its
+        // own position is trustworthy again.
+        let snap = r#"{"frame":"snapshot","cursor":"e1:9","taken_at_ms":1,"sessions":[]}"#;
+        h.apply(decode_frame(snap).unwrap()).unwrap();
+        assert!(!h.needs_resync(), "the snapshot rebuilt the world");
+        assert_eq!(h.cursor(), Some("e1:9"), "…and its position is the one to resume from");
+    }
+
+    /// The same for a line the *reader* dropped (over-long), which arrives here
+    /// as [`Host::on_local_loss`] rather than as a decode error.
+    #[test]
+    fn a_dropped_line_is_the_same_gap_as_an_unreadable_one() {
+        let mut h = host();
+        h.apply(hello("e1", r#"{"kind":"fresh"}"#)).unwrap();
+        h.apply(spawned(1, "e1", "k1", "u1")).unwrap();
+        h.on_local_loss("한 줄이 너무 길어 버렸습니다");
+        assert!(h.needs_resync());
+        assert_eq!(h.cursor(), None);
+        let s = h.snapshot();
+        assert!(matches!(s.resume, Some(ResumeOutcome::Gap { .. })));
+        assert!(s.notices.last().unwrap().message.contains("너무 길어"));
     }
 
     /// A notice `seq` only means something **inside one attachment**, so the

@@ -318,6 +318,7 @@ impl Drop for Link {
 }
 
 /// Why an attach ended.
+#[derive(Debug)]
 enum Ended {
     /// The stream stopped for a reason a retry can fix.
     Transient(String),
@@ -564,13 +565,23 @@ fn consume(
 ) -> Result<usize, Ended> {
     let (lines, dropped) = lines.feed(bytes);
     if dropped > 0 {
-        state.lock().unwrap_or_else(|p| p.into_inner()).push_notice(
-            NoticeLevel::Warn,
-            format!(
-                "원격 스트림의 한 줄이 너무 길어 {dropped}바이트를 버리고 다음 줄부터 다시 읽습니다."
-            ),
-            None,
+        // **Not just a warning.** The dropped line might have been a snapshot, a
+        // `session_spawned`, or a delta — nothing says which, and while the
+        // cursor went on advancing past it the daemon considered those events
+        // delivered, so a reconnect resumed *after* them and the loss was
+        // permanent. Ended here instead: the host holds its position, the next
+        // attach asks for a fresh stream, and the snapshot that begins one
+        // rebuilds what was lost. The lines that came with this batch are not
+        // applied either — they are on the far side of the hole, and their
+        // positions would be exactly the claim being withdrawn.
+        let message = format!(
+            "원격 스트림의 한 줄이 너무 길어 {dropped}바이트를 버렸습니다(무엇이 들어 있었는지 알 수 없습니다)"
         );
+        state
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .on_local_loss(message.clone());
+        return Err(Ended::Transient(message));
     }
     // An oversized line is deliberately *not* counted: it was dropped, no frame
     // came of it, and `Host::last_frame_at_ms` did not move either.
@@ -585,9 +596,15 @@ fn consume(
                     // The phase and the reason are already on screen (`on_hello`).
                     Err(Fatal(_)) => return Err(Ended::Fatal),
                 },
+                // Same as a dropped line: a frame we could not read is a frame
+                // we did not receive, and reading on would commit positions past
+                // it. Earlier lines in this batch are already applied — they are
+                // *before* the hole, so their positions still stand.
                 Err(reason) => {
-                    h.on_undecodable(reason);
-                    Vec::new()
+                    h.on_undecodable(reason.clone());
+                    return Err(Ended::Transient(format!(
+                        "데몬이 보낸 줄을 읽지 못했습니다 — {reason}"
+                    )));
                 }
             }
         };
@@ -1005,6 +1022,75 @@ mod tests {
         assert!(r.feed(b"{\"fra").0.is_empty());
         assert!(r.feed(b"me\":\"a\"}").0.is_empty());
         assert_eq!(r.feed(b"\n\n  \n").0, vec![r#"{"frame":"a"}"#]);
+    }
+
+    fn fresh_host() -> (Arc<Mutex<Host>>, Arc<dyn Sink>, LineReader) {
+        (
+            Arc::new(Mutex::new(Host::with_clock("h1", "l", || 1))),
+            Arc::new(RecordingSink::default()),
+            LineReader::default(),
+        )
+    }
+
+    const HELLO: &str = r#"{"frame":"hello","protocol":2,"daemon_version":"0.1.0","host":{"host_id":"h","hostname":"box","user":"jun","os":"linux"},"epoch":"e1","resume":{"kind":"fresh"},"oldest_seq":1,"next_seq":1}"#;
+    const SPAWNED: &str = r#"{"frame":"event","seq":2,"cursor":"e1:2","ts_ms":1,"event":{"event":"session_spawned","session":{"key":"k1","session_id":"u1","agent":"claude","cwd":"/w","pid":1,"state":"starting","started_at_ms":5,"argv":[],"timeline_len":0}}}"#;
+    const SPAWNED_LATER: &str = r#"{"frame":"event","seq":4,"cursor":"e1:4","ts_ms":1,"event":{"event":"session_spawned","session":{"key":"k2","session_id":"u2","agent":"claude","cwd":"/w","pid":2,"state":"starting","started_at_ms":5,"argv":[],"timeline_len":0}}}"#;
+
+    /// A line this side could not read is **loss**, and loss ends the attach.
+    ///
+    /// Reading on past it was the quiet failure: the next event's cursor was
+    /// committed, the daemon then considered the unreadable frame delivered, and
+    /// a reconnect resumed after it — so a lost `session_spawned` or snapshot
+    /// never came back, however many times the user reconnected.
+    #[test]
+    fn an_unreadable_line_ends_the_attach_instead_of_reading_past_it() {
+        let (state, sink, mut lines) = fresh_host();
+        consume(format!("{HELLO}\n").as_bytes(), &mut lines, &state, &sink).expect("hello");
+
+        let batch = format!("{SPAWNED}\nthis-is-not-json\n{SPAWNED_LATER}\n");
+        let err = consume(batch.as_bytes(), &mut lines, &state, &sink).unwrap_err();
+        assert!(matches!(err, Ended::Transient(_)), "the attach must end, not continue");
+
+        let h = state.lock().unwrap();
+        assert!(h.needs_resync(), "the next attach must ask to be rebuilt");
+        assert_eq!(h.cursor(), None, "no position past the hole may be resumed from");
+        let s = h.snapshot();
+        assert_eq!(
+            s.sessions.len(),
+            1,
+            "the line *before* the hole still applies; the one after it must not"
+        );
+        assert!(s.notices.iter().any(|n| n.level == NoticeLevel::Warn));
+    }
+
+    /// The same for a line the reader dropped for being over-long: nothing in
+    /// the batch is applied, because every position in it is past the hole.
+    #[test]
+    fn a_dropped_line_ends_the_attach_and_applies_nothing_from_its_batch() {
+        let (state, sink, mut lines) = fresh_host();
+        consume(format!("{HELLO}\n").as_bytes(), &mut lines, &state, &sink).expect("hello");
+
+        // A line that grows past the bound with no newline in sight is what the
+        // reader drops — and the drop is now the end of the attach.
+        let monster = vec![b'x'; MAX_LINE + 1];
+        let err = consume(&monster, &mut lines, &state, &sink).unwrap_err();
+        assert!(matches!(err, Ended::Transient(_)), "a drop must end the attach: {err:?}");
+
+        {
+            let h = state.lock().unwrap();
+            assert!(h.needs_resync());
+            assert_eq!(h.cursor(), None);
+        }
+        // …and the good event that was queued behind the dropped line is not
+        // applied on this attach either: its position is past the hole.
+        let tail = format!("tail-of-the-monster\n{SPAWNED}\n");
+        let _ = consume(tail.as_bytes(), &mut lines, &state, &sink);
+        let h = state.lock().unwrap();
+        assert_eq!(
+            h.cursor(),
+            None,
+            "nothing behind the hole may commit a position — the snapshot rebuilds instead"
+        );
     }
 
     #[test]

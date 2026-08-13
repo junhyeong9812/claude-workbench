@@ -15,6 +15,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import type { TimelineItem } from "../types";
 import type { ClaudeTimelineEvent, TokenUsage } from "../hooks/useClaudeTimeline";
+import { errText } from "../utils/error";
 
 /**
  * 원격 세션 id가 시작하는 지점 — `core/src/remote/host.rs`의 `REMOTE_ID_BASE`와
@@ -190,13 +191,47 @@ export function countsLabel(
   return `턴 ${turns} · 항목 ${items}`;
 }
 
-/** 펼쳤을 때 원격에서 본문을 가져와야 하나 (본문이 없고 데몬은 갖고 있다). */
+/** 펼쳤을 때 원격에서 본문을 가져올 수 **있나** (본문이 없고 데몬은 갖고 있다). */
 export function shouldFetchBody(
   s: Pick<RemoteSessionMeta, "body_omitted" | "timeline_len">,
   live: RemoteLiveTimeline | undefined,
 ): boolean {
   if (live && (live.items.length > 0 || live.turns.length > 0)) return false;
   return s.body_omitted || s.timeline_len > 0;
+}
+
+/** 자동 회수를 지금 걸어도 되나 — 판정의 축이 **내용이 아니라 시도**다. */
+export interface FetchAttemptState {
+  /** 이 세션에 대해 회수를 **시도한 적이 있나**(성공·빈 응답·실패 전부 포함). */
+  attempted: boolean;
+  /** 지금 나가 있는 회수가 있나. */
+  fetching: boolean;
+  /** 지난 회수가 실패로 끝났나(그 사유는 화면이 이미 말하고 있다). */
+  failed: boolean;
+}
+
+/**
+ * 펼쳤을 때 **자동으로** 한 번 가져오나.
+ *
+ * `shouldFetchBody`(=가져올 수 있나) 만으로 자동 회수를 정하면, 회수가
+ * **성공했는데 본문이 비었을 때** 판정이 다시 true 로 돌아온다: `pickTimeline`
+ * 이 빈 값을 돌려주고 `fetching` 이 true→false 로 바뀌며 effect 가 재발화한다.
+ * 그 한 바퀴가 `remote_timeline` → `Registry::call` → **새 SSH 연결 1회**이고,
+ * 백오프도 지연도 없다(실측: 빈 세션 하나에 5초 동안 1,400회 이상).
+ * `body_omitted:true, timeline_len:0`(아무것도 하지 않고 끝난 세션)은 데몬이
+ * 정상적으로 내는 조합이라 이 루프는 가정이 아니라 도달 상태다.
+ *
+ * 그래서 축을 **"이 id 에 대해 회수를 시도했다"** 로 옮긴다. 자동은 세션당 한
+ * 번이고, 그 뒤의 재시도는 사용자 버튼에만 남는다 — 화면에는 회수 버튼이 계속
+ * 떠 있으므로 조용히 잃는 것은 없다.
+ */
+export function shouldAutoFetchBody(
+  s: Pick<RemoteSessionMeta, "body_omitted" | "timeline_len">,
+  live: RemoteLiveTimeline | undefined,
+  st: FetchAttemptState,
+): boolean {
+  if (st.attempted || st.fetching || st.failed) return false;
+  return shouldFetchBody(s, live);
 }
 
 /** `remote_timeline` 응답 — 백엔드 `RemoteTimeline`. */
@@ -213,15 +248,34 @@ export interface RemoteTimelineReply {
   last_usage: TokenUsage | null;
 }
 
+/**
+ * 생산자가 **항상** 쓰는 배열 필드 — 없으면 드러낸다.
+ *
+ * `?? []` 로 받으면 필드 이름이 바뀌거나 생산자가 멈춘 것이 예외가 아니라
+ * **조용한 빈 타임라인**이 된다: 화면은 "아무 일도 없었다"를 정직한 답으로
+ * 보이고, 아무도 계약이 깨진 줄 모른다. Rust 쪽은 이 넷(`turns`·`answers`·
+ * `dates`·`tokens`)을 항상 직렬화하고 키 집합까지 테스트로 못박았으므로
+ * (R2b ②: 생산자가 항상 쓰면 소비자도 필수), 여기서는 없는 것이 곧 결함이다.
+ */
+function required<T>(v: unknown, field: string, where: string): T[] {
+  if (!Array.isArray(v)) {
+    throw new Error(
+      `${where}: '${field}' 가 오지 않았습니다 — 데몬/브리지 계약이 깨졌습니다(빈 타임라인으로 감추지 않습니다).`,
+    );
+  }
+  return v as T[];
+}
+
 /** 회수한 본문 → 라이브 타임라인 (순수). 라이브 payload 와 같은 모양으로 만든다. */
 export function fetchedToLive(r: RemoteTimelineReply): RemoteLiveTimeline {
   const u = r.last_usage;
+  const w = "회수한 원격 타임라인";
   return {
-    items: [...r.items].sort((a, b) => a.seq - b.seq),
-    turns: r.turns ?? [],
-    answers: r.answers ?? [],
-    dates: r.dates ?? [],
-    tokens: r.tokens ?? [],
+    items: [...required<TimelineItem>(r.items, "items", w)].sort((a, b) => a.seq - b.seq),
+    turns: required<[number, string]>(r.turns, "turns", w),
+    answers: required<[number, string]>(r.answers, "answers", w),
+    dates: required<[number, string]>(r.dates, "dates", w),
+    tokens: required<[number, TokenUsage]>(r.tokens, "tokens", w),
     model: r.model ?? null,
     ctxTokens: u ? u.input + u.cache_read + u.cache_creation : 0,
   };
@@ -293,16 +347,18 @@ export interface RemoteLiveTimeline {
 
 /** payload → 라이브 타임라인 (순수).
  *
- * `answers`/`dates`/`tokens`는 R2b 부터 실제로 온다. 옛 데몬은 안 보내고, 그건
- * 빈 배열로 디코드된다 — "없다"가 그 생산자의 정직한 답이다. */
+ * `answers`/`dates`/`tokens` 는 생산자가 **항상** 쓴다(빈 배열이라도). 그래서
+ * 여기서도 필수다 — 안 온 것은 "없다"가 아니라 계약이 깨진 것이고,
+ * {@link required} 가 그것을 예외로 드러낸다. */
 export function toLiveTimeline(e: ClaudeTimelineEvent): RemoteLiveTimeline {
   const u = e.last_usage;
+  const w = "원격 타임라인 payload";
   return {
-    items: [...e.items].sort((a, b) => a.seq - b.seq),
-    turns: e.turns ?? [],
-    answers: e.answers ?? [],
-    dates: e.dates ?? [],
-    tokens: e.tokens ?? [],
+    items: [...required<TimelineItem>(e.items, "items", w)].sort((a, b) => a.seq - b.seq),
+    turns: required<[number, string]>(e.turns, "turns", w),
+    answers: required<[number, string]>(e.answers, "answers", w),
+    dates: required<[number, string]>(e.dates, "dates", w),
+    tokens: required<[number, TokenUsage]>(e.tokens, "tokens", w),
     model: e.model ?? null,
     ctxTokens: u ? u.input + u.cache_read + u.cache_creation : 0,
   };
@@ -570,28 +626,65 @@ export function endedReason(
  * 폴링은 패널이 떠 있는 동안만 돈다. 이벤트 구독은 **원격 id 범위만** 통과시켜
  * 로컬 세션 이벤트를 한 번도 만지지 않는다.
  */
-export function useRemoteHosts(pollMs = 700): {
+export interface RemoteHostsView {
   hosts: RemoteHostSnapshot[];
   live: Map<number, RemoteLiveTimeline>;
   fetched: Map<number, RemoteLiveTimeline>;
   fetching: ReadonlySet<number>;
+  /** 회수를 **시도한** id — 자동 회수가 세션당 한 번이라는 사실이 여기 산다. */
+  attempted: ReadonlySet<number>;
   fetchError: Record<number, string>;
+  /** 호스트 목록 조회가 실패한 사유. 성공하면 지워진다. */
+  hostsError: string | null;
+  /** 목록이 마지막으로 **성공한** 시각(ms) — 화면이 얼마나 낡았는지. */
+  hostsAt: number | null;
+  /** 이벤트 구독·해독이 실패한 사유(구독 자체 실패 포함). */
+  streamError: string | null;
+  /** 지금 상태 seed 조회가 실패한 사유 — 빈 배열로 축소하지 않는다. */
+  seedError: string | null;
   fetchBody: (hostId: string, id: number) => void;
+  /** 구독+seed 를 다시 세운다(구독 실패·seed 실패의 재시도). */
+  retryStream: () => void;
   refresh: () => void;
-} {
+}
+
+export function useRemoteHosts(pollMs = 700): RemoteHostsView {
   const [hosts, setHosts] = useState<RemoteHostSnapshot[]>([]);
   const [live, setLive] = useState<Map<number, RemoteLiveTimeline>>(new Map());
   const [fetched, setFetched] = useState<Map<number, RemoteLiveTimeline>>(new Map());
   const [fetching, setFetching] = useState<Set<number>>(new Set());
+  const [attempted, setAttempted] = useState<Set<number>>(new Set());
   const [fetchError, setFetchError] = useState<Record<number, string>>({});
+  const [hostsError, setHostsError] = useState<string | null>(null);
+  const [hostsAt, setHostsAt] = useState<number | null>(null);
+  const [streamError, setStreamError] = useState<string | null>(null);
+  const [seedError, setSeedError] = useState<string | null>(null);
+  const [streamNonce, setStreamNonce] = useState(0);
   /** 이번 마운트에서 **라이브 이벤트가** 채운 id — 늦은 seed 가 덮지 못하게. */
   const livenedRef = useRef<Set<number>>(new Set());
+  /**
+   * 지금 나가 있는 회수 — **상태가 아니라 ref 다**.
+   *
+   * `setFetching` 업데이터 안에서 걸던 가드는 상태에만 걸리고 호출에는 안 걸렸다
+   * (`invoke` 는 그 바깥의 형제 문장이었다). effect·수동 버튼·연속 클릭이 겹치면
+   * 같은 세션에 SSH 회수가 **병렬로** 나갔다. ref 는 렌더를 기다리지 않으므로
+   * 같은 tick 안의 두 번째 호출도 막힌다.
+   */
+  const inFlightRef = useRef<Set<number>>(new Set());
+  /** 회수를 시도한 적 있는 id — 자동 회수의 잠금(R1). */
+  const attemptedRef = useRef<Set<number>>(new Set());
 
   const refresh = useCallback(() => {
     void invoke<RemoteHostSnapshot[]>("remote_hosts")
-      .then((v) => setHosts(v ?? []))
-      .catch(() => {
-        /* 커맨드 자체가 실패하면 이전 목록을 유지한다 — 빈 화면보다 낫다 */
+      .then((v) => {
+        setHosts(v ?? []);
+        setHostsAt(Date.now());
+        setHostsError(null);
+      })
+      .catch((e) => {
+        // 이전 목록은 그대로 두되(빈 화면보다 낫다) **조용히** 두지는 않는다 —
+        // 말없이 유지된 목록은 "지금 이렇다"로 읽히고, 그게 낡은 화면의 첫 단계다.
+        setHostsError(errText(e, "호스트 목록을 읽지 못했습니다."));
       });
   }, []);
 
@@ -601,7 +694,13 @@ export function useRemoteHosts(pollMs = 700): {
     return () => window.clearInterval(t);
   }, [refresh, pollMs]);
 
+  const retryStream = useCallback(() => setStreamNonce((n) => n + 1), []);
+
   const fetchBody = useCallback((hostId: string, id: number) => {
+    if (inFlightRef.current.has(id)) return; // 호출 자체의 중복 방지(R17)
+    inFlightRef.current.add(id);
+    attemptedRef.current.add(id);
+    setAttempted(new Set(attemptedRef.current));
     setFetching((prev) => {
       if (prev.has(id)) return prev;
       const next = new Set(prev);
@@ -621,10 +720,11 @@ export function useRemoteHosts(pollMs = 700): {
       .catch((e) => {
         setFetchError((prev) => ({
           ...prev,
-          [id]: String((e as { message?: string })?.message ?? e),
+          [id]: errText(e, "본문을 가져오지 못했습니다."),
         }));
       })
       .finally(() => {
+        inFlightRef.current.delete(id);
         setFetching((prev) => {
           const next = new Set(prev);
           next.delete(id);
@@ -638,19 +738,35 @@ export function useRemoteHosts(pollMs = 700): {
     let un: UnlistenFn | undefined;
     let unClosed: UnlistenFn | undefined;
     void (async () => {
-      // 리스너 **먼저**. 이벤트는 이미 붙어 있는 리스너에게만 가므로, seed 를
-      // 먼저 받으면 그 왕복 동안의 이벤트가 통째로 사라진다.
-      un = await listen<ClaudeTimelineEvent>("claude-timeline", (e) => {
-        if (!isRemoteId(e.payload.id)) return; // 로컬 세션 — 이 패널의 것이 아니다
-        livenedRef.current.add(e.payload.id);
-        setLive((prev) => new Map(prev).set(e.payload.id, toLiveTimeline(e.payload)));
-      });
-      unClosed = await listen<number>("claude-session-closed", (e) => {
-        // 종료 표시는 스냅샷의 `closed`가 갖는다. 여기서는 아무것도 지우지
-        // 않는다 — 마지막 내용은 남아 있어야 사용자가 읽을 수 있다.
-        if (!isRemoteId(e.payload)) return;
-        refresh();
-      });
+      try {
+        // 리스너 **먼저**. 이벤트는 이미 붙어 있는 리스너에게만 가므로, seed 를
+        // 먼저 받으면 그 왕복 동안의 이벤트가 통째로 사라진다.
+        un = await listen<ClaudeTimelineEvent>("claude-timeline", (e) => {
+          if (!isRemoteId(e.payload.id)) return; // 로컬 세션 — 이 패널의 것이 아니다
+          livenedRef.current.add(e.payload.id);
+          try {
+            const next = toLiveTimeline(e.payload);
+            setLive((prev) => new Map(prev).set(e.payload.id, next));
+            setStreamError(null);
+          } catch (err) {
+            // 계약이 깨진 payload — 빈 타임라인으로 감추지 않는다(R12).
+            setStreamError(errText(err, "원격 타임라인을 읽지 못했습니다."));
+          }
+        });
+        unClosed = await listen<number>("claude-session-closed", (e) => {
+          // 종료 표시는 스냅샷의 `closed`가 갖는다. 여기서는 아무것도 지우지
+          // 않는다 — 마지막 내용은 남아 있어야 사용자가 읽을 수 있다.
+          if (!isRemoteId(e.payload)) return;
+          refresh();
+        });
+      } catch (e) {
+        // 구독 자체가 실패했다. 잡지 않으면 unhandled rejection 하나와 **빈
+        // 화면**만 남고, 이 패널은 앞으로 어떤 이벤트도 받지 못한다(R18).
+        if (!disposed) setStreamError(errText(e, "원격 이벤트를 구독하지 못했습니다."));
+        un?.();
+        unClosed?.();
+        return;
+      }
       if (disposed) {
         un?.();
         unClosed?.();
@@ -658,27 +774,50 @@ export function useRemoteHosts(pollMs = 700): {
         unClosed = undefined;
         return;
       }
+      setStreamError(null);
       // …그리고 **그 다음에** 지금 상태를 받아 빈 자리만 채운다. 탭을 떠났다
       // 돌아온 패널은 그동안의 이벤트를 전부 놓쳤고, 끝난 세션은 앞으로도
-      // 이벤트를 내지 않는다 — seed 가 없으면 영구 빈 화면이다.
-      const seed = await invoke<ClaudeTimelineEvent[]>("remote_timelines").catch(
-        () => [] as ClaudeTimelineEvent[],
-      );
+      // 이벤트를 내지 않는다 — seed 가 없으면 영구 빈 화면이다. 그래서 실패를
+      // 빈 배열로 축소하지 않는다: 그 축소가 곧 "영구 빈 화면"이고, 화면은 그것을
+      // 정상으로 읽는다.
+      let seed: ClaudeTimelineEvent[];
+      try {
+        seed = await invoke<ClaudeTimelineEvent[]>("remote_timelines");
+      } catch (e) {
+        if (!disposed) setSeedError(errText(e, "지금 상태를 받아오지 못했습니다."));
+        return;
+      }
       if (disposed) return;
-      setLive((prev) =>
-        mergeSeed(
-          prev,
-          seed.filter((p) => isRemoteId(p.id)).map((p) => ({ id: p.id, live: toLiveTimeline(p) })),
-          livenedRef.current,
-        ),
-      );
+      try {
+        const merged = seed
+          .filter((p) => isRemoteId(p.id))
+          .map((p) => ({ id: p.id, live: toLiveTimeline(p) }));
+        setLive((prev) => mergeSeed(prev, merged, livenedRef.current));
+        setSeedError(null);
+      } catch (e) {
+        setSeedError(errText(e, "받아온 상태를 읽지 못했습니다."));
+      }
     })();
     return () => {
       disposed = true;
       un?.();
       unClosed?.();
     };
-  }, [refresh]);
+  }, [refresh, streamNonce]);
 
-  return { hosts, live, fetched, fetching, fetchError, fetchBody, refresh };
+  return {
+    hosts,
+    live,
+    fetched,
+    fetching,
+    attempted,
+    fetchError,
+    hostsError,
+    hostsAt,
+    streamError,
+    seedError,
+    fetchBody,
+    retryStream,
+    refresh,
+  };
 }

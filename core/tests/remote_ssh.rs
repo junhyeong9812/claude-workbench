@@ -863,7 +863,13 @@ printf '","sessions":[]}\n'"#,
 }
 
 /// A line this workbench cannot read must not stop the stream in silence: the
-/// bad line is named and the loop keeps going.
+/// bad line is named, the attach ends, and the loop comes back for a **fresh**
+/// stream rather than resuming past the hole (R9 — a lost line may have been a
+/// snapshot, and a resumed cursor tells the daemon it was delivered).
+///
+/// A frame *kind* from a newer daemon is a different thing and keeps its old
+/// behaviour: it decodes, so nothing was lost, and the stream reads on. Hence
+/// the order the script prints them in.
 #[test]
 #[ignore = "needs an SSH server: run with the other tests in this file"]
 fn a_stream_of_nonsense_is_reported_and_retried() {
@@ -874,12 +880,13 @@ fn a_stream_of_nonsense_is_reported_and_retried() {
     let port = start_ssh_server();
     learn_key(&dir, port);
 
-    // The two ways a stream goes wrong: a line that is not a frame at all, and
-    // a frame kind from a newer daemon.
+    // The two ways a stream goes wrong: a frame kind from a newer daemon (read,
+    // reported, read on) and a line that is not a frame at all (loss — the
+    // attach ends there, so it is printed last).
     let script = dir.join("junk.sh");
     std::fs::write(
         &script,
-        "#!/bin/sh\nprintf 'not json\\n{\"frame\":\"usage_delta\"}\\n'\n",
+        "#!/bin/sh\nprintf '{\"frame\":\"usage_delta\"}\\nnot json\\n'\n",
     )
     .expect("script");
     #[cfg(unix)]
@@ -907,6 +914,15 @@ fn a_stream_of_nonsense_is_reported_and_retried() {
     assert!(
         messages.iter().any(|m| m.contains("usage_delta")),
         "a frame kind from the future must be named: {messages:?}"
+    );
+    assert!(
+        messages.iter().any(|m| m.contains("전체 상태를 다시 받습니다")),
+        "an unreadable line must ask to be rebuilt, not be shrugged off: {messages:?}"
+    );
+    assert_eq!(
+        s.cursor, None,
+        "no position may be handed back while a resync is owed: {:?}",
+        s.cursor
     );
     drop(link);
     let _ = std::fs::remove_dir_all(&dir);

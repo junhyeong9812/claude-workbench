@@ -17,6 +17,7 @@ import {
   resumeLabel,
   seenKey,
   seenSeqOf,
+  shouldAutoFetchBody,
   shouldFetchBody,
   nextRemoteResize,
   shouldSendRemoteResize,
@@ -273,6 +274,27 @@ describe("종료된 세션의 본문", () => {
     expect(shouldFetchBody(meta({ timeline_len: 0 }), undefined)).toBe(false);
   });
 
+  it("자동 회수는 **내용**이 아니라 **시도**로 정해진다 (R1)", () => {
+    const empty = live(0, 0);
+    const fresh = { attempted: false, fetching: false, failed: false };
+    const s = meta({ body_omitted: true, timeline_len: 0 });
+    // 처음 펼쳤을 때는 가져온다.
+    expect(shouldAutoFetchBody(s, undefined, fresh)).toBe(true);
+    // …그리고 회수가 **성공했는데 본문이 비어도** 다시 가져가지 않는다. 이게
+    // 무한 SSH 루프가 살던 자리다: `shouldFetchBody` 는 여전히 true 를 돌려주고
+    // (가져올 수는 있으니까) 그것만으로 자동 회수를 정하면 effect 가 영원히
+    // 재발화한다 — 실측 1,400회 이상/5초, 매 회차가 새 SSH 연결.
+    expect(shouldFetchBody(s, empty)).toBe(true);
+    expect(shouldAutoFetchBody(s, empty, { ...fresh, attempted: true })).toBe(false);
+    // 나가 있는 회수가 있거나 지난 회수가 실패로 끝났으면 자동으로 또 걸지 않는다.
+    expect(shouldAutoFetchBody(s, undefined, { ...fresh, fetching: true })).toBe(false);
+    expect(shouldAutoFetchBody(s, undefined, { ...fresh, failed: true })).toBe(false);
+    // 데몬에도 없는 것은 여전히 가져올 곳이 없다.
+    expect(shouldAutoFetchBody(meta({ timeline_len: 0 }), undefined, fresh)).toBe(false);
+    // 본문이 실제로 있으면 애초에 회수 대상이 아니다.
+    expect(shouldAutoFetchBody(s, live(3, 1), fresh)).toBe(false);
+  });
+
   it("갭 뒤 빈 스냅샷이 방금 가져온 본문을 지우지 않는다", () => {
     const body = live(7, 2);
     // 끝난 세션은 갭마다 빈 payload가 다시 온다.
@@ -343,6 +365,46 @@ describe("원격 payload 읽기", () => {
     expect(live.answers).toEqual([[1, "답변"]]);
     expect(live.dates).toEqual([[1, "2026-08-13"]]);
     expect(live.tokens).toEqual([[1, { input: 3, output: 4, cache_read: 0, cache_creation: 0 }]]);
+  });
+
+  it("생산자가 항상 쓰는 필드가 빠지면 **드러낸다** — 빈 타임라인으로 감추지 않는다 (R12)", () => {
+    // Rust 는 `turns`·`answers`·`dates`·`tokens`·`items` 를 항상 직렬화하고 키
+    // 집합까지 테스트로 못박았다. 그래서 안 온 것은 "없다"가 아니라 계약이 깨진
+    // 것이다 — `?? []` 로 흡수하면 이름 변경·생산자 정지가 예외 대신 **조용한 빈
+    // 타임라인**이 되고, 화면은 "아무 일도 없었다"를 정직한 답으로 보인다.
+    const full: ClaudeTimelineEvent = {
+      id: REMOTE_ID_BASE + 3,
+      items: [],
+      turns: [],
+      answers: [],
+      dates: [],
+      tokens: [],
+      subagents: [],
+    };
+    for (const missing of ["items", "turns", "answers", "dates", "tokens"] as const) {
+      const broken = { ...full } as Record<string, unknown>;
+      delete broken[missing];
+      expect(() => toLiveTimeline(broken as unknown as ClaudeTimelineEvent)).toThrow(missing);
+    }
+    // 회수 경로(`remote_timeline` 응답)도 같은 계약이다.
+    const reply = {
+      session_id: "u",
+      total: 0,
+      items: [],
+      turns: [],
+      answers: [],
+      dates: [],
+      tokens: [],
+      model: null,
+      last_usage: null,
+    };
+    for (const missing of ["items", "turns", "answers", "dates", "tokens"] as const) {
+      const broken = { ...reply } as Record<string, unknown>;
+      delete broken[missing];
+      expect(() => fetchedToLive(broken as never)).toThrow(missing);
+    }
+    // 배열이 아닌 값(이름은 같은데 형이 바뀐 경우)도 같다.
+    expect(() => toLiveTimeline({ ...full, turns: null } as never)).toThrow("turns");
   });
 
   it("데몬이 보내지 않는 것은 지어내지 않는다", () => {
