@@ -128,6 +128,7 @@ pub fn run() {
             commands::remote::remote_connect,
             commands::remote::remote_disconnect,
             commands::remote::remote_hosts,
+            commands::remote::remote_timelines,
             commands::remote::remote_timeline,
             commands::remote::remote_sessions,
             commands::terminal::scrollback_set_enabled,

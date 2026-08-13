@@ -31,7 +31,9 @@ use tauri::{AppHandle, Emitter, Manager, State};
 
 use core_lib::remote::host::Emit;
 use core_lib::remote::proto::{decode_response, SessionsReply, TimelineSliceReply};
-use core_lib::remote::{HostConfig, HostSnapshot, RemoteAuth, Registry, Sink};
+use core_lib::remote::{
+    HostConfig, HostSnapshot, RemoteAuth, RemoteTimelinePayload, Registry, Sink,
+};
 
 use super::AppError;
 
@@ -76,6 +78,16 @@ fn known_hosts_path(app: &AppHandle) -> Result<std::path::PathBuf, AppError> {
     Ok(dir.join("known_hosts"))
 }
 
+/// A directly supplied secret wins; the saved connection's keychain entry is the
+/// fallback; **an empty string is not a secret**. Returning `None` rather than
+/// `""` is the whole point — see [`remote_connect`].
+fn secret(direct: Option<String>, saved: Option<String>) -> Option<String> {
+    direct
+        .or(saved)
+        .map(|s| s.trim_end_matches(['\r', '\n']).to_string())
+        .filter(|s| !s.is_empty())
+}
+
 /// Attach a remote host: subscribe to its daemon's event stream over SSH.
 ///
 /// Returns the id it was filed under (the caller's `host_id`). Attaching an id
@@ -103,16 +115,26 @@ pub fn remote_connect(
     cwcd: Option<String>,
     socket: Option<String>,
 ) -> Result<String, AppError> {
+    let saved = || connection_id.as_deref().and_then(super::ssh::ssh_get_secret);
     let auth = match auth_kind.as_str() {
         "password" => RemoteAuth::Password(
-            password
-                .or_else(|| connection_id.as_deref().and_then(super::ssh::ssh_get_secret))
-                .unwrap_or_default(),
+            // **Never an empty default.** A remote host reconnects on its own
+            // every ≤15s, so a missing secret quietly became an empty password
+            // offered to the remote `sshd` at that rate forever — until
+            // `MaxAuthTries`/fail2ban blocked the user's address. A secret that
+            // is not there is an error the user can act on, at the one moment
+            // they are looking at the panel.
+            secret(password, saved()).ok_or_else(|| {
+                AppError::new(
+                    "이 연결의 비밀번호를 찾을 수 없습니다 — 터미널에서 이 SSH 연결로 한 번 접속해 비밀번호를 저장한 뒤 다시 연결하세요.",
+                )
+            })?,
         ),
         "publickey" => RemoteAuth::PublicKey {
             path: key_path.ok_or_else(|| AppError::new("키 파일 경로가 필요합니다."))?,
-            passphrase: passphrase
-                .or_else(|| connection_id.as_deref().and_then(super::ssh::ssh_get_secret)),
+            // A passphrase, unlike a password, is legitimately absent (an
+            // unencrypted key), so `None` is a real answer here.
+            passphrase: secret(passphrase, saved()),
         },
         "agent" => RemoteAuth::Agent,
         _ => return Err(AppError::new("알 수 없는 인증 방식입니다.")),
@@ -132,6 +154,7 @@ pub fn remote_connect(
         cwcd,
         socket,
         known_hosts: known_hosts_path(&app)?,
+        timeouts: core_lib::remote::LinkTimeouts::default(),
     };
     let sink = Arc::new(TauriSink { app: app.clone() });
     Ok(remote.registry.attach(cfg, sink))
@@ -149,6 +172,19 @@ pub fn remote_disconnect(remote: State<'_, RemoteState>, host_id: String) -> boo
 #[tauri::command]
 pub fn remote_hosts(remote: State<'_, RemoteState>) -> Vec<HostSnapshot> {
     remote.registry.snapshots()
+}
+
+/// Every attached host's timelines **as they stand now**.
+///
+/// The timeline arrives as events, and events only reach a listener that was
+/// already there. A panel that is closed and reopened — a sidebar tab switched
+/// away from and back — has missed all of them, and a session that has stopped
+/// producing events (a finished one, most of all) would then show a permanently
+/// blank screen. This is the seed for that case: the same payloads the events
+/// carry, read out of the bridge's own state.
+#[tauri::command]
+pub fn remote_timelines(remote: State<'_, RemoteState>) -> Vec<RemoteTimelinePayload> {
+    remote.registry.live_payloads()
 }
 
 /// One remote session's timeline, fetched on demand.
