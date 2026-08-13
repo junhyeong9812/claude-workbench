@@ -31,7 +31,7 @@ use std::time::{Duration, Instant};
 use core_lib::remote::host::{Emit, Phase, ResumeOutcome};
 use core_lib::remote::link::{RecordingSink, RemoteAuth};
 use core_lib::remote::proto::{decode_response, HealthReply, SessionsReply};
-use core_lib::remote::{HostConfig, Registry};
+use core_lib::remote::{HostConfig, LinkTimeouts, Registry};
 
 use russh::server::{Auth, Handler, Msg, Server as _, Session};
 use russh::{Channel, ChannelId};
@@ -300,6 +300,7 @@ fn config(daemon: &Daemon, port: u16, host_id: &str) -> HostConfig {
         cwcd: daemon.bin.to_string_lossy().to_string(),
         socket: Some(daemon.socket.to_string_lossy().to_string()),
         known_hosts: daemon.dir.join("known_hosts"),
+        timeouts: LinkTimeouts::default(),
     }
 }
 
@@ -549,6 +550,178 @@ fn an_evicted_cursor_is_reported_and_the_screen_is_rebuilt() {
     registry.detach_all();
 }
 
+/// A host whose "daemon" is a shell script — everything on the workbench side is
+/// still production code, and the script decides what the stream does.
+fn script_config(
+    dir: &Path,
+    port: u16,
+    host_id: &str,
+    script: &Path,
+    timeouts: LinkTimeouts,
+) -> HostConfig {
+    HostConfig {
+        host_id: host_id.into(),
+        label: host_id.into(),
+        host: "127.0.0.1".into(),
+        port,
+        username: "tester".into(),
+        auth: RemoteAuth::Password("x".into()),
+        cwcd: script.to_string_lossy().to_string(),
+        socket: None,
+        known_hosts: dir.join("known_hosts"),
+        timeouts,
+    }
+}
+
+/// Write an executable `/bin/sh` script and return its path.
+fn write_script(dir: &Path, name: &str, body: &str) -> PathBuf {
+    let path = dir.join(name);
+    std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).expect("script");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).expect("chmod");
+    }
+    path
+}
+
+/// A scratch directory with the SSH server's key already trusted.
+fn scratch(tag: &str) -> (PathBuf, u16) {
+    restore_the_network();
+    let dir = PathBuf::from(format!("/tmp/cwc-e2e-{tag}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("dir");
+    let port = start_ssh_server();
+    learn_key(&dir, port);
+    (dir, port)
+}
+
+/// **The half-open link.** The connection is perfectly healthy and the remote
+/// command is still running — it has simply stopped saying anything.
+///
+/// Nothing else can catch this: the observation window is output-only so no
+/// error ever surfaces on it, `ssh.rs` disables russh's inactivity timeout, and
+/// Linux would retransmit for ~15 minutes before a write failed. Without the
+/// watchdog the panel says "연결됨" and shows data that stopped being true.
+#[test]
+#[ignore = "needs an SSH server: run with the other tests in this file"]
+fn a_stream_that_goes_silent_is_torn_down_even_though_the_connection_is_fine() {
+    let (dir, port) = scratch("stale");
+    // Speaks once, then holds the channel open forever without another byte —
+    // exactly a wedged `cwcd stream`.
+    let script = write_script(
+        &dir,
+        "mute.sh",
+        r#"printf '{"frame":"hello","protocol":2,"daemon_version":"0.1.0","host":{"host_id":"h","hostname":"box","user":"u","os":"linux"},"epoch":"e1","resume":{"kind":"fresh"},"oldest_seq":1,"next_seq":1}\n'
+sleep 600"#,
+    );
+    let link = core_lib::remote::Link::start(
+        script_config(
+            &dir,
+            port,
+            "stale",
+            &script,
+            LinkTimeouts {
+                stale_after: Duration::from_secs(3),
+                ..LinkTimeouts::default()
+            },
+        ),
+        Arc::new(RecordingSink::default()),
+    );
+
+    wait_for(Duration::from_secs(20), || link.snapshot().phase == Phase::Live)
+        .expect("the hello should attach");
+    let at_hello = link.snapshot().last_frame_at_ms.expect("a frame arrived");
+    assert!(at_hello > 0, "the screen must be able to say how old it is");
+
+    // The connection stays up and the command stays alive; only the frames stop.
+    wait_for(Duration::from_secs(30), || {
+        let s = link.snapshot();
+        s.phase != Phase::Live && s.attempts >= 2
+    })
+    .expect("silence on a live connection must end the window, not be waited out");
+    let s = link.snapshot();
+    assert!(
+        s.notices.iter().any(|n| n.message.contains("아무 것도 오지 않았습니다")),
+        "the staleness must be stated: {:?}",
+        s.notices.iter().map(|n| &n.message).collect::<Vec<_>>()
+    );
+
+    link.stop();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A `cwcd stream` that connects and never says anything at all must fail with a
+/// reason rather than sit on "연결 중" forever.
+#[test]
+#[ignore = "needs an SSH server: run with the other tests in this file"]
+fn an_attach_that_never_gets_a_hello_gives_up_and_says_so() {
+    let (dir, port) = scratch("nohello");
+    let script = write_script(&dir, "mute2.sh", "sleep 600");
+    let link = core_lib::remote::Link::start(
+        script_config(
+            &dir,
+            port,
+            "nohello",
+            &script,
+            LinkTimeouts {
+                hello_deadline: Duration::from_secs(3),
+                ..LinkTimeouts::default()
+            },
+        ),
+        Arc::new(RecordingSink::default()),
+    );
+    wait_for(Duration::from_secs(25), || {
+        link.snapshot()
+            .last_error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("응답하지 않았습니다")
+    })
+    .expect("a silent daemon must be a stated failure, not an indefinite 'connecting'");
+    link.stop();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A reply larger than a terminal's scrollback ring must arrive **whole**.
+///
+/// It used to be read out of that 1 MB ring, which drops from the front — so a
+/// big `cwcd timeline` came back headless and was reported as "daemon reply is
+/// not JSON", pointing the reader at the daemon instead of at the buffer.
+#[test]
+#[ignore = "needs an SSH server: run with the other tests in this file"]
+fn a_reply_bigger_than_the_scrollback_ring_arrives_whole() {
+    let (dir, port) = scratch("bigreply");
+    // ~3 MB of JSON: a head, a lot of padding, and a tail that only survives if
+    // nothing was dropped from the front.
+    let script = write_script(
+        &dir,
+        "big.sh",
+        r#"printf '{"response":"sessions","pad":"'
+i=0
+while [ $i -lt 3072 ]; do
+  printf '%01024d' 0 | tr '0' 'x'
+  i=$((i + 1))
+done
+printf '","sessions":[]}\n'"#,
+    );
+    let link = core_lib::remote::Link::start(
+        script_config(&dir, port, "big", &script, LinkTimeouts::default()),
+        Arc::new(RecordingSink::default()),
+    );
+    let out = link.call(&["list"]).expect("a big reply must not fail");
+    assert!(
+        out.len() > core_lib::session::DEFAULT_SCROLLBACK_CAP,
+        "the reply must actually exceed the default ring, or this proves nothing: {} bytes",
+        out.len()
+    );
+    let reply: SessionsReply =
+        decode_response(&out).expect("a whole reply parses; a headless one does not");
+    assert!(reply.sessions.is_empty());
+    link.stop();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// A line this workbench cannot read must not stop the stream in silence: the
 /// bad line is named and the loop keeps going.
 #[test]
@@ -576,17 +749,7 @@ fn a_stream_of_nonsense_is_reported_and_retried() {
     }
 
     let link = core_lib::remote::Link::start(
-        HostConfig {
-            host_id: "junk".into(),
-            label: "junk".into(),
-            host: "127.0.0.1".into(),
-            port,
-            username: "tester".into(),
-            auth: RemoteAuth::Password("x".into()),
-            cwcd: script.to_string_lossy().to_string(),
-            socket: None,
-            known_hosts: dir.join("known_hosts"),
-        },
+        script_config(&dir, port, "junk", &script, LinkTimeouts::default()),
         Arc::new(RecordingSink::default()),
     );
     wait_for(Duration::from_secs(30), || {

@@ -54,15 +54,53 @@ use super::proto::decode_frame;
 const BACKOFF_MIN: Duration = Duration::from_millis(800);
 const BACKOFF_MAX: Duration = Duration::from_secs(15);
 
-/// How long a short command may take before it is abandoned. `cwcd projects`
-/// on a cold host scans directories, which is measured in seconds.
-const COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
-
-/// A line longer than this is treated as a broken stream rather than buffered.
-/// A snapshot of a busy host is legitimately megabytes (items are capped at 4
-/// KB each), so the bound is high; what it rules out is a server that never
-/// sends a newline holding memory forever.
+/// A line longer than this is dropped and the reader resynchronises at the next
+/// newline. A snapshot of a busy host is legitimately megabytes (items are
+/// capped at 4 KB each), so the bound is high; what it rules out is a server
+/// that never sends a newline holding memory forever.
 const MAX_LINE: usize = 64 * 1024 * 1024;
+
+/// Bound on one short command's stdout. Also the reply collector's ring size,
+/// which is the point: this is the number the code actually enforces, and a
+/// reply that reaches it is reported as **truncated** rather than handed to the
+/// JSON parser to fail as "not JSON".
+const MAX_REPLY: usize = 64 * 1024 * 1024;
+
+/// The deadlines a link runs on. Together in one struct so a test can shorten
+/// them without every call site growing an argument.
+#[derive(Debug, Clone, Copy)]
+pub struct LinkTimeouts {
+    /// How long a short command may take before it is abandoned. `cwcd projects`
+    /// on a cold host scans directories, which is measured in seconds.
+    pub command: Duration,
+    /// How long an attach may go without a `Hello`.
+    ///
+    /// Connecting is not the same as being answered: a `cwcd stream` that starts
+    /// and says nothing leaves the connection perfectly healthy and the panel on
+    /// "연결 중" forever. With a deadline it becomes a stated failure and a retry.
+    pub hello_deadline: Duration,
+    /// How long the stream may go **without a single byte** before the link is
+    /// torn down and re-established.
+    ///
+    /// This is the whole of the workbench's liveness detection, and it exists
+    /// because nothing else can do it: the observation window is *output-only*,
+    /// so a peer that disappears produces no error on it; `ssh.rs` disables
+    /// russh's inactivity timeout; and Linux keeps retransmitting for ~15
+    /// minutes before a write ever fails. The daemon heartbeats every 15s on an
+    /// idle stream (`cwc-core::ipc::heartbeat_interval`), so three missed beats
+    /// is silence that means something.
+    pub stale_after: Duration,
+}
+
+impl Default for LinkTimeouts {
+    fn default() -> Self {
+        LinkTimeouts {
+            command: Duration::from_secs(30),
+            hello_deadline: Duration::from_secs(20),
+            stale_after: Duration::from_secs(45),
+        }
+    }
+}
 
 /// Credentials, in a form that can be cloned for each reconnect attempt.
 /// [`AuthMethod`] cannot be, and a reconnect must not need the UI again.
@@ -103,6 +141,7 @@ pub struct HostConfig {
     /// `CWC_SOCKET` override for the remote daemon.
     pub socket: Option<String>,
     pub known_hosts: PathBuf,
+    pub timeouts: LinkTimeouts,
 }
 
 impl HostConfig {
@@ -161,7 +200,10 @@ pub struct Link {
     cfg: HostConfig,
     state: Arc<Mutex<Host>>,
     cancel: Arc<AtomicBool>,
-    join: Option<JoinHandle<()>>,
+    /// Behind a lock so [`Link::stop`] takes `&self`: the registry hands out
+    /// shared handles (`Arc<Link>`) so a 30-second remote command can be run
+    /// **without** holding the registry's own map lock.
+    join: Mutex<Option<JoinHandle<()>>>,
 }
 
 impl Link {
@@ -175,11 +217,20 @@ impl Link {
             let (cfg, state, cancel) = (cfg.clone(), Arc::clone(&state), Arc::clone(&cancel));
             thread::spawn(move || run(cfg, state, cancel, sink))
         };
-        Link { cfg, state, cancel, join: Some(join) }
+        Link { cfg, state, cancel, join: Mutex::new(Some(join)) }
     }
 
     pub fn snapshot(&self) -> HostSnapshot {
         self.state.lock().unwrap_or_else(|p| p.into_inner()).snapshot()
+    }
+
+    /// Every session's timeline as it stands now — what a viewer that arrives
+    /// after the events is seeded from ([`Host::live_payloads`]).
+    pub fn live_payloads(&self) -> Vec<super::host::RemoteTimelinePayload> {
+        self.state
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .live_payloads()
     }
 
 
@@ -194,14 +245,20 @@ impl Link {
     /// A fresh exec each time — the daemon's short surface takes its whole
     /// request as argv, so nothing here needs a persistent channel or stdin.
     pub fn call(&self, args: &[&str]) -> Result<String, String> {
-        exec_capture(&self.cfg, &self.cfg.command(args), COMMAND_TIMEOUT).map(|o| o.stdout)
+        exec_capture(&self.cfg, &self.cfg.command(args), self.cfg.timeouts.command)
+            .map(|o| o.stdout)
     }
 
     /// Stop observing. The remote daemon and everything it owns keep running —
     /// that is the property the whole design rests on.
-    pub fn stop(&mut self) {
+    pub fn stop(&self) {
         self.cancel.store(true, Ordering::SeqCst);
-        if let Some(h) = self.join.take() {
+        let handle = self
+            .join
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .take();
+        if let Some(h) = handle {
             let _ = h.join();
         }
         self.state
@@ -216,7 +273,8 @@ impl Drop for Link {
         // A link dropped without `stop` would leave its thread holding an SSH
         // connection open for the life of the process.
         self.cancel.store(true, Ordering::SeqCst);
-        if let Some(h) = self.join.take() {
+        let handle = self.join.get_mut().unwrap_or_else(|p| p.into_inner()).take();
+        if let Some(h) = handle {
             let _ = h.join();
         }
     }
@@ -266,6 +324,17 @@ fn run(cfg: HostConfig, state: Arc<Mutex<Host>>, cancel: Arc<AtomicBool>, sink: 
                     .unwrap_or_else(|p| p.into_inner())
                     .fail(Phase::Reconnecting, reason);
             }
+        }
+        // A window that actually worked resets the backoff. Without this the
+        // delay only ever grows, so a host that drops once an hour ends up
+        // waiting the full ceiling before *every* later reconnect, for the rest
+        // of the session — the cost of one old failure charged forever.
+        let progressed = state
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .made_progress();
+        if progressed {
+            backoff = BACKOFF_MIN;
         }
         // Interruptible sleep — a `stop` during the backoff must not wait it out.
         let deadline = Instant::now() + backoff;
@@ -318,12 +387,22 @@ fn attach(
         .subscribe(id)
         .map_err(|e| Ended::Transient(format!("원격 출력을 구독하지 못했습니다: {e}")))?;
     let (seed, seed_seq) = mgr.snapshot(id).unwrap_or_default();
+    // The seed comes out of the session's scrollback ring, which drops from the
+    // *front* when it is full. A seed at the cap is therefore a stream whose
+    // beginning is already gone, and feeding a headless fragment to the decoder
+    // would report it as unreadable JSON instead of as what it is.
+    if seed.len() >= crate::session::DEFAULT_SCROLLBACK_CAP {
+        return Err(Ended::Transient(
+            "원격 스트림의 시작 부분을 놓쳤습니다(버퍼 초과) — 다시 붙습니다.".into(),
+        ));
+    }
 
     let side = SideChannels::spawn(channels, Arc::clone(cancel));
 
-    let mut buf: Vec<u8> = Vec::new();
-    let mut fatal = false;
-    consume(&seed, &mut buf, state, sink, &mut fatal)?;
+    let mut lines = LineReader::default();
+    let started = Instant::now();
+    let mut last_byte_at = Instant::now();
+    consume(&seed, &mut lines, state, sink)?;
 
     loop {
         if cancel.load(Ordering::SeqCst) {
@@ -331,55 +410,119 @@ fn attach(
         }
         match rx.recv_timeout(Duration::from_millis(150)) {
             Ok(chunk) => {
+                last_byte_at = Instant::now();
                 if chunk.seq <= seed_seq {
                     continue; // already in the seed
                 }
-                consume(&chunk.bytes, &mut buf, state, sink, &mut fatal)?;
-                if buf.len() > MAX_LINE {
-                    return Err(Ended::Transient(
-                        "원격 스트림의 한 줄이 너무 길어 연결을 끊었습니다.".into(),
-                    ));
-                }
+                consume(&chunk.bytes, &mut lines, state, sink)?;
             }
             Err(_) => {
                 if mgr.is_alive(id) == Some(false) {
                     // Drain whatever is still queued before declaring the end.
                     while let Ok(chunk) = rx.try_recv() {
                         if chunk.seq > seed_seq {
-                            consume(&chunk.bytes, &mut buf, state, sink, &mut fatal)?;
+                            consume(&chunk.bytes, &mut lines, state, sink)?;
                         }
                     }
                     return Err(side.verdict(state));
+                }
+                // The connection is *up*. That is not the same as the daemon
+                // still talking to us, and on an output-only stream it is the
+                // only thing the socket can tell us — hence both deadlines.
+                let live = state
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .made_progress();
+                if !live && started.elapsed() > cfg.timeouts.hello_deadline {
+                    return Err(Ended::Transient(format!(
+                        "원격 데몬이 {}초 안에 응답하지 않았습니다(cwcd stream 이 시작되지 않았거나 막혀 있습니다) — 다시 시도합니다.",
+                        cfg.timeouts.hello_deadline.as_secs()
+                    )));
+                }
+                if live && last_byte_at.elapsed() > cfg.timeouts.stale_after {
+                    return Err(Ended::Transient(format!(
+                        "원격 데몬에서 {}초 동안 아무 것도 오지 않았습니다(하트비트도 없음) — 연결은 살아 있지만 화면이 낡습니다. 다시 붙습니다.",
+                        cfg.timeouts.stale_after.as_secs()
+                    )));
                 }
             }
         }
     }
 }
 
+/// Splits a byte stream into NDJSON lines.
+///
+/// A line that grows past [`MAX_LINE`] is **dropped and resynchronised at the
+/// next newline**, not turned into a disconnect: a reconnect resumes from the
+/// same cursor, so the same oversized line arrives again and the link livelocks,
+/// reconnecting forever without ever making progress. Dropping it loses one
+/// line — which was unusable anyway — and says so.
+#[derive(Default)]
+struct LineReader {
+    buf: Vec<u8>,
+    /// Inside an oversized line: everything up to the next newline is its tail.
+    skipping: bool,
+}
+
+impl LineReader {
+    /// Feed bytes; returns the complete lines and how many bytes were dropped.
+    fn feed(&mut self, bytes: &[u8]) -> (Vec<String>, usize) {
+        let mut out = Vec::new();
+        let mut dropped = 0usize;
+        self.buf.extend_from_slice(bytes);
+        loop {
+            match self.buf.iter().position(|b| *b == b'\n') {
+                Some(nl) => {
+                    let line: Vec<u8> = self.buf.drain(..=nl).collect();
+                    if self.skipping {
+                        dropped += line.len();
+                        self.skipping = false;
+                        continue;
+                    }
+                    let line = String::from_utf8_lossy(&line[..line.len() - 1]);
+                    if !line.trim().is_empty() {
+                        out.push(line.to_string());
+                    }
+                }
+                None => {
+                    if self.buf.len() > MAX_LINE {
+                        dropped += self.buf.len();
+                        self.buf.clear();
+                        self.skipping = true;
+                    }
+                    break;
+                }
+            }
+        }
+        (out, dropped)
+    }
+}
+
 /// Feed bytes through the line splitter and apply every complete line.
 fn consume(
     bytes: &[u8],
-    buf: &mut Vec<u8>,
+    lines: &mut LineReader,
     state: &Arc<Mutex<Host>>,
     sink: &Arc<dyn Sink>,
-    fatal: &mut bool,
 ) -> Result<(), Ended> {
-    buf.extend_from_slice(bytes);
-    while let Some(nl) = buf.iter().position(|b| *b == b'\n') {
-        let line: Vec<u8> = buf.drain(..=nl).collect();
-        let line = String::from_utf8_lossy(&line[..line.len() - 1]).to_string();
-        if line.trim().is_empty() {
-            continue;
-        }
+    let (lines, dropped) = lines.feed(bytes);
+    if dropped > 0 {
+        state.lock().unwrap_or_else(|p| p.into_inner()).push_notice(
+            NoticeLevel::Warn,
+            format!(
+                "원격 스트림의 한 줄이 너무 길어 {dropped}바이트를 버리고 다음 줄부터 다시 읽습니다."
+            ),
+            None,
+        );
+    }
+    for line in lines {
         let emits = {
             let mut h = state.lock().unwrap_or_else(|p| p.into_inner());
             match decode_frame(&line) {
                 Ok(frame) => match h.apply(frame) {
                     Ok(emits) => emits,
-                    Err(Fatal(_)) => {
-                        *fatal = true;
-                        return Err(Ended::Fatal);
-                    }
+                    // The phase and the reason are already on screen (`on_hello`).
+                    Err(Fatal(_)) => return Err(Ended::Fatal),
                 },
                 Err(reason) => {
                     h.on_undecodable(reason);
@@ -419,6 +562,9 @@ struct SideChannels {
     unknown_host_key: Arc<AtomicBool>,
     stderr: Arc<Mutex<String>>,
     status_error: Arc<Mutex<Option<String>>>,
+    /// The remote command's exit status. `127` is the shell's "not found",
+    /// which is how a missing `cwcd` arrives.
+    exit_code: Arc<Mutex<Option<u32>>>,
 }
 
 impl SideChannels {
@@ -427,6 +573,7 @@ impl SideChannels {
         let unknown_host_key = Arc::new(AtomicBool::new(false));
         let stderr = Arc::new(Mutex::new(String::new()));
         let status_error = Arc::new(Mutex::new(None));
+        let exit_code = Arc::new(Mutex::new(None));
 
         {
             // An unknown host key is **refused**, not prompted for. A remote
@@ -454,6 +601,7 @@ impl SideChannels {
         }
         {
             let sink = Arc::clone(&stderr);
+            let code = Arc::clone(&exit_code);
             thread::spawn(move || {
                 while let Some(ev) = exec_rx.blocking_recv() {
                     if cancel.load(Ordering::SeqCst) {
@@ -461,16 +609,22 @@ impl SideChannels {
                         // accumulating.
                         continue;
                     }
-                    if let ExecEvent::Stderr(b) = ev {
-                        let mut s = sink.lock().unwrap_or_else(|p| p.into_inner());
-                        if s.len() < 4096 {
-                            s.push_str(&String::from_utf8_lossy(&b));
+                    match ev {
+                        ExecEvent::Stderr(b) => {
+                            let mut s = sink.lock().unwrap_or_else(|p| p.into_inner());
+                            if s.len() < 4096 {
+                                s.push_str(&String::from_utf8_lossy(&b));
+                            }
                         }
+                        ExecEvent::Exit { code: c, .. } => {
+                            *code.lock().unwrap_or_else(|p| p.into_inner()) = c;
+                        }
+                        _ => {}
                     }
                 }
             });
         }
-        SideChannels { unknown_host_key, stderr, status_error }
+        SideChannels { unknown_host_key, stderr, status_error, exit_code }
     }
 
     /// Why the window ended, in the user's words.
@@ -490,6 +644,18 @@ impl SideChannels {
             .clone();
         let stderr = self.stderr.lock().unwrap_or_else(|p| p.into_inner()).clone();
         let stderr = stderr.trim().to_string();
+        let code = *self.exit_code.lock().unwrap_or_else(|p| p.into_inner());
+
+        // A failure a retry cannot fix must **stop**, not be re-offered every
+        // few seconds — see [`permanent_reason`].
+        if let Some(msg) = permanent_reason(err.as_deref(), &stderr, code) {
+            state
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .fail(Phase::Failed, msg);
+            return Ended::Fatal;
+        }
+
         Ended::Transient(match (err, stderr.is_empty()) {
             (Some(e), true) => format!("원격 연결이 끊겼습니다: {e}"),
             (Some(e), false) => format!("원격 연결이 끊겼습니다: {e} — {stderr}"),
@@ -497,6 +663,52 @@ impl SideChannels {
             (None, true) => "원격 이벤트 스트림이 끊겼습니다.".into(),
         })
     }
+}
+
+/// The reason this attach must **not** be retried, in the user's words — or
+/// `None` when a retry is the right answer.
+///
+/// The distinction is not cosmetic. A retry loop runs every ≤15s forever, so
+/// classifying a rejected credential as transient means re-offering it to the
+/// remote `sshd` at that rate indefinitely: `MaxAuthTries` and fail2ban then do
+/// exactly what they are for, and the user's own address is blocked from the
+/// host they were trying to reach. Every string matched here is a fixed one
+/// produced by `crate::ssh` (`authenticate`, `authenticate_agent`) or by the
+/// remote shell, and every one of them names something only the user can fix.
+///
+/// A bare `"authentication error"` is deliberately *not* here: `ssh.rs` produces
+/// it for a transport error that happened during the auth phase, which is a
+/// broken network rather than a rejected credential.
+fn permanent_reason(status_error: Option<&str>, stderr: &str, exit_code: Option<u32>) -> Option<String> {
+    let err = status_error.unwrap_or_default();
+    if err.contains("authentication failed") {
+        return Some(
+            "SSH 인증이 거부되었습니다 — 자격 증명을 고치기 전에는 다시 시도해도 같습니다(계속 시도하면 원격 sshd 가 이 주소를 차단합니다). 연결 설정을 확인한 뒤 다시 연결하세요."
+                .into(),
+        );
+    }
+    if err.contains("could not load private key") {
+        return Some(
+            "개인 키를 읽지 못했습니다(경로 또는 passphrase가 맞지 않습니다) — 연결 설정을 고친 뒤 다시 연결하세요."
+                .into(),
+        );
+    }
+    if err.contains("ssh-agent is not available") || err.contains("ssh-agent has no identities") {
+        return Some(
+            "ssh-agent 를 쓸 수 없습니다(실행 중이 아니거나 등록된 키가 없습니다) — 키를 등록한 뒤 다시 연결하세요."
+                .into(),
+        );
+    }
+    // The remote shell's own verdict. 127 is "command not found"; the message
+    // differs by shell, so the code is what is matched and the text is only
+    // shown.
+    if exit_code == Some(127) || stderr.contains("not found") {
+        let detail = if stderr.is_empty() { String::new() } else { format!(" — {stderr}") };
+        return Some(format!(
+            "원격 호스트에서 cwcd 를 실행하지 못했습니다{detail}. 데몬을 설치하거나 이 연결의 cwcd 경로를 지정한 뒤 다시 연결하세요."
+        ));
+    }
+    None
 }
 
 // ---------------------------------------------------------------------------
@@ -508,9 +720,30 @@ pub struct ExecOutput {
     pub stderr: String,
 }
 
+/// Assemble a short command's stdout, refusing a **truncated** one.
+///
+/// The collector is a byte ring that drops from the front when it is full, so a
+/// reply at the cap is one whose beginning is gone. Handing that to the JSON
+/// parser produces "daemon reply is not JSON" — a misdiagnosis that sends the
+/// reader looking at the daemon's output instead of at the buffer that ate it.
+fn assemble_reply(bytes: &[u8], cap: usize) -> Result<String, String> {
+    if bytes.len() >= cap {
+        return Err(format!(
+            "원격 응답이 너무 커서({}MB 상한) 앞부분이 잘렸습니다 — 잘린 조각을 읽으려 하지 않았습니다.",
+            cap / (1024 * 1024)
+        ));
+    }
+    Ok(String::from_utf8_lossy(bytes).to_string())
+}
+
 /// Run one command over its own exec channel and collect stdout.
 fn exec_capture(cfg: &HostConfig, command: &str, timeout: Duration) -> Result<ExecOutput, String> {
-    let mgr = SessionManager::new();
+    // A collector sized for a **reply**, not a terminal's scrollback. The
+    // default 1 MB ring is right for a PTY that scrolls forever and wrong for a
+    // single JSON object that must arrive whole: `cwcd timeline` on a long
+    // session is legitimately larger than that, and the ring drops from the
+    // front, so the reply arrived headless and was reported as malformed JSON.
+    let mgr = SessionManager::with_cap(MAX_REPLY);
     let (id, channels) =
         mgr.create_ssh(cfg.ssh(command.to_string()), cfg.known_hosts.clone(), 80, 24, None);
     let _guard = SessionGuard { mgr: &mgr, id };
@@ -527,13 +760,19 @@ fn exec_capture(cfg: &HostConfig, command: &str, timeout: Duration) -> Result<Ex
                         .into(),
                 );
             }
-            let stdout = String::from_utf8_lossy(&bytes).to_string();
+            let stdout = assemble_reply(&bytes, MAX_REPLY)?;
             if stdout.trim().is_empty() {
                 let err = side
                     .status_error
                     .lock()
                     .unwrap_or_else(|p| p.into_inner())
                     .clone();
+                let code = *side.exit_code.lock().unwrap_or_else(|p| p.into_inner());
+                // The same classification the stream uses, so "cwcd is not
+                // installed" reads the same whichever surface hit it first.
+                if let Some(msg) = permanent_reason(err.as_deref(), stderr.trim(), code) {
+                    return Err(msg);
+                }
                 return Err(match (err, stderr.trim().is_empty()) {
                     (Some(e), _) => format!("원격 명령을 실행하지 못했습니다: {e}"),
                     (None, false) => format!("원격 명령이 실패했습니다: {}", stderr.trim()),
@@ -562,6 +801,7 @@ mod tests {
             cwcd: "cwcd".into(),
             socket: None,
             known_hosts: PathBuf::from("/tmp/kh"),
+            timeouts: LinkTimeouts::default(),
         }
     }
 
@@ -579,6 +819,85 @@ mod tests {
     #[test]
     fn no_socket_override_means_the_daemons_own_default() {
         assert_eq!(cfg().command(&["list"]), "'cwcd' 'list'");
+    }
+
+    /// Every one of these is a failure the user has to fix, and a retry loop
+    /// runs every ≤15s forever. The password case is the one with teeth: while
+    /// it was "transient", a saved connection with no keychain entry sent an
+    /// **empty password** at that rate until the remote `sshd` blocked the
+    /// address.
+    #[test]
+    fn a_failure_only_the_user_can_fix_stops_the_retry_loop() {
+        let permanent = [
+            "authentication failed (server rejected the credentials)",
+            "ssh-agent authentication failed (no identity accepted)",
+            "could not load private key (wrong path or passphrase)",
+            "ssh-agent is not available",
+            "ssh-agent has no identities loaded",
+        ];
+        for e in permanent {
+            assert!(
+                permanent_reason(Some(e), "", None).is_some(),
+                "must be terminal, not retried forever: {e}"
+            );
+        }
+        // The daemon is not installed / not on PATH — the shell's own verdict.
+        assert!(permanent_reason(None, "sh: 1: cwcd: not found", Some(127))
+            .expect("127 is terminal")
+            .contains("cwcd"));
+        assert!(permanent_reason(None, "", Some(127)).is_some(), "the code alone is enough");
+
+        // …and everything a retry *can* fix stays retryable.
+        for e in [
+            "could not connect to the host (check address/port, host key, or network)",
+            "authentication error", // a transport error during auth = a broken network
+            "runtime init failed: x",
+        ] {
+            assert_eq!(permanent_reason(Some(e), "", None), None, "must stay retryable: {e}");
+        }
+        assert_eq!(permanent_reason(None, "", Some(0)), None);
+        assert_eq!(permanent_reason(None, "", None), None);
+    }
+
+    /// A reply that hit the collector's cap lost its **front**, so parsing it
+    /// reports a malformed daemon rather than a buffer that ate the answer.
+    #[test]
+    fn a_truncated_reply_is_named_as_truncated_not_as_bad_json() {
+        assert_eq!(assemble_reply(b"{\"response\":\"sessions\"}", 64).unwrap(), r#"{"response":"sessions"}"#);
+        let err = assemble_reply(&vec![b'x'; 64], 64).unwrap_err();
+        assert!(err.contains("잘렸"), "{err}");
+        // The collector is sized for a reply, not for a terminal's scrollback —
+        // the 1 MB default is what truncated `cwcd timeline` on a long session.
+        assert!(MAX_REPLY > crate::session::DEFAULT_SCROLLBACK_CAP);
+    }
+
+    /// An over-long line is dropped and the reader picks up at the next newline.
+    /// Returning a disconnect instead meant reconnecting from the *same* cursor,
+    /// receiving the same line, and never making progress.
+    #[test]
+    fn an_oversized_line_is_dropped_and_the_reader_resynchronises() {
+        let mut r = LineReader::default();
+        let (lines, dropped) = r.feed(b"{\"frame\":\"a\"}\n");
+        assert_eq!(lines, vec![r#"{"frame":"a"}"#]);
+        assert_eq!(dropped, 0);
+
+        // A line that never ends, fed in pieces.
+        let huge = vec![b'x'; MAX_LINE / 2 + 1];
+        assert_eq!(r.feed(&huge).0.len(), 0);
+        let (lines, dropped) = r.feed(&huge);
+        assert!(lines.is_empty());
+        assert!(dropped > MAX_LINE, "the buffer must be released, not held");
+        // Its tail is skipped, and the next whole line is read normally.
+        let (lines, _) = r.feed(b"tail-of-the-monster\n{\"frame\":\"b\"}\n");
+        assert_eq!(lines, vec![r#"{"frame":"b"}"#], "the reader must recover in place");
+    }
+
+    #[test]
+    fn a_partial_line_waits_for_its_newline() {
+        let mut r = LineReader::default();
+        assert!(r.feed(b"{\"fra").0.is_empty());
+        assert!(r.feed(b"me\":\"a\"}").0.is_empty());
+        assert_eq!(r.feed(b"\n\n  \n").0, vec![r#"{"frame":"a"}"#]);
     }
 
     #[test]
