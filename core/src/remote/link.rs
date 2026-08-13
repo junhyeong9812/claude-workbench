@@ -257,6 +257,30 @@ impl Link {
     ///
     /// A fresh exec each time — the daemon's short surface takes its whole
     /// request as argv, so nothing here needs a persistent channel or stdin.
+    /// An SSH session that **drives** one remote session's terminal.
+    ///
+    /// Unlike [`Self::call`] and the observation window, this one carries stdin
+    /// ([`crate::ssh::ExecStdin::Stream`]): its remote end is `cwcd attach`,
+    /// whose stdout is the agent's terminal bytes and whose stdin is the
+    /// keystrokes. Handed back as a config rather than run here because the
+    /// session belongs in the app's own `SessionManager`, where the existing
+    /// terminal commands (`write`/`resize`/`snapshot`, `terminal-output-{id}`)
+    /// already address it — a remote terminal is then the *same* object as a
+    /// local one, not a parallel one.
+    ///
+    /// `None` when this host has not said `Hello` yet, or does not know that
+    /// session: an address is only composable from an epoch this link has seen.
+    pub fn attach_config(&self, id: u64, cols: u16, rows: u16) -> Option<(SshConfig, PathBuf)> {
+        let addr = self.addr_of(id)?;
+        let cols = cols.max(1).to_string();
+        let rows = rows.max(1).to_string();
+        let command = self.cfg.command(&["attach", &addr, "--cols", &cols, "--rows", &rows]);
+        Some((
+            self.cfg.ssh(command, crate::ssh::ExecStdin::Stream),
+            self.cfg.known_hosts.clone(),
+        ))
+    }
+
     pub fn call(&self, args: &[&str]) -> Result<String, String> {
         exec_capture(&self.cfg, &self.cfg.command(args), self.cfg.timeouts.command)
             .map(|o| o.stdout)

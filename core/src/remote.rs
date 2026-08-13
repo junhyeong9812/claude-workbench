@@ -156,6 +156,18 @@ impl Registry {
             .call(args)
     }
 
+    /// An SSH config that drives a remote session's terminal — see
+    /// [`Link::attach_config`].
+    pub fn attach_config(
+        &self,
+        host_id: &str,
+        id: u64,
+        cols: u16,
+        rows: u16,
+    ) -> Option<(crate::ssh::SshConfig, std::path::PathBuf)> {
+        self.link(host_id)?.attach_config(id, cols, rows)
+    }
+
     /// The `"<epoch>:k<n>"` address of a remote session id.
     pub fn addr_of(&self, host_id: &str, id: u64) -> Option<String> {
         self.link(host_id)?.addr_of(id)
