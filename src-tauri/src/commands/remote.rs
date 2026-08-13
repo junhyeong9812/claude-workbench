@@ -354,7 +354,14 @@ pub fn remote_resize(
 #[tauri::command]
 pub fn remote_attach(
     app: AppHandle,
-    mgr: State<'_, Arc<core_lib::SessionManager>>,
+    // The **same** type `lib.rs` manages, which is the whole requirement:
+    // Tauri's state map is keyed by `TypeId`, so `State<Arc<SessionManager>>`
+    // against a managed bare `SessionManager` is a different key and every call
+    // fails at runtime with "state not managed" — while compiling cleanly,
+    // because `State<T>` is generic. `tests/state_registration.rs` now compares
+    // the two lists that have to agree, so the next one of these is a red test
+    // rather than a discovery made in the running app.
+    mgr: State<'_, core_lib::SessionManager>,
     remote: State<'_, RemoteState>,
     host_id: String,
     id: u64,
