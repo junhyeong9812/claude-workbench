@@ -229,6 +229,19 @@ pub struct SessionSnapshot {
     /// Required, for the same reason as [`Self::items`] — the body's other half.
     #[serde(with = "turn_map")]
     pub turns: BTreeMap<u64, String>,
+    /// The assistant's side of each turn, and what each turn cost.
+    ///
+    /// Optional here, unlike `turns`, because the daemon omits an empty map
+    /// (`skip_serializing_if`) — so "absent" and "empty" are the same statement
+    /// on this wire and defaulting cannot hide a producer that stopped writing.
+    /// A daemon older than R2b simply never sends them, which is exactly the
+    /// state this replaces.
+    #[serde(default, with = "turn_map")]
+    pub answers: BTreeMap<u64, String>,
+    #[serde(default, with = "turn_map")]
+    pub dates: BTreeMap<u64, String>,
+    #[serde(default, with = "turn_map")]
+    pub tokens: BTreeMap<u64, TokenUsage>,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -295,6 +308,12 @@ pub enum Event {
         model: Option<String>,
         last_usage: Option<TokenUsage>,
         turns: BTreeMap<u64, String>,
+        /// New answers/dates/tokens with this delta — same "only what changed"
+        /// rule as `turns`, and the same merge (later value wins, because an
+        /// answer grows while it is being written).
+        answers: BTreeMap<u64, String>,
+        dates: BTreeMap<u64, String>,
+        tokens: BTreeMap<u64, TokenUsage>,
     },
     Hook {
         key: SessionKey,
@@ -430,6 +449,38 @@ pub struct HealthReply {
     pub sessions: usize,
 }
 
+/// `cwcd spawn` — the session the host actually started, as the host describes
+/// it. Read rather than assumed: the daemon decides the key, and may have
+/// refused parts of the request.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct SpawnedReply {
+    pub session: SessionView,
+}
+
+/// `cwcd kill <addr>` — `signal` is **what was delivered**, not what was asked
+/// for: with the process group already gone the daemon falls back to the pty
+/// layer's killer, which sends `SIGHUP` and only to the agent itself.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct KilledReply {
+    pub key: SessionKey,
+    pub session_id: String,
+    pub signal: i32,
+}
+
+/// `cwcd resize <addr>` — the size the pty **actually has** afterwards.
+///
+/// Read rather than discarded, because a resize is the one control call whose
+/// failure is otherwise invisible: the daemon may clamp it, or refuse it for a
+/// session whose terminal is gone, and the caller's next frame looks the same
+/// either way. `exec_capture` alone cannot stand in for this — it only fails on
+/// *empty* stdout, so `{"response":"error",…}` is a perfectly good non-empty
+/// reply and used to arrive as `Ok(())`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+pub struct ResizedReply {
+    pub cols: u16,
+    pub rows: u16,
+}
+
 /// `cwcd timeline <addr>` — the recovery address a finished session's
 /// `items_omitted` points at.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -444,6 +495,15 @@ pub struct TimelineSliceReply {
     pub total: usize,
     #[serde(with = "turn_map")]
     pub turns: BTreeMap<u64, String>,
+    /// Defaulted, unlike `turns`: the daemon omits an empty map, and one older
+    /// than R2b omits them always — which decodes as "this session has none",
+    /// the honest reading of a producer that never had them.
+    #[serde(default, with = "turn_map")]
+    pub answers: BTreeMap<u64, String>,
+    #[serde(default, with = "turn_map")]
+    pub dates: BTreeMap<u64, String>,
+    #[serde(default, with = "turn_map")]
+    pub tokens: BTreeMap<u64, TokenUsage>,
     #[serde(default)]
     pub model: Option<String>,
     #[serde(default)]
@@ -489,8 +549,12 @@ mod turn_map {
     use super::BTreeMap;
     use serde::{Deserialize, Deserializer};
 
-    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<BTreeMap<u64, String>, D::Error> {
-        BTreeMap::<String, String>::deserialize(d)?
+    /// Generic over the value since R2b, mirroring the producer: per-turn token
+    /// counts ride the same encoding as per-turn text.
+    pub fn deserialize<'de, V: Deserialize<'de>, D: Deserializer<'de>>(
+        d: D,
+    ) -> Result<BTreeMap<u64, V>, D::Error> {
+        BTreeMap::<String, V>::deserialize(d)?
             .into_iter()
             .map(|(k, v)| {
                 k.parse::<u64>()
@@ -606,6 +670,15 @@ fn decode_event(v: serde_json::Value) -> Result<Event, String> {
                 last_usage: Option<TokenUsage>,
                 #[serde(default, with = "turn_map")]
                 turns: BTreeMap<u64, String>,
+                /// Defaulted like `turns`: the producer omits an empty map, so
+                /// absent means "nothing new here", never "this consumer could
+                /// not read it".
+                #[serde(default, with = "turn_map")]
+                answers: BTreeMap<u64, String>,
+                #[serde(default, with = "turn_map")]
+                dates: BTreeMap<u64, String>,
+                #[serde(default, with = "turn_map")]
+                tokens: BTreeMap<u64, TokenUsage>,
             }
             let s: S = serde_json::from_value(v).map_err(of)?;
             Event::TimelineDelta {
@@ -615,6 +688,9 @@ fn decode_event(v: serde_json::Value) -> Result<Event, String> {
                 model: s.model,
                 last_usage: s.last_usage,
                 turns: s.turns,
+                answers: s.answers,
+                dates: s.dates,
+                tokens: s.tokens,
             }
         }
         "hook" => {

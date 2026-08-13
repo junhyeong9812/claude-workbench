@@ -30,7 +30,9 @@ use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager, State};
 
 use core_lib::remote::host::Emit;
-use core_lib::remote::proto::{decode_response, SessionsReply, TimelineSliceReply};
+use core_lib::remote::proto::{
+    decode_response, KilledReply, ResizedReply, SessionsReply, SpawnedReply, TimelineSliceReply,
+};
 use core_lib::remote::{
     HostConfig, HostSnapshot, RemoteAuth, RemoteTimelinePayload, Registry, Sink,
 };
@@ -200,6 +202,11 @@ pub struct RemoteTimeline {
     pub total: usize,
     pub items: Vec<core_lib::TimelineItem>,
     pub turns: Vec<(u64, String)>,
+    /// The same three the stream now carries (R2b ⓓ) — a body fetched for a
+    /// finished session must not be poorer than the one that streamed.
+    pub answers: Vec<(u64, String)>,
+    pub dates: Vec<(u64, String)>,
+    pub tokens: Vec<(u64, core_lib::TokenUsage)>,
     pub model: Option<String>,
     pub last_usage: Option<core_lib::TokenUsage>,
 }
@@ -223,9 +230,324 @@ pub fn remote_timeline(
         total: slice.total,
         items: slice.items,
         turns: slice.turns.into_iter().collect(),
+        answers: slice.answers.into_iter().collect(),
+        dates: slice.dates.into_iter().collect(),
+        tokens: slice.tokens.into_iter().collect(),
         model: slice.model,
         last_usage: slice.last_usage,
     })
+}
+
+
+/// The address of a remote session, or the reason there is not one.
+fn addr_of(remote: &State<'_, RemoteState>, host_id: &str, id: u64) -> Result<String, AppError> {
+    remote.registry.addr_of(host_id, id).ok_or_else(|| {
+        AppError::new(
+            "이 세션의 원격 주소를 알 수 없습니다 — 연결이 끊겼거나 데몬이 다시 시작되었습니다.",
+        )
+    })
+}
+
+/// Start an agent **on the remote host**.
+///
+/// The identity is chosen by [`account`] — an id from `cwcd accounts`, never a
+/// path. That is the daemon's rule, not this layer's convenience: the only way
+/// to name an agent home used to be a path field, which made the account list
+/// decoration, and it was removed from the wire for exactly that reason (R1b).
+/// Passing a path here would have to invent it back.
+#[tauri::command]
+pub fn remote_spawn(
+    remote: State<'_, RemoteState>,
+    host_id: String,
+    agent: String,
+    cwd: String,
+    account: Option<String>,
+    model: Option<String>,
+    prompt: Option<String>,
+    label: Option<String>,
+) -> Result<String, AppError> {
+    let mut args: Vec<&str> = vec!["spawn", "--agent", &agent, "--cwd", &cwd];
+    for (flag, value) in [
+        ("--account", &account),
+        ("--model", &model),
+        ("--prompt", &prompt),
+        ("--label", &label),
+    ] {
+        if let Some(v) = value.as_deref() {
+            if !v.is_empty() {
+                args.push(flag);
+                args.push(v);
+            }
+        }
+    }
+    let out = remote
+        .registry
+        .call(&host_id, &args)
+        .map_err(AppError::new)?;
+    let spawned: SpawnedReply = decode_response(&out).map_err(AppError::new)?;
+    Ok(spawned.session.key.to_string())
+}
+
+/// End a remote session. The reply reports the signal **actually delivered**,
+/// which is not always the one asked for (the daemon falls back to `SIGHUP`
+/// when the process group has already gone), so it is handed back rather than
+/// echoed.
+#[tauri::command]
+pub fn remote_kill(
+    remote: State<'_, RemoteState>,
+    host_id: String,
+    id: u64,
+    signal: Option<i32>,
+) -> Result<i32, AppError> {
+    let addr = addr_of(&remote, &host_id, id)?;
+    let signal = signal.map(|s| s.to_string());
+    let mut args: Vec<&str> = vec!["kill", &addr];
+    if let Some(s) = signal.as_deref() {
+        args.push("--signal");
+        args.push(s);
+    }
+    let out = remote
+        .registry
+        .call(&host_id, &args)
+        .map_err(AppError::new)?;
+    let killed: KilledReply = decode_response(&out).map_err(AppError::new)?;
+    Ok(killed.signal)
+}
+
+/// Resize a remote session's pty.
+///
+/// A command of its own rather than something smuggled through the attach
+/// stream: that stream is the agent's own bytes, and this one *answers*, so a
+/// resize that did not happen is visible instead of assumed. It costs one SSH
+/// round trip, so the caller should send settled sizes, not every frame of a
+/// drag.
+///
+/// The answer is **read**, and handed back as the size the pty now has. It was
+/// thrown away, which made the "answers" in the paragraph above untrue: the
+/// underlying `exec_capture` only fails on empty stdout, so a daemon that
+/// refused the resize — a finished session, an adopted one with no terminal —
+/// replied `{"response":"error",…}` and this returned `Ok(())`. Returning the
+/// size also gives the caller something to correct itself against, which a
+/// caller tracking "the last size I sent" cannot do.
+#[tauri::command]
+pub fn remote_resize(
+    remote: State<'_, RemoteState>,
+    host_id: String,
+    id: u64,
+    cols: u16,
+    rows: u16,
+) -> Result<RemoteSize, AppError> {
+    let addr = addr_of(&remote, &host_id, id)?;
+    let (cols, rows) = (cols.max(1).to_string(), rows.max(1).to_string());
+    let out = remote
+        .registry
+        .call(&host_id, &["resize", &addr, "--cols", &cols, "--rows", &rows])
+        .map_err(AppError::new)?;
+    let size: ResizedReply = decode_response(&out).map_err(AppError::new)?;
+    Ok(RemoteSize {
+        cols: size.cols,
+        rows: size.rows,
+    })
+}
+
+/// The size a remote pty has after [`remote_resize`] — the daemon's answer, not
+/// the request.
+#[derive(Clone, Copy, Serialize)]
+pub struct RemoteSize {
+    pub cols: u16,
+    pub rows: u16,
+}
+
+/// Open a **terminal** onto a remote session, and file it in the app's own
+/// session manager.
+///
+/// The returned id is an ordinary local session id: `terminal_write`,
+/// `terminal_resize`, `terminal_snapshot` and `terminal-output-{id}` all address
+/// it unchanged, because the transport underneath is the same byte relay every
+/// other session uses. That is the whole reason this is one SSH exec running
+/// `cwcd attach` rather than a new event kind — a remote terminal is the same
+/// object as a local one, not a parallel one.
+///
+/// Its **pty** size still belongs to the daemon, so a later resize goes through
+/// [`remote_resize`]; the SSH channel here is non-TTY and has no window of its
+/// own to change.
+#[tauri::command]
+pub fn remote_attach(
+    app: AppHandle,
+    // The **same** type `lib.rs` manages, which is the whole requirement:
+    // Tauri's state map is keyed by `TypeId`, so `State<Arc<SessionManager>>`
+    // against a managed bare `SessionManager` is a different key and every call
+    // fails at runtime with "state not managed" — while compiling cleanly,
+    // because `State<T>` is generic. `tests/state_registration.rs` now compares
+    // the two lists that have to agree, so the next one of these is a red test
+    // rather than a discovery made in the running app.
+    mgr: State<'_, core_lib::SessionManager>,
+    remote: State<'_, RemoteState>,
+    host_id: String,
+    id: u64,
+    cols: u16,
+    rows: u16,
+) -> Result<u64, AppError> {
+    let (config, known_hosts) = remote
+        .registry
+        .attach_config(&host_id, id, cols, rows)
+        .ok_or_else(|| {
+            AppError::new(
+                "이 세션의 터미널을 열 수 없습니다 — 연결이 끊겼거나 데몬이 다시 시작되었습니다.",
+            )
+        })?;
+    let (local_id, channels) = mgr.create_ssh(config, known_hosts, cols, rows, None);
+    let rx = mgr.subscribe(local_id).map_err(AppError::new)?;
+    super::spawn_output_relay(app.clone(), local_id, rx, None);
+
+    // The host key is already trusted (this host has a live link) — and a
+    // background attach has no moment to ask, so an unknown key is refused
+    // rather than prompted, exactly as the observation window does it.
+    {
+        let mut prompt_rx = channels.prompt_rx;
+        std::thread::spawn(move || {
+            while let Some(c) = prompt_rx.blocking_recv() {
+                let _ = c.reply.send(core_lib::ssh::HostKeyDecision::Reject);
+            }
+        });
+    }
+    // Whichever of the two relays below gets to the end first is the one that
+    // speaks, and the other stays quiet: a terminal that stopped once must not
+    // be reported as having stopped twice, and the *first* reason is the real
+    // one (the connection failing is why the exec never ran, not the reverse).
+    let said = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+    // `exec_rx` is bounded and its sender blocks: held-but-undrained, it would
+    // stall the read loop and, on a duplex session, the write direction with it.
+    // Drained here so the exit is *said* — a terminal that stops because the
+    // remote refused the command must not look like a quiet one.
+    {
+        let app = app.clone();
+        let host = host_id.clone();
+        let said = Arc::clone(&said);
+        let mut exec_rx = channels.exec_rx;
+        std::thread::spawn(move || {
+            let mut stderr = String::new();
+            while let Some(e) = exec_rx.blocking_recv() {
+                match e {
+                    core_lib::ssh::ExecEvent::Stderr(b) => {
+                        if stderr.len() < 4096 {
+                            stderr.push_str(&String::from_utf8_lossy(&b));
+                        }
+                    }
+                    core_lib::ssh::ExecEvent::Exit { code, signal } => {
+                        emit_terminal_ended(
+                            &app,
+                            &said,
+                            local_id,
+                            &host,
+                            code,
+                            signal,
+                            stderr.trim(),
+                        );
+                    }
+                    core_lib::ssh::ExecEvent::Error(msg) => {
+                        emit_terminal_ended(&app, &said, local_id, &host, None, None, &msg);
+                    }
+                }
+            }
+        });
+    }
+    // The connection's own lifecycle, which the exec channel cannot report:
+    // connect, auth, host-key and channel-open failures all happen *before*
+    // there is an exec, and the contract for that case is **zero** `ExecEvent`s.
+    // Dropped, as this was, they left the one symptom the whole path exists to
+    // avoid — an empty black window that says nothing and never will, until the
+    // user types into it and is told the session is dead.
+    //
+    // `Closed` also lands here (the link went away with no exec verdict). It
+    // gets a sentence rather than a bare phase because at this point the panel's
+    // only other information is that its terminal went quiet.
+    {
+        let app = app.clone();
+        let host = host_id.clone();
+        let said = Arc::clone(&said);
+        let mut status_rx = channels.status_rx;
+        std::thread::spawn(move || {
+            while let Some(s) = status_rx.blocking_recv() {
+                let detail = match s {
+                    core_lib::ssh::SshStatus::Connecting | core_lib::ssh::SshStatus::Ready => {
+                        continue
+                    }
+                    core_lib::ssh::SshStatus::Failed(reason) => {
+                        format!("원격 호스트에 연결하지 못했습니다: {reason}")
+                    }
+                    core_lib::ssh::SshStatus::Closed => {
+                        "원격 호스트와의 연결이 끊어졌습니다.".to_string()
+                    }
+                };
+                emit_terminal_ended(&app, &said, local_id, &host, None, None, &detail);
+            }
+        });
+    }
+    Ok(local_id)
+}
+
+/// Say once that a remote terminal is over. See the `said` flag in
+/// [`remote_attach`]: two relays watch two different ways for it to end, and a
+/// panel that is told twice would report the second, vaguer reason.
+fn emit_terminal_ended(
+    app: &AppHandle,
+    said: &Arc<std::sync::atomic::AtomicBool>,
+    id: u64,
+    host_id: &str,
+    code: Option<u32>,
+    signal: Option<String>,
+    detail: &str,
+) {
+    if said.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        return;
+    }
+    let _ = app.emit(
+        "remote-terminal-ended",
+        RemoteTerminalEnded {
+            id,
+            host_id: host_id.to_string(),
+            code,
+            signal,
+            detail: detail.to_string(),
+        },
+    );
+}
+
+/// Why a remote terminal stopped. Its own event kind because there is no other
+/// way to tell "the agent exited" from "`cwcd attach` was refused" — both leave
+/// the same silent terminal otherwise.
+#[derive(Clone, Serialize)]
+pub struct RemoteTerminalEnded {
+    pub id: u64,
+    pub host_id: String,
+    pub code: Option<u32>,
+    pub signal: Option<String>,
+    pub detail: String,
+}
+
+/// The accounts (agent homes) a host publishes — the input to [`remote_spawn`].
+#[tauri::command]
+pub fn remote_accounts(
+    remote: State<'_, RemoteState>,
+    host_id: String,
+) -> Result<serde_json::Value, AppError> {
+    let out = remote
+        .registry
+        .call(&host_id, &["accounts"])
+        .map_err(AppError::new)?;
+    let v: serde_json::Value = serde_json::from_str(&out)
+        .map_err(|e| AppError::new(format!("데몬 응답을 읽지 못했습니다: {e}")))?;
+    if v.get("response").and_then(|r| r.as_str()) == Some("error") {
+        return Err(AppError::new(
+            v.get("message")
+                .and_then(|m| m.as_str())
+                .unwrap_or("알 수 없는 오류")
+                .to_string(),
+        ));
+    }
+    Ok(v)
 }
 
 /// The host's own session list, asked directly rather than derived from the

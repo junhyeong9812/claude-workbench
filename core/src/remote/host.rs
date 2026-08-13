@@ -22,19 +22,28 @@
 //!
 //! ## What is deliberately not translated
 //!
-//! `answers`, `dates` and per-turn `tokens` are workbench-local derivations of
-//! a transcript (`jsonl::SessionTail`) and **the daemon does not put them on the
-//! wire** — `TimelineDelta` carries `items`, `turns`, `model` and `last_usage`,
-//! and `SessionSnapshot`/`TimelineSlice` carry the same set. They are therefore
-//! emitted empty, and the emptiness is a fact about the contract rather than a
-//! bug here. The same goes for `subagents`: the daemon tails one transcript per
-//! session and never opens `<uuid>/subagents/`. Both are recorded as known
-//! windows in this step's log; closing either is a change to the *daemon's*
-//! contract, which is another repository.
+//! `subagents` is still empty: the daemon tails **one** transcript per session
+//! and never opens `<uuid>/subagents/`, so a remote timeline shows a parallel
+//! agent's spawning tool call but not the agent's own items. Recorded as a
+//! known window; closing it is a change to the daemon's contract *and* to the
+//! payload-size behaviour the workbench had to fix once already (completed
+//! subagents' bodies were 77% of a local payload), so it is not a field this
+//! file can quietly start filling.
 //!
-//! There is likewise no source for `terminal-output-{id}`: the daemon's stream
-//! has no frame carrying an agent's terminal bytes at all. Remote terminal
-//! fidelity is R2b's, not a gap this file can paper over.
+//! `answers`, `dates` and per-turn `tokens` **were** in this list until R2b:
+//! the daemon folded them out of the transcript on every poll and dropped
+//! them, so a remote timeline showed the questions and the tool calls with a
+//! blank where every answer belonged. The daemon now writes all three
+//! (`TimelineDelta`, `SessionSnapshot`, `TimelineSlice`), and this file merges
+//! them the same way it merges `turns` — with one difference that matters: an
+//! answer *grows* while the assistant writes it, so a later value for a turn
+//! replaces the earlier one rather than being ignored as a duplicate.
+//!
+//! `terminal-output-{id}` now has a source too, but not through this file: a
+//! remote terminal is its own SSH exec running `cwcd attach`, whose stdout is
+//! the agent's bytes on the existing byte pipeline (`ssh::ExecStdin::Stream`).
+//! The event stream this module translates carries no terminal bytes and is not
+//! meant to.
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -84,11 +93,12 @@ pub struct RemoteTimelinePayload {
     pub id: u64,
     pub items: Vec<TimelineItem>,
     pub turns: Vec<(u64, String)>,
-    /// Always empty — see the module docs.
+    /// The assistant's reply per turn, its timestamp, and its token cost — the
+    /// same three the local payload carries (R2b closed the gap; see the module
+    /// docs for what a daemon older than that sends instead: nothing, which
+    /// decodes as empty).
     pub answers: Vec<(u64, String)>,
-    /// Always empty — see the module docs.
     pub dates: Vec<(u64, String)>,
-    /// Always empty — see the module docs.
     pub tokens: Vec<(u64, TokenUsage)>,
     pub model: Option<String>,
     pub last_usage: Option<TokenUsage>,
@@ -259,6 +269,11 @@ struct Session {
     /// harmless (the daemon's contract says so explicitly).
     items: Vec<TimelineItem>,
     turns: BTreeMap<u64, String>,
+    /// The assistant's side of each turn, what it cost, and when — the three
+    /// the daemon used to leave off the wire entirely (R2a known window #1).
+    answers: BTreeMap<u64, String>,
+    dates: BTreeMap<u64, String>,
+    tokens: BTreeMap<u64, TokenUsage>,
     model: Option<String>,
     last_usage: Option<TokenUsage>,
     body_omitted: bool,
@@ -274,6 +289,9 @@ impl Session {
             view,
             items: Vec::new(),
             turns: BTreeMap::new(),
+            answers: BTreeMap::new(),
+            dates: BTreeMap::new(),
+            tokens: BTreeMap::new(),
             model: None,
             last_usage: None,
             body_omitted: false,
@@ -302,9 +320,9 @@ impl Session {
             id: self.id,
             items,
             turns: self.turns.iter().map(|(k, v)| (*k, v.clone())).collect(),
-            answers: Vec::new(),
-            dates: Vec::new(),
-            tokens: Vec::new(),
+            answers: self.answers.iter().map(|(k, v)| (*k, v.clone())).collect(),
+            dates: self.dates.iter().map(|(k, v)| (*k, v.clone())).collect(),
+            tokens: self.tokens.iter().map(|(k, v)| (*k, *v)).collect(),
             model: self.model.clone(),
             last_usage: self.last_usage,
             subagents: Vec::new(),
@@ -719,6 +737,9 @@ impl Host {
                 model,
                 last_usage,
                 turns,
+                answers,
+                dates,
+                tokens,
             } = snap;
             // Reuse the existing id when we already knew this key, so a resync
             // does not make a viewer think its session was replaced.
@@ -739,6 +760,9 @@ impl Host {
             if !items_omitted {
                 sess.items = items;
                 sess.turns = turns;
+                sess.answers = answers;
+                sess.dates = dates;
+                sess.tokens = tokens;
             }
             sess.model = model;
             sess.last_usage = last_usage;
@@ -835,12 +859,20 @@ impl Host {
                 model,
                 last_usage,
                 turns,
+                answers,
+                dates,
+                tokens,
                 ..
             } => {
                 if let Some(i) = self.index_of(&key) {
                     let s = &mut self.sessions[i];
                     s.merge_items(items);
                     s.turns.extend(turns);
+                    // Later value wins: an answer grows while it is written,
+                    // and the daemon re-sends the turn each time it does.
+                    s.answers.extend(answers);
+                    s.dates.extend(dates);
+                    s.tokens.extend(tokens);
                     if model.is_some() {
                         s.model = model;
                     }
@@ -993,6 +1025,58 @@ mod tests {
             vec![Emit::Hook { uuid: "h1/5b6f21e0".into(), event: "Stop".into() }],
             "a bare uuid could name a local session; the host prefix makes that impossible"
         );
+    }
+
+    /// ⓓ on the consumer side: the three maps the daemon started sending reach
+    /// the payload the frontend renders, and an answer that grows replaces the
+    /// fragment it grew from instead of being ignored as a duplicate turn.
+    #[test]
+    fn an_answer_that_grows_replaces_the_fragment_it_grew_from() {
+        let mut h = host();
+        h.apply(hello("e1", r#"{"kind":"fresh"}"#)).unwrap();
+        h.apply(spawned(1, "e1", "k1", "u1")).unwrap();
+
+        let out = h
+            .apply(delta(
+                2,
+                "e1",
+                "k1",
+                "u1",
+                r#""items":[],"turns":{"1":"ask"},"answers":{"1":"forty"},"dates":{"1":"2026-08-13"},"tokens":{"1":{"input":11,"output":7,"cache_read":0,"cache_creation":0}}"#,
+            ))
+            .unwrap();
+        let Emit::Timeline(p) = &out[0] else { panic!() };
+        assert_eq!(p.answers, vec![(1, "forty".to_string())]);
+        assert_eq!(p.dates, vec![(1, "2026-08-13".to_string())]);
+        assert_eq!(p.tokens.len(), 1);
+        assert_eq!(p.tokens[0].1.input, 11);
+
+        // The assistant kept writing: same turn, longer answer, more tokens.
+        let out = h
+            .apply(delta(
+                3,
+                "e1",
+                "k1",
+                "u1",
+                r#""items":[],"answers":{"1":"forty-two"},"tokens":{"1":{"input":11,"output":19,"cache_read":0,"cache_creation":0}}"#,
+            ))
+            .unwrap();
+        let Emit::Timeline(p) = &out[0] else { panic!() };
+        assert_eq!(
+            p.answers,
+            vec![(1, "forty-two".to_string())],
+            "the later value must win — a turn-keyed dedupe would freeze the reply at its first fragment"
+        );
+        assert_eq!(p.tokens[0].1.output, 19);
+        assert_eq!(p.turns, vec![(1, "ask".to_string())], "the prompt is untouched");
+
+        // A daemon older than R2b sends none of them; that must decode as
+        // "nothing new", not as a broken delta.
+        let out = h
+            .apply(delta(4, "e1", "k1", "u1", r#""items":[],"turns":{"2":"ask again"}"#))
+            .unwrap();
+        let Emit::Timeline(p) = &out[0] else { panic!() };
+        assert_eq!(p.answers, vec![(1, "forty-two".to_string())], "absent != cleared");
     }
 
     #[test]

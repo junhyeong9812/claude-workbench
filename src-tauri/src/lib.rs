@@ -89,9 +89,36 @@ pub fn run() {
     align_ime_module();
     strip_nested_claude_env();
 
-    tauri::Builder::default()
-        .plugin(tauri_plugin_dialog::init())
-        .plugin(tauri_plugin_notification::init())
+    register(
+        tauri::Builder::default()
+            .plugin(tauri_plugin_dialog::init())
+            .plugin(tauri_plugin_notification::init()),
+    )
+    .build(tauri::generate_context!())
+    .expect("error while building tauri application")
+    .run(run_event);
+}
+
+/// Managed state and the command surface — the **one** list of each, and the
+/// one `tests/state_registration.rs` reads.
+///
+/// It is a function rather than a chain inside [`run`] because the pairing it
+/// expresses — every `State<T>` a command asks for against the `T` that was
+/// actually managed — is checked by neither the compiler nor any test that calls
+/// a command as a plain function. Tauri's state map is keyed by `TypeId`, so a
+/// command written `State<Arc<SessionManager>>` against
+/// `.manage(SessionManager::new())` names a key that was never inserted. It
+/// compiles (because `State<T>` is generic), it passes every Rust test that
+/// reaches the function directly, and it fails **only** in the running app, on
+/// every call, with "state not managed". That is exactly what shipped in
+/// `remote_attach`, where it made the remote terminal button dead on arrival.
+///
+/// The invoke layer cannot be driven from a test here — these commands take a
+/// concrete `AppHandle`, so Tauri's mock runtime cannot host them — so the test
+/// checks the same pairing at the source: every state type any command asks for
+/// must appear in the list below.
+pub fn register(builder: tauri::Builder<tauri::Wry>) -> tauri::Builder<tauri::Wry> {
+    builder
         .manage(core_lib::SessionManager::new())
         .manage(commands::claude::runtime::ClaudeState::default())
         .manage(commands::ssh::SshState::default())
@@ -124,13 +151,18 @@ pub fn run() {
             commands::ssh::ssh_hostkey_decision,
             commands::ssh::ssh_store_secret,
             commands::ssh::ssh_delete_secret,
-            // R2a 원격 호스트 — 관찰 전용(스폰·종료·입력 없음).
+            // 원격 호스트 — R2a 관찰 + R2b 조종(스폰·종료·터미널·리사이즈).
             commands::remote::remote_connect,
             commands::remote::remote_disconnect,
             commands::remote::remote_hosts,
             commands::remote::remote_timelines,
             commands::remote::remote_timeline,
             commands::remote::remote_sessions,
+            commands::remote::remote_spawn,
+            commands::remote::remote_kill,
+            commands::remote::remote_resize,
+            commands::remote::remote_attach,
+            commands::remote::remote_accounts,
             commands::terminal::scrollback_set_enabled,
             commands::claude::runtime::claude_open_or_attach,
             commands::claude::runtime::claude_write,
@@ -219,65 +251,66 @@ pub fn run() {
             commands::git::git_resolve_ours,
             commands::git::git_resolve_theirs,
         ])
-        .build(tauri::generate_context!())
-        .expect("error while building tauri application")
-        .run(|app_handle, event| {
-            use tauri::Manager;
-            match event {
-                // Normal quit (last window closed / OS quit): kill every PTY child
-                // so no orphaned `claude`/shell process lingers after exit. The
-                // window-close itself is driven by the frontend (`win.destroy()`);
-                // this only guarantees clean child teardown on the way out.
-                tauri::RunEvent::ExitRequested { .. } => {
-                    app_handle.state::<core_lib::SessionManager>().kill_all();
-                }
-                // Main window gone = the app should quit — even if a popout
-                // teardown stalled and left other windows alive. Without this,
-                // `ExitRequested` only fires when the *last* window closes, so a
-                // hung shutdown that force-destroys only the main window would
-                // leave the process (and popouts) running. exit(0) force-quits
-                // everything; kill_all() reaps children first.
-                tauri::RunEvent::WindowEvent {
-                    label,
-                    event: tauri::WindowEvent::Destroyed,
-                    ..
-                } if label == "main" => {
-                    app_handle.state::<core_lib::SessionManager>().kill_all();
-                    app_handle.exit(0);
-                }
-                // Hard backstop for the X button: the frontend intercepts the close
-                // (preventDefault) to tear sessions down, then `destroy()`s the
-                // window — which fires `Destroyed` above and exits. But if the
-                // WebView's JS loop freezes mid-teardown, neither `destroy()` nor its
-                // watchdog timer runs and the window can never close. So once the
-                // main window's close is requested, force-quit after a grace period
-                // regardless of the WebView's state. The graceful path normally wins
-                // first (the process is already gone before this fires); this only
-                // bites when the frontend is wedged. `kill_all` reaps PTY children.
-                tauri::RunEvent::WindowEvent {
-                    label,
-                    event: tauri::WindowEvent::CloseRequested { .. },
-                    ..
-                } if label == "main" => {
-                    // Arm exactly once: repeated X clicks (the window is still up
-                    // while wedged) must not pile up timers.
-                    if !CLOSE_BACKSTOP_ARMED.swap(true, std::sync::atomic::Ordering::SeqCst) {
-                        let h = app_handle.clone();
-                        std::thread::spawn(move || {
-                            std::thread::sleep(std::time::Duration::from_secs(5));
-                            // kill_all is non-blocking (signals children, no join,
-                            // poison-tolerant) so it can't wedge this thread; it
-                            // reaps PTY children so none are orphaned.
-                            h.state::<core_lib::SessionManager>().kill_all();
-                            // process::exit, NOT AppHandle::exit: the latter routes
-                            // through the (possibly wedged) event loop — the very
-                            // thing we're escaping. This terminates at the OS level
-                            // immediately and can't hang.
-                            std::process::exit(0);
-                        });
-                    }
-                }
-                _ => {}
+}
+
+/// The app's run loop: shutdown and the close backstop. Split out only so
+/// [`register`] can end where the command list does.
+fn run_event(app_handle: &tauri::AppHandle, event: tauri::RunEvent) {
+    use tauri::Manager;
+    match event {
+        // Normal quit (last window closed / OS quit): kill every PTY child
+        // so no orphaned `claude`/shell process lingers after exit. The
+        // window-close itself is driven by the frontend (`win.destroy()`);
+        // this only guarantees clean child teardown on the way out.
+        tauri::RunEvent::ExitRequested { .. } => {
+            app_handle.state::<core_lib::SessionManager>().kill_all();
+        }
+        // Main window gone = the app should quit — even if a popout
+        // teardown stalled and left other windows alive. Without this,
+        // `ExitRequested` only fires when the *last* window closes, so a
+        // hung shutdown that force-destroys only the main window would
+        // leave the process (and popouts) running. exit(0) force-quits
+        // everything; kill_all() reaps children first.
+        tauri::RunEvent::WindowEvent {
+            label,
+            event: tauri::WindowEvent::Destroyed,
+            ..
+        } if label == "main" => {
+            app_handle.state::<core_lib::SessionManager>().kill_all();
+            app_handle.exit(0);
+        }
+        // Hard backstop for the X button: the frontend intercepts the close
+        // (preventDefault) to tear sessions down, then `destroy()`s the
+        // window — which fires `Destroyed` above and exits. But if the
+        // WebView's JS loop freezes mid-teardown, neither `destroy()` nor its
+        // watchdog timer runs and the window can never close. So once the
+        // main window's close is requested, force-quit after a grace period
+        // regardless of the WebView's state. The graceful path normally wins
+        // first (the process is already gone before this fires); this only
+        // bites when the frontend is wedged. `kill_all` reaps PTY children.
+        tauri::RunEvent::WindowEvent {
+            label,
+            event: tauri::WindowEvent::CloseRequested { .. },
+            ..
+        } if label == "main" => {
+            // Arm exactly once: repeated X clicks (the window is still up
+            // while wedged) must not pile up timers.
+            if !CLOSE_BACKSTOP_ARMED.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                let h = app_handle.clone();
+                std::thread::spawn(move || {
+                    std::thread::sleep(std::time::Duration::from_secs(5));
+                    // kill_all is non-blocking (signals children, no join,
+                    // poison-tolerant) so it can't wedge this thread; it
+                    // reaps PTY children so none are orphaned.
+                    h.state::<core_lib::SessionManager>().kill_all();
+                    // process::exit, NOT AppHandle::exit: the latter routes
+                    // through the (possibly wedged) event loop — the very
+                    // thing we're escaping. This terminates at the OS level
+                    // immediately and can't hang.
+                    std::process::exit(0);
+                });
             }
-        });
+        }
+        _ => {}
+    }
 }
