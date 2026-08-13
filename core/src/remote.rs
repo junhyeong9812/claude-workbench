@@ -59,6 +59,16 @@ impl Registry {
     }
 
     /// Attach (or re-attach) a host. Returns the id it was filed under.
+    ///
+    /// A re-attach reads the world again rather than resuming from the cursor
+    /// the previous link had. That is not a missed optimisation: a cursor is
+    /// only meaningful *together with the state it was taken at*, and detaching
+    /// throws that state away. Resuming from a bare cursor would leave every
+    /// session that existed before the detach permanently absent — the daemon
+    /// would say "continued, you have missed nothing" and be right about the
+    /// events while the workbench was missing the world they describe. The
+    /// gap-free resume that matters is the one inside a live link, where the
+    /// state and the cursor travel together (`link::run`).
     pub fn attach(&self, cfg: HostConfig, sink: Arc<dyn Sink>) -> String {
         let id = cfg.host_id.clone();
         let link = Link::start(cfg, sink);

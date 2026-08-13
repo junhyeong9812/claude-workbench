@@ -182,6 +182,7 @@ impl Link {
         self.state.lock().unwrap_or_else(|p| p.into_inner()).snapshot()
     }
 
+
     /// The `"<epoch>:k<n>"` address of a remote session id, when this link has
     /// both halves. See the module docs.
     pub fn addr_of(&self, id: u64) -> Option<String> {
@@ -273,10 +274,16 @@ fn run(cfg: HostConfig, state: Arc<Mutex<Host>>, cancel: Arc<AtomicBool>, sink: 
         }
         backoff = (backoff * 2).min(BACKOFF_MAX);
     }
-    state
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .set_phase(Phase::Idle);
+    // Only a *cancel* leaves the host idle. A loop that ended because the
+    // daemon is unreadable must keep saying `Failed` — overwriting it with
+    // `Idle` would turn a refusal the user has to act on into a connection that
+    // simply never happened, which is the quiet failure this step forbids.
+    if cancel.load(Ordering::SeqCst) {
+        state
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .set_phase(Phase::Idle);
+    }
 }
 
 /// One observation window: open the exec, read NDJSON until it ends.

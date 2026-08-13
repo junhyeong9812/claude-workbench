@@ -411,6 +411,7 @@ impl Host {
         self.phase
     }
 
+
     /// The cursor to resume from, if any. Handed to `cwcd stream --cursor`
     /// verbatim; it is the daemon's own string.
     pub fn cursor(&self) -> Option<&str> {
