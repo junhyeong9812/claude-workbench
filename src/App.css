@@ -5471,3 +5471,231 @@ body {
   color: var(--fg);
   background: var(--bg-hover);
 }
+
+/* ---- 원격 호스트 패널 (R2a) --------------------------------------------
+   다른 PC의 데몬을 관찰하는 사이드바 탭. 새 어휘를 만들지 않는다: 알림 줄은
+   .claudeterm-refine-note 를 그대로 쓰고, 여기 있는 것은 목록·배지뿐이다. */
+.remote-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  height: 100%;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 6px;
+  font-size: 0.85em;
+}
+.remote-connect {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.remote-connect select,
+.remote-connect input {
+  min-width: 0;
+  width: 100%;
+  background: var(--bg-alt, #1e1e2e);
+  color: var(--fg, #cdd6f4);
+  border: 1px solid var(--border, #333);
+  border-radius: 3px;
+  padding: 3px 6px;
+}
+.remote-empty {
+  padding: 6px 2px;
+  color: var(--fg-dim);
+  line-height: 1.6;
+}
+.remote-host {
+  border: 1px solid var(--border, #333);
+  border-radius: 4px;
+  padding: 6px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.remote-host-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+.remote-host-head strong {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.remote-host-head button {
+  margin-left: auto;
+}
+.remote-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  flex: 0 0 auto;
+  background: var(--fg-dim);
+}
+.remote-dot-live {
+  background: var(--st-ok, #a6e3a1);
+}
+.remote-dot-connecting,
+.remote-dot-reconnecting {
+  background: var(--st-warn, #f9e2af);
+}
+.remote-dot-failed {
+  background: var(--st-err, #f38ba8);
+}
+.remote-phase {
+  color: var(--fg-dim);
+}
+.remote-badge {
+  padding: 0 5px;
+  border-radius: 8px;
+  font-size: 0.8em;
+  color: var(--bg, #11111b);
+  background: var(--fg-dim);
+}
+.remote-badge-warn {
+  background: var(--st-warn, #f9e2af);
+}
+.remote-badge-error {
+  background: var(--st-err, #f38ba8);
+}
+.remote-host-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 10px;
+  color: var(--fg-dim);
+  font-size: 0.92em;
+}
+.remote-host-meta code {
+  word-break: break-all;
+}
+.remote-notices {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.remote-notice {
+  padding: 3px 6px;
+  border-radius: 3px;
+  line-height: 1.5;
+  background: color-mix(in srgb, var(--fg-dim) 12%, transparent);
+}
+.remote-notice-warn {
+  background: color-mix(in srgb, var(--st-warn) 18%, transparent);
+}
+.remote-notice-error {
+  background: color-mix(in srgb, var(--st-err) 18%, transparent);
+}
+.remote-notice-time {
+  margin-right: 6px;
+  color: var(--fg-dim);
+}
+.remote-sessions {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+.remote-session {
+  border-top: 1px solid var(--border, #333);
+  padding-top: 3px;
+}
+.remote-session-closed {
+  opacity: 0.75;
+}
+.remote-session-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  width: 100%;
+  min-width: 0;
+  background: transparent;
+  border: none;
+  color: inherit;
+  cursor: pointer;
+  text-align: left;
+  padding: 1px 0;
+}
+.remote-caret {
+  flex: 0 0 auto;
+  color: var(--fg-dim);
+}
+.remote-agent {
+  flex: 0 0 auto;
+  color: var(--fg-dim);
+}
+.remote-session-name {
+  flex: 1 1 0;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.remote-state {
+  flex: 0 0 auto;
+  color: var(--fg-dim);
+}
+.remote-state-running {
+  color: var(--st-ok, #a6e3a1);
+}
+.remote-state-exited {
+  color: var(--fg-dim);
+}
+.remote-counts {
+  flex: 0 0 auto;
+  color: var(--fg-dim);
+  font-size: 0.9em;
+}
+.remote-session-sub {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 2px 8px;
+  color: var(--fg-dim);
+  font-size: 0.88em;
+  padding-left: 14px;
+}
+.remote-session-sub code {
+  overflow-wrap: anywhere;
+}
+.remote-adopted {
+  color: var(--st-warn, #f9e2af);
+}
+.remote-timeline {
+  padding: 4px 0 4px 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.remote-turn {
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+.remote-turn-no {
+  margin-right: 5px;
+  color: var(--fg-dim);
+}
+.remote-item {
+  display: flex;
+  gap: 6px;
+  min-width: 0;
+}
+.remote-kind {
+  flex: 0 0 auto;
+  width: 3.4em;
+  color: var(--fg-dim);
+  font-size: 0.85em;
+}
+.remote-item-title {
+  flex: 1 1 0;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.remote-item-status {
+  flex: 0 0 auto;
+  color: var(--fg-dim);
+}

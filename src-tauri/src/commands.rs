@@ -23,6 +23,8 @@ pub mod git;
 pub mod graph;
 mod hookserver;
 pub mod memo;
+/// R2a — 원격 호스트 연결과 이벤트 브리지(관찰 전용).
+pub mod remote;
 pub mod refine;
 pub mod ssh;
 pub mod terminal;

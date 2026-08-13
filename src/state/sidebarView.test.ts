@@ -215,8 +215,10 @@ describe("ctrlBAction (하이브리드 — 리뷰 반영)", () => {
 });
 
 describe("SIDEBAR_TABS", () => {
-  it("covers the five activity-bar tabs", () => {
-    const expected: SidebarTab[] = ["files", "git", "worktree", "archive", "graph"];
+  it("covers the activity-bar tabs, in order", () => {
+    // R2a 가 "remote" 를 뒤에 붙였다 — 순서는 액티비티 바의 표시 순서라
+    // 값 단언을 유지한다(길이만 보면 이름이 바뀌어도 통과한다).
+    const expected: SidebarTab[] = ["files", "git", "worktree", "archive", "graph", "remote"];
     expect([...SIDEBAR_TABS]).toEqual(expected);
   });
 

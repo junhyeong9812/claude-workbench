@@ -19,6 +19,7 @@ import { FolderTree } from "./components/FolderTree";
 import { GitPanel } from "./components/GitPanel";
 import { WorktreePanel } from "./components/WorktreePanel";
 import { ArchivePanel } from "./components/ArchivePanel";
+import { RemoteHostPanel } from "./components/RemoteHostPanel";
 import { GraphPanel } from "./components/GraphPanel";
 import { MainArea } from "./components/MainArea";
 import { DevView } from "./components/DevView";
@@ -88,13 +89,14 @@ import "./App.css";
 const TOOLBAR_GROUP_COLLAPSE = 750;
 const TOOLBAR_MODE_COLLAPSE = 430;
 
-/** 사이드바 탭 5종의 표시 메타 — 액티비티 바와 반쪽 헤더 seg가 공유한다. */
+/** 사이드바 탭들의 표시 메타 — 액티비티 바와 반쪽 헤더 seg가 공유한다. */
 const SIDE_TABS = [
   { key: "files", ico: "🗂", label: "파일" },
   { key: "git", ico: "⎇", label: "Git" },
   { key: "worktree", ico: "🌿", label: "워크트리" },
   { key: "archive", ico: "📦", label: "아카이브" },
   { key: "graph", ico: "◉", label: "그래프" },
+  { key: "remote", ico: "🛰", label: "원격" },
 ] as const satisfies readonly { key: SidebarTab; ico: string; label: string }[];
 
 /** 사이드바 탭 하나의 본문 — 분할 ON/OFF가 같은 렌더를 공유한다. */
@@ -103,6 +105,7 @@ function SidebarTabBody({ tab }: { tab: SidebarTab }) {
   if (tab === "git") return <GitPanel />;
   if (tab === "worktree") return <WorktreePanel />;
   if (tab === "archive") return <ArchivePanel />;
+  if (tab === "remote") return <RemoteHostPanel />;
   return <GraphPanel />;
 }
 
