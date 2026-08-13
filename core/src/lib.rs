@@ -28,6 +28,10 @@ pub mod memo_store;
 pub mod pathguard;
 pub mod persist;
 pub mod project_type;
+/// R2a — observing another machine's `cwcd` daemon over SSH (purely additive:
+/// see the module docs for why a remote session cannot be mistaken for a local
+/// one).
+pub mod remote;
 pub mod runner;
 pub mod scan;
 pub mod scrollback_store;
