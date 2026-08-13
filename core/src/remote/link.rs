@@ -763,7 +763,17 @@ fn permanent_reason(status_error: Option<&str>, stderr: &str, exit_code: Option<
     // The remote shell's own verdict. 127 is "command not found"; the message
     // differs by shell, so the code is what is matched and the text is only
     // shown.
-    if exit_code == Some(127) || stderr.contains("not found") {
+    //
+    // **The code, and nothing but the code.** `stderr` is the accumulated first
+    // 4 KB of a whole attach — and an attach is a `cwcd stream` that runs for
+    // hours. A substring rule on it (`"not found"`) meant that one daemon log
+    // line about a missing transcript rewrote every later, perfectly ordinary
+    // disconnect into a terminal failure telling the user to install a daemon
+    // that is demonstrably running. The same classifier serves `exec_capture`,
+    // so a short command whose reply mentioned a missing session was condemned
+    // the same way. A missing `cwcd` already arrives as the shell's 127, which
+    // is a fact about the *process*, not a phrase inside its output.
+    if exit_code == Some(127) {
         let detail = if stderr.is_empty() { String::new() } else { format!(" — {stderr}") };
         return Some(format!(
             "원격 호스트에서 cwcd 를 실행하지 못했습니다{detail}. 데몬을 설치하거나 이 연결의 cwcd 경로를 지정한 뒤 다시 연결하세요."
@@ -924,6 +934,36 @@ mod tests {
         }
         assert_eq!(permanent_reason(None, "", Some(0)), None);
         assert_eq!(permanent_reason(None, "", None), None);
+    }
+
+    /// **stderr text alone must never make a link permanently failed.**
+    ///
+    /// `stderr` here is the first 4 KB of an *entire attach*, and the attach is a
+    /// long-lived `cwcd stream`: one line of `transcript not found` logged hours
+    /// ago would, on a substring rule, turn every later blip — a lid closed, a
+    /// Wi-Fi drop — into a terminal `Failed` with the wrong prescription on
+    /// screen ("install the daemon") for a daemon that is plainly running. The
+    /// permanence decision is therefore made on the **structured** signal (the
+    /// exit code); the text is only ever shown.
+    #[test]
+    fn a_stderr_line_alone_never_makes_a_link_permanently_failed() {
+        for (err, stderr, code) in [
+            (None, "warn: transcript not found for k3", None),
+            (None, "cwcd: command not found", Some(0)),
+            (None, "session not found: e1:k9", Some(1)),
+            (Some("could not connect to the host"), "transcript not found", None),
+        ] {
+            assert_eq!(
+                permanent_reason(err, stderr, code),
+                None,
+                "a running daemon's own log line must stay retryable: {stderr:?}"
+            );
+        }
+        // …while the shell's verdict still stops the loop, and the text it came
+        // with is shown as the detail rather than used as the decision.
+        let msg = permanent_reason(None, "sh: 1: cwcd: not found", Some(127))
+            .expect("127 is the missing daemon");
+        assert!(msg.contains("cwcd: not found"), "the text is the detail: {msg}");
     }
 
     /// A reply that hit the collector's cap lost its **front**, so parsing it
