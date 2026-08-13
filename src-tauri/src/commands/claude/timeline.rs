@@ -691,6 +691,51 @@ pub(super) fn run_timeline_poll(
 mod tests {
     use super::*;
 
+    /// A remote session's `claude-timeline` payload must be **this** payload's
+    /// shape, because the frontend reads both with one type and no branch.
+    ///
+    /// Derived from the producer, not from a copy of it: the key set comes out
+    /// of serialising [`ClaudeTimelinePayload`] itself, so adding a field here
+    /// fails this test instead of leaving the remote panel to render with a
+    /// field that is simply missing. (The earlier version of this check lived in
+    /// `core` and compared against a hand-written list of names — it could not
+    /// see this struct at all, so it passed no matter what was added to it.)
+    #[test]
+    fn the_remote_payload_has_the_same_shape_as_this_one() {
+        let local = ClaudeTimelinePayload {
+            id: 1,
+            items: vec![],
+            turns: vec![],
+            answers: vec![],
+            dates: vec![],
+            tokens: vec![],
+            model: None,
+            last_usage: None,
+            subagents: vec![],
+        };
+        let remote = core_lib::remote::RemoteTimelinePayload {
+            id: 1,
+            items: vec![],
+            turns: vec![],
+            answers: vec![],
+            dates: vec![],
+            tokens: vec![],
+            model: None,
+            last_usage: None,
+            subagents: vec![],
+        };
+        let keys = |v: serde_json::Value| {
+            let mut k: Vec<String> = v.as_object().expect("object").keys().cloned().collect();
+            k.sort();
+            k
+        };
+        assert_eq!(
+            keys(serde_json::to_value(&local).expect("local")),
+            keys(serde_json::to_value(&remote).expect("remote")),
+            "the remote bridge emits `claude-timeline` too — the shapes must not drift apart"
+        );
+    }
+
     /// serde로 최소 필드 TimelineItem 픽스처 생성 (shell()은 pub(crate) of core).
     fn item(tool_call_id: &str, content_text: Option<&str>) -> TimelineItem {
         serde_json::from_value(serde_json::json!({

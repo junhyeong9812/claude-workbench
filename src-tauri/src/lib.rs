@@ -97,6 +97,7 @@ pub fn run() {
         .manage(commands::ssh::SshState::default())
         .manage(commands::ScrollbackState::default())
         .manage(commands::codex::CodexState::default())
+        .manage(commands::remote::RemoteState::default())
         .invoke_handler(tauri::generate_handler![
             commands::files::read_dir,
             commands::files::detect_project_types,
@@ -123,6 +124,13 @@ pub fn run() {
             commands::ssh::ssh_hostkey_decision,
             commands::ssh::ssh_store_secret,
             commands::ssh::ssh_delete_secret,
+            // R2a 원격 호스트 — 관찰 전용(스폰·종료·입력 없음).
+            commands::remote::remote_connect,
+            commands::remote::remote_disconnect,
+            commands::remote::remote_hosts,
+            commands::remote::remote_timelines,
+            commands::remote::remote_timeline,
+            commands::remote::remote_sessions,
             commands::terminal::scrollback_set_enabled,
             commands::claude::runtime::claude_open_or_attach,
             commands::claude::runtime::claude_write,

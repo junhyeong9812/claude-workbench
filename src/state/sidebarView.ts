@@ -11,7 +11,7 @@
  * 이 파일은 손계산 가능한 규칙만 갖는다.
  */
 
-export const SIDEBAR_TABS = ["files", "git", "worktree", "archive", "graph"] as const;
+export const SIDEBAR_TABS = ["files", "git", "worktree", "archive", "graph", "remote"] as const;
 export type SidebarTab = (typeof SIDEBAR_TABS)[number];
 
 /** 분할 ON일 때의 두 반쪽. (반쪽 개별 접기는 범위 밖 — 접기는 전체 단위.) */

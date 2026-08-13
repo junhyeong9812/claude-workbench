@@ -209,7 +209,11 @@ const SSH_KEYRING_SERVICE: &str = "claude-workbench-ssh";
 
 /// Best-effort secret read for a connection id — `None` on any miss/error (the
 /// connect path then proceeds without a stored secret).
-fn ssh_get_secret(id: &str) -> Option<String> {
+///
+/// `pub(super)` so the remote-host connect path (R2a) reads a saved connection's
+/// secret through the **same** function, keeping one rule for where secrets come
+/// from rather than two that can drift.
+pub(super) fn ssh_get_secret(id: &str) -> Option<String> {
     keyring::Entry::new(SSH_KEYRING_SERVICE, id)
         .ok()?
         .get_password()

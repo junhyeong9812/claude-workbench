@@ -39,3 +39,13 @@ portable-pty = "0.9"
 # SSH session thread; SessionManager's public API stays synchronous.
 russh = "0.54"
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "sync", "macros", "net", "time", "io-util"] }
+
+# The remote end-to-end test (`tests/remote_ssh.rs`) stands up a **real** SSH
+# server in-process and talks to a **real** `cwcd` daemon through it, so it
+# needs the same two crates the client side uses. Same versions as above, so
+# nothing extra is compiled; they are repeated here only because an integration
+# test cannot reach a crate's ordinary dependencies.
+[dev-dependencies]
+russh = "0.54"
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "sync", "macros", "net", "time", "io-util", "process"] }
+libc = "0.2"
