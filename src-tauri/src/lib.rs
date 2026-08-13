@@ -173,6 +173,13 @@ pub fn register(builder: tauri::Builder<tauri::Wry>) -> tauri::Builder<tauri::Wr
             commands::remote::remote_resize,
             commands::remote::remote_attach,
             commands::remote::remote_accounts,
+            // 원격 호스트의 **데이터** — 프로젝트·트리·git·워크트리 (R2, 읽기 전용).
+            commands::remote::remote_projects,
+            commands::remote::remote_tree,
+            commands::remote::remote_git_status,
+            commands::remote::remote_git_log,
+            commands::remote::remote_worktrees,
+            commands::remote::remote_git_roots,
             commands::terminal::scrollback_set_enabled,
             commands::claude::runtime::claude_open_or_attach,
             commands::claude::runtime::claude_write,

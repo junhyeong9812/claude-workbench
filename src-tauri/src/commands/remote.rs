@@ -31,7 +31,8 @@ use tauri::{AppHandle, Emitter, Manager, State};
 
 use core_lib::remote::host::Emit;
 use core_lib::remote::proto::{
-    decode_response, KilledReply, ResizedReply, SessionsReply, SpawnedReply, TimelineSliceReply,
+    decode_response, DirReply, GitLogReply, GitRootsReply, GitStatusReply, KilledReply,
+    ProjectsReply, ResizedReply, SessionsReply, SpawnedReply, TimelineSliceReply, WorktreesReply,
 };
 use core_lib::remote::{
     HostConfig, HostSnapshot, RemoteAuth, RemoteTimelinePayload, Registry, Sink,
@@ -599,6 +600,157 @@ pub fn remote_accounts(
         ));
     }
     Ok(v)
+}
+
+// ---------------------------------------------------------------------------
+// R2 — the host as a **data source**: its projects, trees, git and worktrees
+// ---------------------------------------------------------------------------
+//
+// R2a made a host's *sessions* visible. What makes it a place you can work on
+// rather than a list you can watch is everything around them, and the daemon has
+// published all of it since R1b. These are the adapters: one command per daemon
+// command, each decoding into the typed reply `core::remote::proto` mirrors and
+// handing it to the panel unchanged.
+//
+// Two properties they all share, and neither is decoration:
+//
+// - **Read only, and narrowly so.** The same rule R2a set: `list`/`timeline`
+//   were spelled out as separate commands rather than a pass-through argv, and
+//   these are too. Nothing here can reach `spawn` or `kill` by composing a
+//   string, because no caller composes one.
+// - **A cut always arrives as a cut.** `truncated`, `next_cursor`, `total` and
+//   `at_cap` are carried through to the frontend rather than collapsed into a
+//   list. The workbench's own `git_roots` is a registered silent truncation —
+//   a scan that gives up returns a plain, complete-looking list — and the point
+//   of this layer is not to reproduce that over SSH.
+//
+// What they are **not** is a boundary: the daemon's path containment is a
+// guardrail against reading the wrong tree on a socket that also carries
+// `spawn`, and R1b settled that it is not a security boundary. Nothing here
+// changes that in either direction.
+
+/// The projects this host publishes — the `root` every other call here takes.
+///
+/// `notes` comes back with them and is the reason this is not just a list: an
+/// empty project list is a legitimate answer, an unreadable configuration is
+/// not, and without the notes the two are the same screen.
+#[tauri::command]
+pub fn remote_projects(
+    remote: State<'_, RemoteState>,
+    host_id: String,
+    refresh: Option<bool>,
+) -> Result<ProjectsReply, AppError> {
+    let mut args: Vec<&str> = vec!["projects"];
+    if refresh.unwrap_or(false) {
+        args.push("--refresh");
+    }
+    let out = remote.registry.call(&host_id, &args).map_err(AppError::new)?;
+    decode_response(&out).map_err(AppError::new)
+}
+
+/// One directory of one project, gitignore-aware — a **page** of it.
+///
+/// `from`/`limit` page a large directory, and the reply says `total` and
+/// `truncated` so the caller can say "showing M of N" instead of showing M and
+/// calling it the directory.
+#[tauri::command]
+pub fn remote_tree(
+    remote: State<'_, RemoteState>,
+    host_id: String,
+    root: String,
+    path: Option<String>,
+    from: Option<usize>,
+    limit: Option<usize>,
+) -> Result<DirReply, AppError> {
+    let from = from.unwrap_or(0).to_string();
+    let limit = limit.map(|n| n.to_string());
+    let mut args: Vec<&str> = vec!["tree", &root, "--from", &from];
+    if let Some(p) = path.as_deref().filter(|p| !p.is_empty()) {
+        args.push("--path");
+        args.push(p);
+    }
+    if let Some(l) = limit.as_deref() {
+        args.push("--limit");
+        args.push(l);
+    }
+    let out = remote.registry.call(&host_id, &args).map_err(AppError::new)?;
+    decode_response(&out).map_err(AppError::new)
+}
+
+/// One project's working-tree status. Not paged and not capped — the whole of it.
+#[tauri::command]
+pub fn remote_git_status(
+    remote: State<'_, RemoteState>,
+    host_id: String,
+    root: String,
+) -> Result<GitStatusReply, AppError> {
+    let out = remote
+        .registry
+        .call(&host_id, &["git-status", &root])
+        .map_err(AppError::new)?;
+    decode_response(&out).map_err(AppError::new)
+}
+
+/// One page of a project's history.
+///
+/// The `cursor` is the daemon's own, handed back **verbatim**. It is not a ref
+/// and must not be treated as one: continuing by ref means `git log <hash>`,
+/// which walks that commit's ancestors, so every branch outside the first page's
+/// ancestry disappears after page 1 (the daemon measured 708 commits whole, 297
+/// paged). A continuation the daemon refuses is an error the screen shows, not a
+/// silently shorter history.
+#[tauri::command]
+pub fn remote_git_log(
+    remote: State<'_, RemoteState>,
+    host_id: String,
+    root: String,
+    limit: Option<u32>,
+    cursor: Option<String>,
+) -> Result<GitLogReply, AppError> {
+    let limit = limit.map(|n| n.to_string());
+    let mut args: Vec<&str> = vec!["git-log", &root];
+    if let Some(l) = limit.as_deref() {
+        args.push("--limit");
+        args.push(l);
+    }
+    if let Some(c) = cursor.as_deref().filter(|c| !c.is_empty()) {
+        args.push("--cursor");
+        args.push(c);
+    }
+    let out = remote.registry.call(&host_id, &args).map_err(AppError::new)?;
+    decode_response(&out).map_err(AppError::new)
+}
+
+/// `git worktree list` for one project.
+#[tauri::command]
+pub fn remote_worktrees(
+    remote: State<'_, RemoteState>,
+    host_id: String,
+    root: String,
+) -> Result<WorktreesReply, AppError> {
+    let out = remote
+        .registry
+        .call(&host_id, &["worktrees", &root])
+        .map_err(AppError::new)?;
+    decode_response(&out).map_err(AppError::new)
+}
+
+/// Every git root at or under one project — the multi-repo case.
+///
+/// `at_cap` rides along and the panel shows it, because this scan is the one
+/// truncation on the whole surface with **no continuation**: the scanner takes
+/// no offset, so the way past 200 repositories is a narrower `root`.
+#[tauri::command]
+pub fn remote_git_roots(
+    remote: State<'_, RemoteState>,
+    host_id: String,
+    root: String,
+) -> Result<GitRootsReply, AppError> {
+    let out = remote
+        .registry
+        .call(&host_id, &["git-roots", &root])
+        .map_err(AppError::new)?;
+    decode_response(&out).map_err(AppError::new)
 }
 
 /// The host's own session list, asked directly rather than derived from the

@@ -428,3 +428,314 @@ describe("R15 — 떼기 뒤 터미널이 살아 있는 것처럼 보이지 않�
     expect(text()).not.toContain("연결이 끊어졌습니다");
   });
 });
+
+// ---------------------------------------------------------------------------
+// R2 — 원격 호스트의 데이터(트리·git·워크트리). 규칙 하나: **잘림은 말한다**
+// ---------------------------------------------------------------------------
+
+/** 데이터 패널을 펼치고 프로젝트 하나를 고른다. */
+async function openData(root = "/home/jun/p") {
+  await act(async () => {
+    findButton("데이터")!.click();
+  });
+  await flush(10);
+  const select = container.querySelector('select[aria-label="원격 프로젝트"]') as HTMLSelectElement;
+  expect(select).toBeTruthy();
+  await act(async () => {
+    select.value = root;
+    select.dispatchEvent(new Event("change", { bubbles: true }));
+  });
+  await flush(10);
+}
+
+const PROJECTS = {
+  projects: [{ path: "/home/jun/p", name: "p", branch: "main", source: "workbench", project_types: [] }],
+  scanned: [],
+  notes: [],
+};
+
+function tabButton(label: string): HTMLButtonElement {
+  const b = Array.from(container.querySelectorAll("button.remote-data-tab")).find(
+    (x) => (x.textContent ?? "").trim() === label,
+  ) as HTMLButtonElement | undefined;
+  expect(b).toBeTruthy();
+  return b!;
+}
+
+describe("R2 — 원격 트리가 페이지를 폴더 전체인 척 보여주지 않는다", () => {
+  beforeEach(() => {
+    routes.remote_projects = async () => PROJECTS;
+  });
+
+  it("잘린 폴더는 '몇 개 중 몇 개'를 화면에 적고, 더 보기로 이어 받는다", async () => {
+    routes.remote_tree = async (a) =>
+      (a.from as number) === 0
+        ? {
+            root: "/home/jun/p",
+            path: "/home/jun/p",
+            entries: [{ name: "aaa", path: "/home/jun/p/aaa", is_dir: false, project_types: [], is_ignored: false }],
+            from_index: 0,
+            total: 4000,
+            truncated: true,
+          }
+        : {
+            root: "/home/jun/p",
+            path: "/home/jun/p",
+            entries: [{ name: "bbb", path: "/home/jun/p/bbb", is_dir: false, project_types: [], is_ignored: false }],
+            from_index: 1,
+            total: 4000,
+            truncated: true,
+          };
+    await mount();
+    await openData();
+    expect(text()).toContain("aaa");
+    // 이 한 줄이 없으면 200개짜리 화면이 4,000개짜리 폴더처럼 보인다.
+    expect(text()).toContain("4000개 중 1개");
+
+    await act(async () => {
+      findButton("더 보기")!.click();
+    });
+    await flush(10);
+    expect(text()).toContain("bbb");
+    expect(text()).toContain("4000개 중 2개");
+  });
+
+  it("이어지지 않는 페이지는 조용히 붙지 않고 사유가 뜬다", async () => {
+    routes.remote_tree = async (a) =>
+      (a.from as number) === 0
+        ? {
+            root: "/home/jun/p",
+            path: "/home/jun/p",
+            entries: [{ name: "aaa", path: "/home/jun/p/aaa", is_dir: false, project_types: [], is_ignored: false }],
+            from_index: 0,
+            total: 10,
+            truncated: true,
+          }
+        : {
+            // 데몬이 3번째부터 돌려줬다 — 1·2번째가 빠졌다.
+            root: "/home/jun/p",
+            path: "/home/jun/p",
+            entries: [{ name: "ddd", path: "/home/jun/p/ddd", is_dir: false, project_types: [], is_ignored: false }],
+            from_index: 3,
+            total: 10,
+            truncated: true,
+          };
+    await mount();
+    await openData();
+    await act(async () => {
+      findButton("더 보기")!.click();
+    });
+    await flush(10);
+    expect(text()).toContain("이어지지 않습니다");
+    expect(text()).not.toContain("ddd");
+  });
+
+  it("조회 실패는 빈 트리가 아니라 재시도 가능한 실패다", async () => {
+    routes.remote_tree = async () => {
+      throw new Error("no such project root");
+    };
+    await mount();
+    await openData();
+    expect(text()).toContain("no such project root");
+    expect(findButton("다시 시도")).toBeTruthy();
+  });
+
+  /** 64MB 상한에 걸린 응답은 "JSON 이 아니다"가 아니라 잘렸다고 말해야 한다. */
+  it("응답이 상한에 걸려 잘리면 그 사실이 그대로 화면에 온다", async () => {
+    routes.remote_tree = async () => {
+      throw new Error("원격 응답이 너무 커서(64MB 상한) 앞부분이 잘렸습니다 — 잘린 조각을 읽으려 하지 않았습니다.");
+    };
+    await mount();
+    await openData();
+    expect(text()).toContain("64MB 상한");
+    expect(text()).not.toContain("JSON");
+  });
+});
+
+describe("R2 — 자동 조회는 갈래당 한 번이다 (R1 이 남긴 규칙)", () => {
+  /**
+   * 판정의 축이 *내용*이면 **성공했는데 빈 응답**이 오는 순간 다시 true 가 되어
+   * effect 가 무한히 재발화한다. 한 바퀴가 `Registry::call` → 새 SSH 연결 1회라
+   * 백오프도 지연도 없다. R1 이 세션 타임라인에서 실측한 그 사고이고, 이 화면을
+   * 만들면서 **그대로 재현됐다**(빈 응답을 주는 폴더 하나로). 축을 시도로 옮긴
+   * 것을 여기서 못박는다.
+   */
+  it("빈 응답이 와도 `remote_tree` 는 갈래당 정확히 1회다", async () => {
+    routes.remote_projects = async () => PROJECTS;
+    routes.remote_tree = async () => ({
+      root: "/home/jun/p",
+      path: "/home/jun/p",
+      entries: [],
+      from_index: 0,
+      total: 0,
+      truncated: false,
+    });
+    await mount();
+    await openData();
+    await flush(30);
+    expect(calls("remote_tree")).toBe(1);
+    expect(text()).toContain("빈 폴더입니다");
+  });
+
+  it("실패해도 무한 재시도하지 않는다 — 재시도는 버튼에만 남는다", async () => {
+    routes.remote_projects = async () => PROJECTS;
+    routes.remote_git_status = async () => {
+      throw new Error("git 이 없습니다");
+    };
+    routes.remote_git_log = async () => {
+      throw new Error("git 이 없습니다");
+    };
+    await mount();
+    await openData();
+    await act(async () => {
+      tabButton("Git").click();
+    });
+    await flush(30);
+    expect(calls("remote_git_status")).toBe(1);
+    expect(text()).toContain("git 이 없습니다");
+  });
+});
+
+describe("R2 — 원격 git 이 한 페이지를 전체 히스토리로 보이지 않는다", () => {
+  beforeEach(() => {
+    routes.remote_projects = async () => PROJECTS;
+    routes.remote_git_status = async () => ({
+      is_repo: true,
+      branch: "main",
+      upstream: "origin/main",
+      ahead: 0,
+      behind: 0,
+      has_remote: true,
+      merging: false,
+      reverting: false,
+      changes: [{ path: "core/src/remote.rs", code: "M", staged: false, conflicted: false }],
+    });
+  });
+
+  const commit = (short: string) => ({
+    hash: `${short}0000`,
+    short,
+    parents: [],
+    author: "jun",
+    date: "2026-08-13",
+    refs: "",
+    subject: `subject ${short}`,
+  });
+
+  it("이어받을 주소가 있는 잘림에는 '더 보기'가 붙고 실제로 이어진다", async () => {
+    routes.remote_git_log = async (a) =>
+      a.cursor
+        ? { root: "/home/jun/p", commits: [commit("e56cc06")], truncated: false, next_cursor: null }
+        : { root: "/home/jun/p", commits: [commit("4dc8e5a")], truncated: true, next_cursor: "c1" };
+    await mount();
+    await openData();
+    await act(async () => {
+      tabButton("Git").click();
+    });
+    await flush(10);
+    expect(text()).toContain("main");
+    expect(text()).toContain("core/src/remote.rs");
+    expect(text()).toContain("subject 4dc8e5a");
+    expect(text()).toContain("히스토리가 더 있습니다");
+
+    await act(async () => {
+      findButton("더 보기")!.click();
+    });
+    await flush(10);
+    expect(text()).toContain("subject e56cc06");
+    expect(text()).not.toContain("히스토리가 더 있습니다");
+  });
+
+  it("주소 없는 잘림은 누를 것이 없다는 사실까지 말한다", async () => {
+    routes.remote_git_log = async () => ({
+      root: "/home/jun/p",
+      commits: [commit("4dc8e5a")],
+      truncated: true,
+      next_cursor: null,
+    });
+    await mount();
+    await openData();
+    await act(async () => {
+      tabButton("Git").click();
+    });
+    await flush(10);
+    expect(text()).toContain("이어받을 주소가 없습니다");
+    expect(findButton("더 보기")).toBeFalsy();
+  });
+});
+
+describe("R2 — 워크트리·하위 저장소의 잘림", () => {
+  beforeEach(() => {
+    routes.remote_projects = async () => PROJECTS;
+    routes.remote_worktrees = async () => ({
+      root: "/home/jun/p",
+      worktrees: [{ path: "/home/jun/p", head: "4dc8e5a0", branch: "main", is_main: true }],
+    });
+  });
+
+  it("상한에 걸린 스캔은 이어받을 방법이 없다는 것까지 말한다", async () => {
+    routes.remote_git_roots = async () => ({
+      root: "/home/jun/p",
+      roots: [{ path: "/home/jun/p", branch: "main" }],
+      at_cap: true,
+    });
+    await mount();
+    await openData();
+    await act(async () => {
+      tabButton("워크트리").click();
+    });
+    await flush(10);
+    expect(text()).toContain("main");
+    expect(text()).toContain("상한에 걸려 멈췄습니다");
+    expect(text()).toContain("이어받을 주소가 없습니다");
+  });
+
+  /**
+   * `at_cap:false` 는 "완전함"이 아니다 — 같은 스캐너가 2만 디렉터리에서 **표시
+   * 없이** 포기한다. 이 프로젝트에 등재된 무음 유실이라 화면이 늘 말한다.
+   */
+  it("응답으로 알 수 없는 절단은 상시 단서로 화면에 남는다", async () => {
+    routes.remote_git_roots = async () => ({
+      root: "/home/jun/p",
+      roots: [{ path: "/home/jun/p", branch: "main" }],
+      at_cap: false,
+    });
+    await mount();
+    await openData();
+    await act(async () => {
+      tabButton("워크트리").click();
+    });
+    await flush(10);
+    expect(text()).toContain("2만");
+    expect(text()).toContain("부분일 수 있습니다");
+  });
+});
+
+describe("R2 — 프로젝트 목록: 빈 목록과 못 읽은 설정은 다른 화면이다", () => {
+  it("호스트가 붙인 메모가 그대로 보인다", async () => {
+    routes.remote_projects = async () => ({
+      projects: [],
+      scanned: [],
+      notes: ["CWC_PROJECT_ROOTS 항목 /nope 이 없습니다"],
+    });
+    await mount();
+    await act(async () => {
+      findButton("데이터")!.click();
+    });
+    await flush(10);
+    expect(text()).toContain("/nope");
+  });
+
+  it("목록 조회 실패는 '프로젝트 없음'이 아니다", async () => {
+    routes.remote_projects = async () => {
+      throw new Error("데몬이 응답하지 않습니다");
+    };
+    await mount();
+    await act(async () => {
+      findButton("데이터")!.click();
+    });
+    await flush(10);
+    expect(text()).toContain("데몬이 응답하지 않습니다");
+    expect(findButton("다시 시도")).toBeTruthy();
+  });
+});

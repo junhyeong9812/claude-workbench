@@ -5823,3 +5823,162 @@ body {
 .remote-term-ended .remote-term-host {
   opacity: 0.7;
 }
+
+/* ---- 원격 호스트 데이터 (R2) --------------------------------------------
+   그 호스트의 프로젝트·파일트리·Git·워크트리. 로컬 트리/Git/워크트리 컴포넌트를
+   재사용하지 않으므로(명세 ④) 여기에만 있는 어휘가 몇 개 생긴다 — 그래도 실패
+   줄은 여전히 .claudeterm-refine-note 다.
+
+   .remote-cut 은 이 블록의 핵심이다: "더 있는데 안 보여주고 있다"를 말하는 줄
+   이고, 잘림이 조용히 지나가지 않게 하는 유일한 시각 요소다. */
+.remote-data {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 4px 0 2px;
+  border-top: 1px solid var(--border, #333);
+}
+.remote-data-head {
+  display: flex;
+  gap: 4px;
+  min-width: 0;
+}
+.remote-data-head select {
+  flex: 1 1 0;
+  min-width: 0;
+  background: var(--bg-alt, #1e1e2e);
+  color: var(--fg, #cdd6f4);
+  border: 1px solid var(--border, #333);
+  border-radius: 3px;
+  padding: 3px 6px;
+}
+.remote-data-tabs {
+  display: flex;
+  gap: 4px;
+}
+.remote-data-tab {
+  padding: 1px 8px;
+  font-size: 0.92em;
+}
+.remote-data-tab-on {
+  background: var(--bg-hover);
+  color: var(--fg);
+}
+.remote-data-body {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+/* 잘림·호스트 메모 — 눈에 띄되 오류는 아니다. */
+.remote-cut {
+  color: var(--st-warn, #f9e2af);
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+.remote-crumb {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  color: var(--fg-dim);
+}
+.remote-crumb code {
+  flex: 1 1 0;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.remote-tree {
+  display: flex;
+  flex-direction: column;
+  list-style: none;
+}
+.remote-tree-row {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+/* gitignore 로 무시되는 항목 — 로컬 트리와 같은 표현(숨기지 않고 흐리게). */
+.remote-tree-ignored {
+  opacity: 0.55;
+}
+.remote-tree-dir {
+  padding: 0;
+  background: none;
+  border: none;
+  color: inherit;
+  cursor: pointer;
+  font: inherit;
+}
+.remote-tree-file {
+  color: var(--fg-dim);
+}
+.remote-git-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 2px 8px;
+  color: var(--fg-dim);
+}
+.remote-git-flag {
+  color: var(--st-warn, #f9e2af);
+}
+.remote-changes,
+.remote-commits,
+.remote-worktrees {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  list-style: none;
+}
+.remote-change,
+.remote-commit,
+.remote-worktree {
+  display: flex;
+  gap: 6px;
+  min-width: 0;
+}
+.remote-change-code {
+  flex: 0 0 auto;
+  width: 2.2em;
+  color: var(--fg-dim);
+}
+.remote-change-path,
+.remote-commit-subject {
+  flex: 1 1 0;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.remote-change-staged {
+  flex: 0 0 auto;
+  color: var(--st-ok, #a6e3a1);
+  font-size: 0.85em;
+}
+.remote-change-conflict .remote-change-path {
+  color: var(--st-err, #f38ba8);
+}
+.remote-commit-meta {
+  flex: 0 0 auto;
+  color: var(--fg-dim);
+  font-size: 0.85em;
+}
+.remote-worktree code {
+  flex: 1 1 0;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.remote-worktree-branch {
+  flex: 0 0 auto;
+}
+.remote-worktree-main {
+  flex: 0 0 auto;
+  color: var(--fg-dim);
+  font-size: 0.85em;
+}

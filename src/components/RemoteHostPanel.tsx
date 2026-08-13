@@ -64,6 +64,21 @@ import {
   type RemoteTerminalEnded,
   type TermSize,
 } from "../state/remoteHosts";
+import {
+  dirCutNote,
+  dirHasMore,
+  logCutNote,
+  logHasMore,
+  parentPath,
+  relPath,
+  rootsCutNote,
+  staleNote,
+  useRemoteHostData,
+  GIT_ROOTS_CAVEAT,
+  type Loadable,
+  type RemoteDataTab,
+  type RemoteHostDataView,
+} from "../state/remoteHostData";
 import { decodePtyData, ptyEventName, pushPendingCapped } from "./pty";
 import { errText } from "../utils/error";
 import { xtermTheme } from "./xtermTheme";
@@ -511,6 +526,7 @@ function HostCard({
   const resume = resumeLabel(host.resume);
   const age = ageLabel(host.last_frame_at_ms);
   const [spawning, setSpawning] = useState(false);
+  const [showData, setShowData] = useState(false);
   return (
     <section className="remote-host">
       <header className="remote-host-head">
@@ -520,6 +536,15 @@ function HostCard({
         {badge ? (
           <span className={`remote-badge remote-badge-${badge.level}`}>{badge.count}</span>
         ) : null}
+        <button
+          type="button"
+          className="remote-new"
+          onClick={() => setShowData((v) => !v)}
+          title="이 호스트의 프로젝트·파일트리·Git·워크트리를 봅니다 (읽기 전용)"
+          aria-expanded={showData}
+        >
+          {showData ? "데이터 접기" : "데이터"}
+        </button>
         <button
           type="button"
           className="remote-new"
@@ -535,6 +560,7 @@ function HostCard({
       </header>
 
       {spawning ? <NewSessionForm hostId={host.host_id} onSpawned={onSpawned} /> : null}
+      {showData ? <RemoteDataPanel hostId={host.host_id} /> : null}
 
       <div className="remote-host-meta">
         {host.daemon ? (
@@ -743,6 +769,328 @@ function SessionRow({
         </div>
       ) : null}
     </li>
+  );
+}
+
+/**
+ * 조회 하나의 실패·낡음을 말하는 줄. 값은 남기고 사유를 얹는다.
+ *
+ * 앞 슬라이스가 `hostsError`/`hostsAt` 으로 세운 결 그대로다: 실패를 빈 값으로
+ * 축소하면 화면은 "없음"을 정직한 답으로 보이고, 아무도 계약이 깨진 줄 모른다.
+ */
+function LoadNote({ of, onRetry }: { of: Loadable<unknown>; onRetry: () => void }) {
+  if (!of.error) return null;
+  const stale = staleNote(of);
+  return (
+    <div className="claudeterm-refine-note" role="alert">
+      원격에서 읽지 못했습니다 — {of.error}
+      {stale ? ` (${stale})` : ""}
+      <button type="button" className="remote-fetch" onClick={onRetry}>
+        다시 시도
+      </button>
+    </div>
+  );
+}
+
+/** 잘림 한 줄 — 있으면 반드시 보인다. 없으면 아무 자리도 차지하지 않는다. */
+function CutNote({ note, onMore }: { note: string | null; onMore?: () => void }) {
+  if (!note) return null;
+  return (
+    <p className="remote-cut" role="status">
+      {note}
+      {onMore ? (
+        <button type="button" className="remote-fetch" onClick={onMore}>
+          더 보기
+        </button>
+      ) : null}
+    </p>
+  );
+}
+
+/**
+ * 한 호스트의 **데이터** — 프로젝트·파일트리·Git·워크트리 (R2, 읽기 전용).
+ *
+ * 로컬 트리·GitPanel·WorktreePanel 을 재사용하지 않는다(명세 ④). 저 셋은 로컬
+ * 정본이고 원격 차원을 끼워 넣는 회귀 위험이 얻는 것보다 크다 — 같은 정보를
+ * 보이되 뷰 모델을 따로 둔다. 최상위 호스트 탭·표면 트리의 host 차원은 여전히
+ * R3 의 몫이라, 이 뷰는 **원격 패널 안**을 넘지 않는다.
+ *
+ * 폴링하지 않는다. 한 번의 조회가 SSH 왕복 한 번이고, 자동 반복에는 상한이
+ * 있어야 한다(R1 이 남긴 규칙) — 갈래를 열 때 한 번 읽고 그 뒤는 새로고침이다.
+ */
+function RemoteDataPanel({ hostId }: { hostId: string }) {
+  const d = useRemoteHostData(hostId);
+  const [tab, setTab] = useState<RemoteDataTab>("tree");
+  const { root, openDir, reloadStatus, reloadLog, reloadWorktrees, reloadRoots } = d;
+
+  // 갈래를 처음 열면 한 번 읽는다. 판정의 축은 **내용이 아니라 시도**다(R1):
+  // "값이 비었으면 다시 읽는다" 로 쓰면 빈 응답이 정상적으로 오는 순간 판정이
+  // true 로 돌아와 effect 가 무한히 재발화하고, 그 한 바퀴가 새 SSH 연결 1회다.
+  // 이 화면에서도 실제로 재현됐다(빈 폴더 하나 → 무한 재조회). 그 뒤의 재시도는
+  // 사용자가 누르는 버튼에만 남는다 — 화면에 계속 떠 있으므로 잃는 것은 없다.
+  useEffect(() => {
+    if (!root) return;
+    if (tab === "tree" && !d.dir.attempted) openDir("");
+    if (tab === "git") {
+      if (!d.status.attempted) reloadStatus();
+      if (!d.log.attempted) reloadLog();
+    }
+    if (tab === "worktrees") {
+      if (!d.worktrees.attempted) reloadWorktrees();
+      if (!d.roots.attempted) reloadRoots();
+    }
+    // 조회 함수는 호출마다 새 클로저라 의존성에서 뺀다(넣으면 매 렌더 재조회).
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [
+    root,
+    tab,
+    d.dir.attempted,
+    d.status.attempted,
+    d.log.attempted,
+    d.worktrees.attempted,
+    d.roots.attempted,
+  ]);
+
+  const projects = d.projects.value;
+  return (
+    <div className="remote-data">
+      <div className="remote-data-head">
+        <select
+          value={root}
+          onChange={(e) => d.setRoot(e.target.value)}
+          aria-label="원격 프로젝트"
+          disabled={d.projects.loading && !projects}
+        >
+          <option value="">
+            {d.projects.loading && !projects
+              ? "프로젝트 읽는 중…"
+              : projects && projects.projects.length === 0
+                ? "이 호스트가 발행한 프로젝트가 없습니다"
+                : "프로젝트 선택…"}
+          </option>
+          {(projects?.projects ?? []).map((p) => (
+            <option key={p.path} value={p.path} title={p.path}>
+              {p.name}
+              {p.branch ? ` (${p.branch})` : ""}
+            </option>
+          ))}
+        </select>
+        <button
+          type="button"
+          className="remote-fetch"
+          onClick={() => d.reloadProjects(true)}
+          title="호스트의 프로젝트 목록을 캐시 없이 다시 읽습니다"
+        >
+          목록 새로고침
+        </button>
+      </div>
+      <LoadNote of={d.projects} onRetry={() => d.reloadProjects(true)} />
+      {/* 프로젝트가 0개인 것은 정상적인 답이고 설정을 못 읽은 것은 아니다 —
+          데몬이 그 차이를 `notes` 로 말해 주므로 그대로 보인다. */}
+      {(projects?.notes ?? []).map((n) => (
+        <p key={n} className="remote-cut" role="status">
+          호스트 메모: {n}
+        </p>
+      ))}
+
+      {!root ? (
+        <p className="remote-empty">프로젝트를 고르면 그 트리·Git·워크트리를 봅니다.</p>
+      ) : (
+        <>
+          <div className="remote-data-tabs">
+            {(
+              [
+                ["tree", "파일"],
+                ["git", "Git"],
+                ["worktrees", "워크트리"],
+              ] as const
+            ).map(([id, label]) => (
+              <button
+                key={id}
+                type="button"
+                className={`remote-data-tab${tab === id ? " remote-data-tab-on" : ""}`}
+                aria-pressed={tab === id}
+                onClick={() => setTab(id)}
+              >
+                {label}
+              </button>
+            ))}
+          </div>
+          {tab === "tree" ? <RemoteTreeView d={d} /> : null}
+          {tab === "git" ? <RemoteGitView d={d} /> : null}
+          {tab === "worktrees" ? <RemoteWorktreeView d={d} /> : null}
+        </>
+      )}
+    </div>
+  );
+}
+
+/** 폴더 하나씩 — 로컬 트리를 흉내 내지 않고, 페이지가 폴더 전체인 척하지도 않는다. */
+function RemoteTreeView({ d }: { d: RemoteHostDataView }) {
+  const dir = d.dir.value;
+  const up = parentPath(d.root, d.path);
+  return (
+    <div className="remote-data-body">
+      <div className="remote-crumb">
+        <button
+          type="button"
+          className="remote-fetch"
+          disabled={up === null}
+          onClick={() => (up === null ? undefined : d.openDir(up))}
+          title={up === null ? "여기가 프로젝트 루트입니다." : "한 단계 위로"}
+        >
+          위로
+        </button>
+        <code title={d.path || d.root}>{relPath(d.root, d.path) || "/"}</code>
+        <button type="button" className="remote-fetch" onClick={d.reloadDir}>
+          새로고침
+        </button>
+      </div>
+      <LoadNote of={d.dir} onRetry={d.reloadDir} />
+      {d.dir.loading && !dir ? <p className="remote-empty">읽는 중…</p> : null}
+      {dir ? (
+        <>
+          <ul className="remote-tree">
+            {dir.entries.map((e) => (
+              <li
+                key={e.path}
+                className={`remote-tree-row${e.is_ignored ? " remote-tree-ignored" : ""}`}
+              >
+                {e.is_dir ? (
+                  <button type="button" className="remote-tree-dir" onClick={() => d.openDir(e.path)}>
+                    📁 {e.name}
+                  </button>
+                ) : (
+                  <span className="remote-tree-file">📄 {e.name}</span>
+                )}
+              </li>
+            ))}
+          </ul>
+          {dir.entries.length === 0 ? <p className="remote-empty">빈 폴더입니다.</p> : null}
+          {/* 더 있는데 안 보여주면 화면이 그것을 말한다 — 페이지가 폴더 전체처럼
+              보이는 것이 이 경로의 무음 유실이다. */}
+          <CutNote note={dirCutNote(dir)} onMore={dirHasMore(dir) ? d.moreDir : undefined} />
+        </>
+      ) : null}
+    </div>
+  );
+}
+
+/** 상태 + 히스토리. 로컬 GitPanel 은 건드리지 않는다 — 여기 있는 것은 읽기뿐이다. */
+function RemoteGitView({ d }: { d: RemoteHostDataView }) {
+  const s = d.status.value;
+  const log = d.log.value;
+  return (
+    <div className="remote-data-body">
+      <LoadNote of={d.status} onRetry={d.reloadStatus} />
+      {s ? (
+        s.is_repo ? (
+          <div className="remote-git-head">
+            <strong>{s.branch}</strong>
+            {s.upstream ? <span>↑{s.ahead} ↓{s.behind} · {s.upstream}</span> : <span>업스트림 없음</span>}
+            {s.merging ? <span className="remote-git-flag">머지 중</span> : null}
+            {s.reverting ? <span className="remote-git-flag">리버트 중</span> : null}
+            <button type="button" className="remote-fetch" onClick={d.reloadStatus}>
+              새로고침
+            </button>
+          </div>
+        ) : (
+          <p className="remote-empty">이 프로젝트는 git 저장소가 아닙니다.</p>
+        )
+      ) : null}
+      {s?.is_repo ? (
+        <ul className="remote-changes">
+          {s.changes.length === 0 ? <li className="remote-empty">변경 없음</li> : null}
+          {s.changes.map((c) => (
+            <li
+              key={`${c.staged ? "s" : "w"}:${c.path}`}
+              className={`remote-change${c.conflicted ? " remote-change-conflict" : ""}`}
+            >
+              <span className="remote-change-code">{c.code}</span>
+              <span className="remote-change-path" title={c.path}>
+                {c.path}
+              </span>
+              {c.staged ? <span className="remote-change-staged">staged</span> : null}
+            </li>
+          ))}
+        </ul>
+      ) : null}
+
+      <LoadNote of={d.log} onRetry={d.reloadLog} />
+      {log ? (
+        <>
+          <ul className="remote-commits">
+            {log.commits.length === 0 ? <li className="remote-empty">커밋이 없습니다.</li> : null}
+            {log.commits.map((c) => (
+              <li key={c.hash} className="remote-commit">
+                <code>{c.short}</code>
+                <span className="remote-commit-subject" title={c.subject}>
+                  {c.subject}
+                </span>
+                <span className="remote-commit-meta">
+                  {c.author} · {c.date}
+                </span>
+              </li>
+            ))}
+          </ul>
+          {/* 주소가 있는 잘림에만 버튼이 붙는다. 주소 없는 잘림(데몬 페이징 상한)은
+              누를 것이 없다는 사실까지 문장이 말한다. */}
+          <CutNote note={logCutNote(log)} onMore={logHasMore(log) ? d.moreLog : undefined} />
+        </>
+      ) : null}
+    </div>
+  );
+}
+
+/** 워크트리 + 하위 저장소. 여기가 이 화면에서 잘림이 가장 조용한 자리다. */
+function RemoteWorktreeView({ d }: { d: RemoteHostDataView }) {
+  const w = d.worktrees.value;
+  const r = d.roots.value;
+  return (
+    <div className="remote-data-body">
+      <LoadNote of={d.worktrees} onRetry={d.reloadWorktrees} />
+      {w ? (
+        <ul className="remote-worktrees">
+          {w.worktrees.length === 0 ? <li className="remote-empty">워크트리가 없습니다.</li> : null}
+          {w.worktrees.map((t) => (
+            <li key={t.path} className="remote-worktree">
+              <span className="remote-worktree-branch">{t.branch}</span>
+              {t.is_main ? <span className="remote-worktree-main">main</span> : null}
+              <code title={t.path}>{t.path}</code>
+              <span className="remote-commit-meta">{t.head.slice(0, 7)}</span>
+            </li>
+          ))}
+        </ul>
+      ) : null}
+
+      <div className="remote-crumb">
+        <span>하위 저장소</span>
+        <button type="button" className="remote-fetch" onClick={d.reloadRoots}>
+          다시 스캔
+        </button>
+      </div>
+      <LoadNote of={d.roots} onRetry={d.reloadRoots} />
+      {r ? (
+        <>
+          <ul className="remote-worktrees">
+            {r.roots.length === 0 ? <li className="remote-empty">하위 저장소가 없습니다.</li> : null}
+            {r.roots.map((g) => (
+              <li key={g.path} className="remote-worktree">
+                <span className="remote-worktree-branch">{g.branch}</span>
+                <code title={g.path}>{g.path}</code>
+              </li>
+            ))}
+          </ul>
+          {/* 이어받을 주소가 **없는** 잘림 — 그래서 "더 보기"가 아니라 사실만 적는다. */}
+          <CutNote note={rootsCutNote(r)} />
+          {/* …그리고 응답으로는 알 수 없는 절단(2만 디렉터리)은 늘 말한다. 이
+              프로젝트에 등재된 무음 유실이 바로 그것이다. */}
+          <p className="remote-cut" role="status">
+            {GIT_ROOTS_CAVEAT}
+          </p>
+        </>
+      ) : null}
+    </div>
   );
 }
 
