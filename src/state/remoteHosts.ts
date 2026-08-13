@@ -14,7 +14,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import type { TimelineItem } from "../types";
-import type { ClaudeTimelineEvent } from "../hooks/useClaudeTimeline";
+import type { ClaudeTimelineEvent, TokenUsage } from "../hooks/useClaudeTimeline";
 
 /**
  * 원격 세션 id가 시작하는 지점 — `core/src/remote/host.rs`의 `REMOTE_ID_BASE`와
@@ -205,8 +205,12 @@ export interface RemoteTimelineReply {
   total: number;
   items: TimelineItem[];
   turns: [number, string][];
+  /** 라이브와 같은 셋 — 회수한 본문이 스트림보다 가난해서는 안 된다. */
+  answers: [number, string][];
+  dates: [number, string][];
+  tokens: [number, TokenUsage][];
   model: string | null;
-  last_usage: { input: number; output: number; cache_read: number; cache_creation: number } | null;
+  last_usage: TokenUsage | null;
 }
 
 /** 회수한 본문 → 라이브 타임라인 (순수). 라이브 payload 와 같은 모양으로 만든다. */
@@ -215,6 +219,9 @@ export function fetchedToLive(r: RemoteTimelineReply): RemoteLiveTimeline {
   return {
     items: [...r.items].sort((a, b) => a.seq - b.seq),
     turns: r.turns ?? [],
+    answers: r.answers ?? [],
+    dates: r.dates ?? [],
+    tokens: r.tokens ?? [],
     model: r.model ?? null,
     ctxTokens: u ? u.input + u.cache_read + u.cache_creation : 0,
   };
@@ -275,17 +282,27 @@ export function noticeBadge(
 export interface RemoteLiveTimeline {
   items: TimelineItem[];
   turns: [number, string][];
+  /** 턴별 **답변**. R2b ⓓ 이전에는 데몬이 계산해 놓고 버렸고, 그 뒤에는 데몬이
+   * 실어 보내는데 여기서 버렸다 — 두 경우 모두 화면에는 질문만 남았다. */
+  answers: [number, string][];
+  dates: [number, string][];
+  tokens: [number, TokenUsage][];
   model: string | null;
   ctxTokens: number;
 }
 
-/** payload → 라이브 타임라인 (순수). 원격 payload의 `answers`/`dates`/`tokens`는
- * 언제나 비어 있다 — 데몬이 보내지 않는다(백엔드 `remote/host.rs` 주석). */
+/** payload → 라이브 타임라인 (순수).
+ *
+ * `answers`/`dates`/`tokens`는 R2b 부터 실제로 온다. 옛 데몬은 안 보내고, 그건
+ * 빈 배열로 디코드된다 — "없다"가 그 생산자의 정직한 답이다. */
 export function toLiveTimeline(e: ClaudeTimelineEvent): RemoteLiveTimeline {
   const u = e.last_usage;
   return {
     items: [...e.items].sort((a, b) => a.seq - b.seq),
     turns: e.turns ?? [],
+    answers: e.answers ?? [],
+    dates: e.dates ?? [],
+    tokens: e.tokens ?? [],
     model: e.model ?? null,
     ctxTokens: u ? u.input + u.cache_read + u.cache_creation : 0,
   };

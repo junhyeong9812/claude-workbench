@@ -17,7 +17,15 @@
  * 내장 터미널의 배선(구독 → 스냅샷 → drain, 테마·폰트, FitAddon)은
  * `TerminalPanel`이 하는 그대로다.
  */
-import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import {
+  Fragment,
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type ReactNode,
+} from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { Terminal } from "@xterm/xterm";
@@ -501,6 +509,9 @@ function SessionRow({
   const shown = pickTimeline(live, fetched);
   const items = shown?.items ?? [];
   const turns = shown?.turns ?? [];
+  // 턴 → 답변. 데몬은 R2b 부터 이것을 실어 보내는데 화면이 버리고 있었다 —
+  // 그래서 "로컬과 같은 내용"이라던 원격 타임라인에 질문만 있었다.
+  const answers = new Map(shown?.answers ?? []);
   const model = shown?.model ?? s.model;
   const ctx = shown?.ctxTokens ?? s.ctx_tokens;
   const recoverable = shouldFetchBody(s, shown);
@@ -562,10 +573,18 @@ function SessionRow({
             </p>
           ) : null}
           {turns.map(([n, text]) => (
-            <p key={`t${n}`} className="remote-turn">
-              <span className="remote-turn-no">Q{n}</span>
-              {text}
-            </p>
+            <Fragment key={`t${n}`}>
+              <p className="remote-turn">
+                <span className="remote-turn-no">Q{n}</span>
+                {text}
+              </p>
+              {answers.has(n) ? (
+                <p className="remote-answer">
+                  <span className="remote-turn-no">A{n}</span>
+                  {answers.get(n)}
+                </p>
+              ) : null}
+            </Fragment>
           ))}
           {items.slice(-ITEM_ROWS).map((it) => (
             <p key={it.tool_call_id} className="remote-item">

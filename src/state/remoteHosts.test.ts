@@ -106,6 +106,9 @@ function live(items: number, turns: number): RemoteLiveTimeline {
   return {
     items: Array.from({ length: items }, (_, i) => item(`t${i}`, i)),
     turns: Array.from({ length: turns }, (_, i) => [i + 1, `q${i}`] as [number, string]),
+    answers: [],
+    dates: [],
+    tokens: [],
     model: null,
     ctxTokens: 0,
   };
@@ -286,12 +289,19 @@ describe("종료된 세션의 본문", () => {
       total: 2,
       items: [item("b", 2), item("a", 1)],
       turns: [[1, "질문"]],
+      answers: [[1, "답변"]],
+      dates: [[1, "2026-08-13"]],
+      tokens: [[1, { input: 1, output: 2, cache_read: 0, cache_creation: 0 }]],
       model: "claude-opus-5",
       last_usage: { input: 2, output: 5, cache_read: 10, cache_creation: 3 },
     });
     expect(l.items.map((i) => i.tool_call_id)).toEqual(["a", "b"]);
     expect(l.turns).toEqual([[1, "질문"]]);
     expect(l.ctxTokens).toBe(15);
+    // R2b ⓓ: 회수한 본문이 스트림보다 가난하면 안 된다 — 답변까지 온다.
+    expect(l.answers).toEqual([[1, "답변"]]);
+    expect(l.dates).toEqual([[1, "2026-08-13"]]);
+    expect(l.tokens).toEqual([[1, { input: 1, output: 2, cache_read: 0, cache_creation: 0 }]]);
   });
 });
 
@@ -316,6 +326,24 @@ describe("원격 payload 읽기", () => {
     expect(live.ctxTokens).toBe(15);
   });
 
+  it("데몬이 실어 보낸 답변·날짜·턴 토큰을 버리지 않는다 (R2b ⓓ)", () => {
+    // 데몬은 R2b 부터 이 셋을 계산해 **보낸다**. 여기서 버리면 화면에는 질문만
+    // 남고, "로컬과 같은 내용"이라는 이 단계의 목표가 payload 에서 멈춘다.
+    const e: ClaudeTimelineEvent = {
+      id: REMOTE_ID_BASE + 2,
+      items: [],
+      turns: [[1, "질문"]],
+      answers: [[1, "답변"]],
+      dates: [[1, "2026-08-13"]],
+      tokens: [[1, { input: 3, output: 4, cache_read: 0, cache_creation: 0 }]],
+      subagents: [],
+    };
+    const live = toLiveTimeline(e);
+    expect(live.answers).toEqual([[1, "답변"]]);
+    expect(live.dates).toEqual([[1, "2026-08-13"]]);
+    expect(live.tokens).toEqual([[1, { input: 3, output: 4, cache_read: 0, cache_creation: 0 }]]);
+  });
+
   it("데몬이 보내지 않는 것은 지어내지 않는다", () => {
     const e: ClaudeTimelineEvent = {
       id: REMOTE_ID_BASE,
@@ -331,6 +359,10 @@ describe("원격 payload 읽기", () => {
     expect(live.turns).toEqual([]);
     expect(live.model).toBeNull();
     expect(live.ctxTokens).toBe(0);
+    // 옛 데몬은 이 셋을 아예 안 보낸다 — 빈 것이 그 생산자의 정직한 답이다.
+    expect(live.answers).toEqual([]);
+    expect(live.dates).toEqual([]);
+    expect(live.tokens).toEqual([]);
   });
 });
 

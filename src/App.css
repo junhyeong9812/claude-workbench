@@ -5711,6 +5711,13 @@ body {
   margin-right: 5px;
   color: var(--fg-dim);
 }
+/* 질문 바로 아래 붙는 그 턴의 답변 — 들여쓰기와 흐린 색으로 질문과 구분한다. */
+.remote-answer {
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+  padding-left: 10px;
+  color: var(--fg-dim);
+}
 .remote-item {
   display: flex;
   gap: 6px;
