@@ -18,8 +18,10 @@ import {
   phaseLabel,
   pickTimeline,
   resumeLabel,
+  seenKey,
+  seenSeqOf,
   shouldFetchBody,
-  staleSeenHosts,
+  staleSeenKeys,
   useRemoteHosts,
   type RemoteHostSnapshot,
   type RemoteLiveTimeline,
@@ -61,15 +63,16 @@ export function RemoteHostPanel() {
   const attached = useMemo(() => new Set(hosts.map((h) => h.host_id)), [hosts]);
   const candidates = connections.filter((c) => !attached.has(c.id));
 
-  // 다시 붙은 호스트는 알림 seq 가 1부터 다시 시작한다(새 Host 객체). 옛
-  // 연결의 "여기까지 봤다"를 그대로 두면 새 연결의 알림이 전부 걸러져
-  // **알림 채널이 통째로 죽는다** — 갭도 데몬 재시작도 안 보인다.
+  // "여기까지 봤다"는 **그 연결의 것**이다(`seenKey`). 다시 붙은 호스트는 알림
+  // seq 가 1부터 다시 시작하므로 옛 연결의 표시를 그대로 적용하면 새 연결의
+  // 알림이 걸러져 **알림 채널이 통째로 죽는다** — 갭도 데몬 재시작도 안 보인다.
+  // 키가 다르니 그 일은 애초에 일어나지 않고, 여기서는 안 쓰이게 된 칸만 치운다.
   useEffect(() => {
-    const stale = staleSeenHosts(hosts, seen);
+    const stale = staleSeenKeys(hosts, seen);
     if (stale.length === 0) return;
     setSeen((s) => {
       const next = { ...s };
-      for (const id of stale) delete next[id];
+      for (const k of stale) delete next[k];
       return next;
     });
   }, [hosts, seen]);
@@ -176,11 +179,11 @@ export function RemoteHostPanel() {
           fetching={fetching}
           fetchError={fetchError}
           onFetch={(id) => fetchBody(h.host_id, id)}
-          seenSeq={seen[h.host_id] ?? 0}
+          seenSeq={seenSeqOf(h, seen)}
           onSeen={() =>
             setSeen((s) => ({
               ...s,
-              [h.host_id]: h.notices.length ? h.notices[h.notices.length - 1].seq : 0,
+              [seenKey(h)]: h.notices.length ? h.notices[h.notices.length - 1].seq : 0,
             }))
           }
           openIds={open}

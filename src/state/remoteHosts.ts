@@ -81,6 +81,8 @@ export interface RemoteDaemonInfo {
 export interface RemoteHostSnapshot {
   host_id: string;
   label: string;
+  /** 이 연결(attach)의 식별자 — 다시 붙을 때마다 바뀐다. 백엔드 `HostSnapshot`. */
+  incarnation: number;
   phase: RemotePhase;
   daemon: RemoteDaemonInfo | null;
   resume: RemoteResume | null;
@@ -128,29 +130,45 @@ export function unseenNotices(notices: readonly RemoteNotice[], seenSeq: number)
 }
 
 /**
- * 저장해 둔 "여기까지 봤다"가 **이 연결의 것이 아닌** 호스트들.
+ * "여기까지 봤다"를 담아 두는 키 — **host_id 하나로는 부족하다**.
  *
- * `seq`가 호스트 안에서 단조인 것은 맞지만 그건 **한 Host 객체 안에서**다.
- * 다시 붙으면(`Registry::attach` 마다 새 Host) 카운터가 1부터 다시 시작하는데,
- * 화면이 들고 있는 seen 은 옛 연결의 큰 값이라 새 연결의 알림 전부가 "이미
- * 본 것"으로 걸러진다 — 갭·데몬 재시작·읽지 못한 줄까지 통째로 안 보인다.
- * 알림 채널이 조용히 죽는 것이 이 단계에서 가장 나쁜 실패다.
+ * `seq`가 단조인 것은 맞지만 그건 **한 Host 객체 안에서**다. 다시 붙으면
+ * (`Registry::attach` 마다 새 Host) 카운터가 1부터 다시 시작하는데, 화면이 들고
+ * 있는 seen 은 옛 연결의 값이라 새 연결의 알림이 "이미 본 것"으로 걸러진다 —
+ * 갭·데몬 재시작·읽지 못한 줄까지 통째로 안 보인다. 알림 채널이 조용히 죽는
+ * 것이 이 단계에서 가장 나쁜 실패다.
  *
- * 판정은 epoch 비교가 아니라 **되감김 자체**다: 같은 데몬에 다시 붙어도
- * (epoch 동일) 카운터는 리셋되므로 epoch 로는 못 잡는다.
+ * 카운터 비교로는 못 막는다: 이전에 1까지 봤는데 새 연결의 첫 알림이 seq 1이면
+ * **동률**이라 되감김이 아니고, 폴링 사이에 다시 붙어 옛 표시를 지나가 버리면
+ * 아예 **추월**이다 — 둘 다 새 연결의 알림을 옛 표시 뒤에 영원히 숨긴다. epoch
+ * 도 답이 못 된다(같은 데몬에 다시 붙으면 epoch 는 그대로). 그래서 백엔드가
+ * 연결마다 새로 찍어 주는 `incarnation` 을 키에 넣는다 — 다른 연결이면 표시
+ * 자체가 다른 칸이라 비교할 일이 없다.
  */
-export function staleSeenHosts(
+export function seenKey(h: Pick<RemoteHostSnapshot, "host_id" | "incarnation">): string {
+  return `${h.host_id}#${h.incarnation}`;
+}
+
+/** 이 연결에서 어디까지 봤나 (다른 연결의 표시는 이 연결의 것이 아니다). */
+export function seenSeqOf(
+  h: Pick<RemoteHostSnapshot, "host_id" | "incarnation">,
+  seen: Readonly<Record<string, number>>,
+): number {
+  return seen[seenKey(h)] ?? 0;
+}
+
+/**
+ * 지금 붙어 있는 연결의 것이 아닌 표시들 — 지울 키.
+ *
+ * 떨어졌거나 다시 붙은 연결의 표시는 다시 쓰일 일이 없다(같은 incarnation 은
+ * 다시 오지 않는다). 남겨 두면 패널이 열려 있는 동안 계속 쌓이기만 한다.
+ */
+export function staleSeenKeys(
   hosts: readonly RemoteHostSnapshot[],
   seen: Readonly<Record<string, number>>,
 ): string[] {
-  return hosts
-    .filter((h) => {
-      const mine = seen[h.host_id] ?? 0;
-      if (mine === 0) return false;
-      const newest = h.notices.length ? h.notices[h.notices.length - 1].seq : 0;
-      return mine > newest;
-    })
-    .map((h) => h.host_id);
+  const alive = new Set(hosts.map(seenKey));
+  return Object.keys(seen).filter((k) => !alive.has(k));
 }
 
 /**

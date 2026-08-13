@@ -65,6 +65,10 @@ fn alloc_remote_id() -> u64 {
     NEXT_REMOTE_ID.fetch_add(1, Ordering::Relaxed)
 }
 
+/// Identifies one *attachment*, so a consumer can tell a counter that restarted
+/// from one that never moved. See [`HostSnapshot::incarnation`].
+static NEXT_INCARNATION: AtomicU64 = AtomicU64::new(1);
+
 // ---------------------------------------------------------------------------
 // Outputs
 // ---------------------------------------------------------------------------
@@ -197,6 +201,20 @@ pub struct SessionMeta {
 pub struct HostSnapshot {
     pub host_id: String,
     pub label: String,
+    /// Which *attachment* this snapshot belongs to. A number that changes every
+    /// time this `host_id` is attached again, and never repeats in this process.
+    ///
+    /// A notice's `seq` counts from zero **inside one attachment** ([`Host`] is
+    /// new per [`super::link::Link`]), so a viewer's "I have read up to N" is
+    /// only meaningful together with the attachment it was counted in. Nothing
+    /// already on the wire can stand in for this: the daemon's `epoch` is the
+    /// same daemon's, so re-attaching to it keeps the epoch while the counter
+    /// restarts; and comparing the counter with the last one seen cannot
+    /// separate "restarted at 1" from "still at 1", nor catch a new attachment
+    /// that ran past the old mark between two polls. Both of those hide the new
+    /// connection's notices — every one of them — behind a mark from a
+    /// connection that is gone.
+    pub incarnation: u64,
     pub phase: Phase,
     /// Non-null once a `Hello` has been read.
     pub daemon: Option<DaemonInfo>,
@@ -381,6 +399,9 @@ pub struct Fatal(pub String);
 pub struct Host {
     pub host_id: String,
     pub label: String,
+    /// This attachment's id — see [`HostSnapshot::incarnation`]. Minted here
+    /// because here is where the notice counter starts over.
+    incarnation: u64,
     phase: Phase,
     daemon: Option<DaemonInfo>,
     epoch: Option<String>,
@@ -417,6 +438,7 @@ impl Host {
         Host {
             host_id: host_id.into(),
             label: label.into(),
+            incarnation: NEXT_INCARNATION.fetch_add(1, Ordering::Relaxed),
             phase: Phase::Idle,
             daemon: None,
             epoch: None,
@@ -533,6 +555,7 @@ impl Host {
         HostSnapshot {
             host_id: self.host_id.clone(),
             label: self.label.clone(),
+            incarnation: self.incarnation,
             phase: self.phase,
             daemon: self.daemon.clone(),
             resume: self.resume.clone(),
@@ -1110,6 +1133,40 @@ mod tests {
         h.on_undecodable("not JSON".into());
         assert_eq!(h.last_frame_at_ms(), Some(5_000));
         assert_eq!(h.snapshot().last_frame_at_ms, Some(5_000));
+    }
+
+    /// A notice `seq` only means something **inside one attachment**, so the
+    /// snapshot has to say which attachment it was counted in.
+    ///
+    /// Without it a viewer holding "read up to 1" cannot tell a re-attached host
+    /// whose first notice is `seq 1` from the one it already read — the counters
+    /// are equal — and hides it. Nothing else on the snapshot can stand in: the
+    /// same daemon keeps its `epoch` across a re-attach while the counter starts
+    /// over, and `attempts` starts over with it.
+    #[test]
+    fn a_re_attached_host_is_a_new_incarnation_even_though_the_daemon_is_the_same() {
+        let mut first = Host::new("h1", "l");
+        first.apply(hello("e1", r#"{"kind":"fresh"}"#)).unwrap();
+        first.push_notice(NoticeLevel::Warn, "old", None);
+        let before = first.snapshot();
+
+        // What `Registry::attach` does to the same host id: a new `Host`, and a
+        // notice counter that starts over.
+        let mut again = Host::new("h1", "l");
+        again.apply(hello("e1", r#"{"kind":"fresh"}"#)).unwrap();
+        again.push_notice(NoticeLevel::Error, "new", None);
+        let after = again.snapshot();
+
+        assert_eq!(after.notices[0].seq, before.notices[0].seq, "the counter restarts");
+        assert_eq!(
+            after.daemon.as_ref().map(|d| &d.epoch),
+            before.daemon.as_ref().map(|d| &d.epoch),
+            "the same daemon keeps its epoch — which is why the epoch cannot answer this"
+        );
+        assert_ne!(
+            after.incarnation, before.incarnation,
+            "a viewer must be able to tell the two connections apart"
+        );
     }
 
     /// A reopened panel is seeded from what the bridge already holds — the

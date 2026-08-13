@@ -8,8 +8,10 @@ import {
   phaseLabel,
   pickTimeline,
   resumeLabel,
+  seenKey,
+  seenSeqOf,
   shouldFetchBody,
-  staleSeenHosts,
+  staleSeenKeys,
   toLiveTimeline,
   unseenNotices,
   REMOTE_ID_BASE,
@@ -45,10 +47,11 @@ function notice(seq: number, level: RemoteNotice["level"]): RemoteNotice {
   return { seq, level, message: `n${seq}`, session: null, at_ms: 0 };
 }
 
-function host(id: string, notices: RemoteNotice[]): RemoteHostSnapshot {
+function host(id: string, notices: RemoteNotice[], incarnation = 1): RemoteHostSnapshot {
   return {
     host_id: id,
     label: id,
+    incarnation,
     phase: "live",
     daemon: null,
     resume: null,
@@ -154,22 +157,55 @@ describe("알림 배지", () => {
 });
 
 describe("알림 채널이 재접속 후에도 살아 있다", () => {
-  it("호스트가 다시 붙어 seq가 1부터 다시 시작하면 '봤다'를 버린다", () => {
-    // 화면은 seq 50까지 봤다고 기억한다. 그런데 다시 붙은 호스트는 새 Host
-    // 객체라 notice_seq가 0부터 다시 센다 — 이 리셋이 없으면 새 연결의 1~50이
+  it("다시 붙은 연결의 알림은 옛 '봤다' 뒤에 숨지 않는다 — 큰 값이든 동률이든", () => {
+    // 화면은 seq 50까지 봤다고 기억한다. 다시 붙은 호스트는 새 Host 객체라
+    // notice_seq가 0부터 다시 센다 — 옛 표시를 그대로 적용하면 새 연결의 1~50이
     // 전부 '이미 본 것'으로 걸러져 갭도 데몬 재시작도 안 보인다.
-    const reconnected = host("h1", [notice(1, "warn"), notice(2, "error")]);
-    expect(staleSeenHosts([reconnected], { h1: 50 })).toEqual(["h1"]);
-    // 정상 진행 중인 호스트는 건드리지 않는다.
-    expect(staleSeenHosts([host("h1", [notice(60, "info")])], { h1: 50 })).toEqual([]);
-    // 아직 아무것도 안 본 호스트도 건드리지 않는다(0 = 전부 새 것).
-    expect(staleSeenHosts([host("h1", [])], { h1: 0 })).toEqual([]);
-    expect(staleSeenHosts([host("h1", [])], {})).toEqual([]);
-    // 알림이 하나도 없는데 봤다고 되어 있으면 그것도 옛 연결의 흔적이다.
-    expect(staleSeenHosts([host("h1", [])], { h1: 7 })).toEqual(["h1"]);
-    // 리셋 후에는 배지가 실제로 돌아온다.
-    expect(noticeBadge(reconnected.notices, 50)).toBeNull();
-    expect(noticeBadge(reconnected.notices, 0)).toEqual({ count: 2, level: "error" });
+    const reconnected = host("h1", [notice(1, "warn"), notice(2, "error")], 2);
+    const seen = { [seenKey(host("h1", [], 1))]: 50 };
+    expect(seenSeqOf(reconnected, seen)).toBe(0);
+    expect(noticeBadge(reconnected.notices, seenSeqOf(reconnected, seen))).toEqual({
+      count: 2,
+      level: "error",
+    });
+
+    // **동률**: 옛 연결에서 seq 1까지 봤고, 새 연결의 첫 알림도 seq 1이다.
+    // "카운터가 되감겼나"로는 이 경우를 못 잡는다(1 > 1 이 아니다) — 그래서
+    // 새 오류가 영구히 숨었다.
+    const tied = host("h1", [notice(1, "error")], 3);
+    const seenTied = { [seenKey(host("h1", [], 1))]: 1 };
+    expect(seenSeqOf(tied, seenTied)).toBe(0);
+    expect(noticeBadge(tied.notices, seenSeqOf(tied, seenTied))).toEqual({
+      count: 1,
+      level: "error",
+    });
+
+    // **추월**: 폴링 사이에 다시 붙어 새 카운터가 옛 표시를 지나가 버렸다.
+    // 되감김을 한 번도 관측하지 못했지만 1~5는 여전히 새 연결의 것이다.
+    const overtaken = host("h1", [1, 2, 3, 4, 5].map((s) => notice(s, "warn")), 4);
+    const seenOvertaken = { [seenKey(host("h1", [], 1))]: 3 };
+    expect(noticeBadge(overtaken.notices, seenSeqOf(overtaken, seenOvertaken))).toEqual({
+      count: 5,
+      level: "warn",
+    });
+
+    // 같은 연결 안에서는 표시가 그대로 산다 — 매번 다시 보이면 배지가 무의미하다.
+    const same = host("h1", [notice(1, "warn"), notice(2, "info")], 1);
+    const seenSame = { [seenKey(same)]: 1 };
+    expect(seenSeqOf(same, seenSame)).toBe(1);
+    expect(noticeBadge(same.notices, seenSeqOf(same, seenSame))).toEqual({
+      count: 1,
+      level: "info",
+    });
+  });
+
+  it("안 쓰이게 된 표시만 치운다", () => {
+    const live = host("h1", [notice(1, "info")], 7);
+    const seen = { [seenKey(live)]: 1, "h1#6": 40, "h2#1": 3 };
+    // 지금 붙어 있는 연결의 표시는 남고, 떨어졌거나 옛 연결의 것만 지운다.
+    expect(staleSeenKeys([live], seen).sort()).toEqual(["h1#6", "h2#1"]);
+    expect(staleSeenKeys([live], { [seenKey(live)]: 1 })).toEqual([]);
+    expect(staleSeenKeys([], {})).toEqual([]);
   });
 });
 
