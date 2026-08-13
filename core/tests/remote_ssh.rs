@@ -307,7 +307,7 @@ fn config(daemon: &Daemon, port: u16, host_id: &str) -> HostConfig {
 /// Trust the server's key the way a user does — by connecting once with the
 /// prompting client (an SSH terminal). The remote link itself never prompts.
 fn learn_key(dir: &Path, port: u16) {
-    use core_lib::ssh::{AuthMethod, HostKeyDecision, SshConfig};
+    use core_lib::ssh::{AuthMethod, ExecSpec, HostKeyDecision, SshConfig};
     let mgr = core_lib::SessionManager::new();
     let (id, mut ch) = mgr.create_ssh(
         SshConfig {
@@ -315,7 +315,7 @@ fn learn_key(dir: &Path, port: u16) {
             port,
             username: "tester".into(),
             auth: AuthMethod::Password("x".into()),
-            exec: Some("true".into()),
+            exec: Some(ExecSpec::output_only("true")),
         },
         dir.join("known_hosts"),
         80,

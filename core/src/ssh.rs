@@ -17,6 +17,14 @@
 //! - an [`AliveGuard`] marks the session dead + emits `Closed` on **every** exit
 //!   path (connect/auth/host-key/cancel/panic — C9).
 //! - host-key check distinguishes match / mismatch / unknown (F7).
+//!
+//! Three session shapes share all of the above and differ only in what the
+//! channel is: the interactive **pty + shell** ([`SshConfig::exec`] = `None`),
+//! an **output-only exec** ([`ExecStdin::Eof`]), and a **duplex exec**
+//! ([`ExecStdin::Stream`]). The last one is the only place in this file where
+//! reads and writes race, and it is deliberately built out of
+//! [`russh::Channel::split`] halves under one `join!` rather than one `select!`
+//! — see [`ExecStdin::Stream`] for the measurement behind that.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -78,24 +86,68 @@ pub struct SshConfig {
     pub username: String,
     pub auth: AuthMethod,
     /// Remote execution mode (R0 seam — additive). `None` keeps the existing
-    /// interactive **pty + shell** path byte-for-byte. `Some(command)` opens a
-    /// **non-TTY exec channel** running `command`: stdout flows through the shared
-    /// `terminal-output` pipeline (`Shared::emit`), stderr and the exit status are
-    /// surfaced separately over [`ExecEvent`] (structured stream-json prep, R1+).
-    /// This carries a generic command — remote claude/codex argv·env·cwd wiring is
-    /// R1's job, not hardcoded here.
+    /// interactive **pty + shell** path byte-for-byte. `Some(spec)` opens a
+    /// **non-TTY exec channel** running `spec.command`: stdout flows through the
+    /// shared `terminal-output` pipeline (`Shared::emit`), stderr and the exit
+    /// status are surfaced separately over [`ExecEvent`]. This carries a generic
+    /// command — remote claude/codex argv·env·cwd wiring belongs to the caller.
+    pub exec: Option<ExecSpec>,
+}
+
+/// A remote command to run on an exec channel, and what its **stdin** carries.
+///
+/// The two live in one type on purpose: an stdin mode without a command is not a
+/// state this transport can be in, and a second field would let a caller set one
+/// and forget the other.
+pub struct ExecSpec {
+    pub command: String,
+    pub stdin: ExecStdin,
+}
+
+impl ExecSpec {
+    /// R0's shape: run `command`, never send it a byte (see [`ExecStdin::Eof`]).
+    pub fn output_only(command: impl Into<String>) -> Self {
+        Self {
+            command: command.into(),
+            stdin: ExecStdin::Eof,
+        }
+    }
+
+    /// R2b's shape: run `command` and stream this session's input to it (see
+    /// [`ExecStdin::Stream`]).
+    pub fn duplex(command: impl Into<String>) -> Self {
+        Self {
+            command: command.into(),
+            stdin: ExecStdin::Stream,
+        }
+    }
+}
+
+/// What the write direction of an exec channel carries.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ExecStdin {
+    /// **Output-only** (R0). The write direction is half-closed (**EOF**) the
+    /// moment the exec is accepted, so a command that reads stdin sees
+    /// end-of-input and exits instead of waiting forever. No data is ever
+    /// written, so the send window is never consulted and the write-window
+    /// deadlock class cannot arise on this setting at all.
+    Eof,
+    /// **Full duplex** (R2b). Bytes handed to [`SshHandle::send_input`] are
+    /// streamed to the remote command's stdin, and EOF follows when the input
+    /// side closes.
     ///
-    /// **R0 is an output-only exec.** There is no remote stdin here: an exec
-    /// session's channel loop only *reads* (stdout/stderr/exit), and the write
-    /// direction is half-closed (**EOF**) the moment the exec is accepted, so a
-    /// command that reads stdin terminates instead of waiting forever. Feeding
-    /// actual bytes to a remote command's stdin — bidirectional streaming for a
-    /// long-lived `remote claude` — is **R1's** job, built on channel halves or a
-    /// dedicated writer task. A single `select!` cannot independently poll russh
-    /// read + write (the write side parks on send-window back-pressure that only an
-    /// interleaved read releases → window deadlock), which is why R0 does not carry
-    /// stdin at all (codex review loop 3; see the log's stop-rule entry).
-    pub exec: Option<String>,
+    /// The read and write directions are driven as **two futures over
+    /// [`russh::Channel::split`] halves**, never as two branches of one
+    /// `select!`. That distinction is the whole reason R0 shipped without stdin:
+    /// a `select!` whose branch body awaits `channel.data(..)` stops polling the
+    /// read branch for the duration of that await; the channel's receive queue
+    /// then fills, which parks russh's connection loop, which is the only thing
+    /// that could deliver the `WINDOW_ADJUST` the write is waiting for. Measured
+    /// (2026-08-13, russh 0.54.5, 3 MB in against a 6.4 MB flood out): the
+    /// `select!` shape wedged **5/5** rounds on the 20 s deadline, the split
+    /// shape completed **35/35** in ~200 ms. The regression test
+    /// `an_exec_that_is_flooded_while_it_floods_does_not_wedge` holds this.
+    Stream,
 }
 
 /// Events specific to an **exec-channel** session (non-TTY remote command). Only
@@ -172,9 +224,11 @@ pub struct SshChannels {
     /// **Hold it only if you drain it.** Because the queue is bounded and the
     /// send side blocks, a receiver that is kept alive but never polled stalls the
     /// exec read loop entirely — including **stdout**, which rides `Shared::emit`
-    /// and would otherwise look unrelated. Either consume it or drop it; the
-    /// current `src-tauri` shell path drops it immediately, which is why an
-    /// unsubscribed session cannot stall.
+    /// and would otherwise look unrelated. On an [`ExecStdin::Stream`] session it
+    /// stalls the **input** direction too, for the same reason the split exists:
+    /// the write parks on a send window that only the (now stalled) reader could
+    /// reopen. Either consume it or drop it; the current `src-tauri` shell path
+    /// drops it immediately, which is why an unsubscribed session cannot stall.
     pub exec_rx: mpsc::Receiver<ExecEvent>,
 }
 
@@ -184,11 +238,12 @@ pub struct SshHandle {
     size_tx: watch::Sender<(u16, u16)>,
     cancel_tx: watch::Sender<bool>,
     join: Option<JoinHandle<()>>,
-    /// `true` for an [`SshConfig::exec`] session, which has **no remote stdin**.
+    /// `true` for an [`ExecStdin::Eof`] session, which has **no remote stdin**.
     /// Decided at handle creation so `send_input` rejects from the very first
     /// call — dropping the receiver alone would only take effect once connect,
     /// auth and channel-open finished, leaving an early window where writes were
-    /// accepted and then discarded (codex final audit P2).
+    /// accepted and then discarded (codex final audit P2). An
+    /// [`ExecStdin::Stream`] exec and the interactive shell both accept input.
     output_only: bool,
 }
 
@@ -198,7 +253,7 @@ impl SshHandle {
     pub fn send_input(&self, data: &[u8]) -> Result<(), String> {
         use mpsc::error::TrySendError;
         if self.output_only {
-            return Err("exec session has no stdin (output-only; R1 owns remote input)".into());
+            return Err("exec session has no stdin (output-only)".into());
         }
         match self.input_tx.try_send(data.to_vec()) {
             Ok(()) => Ok(()),
@@ -247,9 +302,9 @@ pub(crate) fn spawn_ssh(
     cols: u16,
     rows: u16,
 ) -> (SshHandle, SshChannels) {
-    // Read before `config` moves into the session thread: an exec session is
-    // output-only, and the handle must know that from its first moment.
-    let output_only = config.exec.is_some();
+    // Read before `config` moves into the session thread: an output-only exec
+    // takes no input, and the handle must know that from its first moment.
+    let output_only = matches!(&config.exec, Some(spec) if spec.stdin == ExecStdin::Eof);
     let (input_tx, input_rx) = mpsc::channel::<Vec<u8>>(INPUT_QUEUE);
     let (size_tx, size_rx) = watch::channel((cols.max(1), rows.max(1)));
     let (cancel_tx, cancel_rx) = watch::channel(false);
@@ -347,18 +402,23 @@ async fn run(
         .await
         .map_err(|_| "failed to open session channel".to_string())?;
 
-    // R0 exec seam: a `Some(command)` config runs a non-TTY remote command on a
+    // Exec seam: a `Some(spec)` config runs a non-TTY remote command on a
     // separate code path and returns here, so the interactive pty+shell block
     // below stays untouched (regression 0). `None` falls through to the shell.
-    // The exec path is **output-only** and never reads `input_rx`; remote stdin is
-    // R1's job (see `SshConfig::exec`).
-    if let Some(command) = &config.exec {
-        // Drop the receiver *before* running, so `SessionManager::write()` on an
-        // exec session fails immediately (closed channel) instead of silently
-        // buffering up to the channel capacity and reporting `Ok` — a caller
-        // would otherwise believe input reached the remote (codex audit P2).
-        drop(input_rx);
-        return run_exec(channel, command, shared, status_tx, exec_tx).await;
+    if let Some(spec) = &config.exec {
+        let input_rx = match spec.stdin {
+            // Drop the receiver *before* running, so `SessionManager::write()` on
+            // an output-only exec fails immediately (closed channel) instead of
+            // silently buffering up to the channel capacity and reporting `Ok` —
+            // a caller would otherwise believe input reached the remote (codex
+            // audit P2).
+            ExecStdin::Eof => {
+                drop(input_rx);
+                None
+            }
+            ExecStdin::Stream => Some(input_rx),
+        };
+        return run_exec(channel, spec, shared, status_tx, exec_tx, input_rx).await;
     }
 
     let (cols, rows) = *size_rx.borrow();
@@ -437,19 +497,27 @@ async fn run(
 ///   *no* `ExecEvent` is produced at all — the consumer learns of the outcome
 ///   from `exec_rx` closing plus [`SshStatus::Failed`]/[`SshStatus::Closed`].
 ///
-/// **Output-only** (R0): no PTY is requested (non-TTY), and no stdin is wired —
-/// the loop only *reads* the channel (stdout / stderr / exit). "No stdin" is
-/// signalled explicitly: the write direction is **half-closed (EOF) as soon as
-/// the exec is accepted**, so a command that reads stdin sees end-of-input and
-/// exits instead of blocking forever. Feeding actual bytes to a remote command's
-/// stdin (bidirectional streaming for a long-lived `remote claude`) is **R1's**
-/// job, built on channel halves or a dedicated writer task; a single `select!`
-/// cannot independently poll russh read + write without risking the send-window
-/// deadlock, which is why R0 carries no write side at all (codex review loop 3;
-/// see the log's stop-rule entry). Because the loop has a single await source
-/// (`channel.wait()`), there is no `select!` here and the whole deadlock class
-/// (write-window back-pressure) is structurally absent — the one-shot `eof()` is
-/// a control message, not a windowed data write (see the `Success` arm).
+/// No PTY is requested (non-TTY). What the write direction carries is
+/// [`ExecSpec::stdin`]:
+/// - [`ExecStdin::Eof`] — "no stdin" is signalled *explicitly* as EOF as soon as
+///   the exec is accepted, so a command that reads stdin (`cat`, anything waiting
+///   on end-of-input) exits instead of blocking forever. Blocking forever would
+///   mean `wait()` never yields a status, silently breaking the "exactly one
+///   terminal event" contract while the thread and TCP connection stay pinned.
+/// - [`ExecStdin::Stream`] — `input_rx` is drained onto the channel, then EOF.
+///
+/// **Structure (the deadlock class):** the channel is [`russh::Channel::split`]
+/// into halves and driven by **two futures under one `join!`**. This is not a
+/// stylistic choice. Writing is what parks: `data()` goes through
+/// `ChannelTx::poll_write` (russh 0.54.5 `channels/io/tx.rs:78-106`), which waits
+/// on a `WINDOW_ADJUST` that only russh's connection loop can deliver — and that
+/// loop parks as soon as this channel's receive queue fills (capacity
+/// `channel_buffer_size` = 100, `client/mod.rs:1691`). So a write that stops the
+/// reads deadlocks itself. Two branches of one `select!` do exactly that, because
+/// an `.await` inside a branch body suspends the whole `select!`; two futures
+/// under `join!` do not, because `join!` polls the reader again on every wake.
+/// `eof()` is exempt either way — it is `send_msg` (`channels/mod.rs:347`), a
+/// control message that never consults `window_size`.
 ///
 /// Ordering (review F3/F4):
 /// - `Ready` is emitted only after the server **accepts** the exec (`Success`) —
@@ -460,91 +528,138 @@ async fn run(
 ///   only on `Close`/end-of-stream.
 async fn run_exec(
     channel: russh::Channel<client::Msg>,
-    command: &str,
+    spec: &ExecSpec,
     shared: &Arc<Shared>,
     status_tx: &mpsc::UnboundedSender<SshStatus>,
     exec_tx: &mpsc::Sender<ExecEvent>,
+    input_rx: Option<mpsc::Receiver<Vec<u8>>>,
 ) -> Result<(), String> {
+    let (mut read, write) = channel.split();
+
     // want_reply=true so a server that rejects the exec surfaces as
     // `ChannelMsg::Failure` we can act on (mirrors the pty/shell rationale).
     // NOTE: `exec()` only *queues* the request (russh 0.54); acceptance arrives
     // later as `ChannelMsg::Success`, so we do NOT signal `Ready` here (F4).
-    if channel.exec(true, command.as_bytes().to_vec()).await.is_err() {
+    if write
+        .exec(true, spec.command.as_bytes().to_vec())
+        .await
+        .is_err()
+    {
         let msg = "failed to start remote command".to_string();
         // Transmission failure is still a terminal outcome for the consumer (F4).
         let _ = exec_tx.send(ExecEvent::Error(msg.clone())).await;
         return Err(msg);
     }
 
-    let mut channel = channel;
-    let mut exit_code: Option<u32> = None;
-    let mut exit_signal: Option<String> = None;
-    let mut started = false; // exec accepted (Success seen) -> Ready emitted once
-    // Read-only loop: no stdin/write branch, so no `select!` and no write-window
-    // deadlock is possible. Drains past `Eof` for the late exit-status (F3).
-    loop {
-        match channel.wait().await {
-            // stdout — shared byte pipeline (unchanged output contract).
-            Some(ChannelMsg::Data { ref data }) => shared.emit(data),
-            // Extended data: ext==1 is stderr (SSH_EXTENDED_DATA_STDERR) — kept
-            // separate. Any other (unknown) extended type folds into stdout so
-            // nothing is silently dropped. The bounded, blocking send is the
-            // back-pressure: if the consumer stalls, this await stalls the read
-            // loop and the remote is throttled (F1). A dropped receiver ends the
-            // send (ignored — nobody is consuming).
-            Some(ChannelMsg::ExtendedData { ref data, ext }) => {
-                if ext == 1 {
-                    let _ = exec_tx.send(ExecEvent::Stderr(data.to_vec())).await;
-                } else {
-                    shared.emit(data);
+    // reader -> writer: the server accepted the exec (nothing may be written
+    // before that, and on a rejection nothing is written at all).
+    let (start_tx, start_rx) = oneshot::channel::<()>();
+    // reader -> writer: the channel is finished. Without this the writer would
+    // sit on `recv()` (or on a send window that will never open again) after the
+    // remote is gone, and `join!` below would never complete.
+    let (done_tx, done_rx) = watch::channel(false);
+
+    let reader = async {
+        let mut exit_code: Option<u32> = None;
+        let mut exit_signal: Option<String> = None;
+        let mut rejected = false;
+        let mut start_tx = Some(start_tx);
+        // Single await source: this future only ever reads.
+        loop {
+            match read.wait().await {
+                // stdout — shared byte pipeline (unchanged output contract).
+                Some(ChannelMsg::Data { ref data }) => shared.emit(data),
+                // Extended data: ext==1 is stderr (SSH_EXTENDED_DATA_STDERR) —
+                // kept separate. Any other (unknown) extended type folds into
+                // stdout so nothing is silently dropped. The bounded, blocking
+                // send is the back-pressure: if the consumer stalls, this await
+                // stalls the read loop and the remote is throttled (F1). A
+                // dropped receiver ends the send (ignored — nobody is consuming).
+                Some(ChannelMsg::ExtendedData { ref data, ext }) => {
+                    if ext == 1 {
+                        let _ = exec_tx.send(ExecEvent::Stderr(data.to_vec())).await;
+                    } else {
+                        shared.emit(data);
+                    }
                 }
-            }
-            // exec accepted: only now is the command actually running (F4).
-            Some(ChannelMsg::Success) => {
-                if !started {
-                    started = true;
-                    // Half-close the write direction immediately: an output-only
-                    // exec has no stdin, and a remote command that *reads* stdin
-                    // (`cat`, anything waiting on EOF) would otherwise block
-                    // forever — never exiting, so `wait()` never yields a status
-                    // and the "exactly one terminal event" contract breaks
-                    // silently while the thread and TCP connection stay pinned.
-                    // "No stdin" must therefore be sent as *EOF*, not as silence.
-                    //
-                    // Safe w.r.t. the write-window deadlock class this path was
-                    // re-sliced to remove: `Channel::eof()` is `send_msg`
-                    // (russh 0.54.5 `channels/mod.rs:347` → `:360`), a plain
-                    // bounded send onto the session's control queue (capacity 10,
-                    // at most our own one in-flight message). It never consults
-                    // `window_size`, unlike `data()`, which goes through
-                    // `ChannelTx::poll_write` and parks until a WINDOW_ADJUST that
-                    // only an interleaved read can deliver.
-                    let _ = channel.eof().await;
-                    let _ = status_tx.send(SshStatus::Ready);
+                // exec accepted: only now is the command actually running (F4),
+                // and only now may anything be written to it.
+                Some(ChannelMsg::Success) => {
+                    if let Some(tx) = start_tx.take() {
+                        let _ = tx.send(());
+                        let _ = status_tx.send(SshStatus::Ready);
+                    }
                 }
+                // The server rejected the exec request. Reported as a terminal
+                // Error below (F4) — never a silent end.
+                Some(ChannelMsg::Failure) => {
+                    rejected = true;
+                    break;
+                }
+                // Capture terminal disposition. These may arrive AFTER Eof and
+                // before Close, so we record and keep draining (F3).
+                Some(ChannelMsg::ExitStatus { exit_status }) => exit_code = Some(exit_status),
+                Some(ChannelMsg::ExitSignal { ref signal_name, .. }) => {
+                    exit_signal = Some(sig_name(signal_name));
+                }
+                // Eof closes only the data direction — NOT the channel. The
+                // exit-status/signal can still be in flight before Close, so we
+                // keep draining (F3).
+                Some(ChannelMsg::Eof) => {}
+                // Channel fully closed / stream ended — done.
+                Some(ChannelMsg::Close) | None => break,
+                Some(_) => {}
             }
-            // The server rejected the exec request — deliver a terminal Error so
-            // the consumer always sees a terminating event (F4), never a silent
-            // early return.
-            Some(ChannelMsg::Failure) => {
-                let msg = "server rejected the exec request".to_string();
-                let _ = exec_tx.send(ExecEvent::Error(msg.clone())).await;
-                return Err(msg);
-            }
-            // Capture terminal disposition. These may arrive AFTER Eof and before
-            // Close, so we record and keep draining (F3).
-            Some(ChannelMsg::ExitStatus { exit_status }) => exit_code = Some(exit_status),
-            Some(ChannelMsg::ExitSignal { ref signal_name, .. }) => {
-                exit_signal = Some(sig_name(signal_name));
-            }
-            // Eof closes only the data direction — NOT the channel. The
-            // exit-status/signal can still be in flight before Close, so we keep
-            // draining (F3).
-            Some(ChannelMsg::Eof) => {}
-            // Channel fully closed / stream ended — done.
-            Some(ChannelMsg::Close) | None => break,
-            Some(_) => {}
         }
+        // Release the writer however this ended (accepted, rejected, or gone).
+        let _ = done_tx.send(true);
+        (rejected, exit_code, exit_signal)
+    };
+
+    let writer = async move {
+        let mut done_rx = done_rx;
+        // Nothing may be written before the server accepts the exec. If the
+        // channel ends first (rejection, teardown), there is nothing to write.
+        tokio::select! {
+            accepted = start_rx => {
+                if accepted.is_err() {
+                    return;
+                }
+            }
+            _ = done_rx.changed() => return,
+        }
+        let Some(mut input_rx) = input_rx else {
+            // Output-only: say "no stdin" as EOF, not as silence.
+            let _ = write.eof().await;
+            return;
+        };
+        loop {
+            let msg = tokio::select! {
+                m = input_rx.recv() => m,
+                _ = done_rx.changed() => return,
+            };
+            // `None` = every sender dropped, i.e. the session is going away.
+            let Some(bytes) = msg else { break };
+            // This is the await that parks on the send window. It is safe here
+            // only because `reader` above is a *separate* future that keeps
+            // draining the channel while this one waits (see the fn docs).
+            let sent = tokio::select! {
+                r = write.data(&bytes[..]) => r.is_ok(),
+                _ = done_rx.changed() => return,
+            };
+            if !sent {
+                return;
+            }
+        }
+        let _ = write.eof().await;
+    };
+
+    let ((rejected, exit_code, exit_signal), ()) = tokio::join!(reader, writer);
+
+    if rejected {
+        let msg = "server rejected the exec request".to_string();
+        let _ = exec_tx.send(ExecEvent::Error(msg.clone())).await;
+        return Err(msg);
     }
     // Always deliver a terminal Exit event so a consumer can distinguish clean
     // exit, non-zero exit, and signal death (None/None = ended without a status).
@@ -952,6 +1067,21 @@ W8CkSL2Yx++XP/fxFe/RAAAAD210LXRlc3QtaG9zdGtleQECAwQFBg==\n\
     where
         H: russh::server::Handler + Send + 'static,
     {
+        serve_once_with_window(handler, None)
+    }
+
+    /// As [`serve_once`], but able to advertise a **small receive window**.
+    ///
+    /// A window this side of a megabyte is what makes the duplex test mean
+    /// something: with russh's 2 MB default the client's writes almost never park
+    /// on the send window, and a test that never reaches the parked state cannot
+    /// tell a deadlock-free design from a lucky one. Measured with the real
+    /// prototype: at the default window the single-`select!` shape (the one this
+    /// module deliberately does *not* use) passed 6/6; at 64 KB it wedged 5/5.
+    fn serve_once_with_window<H>(handler: H, window_size: Option<u32>) -> u16
+    where
+        H: russh::server::Handler + Send + 'static,
+    {
         use russh::keys::decode_secret_key;
         use russh::server::{run_stream, Config as ServerConfig};
 
@@ -959,6 +1089,9 @@ W8CkSL2Yx++XP/fxFe/RAAAAD210LXRlc3QtaG9zdGtleQECAwQFBg==\n\
         let mut server_cfg = ServerConfig::default();
         server_cfg.keys = vec![host_key];
         server_cfg.auth_rejection_time = Duration::from_millis(100);
+        if let Some(w) = window_size {
+            server_cfg.window_size = w;
+        }
         let server_cfg = Arc::new(server_cfg);
 
         let std_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -1063,7 +1196,7 @@ W8CkSL2Yx++XP/fxFe/RAAAAD210LXRlc3QtaG9zdGtleQECAwQFBg==\n\
             port,
             username: "tester".into(),
             auth: AuthMethod::Password("testpass".into()),
-            exec: Some(command.into()),
+            exec: Some(ExecSpec::output_only(command)),
         };
         let (id, mut chans) = mgr.create_ssh(cfg, temp_known_hosts(tag), 80, 24, None);
 
@@ -1188,7 +1321,7 @@ W8CkSL2Yx++XP/fxFe/RAAAAD210LXRlc3QtaG9zdGtleQECAwQFBg==\n\
             port: 1, // nothing listens — the session stays in connect/auth
             username: "tester".into(),
             auth: AuthMethod::Password("testpass".into()),
-            exec: Some("irrelevant".into()),
+            exec: Some(ExecSpec::output_only("irrelevant")),
         };
         let (id, _chans) = mgr.create_ssh(cfg, temp_known_hosts("exec_early_write"), 80, 24, None);
         // Immediately, with no status observed yet.
@@ -1382,7 +1515,7 @@ W8CkSL2Yx++XP/fxFe/RAAAAD210LXRlc3QtaG9zdGtleQECAwQFBg==\n\
             port,
             username: "tester".into(),
             auth: AuthMethod::Password("testpass".into()),
-            exec: Some("flood".into()),
+            exec: Some(ExecSpec::output_only("flood")),
         };
         let (id, mut chans) = mgr.create_ssh(cfg, temp_known_hosts("exec_flood"), 80, 24, None);
 
@@ -1502,5 +1635,280 @@ W8CkSL2Yx++XP/fxFe/RAAAAD210LXRlc3QtaG9zdGtleQECAwQFBg==\n\
         );
         assert!(out.stderr.is_empty(), "unknown ext is not stderr");
         assert_eq!(out.exit, Some((Some(0), None)));
+    }
+
+    // ---- duplex exec (R2b): remote stdin ----
+
+    /// Server for the duplex tests: on exec it starts flooding stdout, counts
+    /// every byte the client sends, and only reports an exit once it has the
+    /// whole expected payload. "Flooding while being flooded" is the shape that
+    /// deadlocked R0, so both directions must be under pressure at once.
+    #[derive(Clone)]
+    struct ExecDuplexFloodHandler {
+        inbound: Arc<AtomicU64>,
+        expect_in: u64,
+        out_chunk: usize,
+        out_chunks: usize,
+    }
+
+    impl russh::server::Handler for ExecDuplexFloodHandler {
+        type Error = russh::Error;
+
+        async fn auth_password(
+            &mut self,
+            _user: &str,
+            password: &str,
+        ) -> Result<russh::server::Auth, Self::Error> {
+            if password == "testpass" {
+                Ok(russh::server::Auth::Accept)
+            } else {
+                Ok(russh::server::Auth::reject())
+            }
+        }
+
+        async fn channel_open_session(
+            &mut self,
+            _channel: russh::Channel<russh::server::Msg>,
+            _session: &mut russh::server::Session,
+        ) -> Result<bool, Self::Error> {
+            Ok(true)
+        }
+
+        async fn exec_request(
+            &mut self,
+            channel: russh::ChannelId,
+            _data: &[u8],
+            session: &mut russh::server::Session,
+        ) -> Result<(), Self::Error> {
+            session.channel_success(channel)?;
+            let handle = session.handle();
+            let inbound = Arc::clone(&self.inbound);
+            let (expect_in, out_chunk, out_chunks) =
+                (self.expect_in, self.out_chunk, self.out_chunks);
+            // Flood from a task so the server's own event loop keeps serving —
+            // otherwise the server, not the client, would be the thing that stops.
+            tokio::spawn(async move {
+                let chunk = russh::CryptoVec::from(vec![b'o'; out_chunk]);
+                for _ in 0..out_chunks {
+                    if handle.data(channel, chunk.clone()).await.is_err() {
+                        return;
+                    }
+                }
+                let deadline = Instant::now() + Duration::from_secs(25);
+                while inbound.load(Ordering::Relaxed) < expect_in && Instant::now() < deadline {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+                let _ = handle.exit_status_request(channel, 0).await;
+                let _ = handle.eof(channel).await;
+                let _ = handle.close(channel).await;
+            });
+            Ok(())
+        }
+
+        async fn data(
+            &mut self,
+            _channel: russh::ChannelId,
+            data: &[u8],
+            _session: &mut russh::server::Session,
+        ) -> Result<(), Self::Error> {
+            self.inbound.fetch_add(data.len() as u64, Ordering::Relaxed);
+            Ok(())
+        }
+    }
+
+    /// The R2b regression test, and the reason this module splits the channel.
+    ///
+    /// A remote agent floods its terminal while the user keeps typing. R0 drove
+    /// both directions from one `select!`, and this exact situation wedged it:
+    /// the write parks on the send window, the parked branch stops the reads, the
+    /// unread channel queue parks russh's connection loop, and the `WINDOW_ADJUST`
+    /// that would release the write never gets processed. Measured against the
+    /// same server: `select!` 5/5 wedged, split halves 35/35 clean (~200 ms).
+    ///
+    /// The deadline is the assertion: a deadlock here is an `exit` of `None`
+    /// after the wait, never a hung test run.
+    #[test]
+    fn an_exec_that_is_flooded_while_it_floods_does_not_wedge() {
+        const OUT_CHUNK: usize = 32 * 1024;
+        const OUT_CHUNKS: usize = 200; // 6.4 MB out
+        const IN_CHUNK: usize = 8 * 1024;
+        const IN_CHUNKS: usize = 384; // 3 MB in — several times the 64 KB window
+        let expect_in = (IN_CHUNK * IN_CHUNKS) as u64;
+
+        let inbound = Arc::new(AtomicU64::new(0));
+        let port = serve_once_with_window(
+            ExecDuplexFloodHandler {
+                inbound: Arc::clone(&inbound),
+                expect_in,
+                out_chunk: OUT_CHUNK,
+                out_chunks: OUT_CHUNKS,
+            },
+            Some(64 * 1024),
+        );
+
+        let mgr = SessionManager::new();
+        let cfg = SshConfig {
+            host: "127.0.0.1".into(),
+            port,
+            username: "tester".into(),
+            auth: AuthMethod::Password("testpass".into()),
+            exec: Some(ExecSpec::duplex("flood")),
+        };
+        let (id, mut chans) = mgr.create_ssh(cfg, temp_known_hosts("exec_duplex"), 80, 24, None);
+
+        let mut ready = false;
+        let mut exit: Option<(Option<u32>, Option<String>)> = None;
+        let mut sent = 0usize;
+        let payload = vec![b'i'; IN_CHUNK];
+        let deadline = Instant::now() + Duration::from_millis(20_000);
+        while Instant::now() < deadline && exit.is_none() {
+            if let Ok(ch) = chans.prompt_rx.try_recv() {
+                let _ = ch.reply.send(HostKeyDecision::Accept);
+            }
+            if let Ok(SshStatus::Ready) = chans.status_rx.try_recv() {
+                ready = true;
+            }
+            // Keep typing into the flood. A full queue is back-pressure, not
+            // loss: retry on the next turn rather than dropping the bytes.
+            while ready && sent < IN_CHUNKS && mgr.write(id, &payload).is_ok() {
+                sent += 1;
+            }
+            match chans.exec_rx.try_recv() {
+                Ok(ExecEvent::Exit { code, signal }) => exit = Some((code, signal)),
+                Ok(ExecEvent::Error(e)) => panic!("exec failed: {e}"),
+                Ok(_) => {}
+                Err(mpsc::error::TryRecvError::Disconnected) => break,
+                Err(mpsc::error::TryRecvError::Empty) => {}
+            }
+            thread::sleep(Duration::from_millis(2));
+        }
+
+        let stdout = mgr.snapshot(id).map(|(b, _)| b).unwrap_or_default();
+        let got_in = inbound.load(Ordering::Relaxed);
+        let _ = mgr.remove(id);
+
+        assert_eq!(sent, IN_CHUNKS, "the whole payload must be handed over");
+        assert_eq!(
+            exit,
+            Some((Some(0), None)),
+            "no terminal event within the deadline = the write direction wedged \
+             (input delivered so far: {got_in}/{expect_in})"
+        );
+        assert_eq!(got_in, expect_in, "every byte typed must reach the remote");
+        // The scrollback is a bounded ring, so the flood is measured by it being
+        // full, not by its total (6.4 MB does not fit in 1 MB).
+        assert_eq!(
+            stdout.len(),
+            crate::session::DEFAULT_SCROLLBACK_CAP,
+            "the flood must still have reached the scrollback while input flowed"
+        );
+    }
+
+    /// Server that echoes stdin back on stdout and exits only when it sees EOF —
+    /// so the test can tell "the bytes arrived" from "the write side was closed".
+    #[derive(Clone)]
+    struct ExecStdinEchoHandler;
+
+    impl russh::server::Handler for ExecStdinEchoHandler {
+        type Error = russh::Error;
+
+        async fn auth_password(
+            &mut self,
+            _user: &str,
+            password: &str,
+        ) -> Result<russh::server::Auth, Self::Error> {
+            if password == "testpass" {
+                Ok(russh::server::Auth::Accept)
+            } else {
+                Ok(russh::server::Auth::reject())
+            }
+        }
+
+        async fn channel_open_session(
+            &mut self,
+            _channel: russh::Channel<russh::server::Msg>,
+            _session: &mut russh::server::Session,
+        ) -> Result<bool, Self::Error> {
+            Ok(true)
+        }
+
+        async fn exec_request(
+            &mut self,
+            channel: russh::ChannelId,
+            _data: &[u8],
+            session: &mut russh::server::Session,
+        ) -> Result<(), Self::Error> {
+            session.channel_success(channel)?;
+            Ok(())
+        }
+
+        async fn data(
+            &mut self,
+            channel: russh::ChannelId,
+            data: &[u8],
+            session: &mut russh::server::Session,
+        ) -> Result<(), Self::Error> {
+            session.data(channel, russh::CryptoVec::from(data))?;
+            Ok(())
+        }
+
+        async fn channel_eof(
+            &mut self,
+            channel: russh::ChannelId,
+            session: &mut russh::server::Session,
+        ) -> Result<(), Self::Error> {
+            session.data(channel, russh::CryptoVec::from(&b"SAW-EOF"[..]))?;
+            session.exit_status_request(channel, 0)?;
+            session.eof(channel)?;
+            session.close(channel)?;
+            Ok(())
+        }
+    }
+
+    /// A duplex exec carries typed bytes to the remote command — the plain
+    /// round trip behind ⓐ, with no flood in the way.
+    ///
+    /// Note what is *not* asserted: EOF on teardown. `SessionManager::remove`
+    /// cancels the session future before the input senders drop, so the writer's
+    /// closing `eof()` is not reachable from the manager today (recorded as a
+    /// known window). The `Eof` mode's `eof()` — the one production depends on —
+    /// is held by `inprocess_exec_sends_stdin_eof_so_stdin_readers_terminate`.
+    #[test]
+    fn a_duplex_exec_carries_typed_bytes_to_the_remote() {
+        let port = serve_once(ExecStdinEchoHandler);
+        let mgr = SessionManager::new();
+        let cfg = SshConfig {
+            host: "127.0.0.1".into(),
+            port,
+            username: "tester".into(),
+            auth: AuthMethod::Password("testpass".into()),
+            exec: Some(ExecSpec::duplex("attach")),
+        };
+        let (id, mut chans) = mgr.create_ssh(cfg, temp_known_hosts("exec_echo"), 80, 24, None);
+
+        let mut ready = false;
+        let deadline = Instant::now() + Duration::from_millis(8000);
+        while Instant::now() < deadline && !ready {
+            if let Ok(ch) = chans.prompt_rx.try_recv() {
+                let _ = ch.reply.send(HostKeyDecision::Accept);
+            }
+            if let Ok(SshStatus::Ready) = chans.status_rx.try_recv() {
+                ready = true;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(ready, "duplex exec never became ready");
+
+        mgr.write(id, b"typed-into-the-remote\n")
+            .expect("a duplex exec accepts input");
+        assert!(
+            wait_until(4000, || {
+                let b = mgr.snapshot(id).map(|(b, _)| b).unwrap_or_default();
+                b.windows(21).any(|w| w == b"typed-into-the-remote")
+            }),
+            "typed bytes must reach the remote command and come back on stdout"
+        );
+
+        let _ = mgr.remove(id);
     }
 }

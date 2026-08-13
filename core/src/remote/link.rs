@@ -152,13 +152,19 @@ pub struct HostConfig {
 }
 
 impl HostConfig {
-    fn ssh(&self, exec: String) -> SshConfig {
+    /// An SSH session running `exec` on the remote host. `stdin` decides whether
+    /// this is one of the observing calls (`stream`, the short commands — which
+    /// must stay output-only) or a terminal attach that carries keystrokes.
+    fn ssh(&self, exec: String, stdin: crate::ssh::ExecStdin) -> SshConfig {
         SshConfig {
             host: self.host.clone(),
             port: self.port,
             username: self.username.clone(),
             auth: self.auth.to_method(),
-            exec: Some(exec),
+            exec: Some(crate::ssh::ExecSpec {
+                command: exec,
+                stdin,
+            }),
         }
     }
 
@@ -382,7 +388,13 @@ fn attach(
     let command = cfg.command(&args);
 
     let mgr = SessionManager::new();
-    let (id, channels) = mgr.create_ssh(cfg.ssh(command), cfg.known_hosts.clone(), 80, 24, None);
+    let (id, channels) = mgr.create_ssh(
+        cfg.ssh(command, crate::ssh::ExecStdin::Eof),
+        cfg.known_hosts.clone(),
+        80,
+        24,
+        None,
+    );
     // Removing the session is what cancels the SSH thread; a guard so every
     // exit path below (including a panic) tears the connection down.
     let _guard = SessionGuard { mgr: &mgr, id };
@@ -770,7 +782,13 @@ fn exec_capture(cfg: &HostConfig, command: &str, timeout: Duration) -> Result<Ex
     // front, so the reply arrived headless and was reported as malformed JSON.
     let mgr = SessionManager::with_cap(MAX_REPLY);
     let (id, channels) =
-        mgr.create_ssh(cfg.ssh(command.to_string()), cfg.known_hosts.clone(), 80, 24, None);
+        mgr.create_ssh(
+        cfg.ssh(command.to_string(), crate::ssh::ExecStdin::Eof),
+        cfg.known_hosts.clone(),
+        80,
+        24,
+        None,
+    );
     let _guard = SessionGuard { mgr: &mgr, id };
     let side = SideChannels::spawn(channels, Arc::new(AtomicBool::new(false)));
 
