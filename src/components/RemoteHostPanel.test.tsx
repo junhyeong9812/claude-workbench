@@ -386,3 +386,45 @@ describe("R18 — 구독 실패가 무음화되지 않는다", () => {
     expect(text()).toContain("listen(remote-terminal-ended) 실패");
   });
 });
+
+// ---------------------------------------------------------------------------
+// R15 — "떼기"는 카드가 아니라 **제어**에 대한 말이다
+// ---------------------------------------------------------------------------
+
+describe("R15 — 떼기 뒤 터미널이 살아 있는 것처럼 보이지 않는다", () => {
+  /**
+   * 한 터미널이 두 번 말할 수 있다: 백엔드의 closer 가 "떼어져 닫았습니다"를 낸
+   * 뒤, 그 때문에 세션이 사라지면서 SSH 상태 릴레이가 "연결이 끊어졌습니다"를
+   * 잇달아 낸다. 나중 것으로 덮으면 화면은 **원인이 아니라 결과**를 말한다 —
+   * 백엔드가 한 attach 안에서 `said` 플래그로 지키는 규칙과 같은 규칙이다.
+   */
+  it("떼기 사유가 뒤따라온 막연한 사유에 덮이지 않는다", async () => {
+    routes.remote_hosts = async () => [snapshot([session({ state: "running", closed: false })])];
+    await mount();
+    await act(async () => {
+      findButton("터미널")!.click();
+    });
+    await flush(10);
+
+    await act(async () => {
+      emitEvent("remote-terminal-ended", {
+        id: LOCAL_ID,
+        host_id: "h1",
+        code: null,
+        signal: null,
+        detail: "이 호스트에서 떼어져 터미널을 닫았습니다 — 원격 세션은 계속 돕니다.",
+      });
+      // …그리고 그 결과로 SSH 채널이 죽으면서 나오는, 덜 정확한 두 번째 사유.
+      emitEvent("remote-terminal-ended", {
+        id: LOCAL_ID,
+        host_id: "h1",
+        code: null,
+        signal: null,
+        detail: "원격 호스트와의 연결이 끊어졌습니다.",
+      });
+    });
+    await flush(10);
+    expect(text()).toContain("떼어져 터미널을 닫았습니다");
+    expect(text()).not.toContain("연결이 끊어졌습니다");
+  });
+});

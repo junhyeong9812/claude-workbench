@@ -68,8 +68,12 @@ pub struct Registry {
     /// How a terminal is closed, installed by the layer that owns the session
     /// manager. `core` cannot reach it: the manager lives in the app's Tauri
     /// state, and giving this module a handle to it would invert the dependency.
+    ///
+    /// It is handed the **host** as well as the terminal, because the app layer
+    /// tells the user *why* a terminal stopped and "the host it belonged to was
+    /// detached" is not something an id alone can say.
     #[allow(clippy::type_complexity)]
-    closer: Mutex<Option<Arc<dyn Fn(u64) + Send + Sync>>>,
+    closer: Mutex<Option<Arc<dyn Fn(&str, u64) + Send + Sync>>>,
 }
 
 impl Registry {
@@ -177,7 +181,7 @@ impl Registry {
     /// **tracked** — [`Self::terminals`] keeps answering after a detach — so an
     /// uninstalled closer degrades to "nobody closed them", never to "nobody
     /// knows they exist".
-    pub fn on_close_terminal(&self, close: impl Fn(u64) + Send + Sync + 'static) {
+    pub fn on_close_terminal(&self, close: impl Fn(&str, u64) + Send + Sync + 'static) {
         *self.closer.lock().unwrap_or_else(|p| p.into_inner()) = Some(Arc::new(close));
     }
 
@@ -230,7 +234,7 @@ impl Registry {
             .remove(host_id)
             .unwrap_or_default();
         for id in ids {
-            closer(id);
+            closer(host_id, id);
         }
     }
 
@@ -288,12 +292,18 @@ impl Registry {
 mod tests {
     use super::*;
 
-    fn recording() -> (Registry, Arc<Mutex<Vec<u64>>>) {
+    /// Records `(host_id, terminal_id)` — the app layer needs both to say why a
+    /// terminal stopped, so both are part of the contract being checked.
+    fn recording() -> (Registry, Arc<Mutex<Vec<(String, u64)>>>) {
         let reg = Registry::new();
         let closed = Arc::new(Mutex::new(Vec::new()));
         let sink = Arc::clone(&closed);
-        reg.on_close_terminal(move |id| sink.lock().unwrap().push(id));
+        reg.on_close_terminal(move |host, id| sink.lock().unwrap().push((host.to_string(), id)));
         (reg, closed)
+    }
+
+    fn ids(closed: &Arc<Mutex<Vec<(String, u64)>>>) -> Vec<u64> {
+        closed.lock().unwrap().iter().map(|(_, id)| *id).collect()
     }
 
     /// **"떼기" takes the terminals with it.**
@@ -313,7 +323,11 @@ mod tests {
 
         reg.detach("h1");
 
-        assert_eq!(*closed.lock().unwrap(), vec![7, 8], "both of this host's terminals end");
+        assert_eq!(
+            *closed.lock().unwrap(),
+            vec![("h1".to_string(), 7), ("h1".to_string(), 8)],
+            "both of this host's terminals end, and the closer is told whose they were"
+        );
         assert!(reg.terminals("h1").is_empty(), "…and are forgotten with it");
         assert_eq!(reg.terminals("h2"), vec![9], "another host's terminal is untouched");
     }
@@ -328,7 +342,7 @@ mod tests {
         reg.forget_terminal(7);
         assert_eq!(reg.terminals("h1"), vec![8]);
         reg.detach("h1");
-        assert_eq!(*closed.lock().unwrap(), vec![8]);
+        assert_eq!(ids(&closed), vec![8]);
     }
 
     #[test]
@@ -337,7 +351,7 @@ mod tests {
         reg.note_terminal("h1", 7);
         reg.note_terminal("h2", 9);
         reg.detach_all();
-        let mut got = closed.lock().unwrap().clone();
+        let mut got = ids(&closed);
         got.sort_unstable();
         assert_eq!(got, vec![7, 9]);
         assert!(reg.terminals("h1").is_empty() && reg.terminals("h2").is_empty());

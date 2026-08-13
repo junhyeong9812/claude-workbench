@@ -45,6 +45,42 @@ pub struct RemoteState {
     registry: Registry,
 }
 
+/// Teach the registry how to end a terminal — the one piece of the R15 contract
+/// that cannot live in `core`.
+///
+/// `core::remote::Registry` knows *which* terminals belong to a host, and closes
+/// them on detach, re-attach and shutdown. What it cannot do is the closing: the
+/// session manager lives in Tauri's state map, and handing `core` a path to it
+/// would invert the dependency. So the closure is installed here, once, at app
+/// start — **and without it nothing is closed at all**, which is the state this
+/// shipped in: "떼기" removed the card while the terminal kept carrying
+/// keystrokes to the remote agent.
+///
+/// The order inside is deliberate. The reason is emitted **before** the session
+/// is removed, because removing it tears down the SSH channel and the status
+/// relay in [`remote_attach`] then reports the vaguer "연결이 끊어졌습니다".
+/// Both reach the panel; the first one is the true one, and the panel keeps the
+/// first (the same rule the `said` flag applies inside one attach).
+pub fn install_terminal_closer(app: &AppHandle) {
+    let handle = app.clone();
+    app.state::<RemoteState>()
+        .registry
+        .on_close_terminal(move |host_id, id| {
+            let _ = handle.emit(
+                "remote-terminal-ended",
+                RemoteTerminalEnded {
+                    id,
+                    host_id: host_id.to_string(),
+                    code: None,
+                    signal: None,
+                    detail: "이 호스트에서 떼어져 터미널을 닫았습니다 — 원격 세션은 계속 돕니다."
+                        .to_string(),
+                },
+            );
+            let _ = handle.state::<core_lib::SessionManager>().remove(id);
+        });
+}
+
 /// Turns a bridged event into the workbench event it has always been.
 struct TauriSink {
     app: AppHandle,
@@ -397,6 +433,10 @@ pub fn remote_attach(
             )
         })?;
     let (local_id, channels) = mgr.create_ssh(config, known_hosts, cols, rows, None);
+    // File it under the host **before** anything can fail: from here on the
+    // registry is the only place that knows this terminal belongs to `host_id`,
+    // and a detach that does not know cannot close it (R15).
+    remote.registry.note_terminal(&host_id, local_id);
     let rx = mgr.subscribe(local_id).map_err(AppError::new)?;
     super::spawn_output_relay(app.clone(), local_id, rx, None);
 
@@ -491,6 +531,14 @@ pub fn remote_attach(
 /// Say once that a remote terminal is over. See the `said` flag in
 /// [`remote_attach`]: two relays watch two different ways for it to end, and a
 /// panel that is told twice would report the second, vaguer reason.
+///
+/// This is also where the registry **forgets** the terminal. It has to be: a
+/// terminal that ended on its own (the agent exited, `cwcd attach` was refused,
+/// the connection dropped, the user pressed 닫기) is still filed under its host,
+/// and a later detach would then close whatever id the session manager has since
+/// handed out. That is the class R1a shipped — a detach that `SIGKILL`ed an
+/// unrelated session — and the only thing standing between it and here is this
+/// line.
 fn emit_terminal_ended(
     app: &AppHandle,
     said: &Arc<std::sync::atomic::AtomicBool>,
@@ -500,6 +548,9 @@ fn emit_terminal_ended(
     signal: Option<String>,
     detail: &str,
 ) {
+    // Outside the `said` guard: whichever relay speaks, both know the terminal
+    // is over, and forgetting twice is a no-op while forgetting never is not.
+    app.state::<RemoteState>().registry.forget_terminal(id);
     if said.swap(true, std::sync::atomic::Ordering::SeqCst) {
         return;
     }

@@ -168,7 +168,12 @@ export function RemoteHostPanel() {
     endedReady.current = (async () => {
       try {
         un = await listen<RemoteTerminalEnded>("remote-terminal-ended", (e) => {
-          setEndedById((m) => ({ ...m, [e.payload.id]: endedReason(e.payload) }));
+          // **첫 사유가 진짜다.** 한 터미널이 두 번 말할 수 있다: 호스트를 떼면
+          // 백엔드가 "떼어져 닫았습니다"를 먼저 내고, 그 때문에 세션이 사라지면
+          // SSH 상태 릴레이가 뒤이어 "연결이 끊어졌습니다"를 낸다. 나중 것으로
+          // 덮으면 화면은 원인이 아니라 결과를 말하게 된다 — 백엔드가 한 attach
+          // 안에서 `said` 플래그로 지키는 규칙과 같은 규칙이다.
+          setEndedById((m) => (e.payload.id in m ? m : { ...m, [e.payload.id]: endedReason(e.payload) }));
         });
         if (disposed) {
           un?.();

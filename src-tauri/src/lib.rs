@@ -125,6 +125,16 @@ pub fn register(builder: tauri::Builder<tauri::Wry>) -> tauri::Builder<tauri::Wr
         .manage(commands::ScrollbackState::default())
         .manage(commands::codex::CodexState::default())
         .manage(commands::remote::RemoteState::default())
+        // The one piece of R15 that `core` cannot install itself: how a remote
+        // terminal is closed. `Registry` tracks which terminals belong to which
+        // host and closes them on detach / re-attach / shutdown, but the closing
+        // reaches into the session manager, which lives in the state map above.
+        // **Without this line nothing is closed** — "떼기" hides the card while
+        // the terminal keeps carrying keystrokes to the remote agent.
+        .setup(|app| {
+            commands::remote::install_terminal_closer(app.handle());
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
             commands::files::read_dir,
             commands::files::detect_project_types,
