@@ -782,6 +782,31 @@ mod tests {
         assert!(serde_json::from_str::<Cursor>(r#"":7""#).is_err());
     }
 
+    /// `cwcd timeline <addr>` — the reply the bridge's on-demand fetch reads.
+    /// The turn map's **string** keys are here too, and they are the half a
+    /// typed consumer gets wrong: a slice whose session was ever prompted is
+    /// every real one.
+    #[test]
+    fn a_timeline_slice_reply_decodes_with_its_string_keyed_turns() {
+        let slice: TimelineSliceReply = decode_response(
+            r#"{"response":"timeline","key":"k2","session_id":"7699b5b5","from_index":0,
+                "items":[{"session_id":"7699b5b5","tool_call_id":"toolu_01Va","turn":1,"seq":0,
+                          "kind":"edit","title":"Write /tmp/r2a/work/hello.txt","locations":[],
+                          "project_label":null,"diffs":[],"content_text":null,"raw_input":null,
+                          "agent_status":"completed","write_status":"none","revision":1}],
+                "total":1,"turns":{"1":"Create a file named hello.txt"},
+                "model":"claude-opus-5",
+                "last_usage":{"input":2,"output":5,"cache_read":31000,"cache_creation":800}}"#,
+        )
+        .expect("a finished session's body must be readable — it is the address `items_omitted` points at");
+        assert_eq!(slice.key.as_str(), "k2");
+        assert_eq!(slice.total, 1);
+        assert_eq!(slice.items[0].title, "Write /tmp/r2a/work/hello.txt");
+        assert_eq!(slice.turns.get(&1).map(String::as_str), Some("Create a file named hello.txt"));
+        assert_eq!(slice.model.as_deref(), Some("claude-opus-5"));
+        assert_eq!(slice.last_usage.unwrap().cache_read, 31000);
+    }
+
     #[test]
     fn an_error_reply_is_an_error_not_a_missing_field() {
         let err = decode_response::<SessionsReply>(
