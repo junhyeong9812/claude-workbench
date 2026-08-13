@@ -756,3 +756,104 @@ describe("R2 — 프로젝트 목록: 빈 목록과 못 읽은 설정은 다른 
     expect(findButton("다시 시도")).toBeTruthy();
   });
 });
+
+// ---------------------------------------------------------------------------
+// R7 (a) — 원격 타임라인이 로컬과 **같은 내용**을 보인다
+//
+// 셋 다 "프론트 상태에는 있는데 화면에 안 그린다"는 한 가지 결함의 세 얼굴이다:
+// 감사가 R7 을 P1 으로 올린 근거가 그것이고, 그래서 단언은 전부 화면 텍스트에
+// 건다(상태에 들어갔나가 아니라 **사용자가 보나**).
+// ---------------------------------------------------------------------------
+
+function tlItem(id: string, seq: number, over: Record<string, unknown> = {}) {
+  return {
+    session_id: "abcdefgh",
+    tool_call_id: id,
+    turn: 1,
+    seq,
+    kind: "execute",
+    title: `제목 ${id}`,
+    locations: [],
+    project_label: null,
+    diffs: [],
+    content_text: null,
+    content_truncated: false,
+    raw_input: null,
+    agent_status: "completed",
+    write_status: "none",
+    revision: 1,
+    ...over,
+  };
+}
+
+function liveEvent(over: Record<string, unknown> = {}) {
+  return {
+    id: SID,
+    items: [],
+    turns: [[1, "무엇을 했나"]],
+    answers: [[1, "이렇게 했다"]],
+    dates: [[1, "2026-08-13"]],
+    tokens: [[1, { input: 100, output: 20, cache_read: 3, cache_creation: 7 }]],
+    model: "claude-opus-4-8",
+    last_usage: null,
+    subagents: [],
+    ...over,
+  };
+}
+
+/** 살아 있는(본문이 오는) 원격 세션 하나. */
+function liveSession() {
+  return snapshot([
+    session({ body_omitted: false, timeline_len: 3, turns: 1, items: 3, closed: false, state: "running" }),
+  ]);
+}
+
+describe("R7 — 턴의 날짜·토큰이 화면에 닿는다", () => {
+  it("payload 로 온 dates·tokens 가 상태에만 머물지 않고 그려진다", async () => {
+    routes.remote_hosts = async () => [liveSession()];
+    await mount();
+    await act(async () => emitEvent("claude-timeline", liveEvent()));
+    await openRow();
+    expect(text()).toContain("이렇게 했다"); // 앞 슬라이스가 세운 것(회귀 방지)
+    expect(text(), "턴의 날짜가 어디에도 없다").toContain("2026-08-13");
+    expect(text(), "턴별 토큰(↑input+cache_creation)이 없다").toContain("107");
+    expect(text()).toContain("20");
+  });
+});
+
+describe("R7 — tool 항목이 제목만 남지 않는다", () => {
+  it("항목의 본문이 화면에 나오고, 잘린 본문은 잘렸다고 말한다", async () => {
+    routes.remote_hosts = async () => [liveSession()];
+    await mount();
+    await act(async () =>
+      emitEvent(
+        "claude-timeline",
+        liveEvent({
+          items: [
+            tlItem("c1", 1, { content_text: "명령의 결과 본문이다" }),
+            tlItem("c2", 2, { content_text: "잘린 본문", content_truncated: true }),
+          ],
+        }),
+      ),
+    );
+    await openRow();
+    expect(text(), "본문이 없으면 제목 12줄은 목차일 뿐이다").toContain("명령의 결과 본문이다");
+    expect(text()).toContain("잘린 본문");
+    expect(text(), "절단이 화면에 안 보이면 조용한 유실이다").toContain("잘렸");
+  });
+});
+
+describe("R7 — 항목 목록의 상한은 화면이 말한다", () => {
+  it("최근 몇 개만 그렸다는 사실과 전체 개수가 함께 뜬다", async () => {
+    routes.remote_hosts = async () => [liveSession()];
+    await mount();
+    const many = Array.from({ length: 40 }, (_, i) => tlItem(`c${i}`, i + 1));
+    await act(async () => emitEvent("claude-timeline", liveEvent({ items: many })));
+    await openRow();
+    expect(text(), "40개 중 일부만 그렸다는 말이 없다").toContain("40");
+    expect(text()).toContain("최근");
+    // 가장 최근 것이 보이고 가장 오래된 것은 잘려 있다 — 상한이 실제로 최근 쪽이다.
+    expect(text()).toContain("제목 c39");
+    expect(text()).not.toContain("제목 c0 ");
+  });
+});

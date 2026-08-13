@@ -5718,10 +5718,30 @@ body {
   padding-left: 10px;
   color: var(--fg-dim);
 }
+/* 그 턴의 날짜와 토큰 — 답변 아래 한 줄. 로컬 타임라인의 날짜 구분선·토큰
+   배지와 같은 정보를, 좁은 패널에 맞게 한 줄로 눕힌 것. */
+.remote-turn-meta {
+  padding-left: 10px;
+  color: var(--fg-dim);
+  font-size: 0.85em;
+  line-height: 1.5;
+}
 .remote-item {
   display: flex;
   gap: 6px;
   min-width: 0;
+}
+/* 항목의 본문. 제목만 있는 목록은 목차이지 타임라인이 아니다(R7). */
+.remote-item-body {
+  padding-left: calc(3.4em + 6px);
+  color: var(--fg-dim);
+  font-size: 0.9em;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+}
+.remote-item-cut {
+  color: var(--st-warn, #f9e2af);
 }
 .remote-kind {
   flex: 0 0 auto;

@@ -14,7 +14,11 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import type { TimelineItem } from "../types";
-import type { ClaudeTimelineEvent, TokenUsage } from "../hooks/useClaudeTimeline";
+import {
+  sumTokenTotals,
+  type ClaudeTimelineEvent,
+  type TokenUsage,
+} from "../hooks/useClaudeTimeline";
 import { errText } from "../utils/error";
 
 /**
@@ -189,6 +193,47 @@ export function countsLabel(
     return `턴 ${turns} · 본문 생략됨 · ${s.timeline_len}개`;
   }
   return `턴 ${turns} · 항목 ${items}`;
+}
+
+/**
+ * 한 턴 옆에 붙는 **날짜 · 토큰** 한 줄. 붙일 것이 없으면 `null`.
+ *
+ * 데몬은 R2b 부터 `dates`·`tokens` 를 실어 보내고 소비자도 필수로 받는데
+ * ({@link required}), 화면은 그 둘을 상태에 넣어 두고 **그리지 않았다** — 원격
+ * 타임라인이 "로컬과 같은 내용"이 아니라던 R7 의 절반이 이것이다.
+ *
+ * ↑/↓ 의 정의는 로컬 게이지와 **같은 함수**({@link sumTokenTotals})에서 온다.
+ * 여기서 손으로 더하면 두 화면이 같은 세션에 다른 숫자를 말하게 된다.
+ */
+export function turnMetaLabel(
+  turn: number,
+  dates: ReadonlyMap<number, string>,
+  tokens: ReadonlyMap<number, TokenUsage>,
+): string | null {
+  const parts: string[] = [];
+  const date = dates.get(turn);
+  if (date) parts.push(date);
+  const usage = tokens.get(turn);
+  if (usage) {
+    const { input, output } = sumTokenTotals([[turn, usage]]);
+    if (input > 0 || output > 0) {
+      parts.push(`↑${input.toLocaleString()} ↓${output.toLocaleString()}`);
+    }
+  }
+  return parts.length > 0 ? parts.join(" · ") : null;
+}
+
+/**
+ * "N개 중 최근 M개만" — 항목 목록을 잘라 그렸다는 사실. 다 보이면 `null`.
+ *
+ * 원격 세션 하나에 아이템이 수백 개일 수 있어 목록은 최근 몇 개만 그린다. 그
+ * 상한 자체는 문제가 아니지만, **잘렸다는 말이 없으면** 사용자는 그 몇 개가
+ * 세션 전부라고 읽는다 — 앞 슬라이스가 트리·git-log 잘림에 세운 규칙
+ * ({@link dirCutNote} 계열)을 타임라인에도 그대로 적용한다.
+ */
+export function itemCutNote(total: number, shown: number): string | null {
+  if (total <= shown) return null;
+  return `항목 ${total}개 중 최근 ${shown}개만 보이고 있습니다.`;
 }
 
 /** 펼쳤을 때 원격에서 본문을 가져올 수 **있나** (본문이 없고 데몬은 갖고 있다). */

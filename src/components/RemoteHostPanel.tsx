@@ -38,6 +38,7 @@ import {
   countsLabel,
   defaultAccountId,
   endedReason,
+  itemCutNote,
   killGate,
   killLabel,
   noticeBadge,
@@ -52,6 +53,7 @@ import {
   shouldFetchBody,
   spawnRequest,
   staleSeenKeys,
+  turnMetaLabel,
   useRemoteHosts,
   KILL_SIGNAL,
   REMOTE_RESIZE_DEBOUNCE_MS,
@@ -673,6 +675,10 @@ function SessionRow({
   // 턴 → 답변. 데몬은 R2b 부터 이것을 실어 보내는데 화면이 버리고 있었다 —
   // 그래서 "로컬과 같은 내용"이라던 원격 타임라인에 질문만 있었다.
   const answers = new Map(shown?.answers ?? []);
+  // 날짜·턴별 토큰도 마찬가지였다 — payload 에 실려 상태까지 들어왔는데 그리는
+  // 곳이 없었다(R7). 그려야 로컬 타임라인과 "같은 내용"이 된다.
+  const dates = new Map(shown?.dates ?? []);
+  const tokens = new Map(shown?.tokens ?? []);
   const model = shown?.model ?? s.model;
   const ctx = shown?.ctxTokens ?? s.ctx_tokens;
   const recoverable = shouldFetchBody(s, shown);
@@ -743,27 +749,45 @@ function SessionRow({
               </button>
             </p>
           ) : null}
-          {turns.map(([n, text]) => (
-            <Fragment key={`t${n}`}>
-              <p className="remote-turn">
-                <span className="remote-turn-no">Q{n}</span>
-                {text}
+          {turns.map(([n, text]) => {
+            const meta = turnMetaLabel(n, dates, tokens);
+            return (
+              <Fragment key={`t${n}`}>
+                <p className="remote-turn">
+                  <span className="remote-turn-no">Q{n}</span>
+                  {text}
+                </p>
+                {answers.has(n) ? (
+                  <p className="remote-answer">
+                    <span className="remote-turn-no">A{n}</span>
+                    {answers.get(n)}
+                  </p>
+                ) : null}
+                {meta ? <p className="remote-turn-meta">{meta}</p> : null}
+              </Fragment>
+            );
+          })}
+          {items.slice(-ITEM_ROWS).map((it) => (
+            <Fragment key={it.tool_call_id}>
+              <p className="remote-item">
+                <span className="remote-kind">{KIND_LABEL[it.kind] ?? "·"}</span>
+                <span className="remote-item-title">{it.title}</span>
+                <span className="remote-item-status">{AGENT_BADGE[it.agent_status] ?? ""}</span>
               </p>
-              {answers.has(n) ? (
-                <p className="remote-answer">
-                  <span className="remote-turn-no">A{n}</span>
-                  {answers.get(n)}
+              {it.content_text ? (
+                <p className="remote-item-body">
+                  {it.content_text}
+                  {it.content_truncated ? (
+                    // 원격 아이템에는 `claude_item_detail` 같은 원문 주소가 아직
+                    // 없다 — 그래서 잘림은 **말로만** 갚는다. 말이 없으면 사용자는
+                    // 잘린 본문을 전부라고 읽는다.
+                    <span className="remote-item-cut"> …여기서 잘렸습니다</span>
+                  ) : null}
                 </p>
               ) : null}
             </Fragment>
           ))}
-          {items.slice(-ITEM_ROWS).map((it) => (
-            <p key={it.tool_call_id} className="remote-item">
-              <span className="remote-kind">{KIND_LABEL[it.kind] ?? "·"}</span>
-              <span className="remote-item-title">{it.title}</span>
-              <span className="remote-item-status">{AGENT_BADGE[it.agent_status] ?? ""}</span>
-            </p>
-          ))}
+          <CutNote note={itemCutNote(items.length, ITEM_ROWS)} />
           {items.length === 0 && turns.length === 0 && !recoverable && !fetching ? (
             <p className="remote-empty">아직 받은 타임라인이 없습니다.</p>
           ) : null}

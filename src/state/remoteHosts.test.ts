@@ -7,6 +7,7 @@ import {
   endedReason,
   fetchedToLive,
   isRemoteId,
+  itemCutNote,
   killGate,
   killLabel,
   mergeSeed,
@@ -25,6 +26,7 @@ import {
   spawnRequest,
   staleSeenKeys,
   toLiveTimeline,
+  turnMetaLabel,
   unseenNotices,
   REMOTE_ID_BASE,
   type RemoteHostSnapshot,
@@ -633,5 +635,45 @@ describe("원격 터미널이 멈춘 이유", () => {
     expect(multi).not.toContain("\n");
     const long = endedReason({ code: 1, signal: null, detail: "x".repeat(1000) });
     expect(long.length).toBeLessThan(400);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// R7 (a) — 원격 타임라인이 로컬과 "같은 내용"을 보인다: 날짜·턴별 토큰·본문·잘림
+// ---------------------------------------------------------------------------
+
+describe("R7 — 턴의 날짜와 토큰이 화면에 닿는다", () => {
+  it("날짜와 토큰이 한 줄로 합쳐지고, 둘 다 없으면 줄을 만들지 않는다", () => {
+    const dates = new Map([[1, "2026-08-13"]]);
+    const tokens = new Map([
+      [1, { input: 100, output: 20, cache_read: 5, cache_creation: 7 }],
+    ]);
+    const both = turnMetaLabel(1, dates, tokens);
+    expect(both).toContain("2026-08-13");
+    // ↑ = 새로 처리한 컨텍스트(input + cache_creation), ↓ = 생성 출력 —
+    // 로컬 `sumTokenTotals` 와 같은 정의여야 두 화면이 다른 숫자를 말하지 않는다.
+    expect(both).toContain("107");
+    expect(both).toContain("20");
+    // 날짜만·토큰만·아무것도 없음 — 셋이 서로 다른 답이다.
+    expect(turnMetaLabel(1, dates, new Map())).toBe("2026-08-13");
+    expect(turnMetaLabel(1, new Map(), tokens)).not.toContain("2026");
+    expect(turnMetaLabel(9, dates, tokens)).toBeNull();
+  });
+
+  it("0 토큰은 숫자를 만들어 내지 않는다", () => {
+    const zero = new Map([[1, { input: 0, output: 0, cache_read: 0, cache_creation: 0 }]]);
+    expect(turnMetaLabel(1, new Map(), zero)).toBeNull();
+  });
+});
+
+describe("R7 — 항목 목록의 잘림은 화면이 말한다", () => {
+  it("최근 N 개만 그렸으면 전체 개수와 함께 그 사실이 문장으로 나온다", () => {
+    const note = itemCutNote(57, 12);
+    expect(note).not.toBeNull();
+    expect(note).toContain("57");
+    expect(note).toContain("12");
+    // 다 보이면 할 말이 없다 — 없는 잘림을 지어내지 않는다.
+    expect(itemCutNote(12, 12)).toBeNull();
+    expect(itemCutNote(3, 12)).toBeNull();
   });
 });
