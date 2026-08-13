@@ -56,6 +56,20 @@ pub use link::{HostConfig, Link, LinkTimeouts, RemoteAuth, Sink};
 #[derive(Default)]
 pub struct Registry {
     links: Mutex<BTreeMap<String, Arc<Link>>>,
+    /// The terminals opened onto each host's sessions, by the id the app's own
+    /// `SessionManager` filed them under.
+    ///
+    /// A remote terminal is an **SSH exec of its own** (`cwcd attach`), not part
+    /// of the observation window, so stopping the link leaves it running: the
+    /// host's card disappears while typing still reaches the remote agent. Held
+    /// here because this is the one place that knows a terminal belongs to a
+    /// host — the session manager only sees a session like any other.
+    terminals: Mutex<BTreeMap<String, Vec<u64>>>,
+    /// How a terminal is closed, installed by the layer that owns the session
+    /// manager. `core` cannot reach it: the manager lives in the app's Tauri
+    /// state, and giving this module a handle to it would invert the dependency.
+    #[allow(clippy::type_complexity)]
+    closer: Mutex<Option<Arc<dyn Fn(u64) + Send + Sync>>>,
 }
 
 impl Registry {
@@ -95,18 +109,36 @@ impl Registry {
             old
         };
         if let Some(old) = old {
+            // Replacing a link is an implicit detach, and it invalidates exactly
+            // what a detach does: the new attachment allocates its own session
+            // ids, so a terminal opened through the old one still types into the
+            // agent while every command that addresses it (resize, kill) can no
+            // longer find it. Closed with the link it belonged to.
+            self.close_terminals_of(&id);
             old.stop();
         }
         id
     }
 
-    /// Detach one host. `false` when it was not attached.
+    /// Detach one host **and everything it is driving**. `false` when it was not
+    /// attached.
+    ///
+    /// The terminals go with it. "떼기" is a statement about control, not about
+    /// a card: a remote terminal left open after the host is detached still
+    /// carries every keystroke to the agent, while the commands that answer
+    /// (`remote_resize`, `remote_kill`) fail with "주소를 알 수 없습니다" because
+    /// the link they addressed through is gone. The user's intent and the
+    /// machine's state have to end up in the same place.
+    ///
+    /// The daemon and its agents are, as ever, untouched — closing a terminal
+    /// closes this workbench's window onto a session, not the session.
     pub fn detach(&self, host_id: &str) -> bool {
         let taken = self
             .links
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .remove(host_id);
+        self.close_terminals_of(host_id);
         match taken {
             Some(link) => {
                 link.stop();
@@ -119,8 +151,86 @@ impl Registry {
     /// Detach everything (app shutdown).
     pub fn detach_all(&self) {
         let taken = std::mem::take(&mut *self.links.lock().unwrap_or_else(|p| p.into_inner()));
+        let hosts: Vec<String> = self
+            .terminals
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .keys()
+            .cloned()
+            .collect();
+        for host in hosts {
+            self.close_terminals_of(&host);
+        }
         for (_, link) in taken {
             link.stop();
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Terminals opened onto a host (R2b `remote_attach`)
+    // -----------------------------------------------------------------------
+
+    /// Install the one thing this module cannot do itself: end a terminal.
+    ///
+    /// Called once by the app layer with a closure that removes the session from
+    /// the manager (and tells the frontend). Without it, terminals are still
+    /// **tracked** — [`Self::terminals`] keeps answering after a detach — so an
+    /// uninstalled closer degrades to "nobody closed them", never to "nobody
+    /// knows they exist".
+    pub fn on_close_terminal(&self, close: impl Fn(u64) + Send + Sync + 'static) {
+        *self.closer.lock().unwrap_or_else(|p| p.into_inner()) = Some(Arc::new(close));
+    }
+
+    /// Record a terminal that was opened onto one of `host_id`'s sessions.
+    pub fn note_terminal(&self, host_id: &str, terminal_id: u64) {
+        let mut map = self.terminals.lock().unwrap_or_else(|p| p.into_inner());
+        let ids = map.entry(host_id.to_string()).or_default();
+        if !ids.contains(&terminal_id) {
+            ids.push(terminal_id);
+        }
+    }
+
+    /// Forget a terminal that ended on its own — the remote command exited, the
+    /// connection dropped, the user closed the tab. Keeping it would mean a
+    /// later detach closing an id the manager has already reused.
+    pub fn forget_terminal(&self, terminal_id: u64) {
+        let mut map = self.terminals.lock().unwrap_or_else(|p| p.into_inner());
+        for ids in map.values_mut() {
+            ids.retain(|id| *id != terminal_id);
+        }
+        map.retain(|_, ids| !ids.is_empty());
+    }
+
+    /// The terminals currently open onto one host's sessions.
+    pub fn terminals(&self, host_id: &str) -> Vec<u64> {
+        self.terminals
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(host_id)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// Close (and forget) every terminal of one host. Both locks are released
+    /// before the closer runs — it reaches into the session manager, which is a
+    /// different lock order.
+    fn close_terminals_of(&self, host_id: &str) {
+        let closer = self
+            .closer
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone();
+        // Nothing to close them with: keep them recorded rather than dropping
+        // the only record that they exist.
+        let Some(closer) = closer else { return };
+        let ids = self
+            .terminals
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(host_id)
+            .unwrap_or_default();
+        for id in ids {
+            closer(id);
         }
     }
 
@@ -171,5 +281,90 @@ impl Registry {
     /// The `"<epoch>:k<n>"` address of a remote session id.
     pub fn addr_of(&self, host_id: &str, id: u64) -> Option<String> {
         self.link(host_id)?.addr_of(id)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn recording() -> (Registry, Arc<Mutex<Vec<u64>>>) {
+        let reg = Registry::new();
+        let closed = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&closed);
+        reg.on_close_terminal(move |id| sink.lock().unwrap().push(id));
+        (reg, closed)
+    }
+
+    /// **"떼기" takes the terminals with it.**
+    ///
+    /// Detaching stopped only the observation window. The host's card vanished
+    /// from the panel while its terminal kept carrying keystrokes to the remote
+    /// agent — and `remote_resize`, which goes through the link, answered "이
+    /// 세션의 원격 주소를 알 수 없습니다". The user had said "stop controlling
+    /// this host" and was still controlling it.
+    #[test]
+    fn detaching_a_host_closes_the_terminals_opened_onto_it() {
+        let (reg, closed) = recording();
+        reg.note_terminal("h1", 7);
+        reg.note_terminal("h1", 8);
+        reg.note_terminal("h2", 9);
+        assert_eq!(reg.terminals("h1"), vec![7, 8]);
+
+        reg.detach("h1");
+
+        assert_eq!(*closed.lock().unwrap(), vec![7, 8], "both of this host's terminals end");
+        assert!(reg.terminals("h1").is_empty(), "…and are forgotten with it");
+        assert_eq!(reg.terminals("h2"), vec![9], "another host's terminal is untouched");
+    }
+
+    /// A terminal that ended on its own must be forgotten, or a later detach
+    /// would close an id the session manager has since handed to somebody else.
+    #[test]
+    fn a_terminal_that_ended_on_its_own_is_not_closed_again() {
+        let (reg, closed) = recording();
+        reg.note_terminal("h1", 7);
+        reg.note_terminal("h1", 8);
+        reg.forget_terminal(7);
+        assert_eq!(reg.terminals("h1"), vec![8]);
+        reg.detach("h1");
+        assert_eq!(*closed.lock().unwrap(), vec![8]);
+    }
+
+    #[test]
+    fn shutdown_closes_every_hosts_terminals() {
+        let (reg, closed) = recording();
+        reg.note_terminal("h1", 7);
+        reg.note_terminal("h2", 9);
+        reg.detach_all();
+        let mut got = closed.lock().unwrap().clone();
+        got.sort_unstable();
+        assert_eq!(got, vec![7, 9]);
+        assert!(reg.terminals("h1").is_empty() && reg.terminals("h2").is_empty());
+    }
+
+    /// Recording twice is not two terminals, and an unknown host has none —
+    /// the query is what the app layer reads, so it must not invent rows.
+    #[test]
+    fn a_terminal_is_recorded_once_and_an_unknown_host_has_none() {
+        let (reg, _) = recording();
+        reg.note_terminal("h1", 7);
+        reg.note_terminal("h1", 7);
+        assert_eq!(reg.terminals("h1"), vec![7]);
+        assert!(reg.terminals("nope").is_empty());
+    }
+
+    /// With no closer installed nothing can be closed — but nothing is silently
+    /// forgotten either: the record survives so the app can still act on it.
+    #[test]
+    fn without_a_closer_the_terminals_are_kept_not_dropped() {
+        let reg = Registry::new();
+        reg.note_terminal("h1", 7);
+        reg.detach("h1");
+        assert_eq!(
+            reg.terminals("h1"),
+            vec![7],
+            "a missing closer must not turn into a lost record"
+        );
     }
 }
