@@ -39,7 +39,7 @@ pub use host::{
     namespaced_uuid, DaemonInfo, Emit, HostSnapshot, Notice, NoticeLevel, Phase,
     RemoteTimelinePayload, ResumeOutcome, SessionMeta, REMOTE_ID_BASE,
 };
-pub use link::{HostConfig, Link, RemoteAuth, Sink};
+pub use link::{HostConfig, Link, LinkTimeouts, RemoteAuth, Sink};
 
 /// Every attached host, keyed by `host_id`.
 ///
@@ -48,14 +48,28 @@ pub use link::{HostConfig, Link, RemoteAuth, Sink};
 /// link, and replacing it stops it — a second observation window on the same
 /// host is not harmful to the daemon, but it would double every event the
 /// workbench emits.
+/// Every attached host's link is held behind an `Arc` for one reason: a short
+/// command is a whole SSH round-trip (up to 30s), and it must not be run while
+/// the map lock is held. Taking a handle and **then** releasing the lock is what
+/// keeps one wedged host from freezing every other host's polling, detaching and
+/// attaching — the map is an index, not a queue.
 #[derive(Default)]
 pub struct Registry {
-    links: Mutex<BTreeMap<String, Link>>,
+    links: Mutex<BTreeMap<String, Arc<Link>>>,
 }
 
 impl Registry {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// A handle to one host's link, with the map lock released.
+    fn link(&self, host_id: &str) -> Option<Arc<Link>> {
+        self.links
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(host_id)
+            .map(Arc::clone)
     }
 
     /// Attach (or re-attach) a host. Returns the id it was filed under.
@@ -71,12 +85,18 @@ impl Registry {
     /// state and the cursor travel together (`link::run`).
     pub fn attach(&self, cfg: HostConfig, sink: Arc<dyn Sink>) -> String {
         let id = cfg.host_id.clone();
-        let link = Link::start(cfg, sink);
-        let mut links = self.links.lock().unwrap_or_else(|p| p.into_inner());
-        if let Some(mut old) = links.remove(&id) {
+        let link = Arc::new(Link::start(cfg, sink));
+        // The old link is stopped **after** the lock is released: `stop` joins a
+        // thread, and joining under the map lock blocks every other host.
+        let old = {
+            let mut links = self.links.lock().unwrap_or_else(|p| p.into_inner());
+            let old = links.remove(&id);
+            links.insert(id.clone(), link);
+            old
+        };
+        if let Some(old) = old {
             old.stop();
         }
-        links.insert(id.clone(), link);
         id
     }
 
@@ -88,7 +108,7 @@ impl Registry {
             .unwrap_or_else(|p| p.into_inner())
             .remove(host_id);
         match taken {
-            Some(mut link) => {
+            Some(link) => {
                 link.stop();
                 true
             }
@@ -99,35 +119,45 @@ impl Registry {
     /// Detach everything (app shutdown).
     pub fn detach_all(&self) {
         let taken = std::mem::take(&mut *self.links.lock().unwrap_or_else(|p| p.into_inner()));
-        for (_, mut link) in taken {
+        for (_, link) in taken {
             link.stop();
         }
     }
 
     pub fn snapshots(&self) -> Vec<HostSnapshot> {
-        self.links
+        let links: Vec<Arc<Link>> = self
+            .links
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .values()
-            .map(|l| l.snapshot())
-            .collect()
+            .map(Arc::clone)
+            .collect();
+        links.iter().map(|l| l.snapshot()).collect()
     }
 
-    /// Run a short command on one host.
+    /// Every attached host's current timelines — what a panel that was closed
+    /// and reopened is seeded from, since the events it missed are gone.
+    pub fn live_payloads(&self) -> Vec<RemoteTimelinePayload> {
+        let links: Vec<Arc<Link>> = self
+            .links
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .values()
+            .map(Arc::clone)
+            .collect();
+        links.iter().flat_map(|l| l.live_payloads()).collect()
+    }
+
+    /// Run a short command on one host. The map lock is released first — this
+    /// call is a full SSH round-trip.
     pub fn call(&self, host_id: &str, args: &[&str]) -> Result<String, String> {
-        let links = self.links.lock().unwrap_or_else(|p| p.into_inner());
-        let link = links
-            .get(host_id)
-            .ok_or_else(|| "그 호스트에 연결되어 있지 않습니다.".to_string())?;
-        link.call(args)
+        self.link(host_id)
+            .ok_or_else(|| "그 호스트에 연결되어 있지 않습니다.".to_string())?
+            .call(args)
     }
 
     /// The `"<epoch>:k<n>"` address of a remote session id.
     pub fn addr_of(&self, host_id: &str, id: u64) -> Option<String> {
-        self.links
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .get(host_id)?
-            .addr_of(id)
+        self.link(host_id)?.addr_of(id)
     }
 }
