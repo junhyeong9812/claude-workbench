@@ -116,9 +116,21 @@ export function RemoteHostPanel() {
 
   // 열려 있는 터미널을 이벤트 밖(언마운트·교체)에서도 닫을 수 있게 들고 있는다.
   const termRef = useRef<AttachedTerm | null>(null);
-  useEffect(() => {
-    termRef.current = term;
-  }, [term]);
+  /**
+   * 세우는 순간 ref 도 같이 — effect 로 미루면 안 된다.
+   *
+   * `attach` 는 `await` 뒤에 "직전 터미널"을 ref 에서 읽어 닫는데, ref 를 렌더
+   * 뒤 effect 에서 맞추면 그 시점의 값은 아직 옛것(대개 null)이다. 두 세션의
+   * `터미널` 을 잇달아 누르면 둘 다 null 을 보고 아무도 닫지 않아, 앞의 SSH
+   * 연결과 그 원격 attach 가 세션이 끝날 때까지 남는다(데몬 쪽 MAX_CONNS 슬롯도
+   * 같이).
+   */
+  const putTerm = useCallback((t: AttachedTerm | null) => {
+    termRef.current = t;
+    setTerm(t);
+  }, []);
+  /** attach 세대 — 왕복 중에 다른 attach 나 닫기가 끼어들었는지. */
+  const attachSeq = useRef(0);
   // 패널이 사라질 때 SSH exec 채널을 남기지 않는다. **원격 세션은 죽지 않는다** —
   // 닫는 것은 이 관찰 창(로컬 세션)뿐이고, 에이전트는 데몬이 계속 소유한다.
   useEffect(
@@ -134,16 +146,23 @@ export function RemoteHostPanel() {
   }, []);
 
   const closeTerm = useCallback(() => {
+    // 세대를 올려, 왕복 중인 attach 가 돌아와 방금 닫은 창을 되살리지 않게.
+    attachSeq.current += 1;
     const t = termRef.current;
     if (t) invoke("terminal_close", { id: t.localId }).catch(() => {});
-    setTerm(null);
-  }, []);
+    putTerm(null);
+  }, [putTerm]);
 
   /** 이 세션의 화면을 아래에 연다. 한 번에 하나 — 앞의 것은 닫는다. */
   const attach = useCallback(
     async (hostId: string, s: RemoteSessionMeta) => {
       setBusy((b) => ({ ...b, [s.id]: true }));
       setNoteFor(s.id, "");
+      // `busy` 는 **세션별**이라 서로 다른 두 세션의 `터미널` 은 동시에 눌린다.
+      // 늦게 시작한 쪽이 이긴다는 규칙을 세대로 못박고, 진 쪽은 자기가 연 것을
+      // 반드시 닫는다 — 안 닫으면 SSH 연결·원격 attach·데몬 연결 슬롯이 세션이
+      // 끝날 때까지 남는다.
+      const mine = ++attachSeq.current;
       try {
         // 처음 크기는 짐작이고, 첫 정착 크기가 곧바로 로컬·원격 양쪽을 고친다.
         const localId = await invoke<number>("remote_attach", {
@@ -152,16 +171,20 @@ export function RemoteHostPanel() {
           cols: 80,
           rows: 24,
         });
+        if (mine !== attachSeq.current) {
+          invoke("terminal_close", { id: localId }).catch(() => {});
+          return;
+        }
         const prev = termRef.current;
         if (prev) invoke("terminal_close", { id: prev.localId }).catch(() => {});
-        setTerm({ hostId, remoteId: s.id, localId, sessionKey: s.key });
+        putTerm({ hostId, remoteId: s.id, localId, sessionKey: s.key });
       } catch (e) {
         setNoteFor(s.id, errText(e, "터미널을 열지 못했습니다."));
       } finally {
         setBusy((b) => ({ ...b, [s.id]: false }));
       }
     },
-    [setNoteFor],
+    [putTerm, setNoteFor],
   );
 
   /** 종료 요청. 화면에 적는 것은 **전달된** 신호다(요청한 것이 아니라). */
