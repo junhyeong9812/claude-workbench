@@ -242,3 +242,32 @@ pub fn remote_sessions(
     let reply: SessionsReply = decode_response(&out).map_err(AppError::new)?;
     Ok(reply.sessions.len())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A missing secret must be **nothing**, never an empty string.
+    ///
+    /// While it defaulted to `""`, a saved connection whose keychain entry was
+    /// gone (the panel never sends a password) offered an empty password to the
+    /// remote `sshd` on every reconnect — every ≤15s, forever. That is what
+    /// `MaxAuthTries` and fail2ban exist to punish, and the address they block
+    /// is the user's own.
+    #[test]
+    fn a_missing_secret_is_none_not_an_empty_password() {
+        assert_eq!(secret(None, None), None, "no secret anywhere");
+        assert_eq!(secret(Some(String::new()), None), None, "an empty string is not a secret");
+        assert_eq!(secret(None, Some(String::new())), None, "…and neither is an empty entry");
+        assert_eq!(secret(Some("\r\n".into()), None), None, "nor a keychain entry of newlines");
+        // …but whitespace *inside* a secret is part of it, so only the line
+        // ending a keychain read can add is stripped.
+        assert_eq!(secret(None, Some(" p w ".into())), Some(" p w ".into()));
+        // A supplied secret wins over the saved one; the saved one is the
+        // fallback (the same rule `ssh_create` follows).
+        assert_eq!(secret(Some("typed".into()), Some("saved".into())), Some("typed".into()));
+        assert_eq!(secret(None, Some("saved".into())), Some("saved".into()));
+        // A trailing newline from the keychain is not part of the secret.
+        assert_eq!(secret(None, Some("saved\n".into())), Some("saved".into()));
+    }
+}

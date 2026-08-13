@@ -683,6 +683,42 @@ fn an_attach_that_never_gets_a_hello_gives_up_and_says_so() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A failure only the user can fix must **stop**, not be retried every few
+/// seconds forever.
+///
+/// The retry loop runs at ≤15s, so a permanent failure classified as transient
+/// is a request repeated indefinitely — which for a rejected credential is how
+/// the remote `sshd` comes to block the user's own address.
+#[test]
+#[ignore = "needs an SSH server: run with the other tests in this file"]
+fn a_missing_daemon_is_a_terminal_failure_not_an_endless_retry() {
+    let (dir, port) = scratch("notfound");
+    // What a host without `cwcd` installed actually does: the login shell says
+    // "not found" and exits 127.
+    let script = write_script(&dir, "gone.sh", "echo 'sh: cwcd: not found' >&2\nexit 127");
+    let link = core_lib::remote::Link::start(
+        script_config(&dir, port, "notfound", &script, LinkTimeouts::default()),
+        Arc::new(RecordingSink::default()),
+    );
+    wait_for(Duration::from_secs(25), || link.snapshot().phase == Phase::Failed)
+        .expect("a host without the daemon must fail, not retry forever");
+    let s = link.snapshot();
+    assert!(
+        s.last_error.as_deref().unwrap_or_default().contains("cwcd"),
+        "the user must be told what to fix: {:?}",
+        s.last_error
+    );
+    let attempts = s.attempts;
+    std::thread::sleep(Duration::from_secs(3));
+    assert_eq!(
+        link.snapshot().attempts,
+        attempts,
+        "a terminal failure must stop the loop, not slow it down"
+    );
+    link.stop();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// A reply larger than a terminal's scrollback ring must arrive **whole**.
 ///
 /// It used to be read out of that 1 MB ring, which drops from the front — so a
