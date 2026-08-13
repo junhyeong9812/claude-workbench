@@ -1140,13 +1140,16 @@ W8CkSL2Yx++XP/fxFe/RAAAAD210LXRlc3QtaG9zdGtleQECAwQFBg==\n\
         use russh::server::{run_stream, Config as ServerConfig};
 
         let host_key = decode_secret_key(TEST_HOST_KEY, None).expect("decode host key");
-        let mut server_cfg = ServerConfig::default();
-        server_cfg.keys = vec![host_key];
-        server_cfg.auth_rejection_time = Duration::from_millis(100);
-        if let Some(w) = window_size {
-            server_cfg.window_size = w;
-        }
-        let server_cfg = Arc::new(server_cfg);
+        let defaults = ServerConfig::default();
+        let server_cfg = Arc::new(ServerConfig {
+            keys: vec![host_key],
+            auth_rejection_time: Duration::from_millis(100),
+            // The one knob this helper exists for: `None` means "whatever russh
+            // advertises normally", which is the case the deadlock test's
+            // control arm needs left alone.
+            window_size: window_size.unwrap_or(defaults.window_size),
+            ..defaults
+        });
 
         let std_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = std_listener.local_addr().unwrap().port();
