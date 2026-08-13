@@ -71,12 +71,18 @@ struct Srv;
 impl russh::server::Server for Srv {
     type Handler = Conn;
     fn new_client(&mut self, _peer: Option<std::net::SocketAddr>) -> Conn {
-        Conn { chan: None }
+        Conn { chan: None, stdin: None }
     }
 }
 
 struct Conn {
     chan: Option<Channel<Msg>>,
+    /// Where this channel's incoming bytes go — the exec'd shell's stdin.
+    ///
+    /// R2a's server pinned stdin to `/dev/null`, which was honest then: nothing
+    /// the bridge ran read it. A terminal attach does, so the server has to be
+    /// a real one in both directions or the test would prove the client alone.
+    stdin: Option<tokio::sync::mpsc::UnboundedSender<Vec<u8>>>,
 }
 
 impl Handler for Conn {
@@ -95,6 +101,18 @@ impl Handler for Conn {
         Ok(true)
     }
 
+    async fn data(
+        &mut self,
+        _id: ChannelId,
+        data: &[u8],
+        _s: &mut Session,
+    ) -> Result<(), Self::Error> {
+        if let Some(tx) = &self.stdin {
+            let _ = tx.send(data.to_vec());
+        }
+        Ok(())
+    }
+
     async fn exec_request(
         &mut self,
         id: ChannelId,
@@ -111,6 +129,8 @@ impl Handler for Conn {
             return Ok(());
         }
         session.channel_success(id)?;
+        let (stdin_tx, mut stdin_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+        self.stdin = Some(stdin_tx);
         tokio::spawn(async move {
             let mut child = match tokio::process::Command::new("/bin/sh")
                 .arg("-c")
@@ -118,7 +138,7 @@ impl Handler for Conn {
                 // Its own process group, so a cut can take the shell and
                 // everything it started.
                 .process_group(0)
-                .stdin(Stdio::null())
+                .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
                 .spawn()
@@ -135,6 +155,16 @@ impl Handler for Conn {
             };
             if let Some(pid) = child.id() {
                 running().lock().expect("pids").push(pid);
+            }
+            if let Some(mut sin) = child.stdin.take() {
+                tokio::spawn(async move {
+                    use tokio::io::AsyncWriteExt as _;
+                    while let Some(b) = stdin_rx.recv().await {
+                        if sin.write_all(&b).await.is_err() || sin.flush().await.is_err() {
+                            break;
+                        }
+                    }
+                });
             }
             let mut out = child.stdout.take().expect("piped");
             let mut err = child.stderr.take().expect("piped");
@@ -199,6 +229,12 @@ impl Daemon {
     /// `buffer` is the daemon's event ring size — a tiny one makes eviction
     /// (and therefore a real `Gap`) happen on demand.
     fn start(tag: &str, buffer: Option<u32>) -> Daemon {
+        Daemon::start_with_agent(tag, buffer, "/bin/true")
+    }
+
+    /// As [`Self::start`], but with a chosen agent binary — a terminal test
+    /// needs one that stays alive and answers.
+    fn start_with_agent(tag: &str, buffer: Option<u32>, agent: &str) -> Daemon {
         let bin = PathBuf::from(
             std::env::var("CWCD").expect("set CWCD to the cwcd binary to run this test"),
         );
@@ -222,7 +258,7 @@ impl Daemon {
             // `/bin/true` as the agent: this test is about the *bridge*, and a
             // session that starts and exits produces exactly the frames it needs
             // (spawned → exited) without an API call.
-            .env("CWC_CLAUDE_BIN", "/bin/true")
+            .env("CWC_CLAUDE_BIN", agent)
             .env("CWC_PROJECT_ROOTS", dir.join("work"))
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -874,4 +910,135 @@ fn a_stream_of_nonsense_is_reported_and_retried() {
     );
     drop(link);
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// **R2b's reason to exist**: type into a remote agent's terminal over a real
+/// SSH connection to a real daemon, and see the agent answer.
+///
+/// Everything below the assertion is production code — `Registry::attach_config`
+/// composes the address and the command, `ssh::ExecStdin::Stream` carries the
+/// keystrokes, `cwcd attach` writes them into the pty the daemon owns, and the
+/// agent's output comes back on the same byte pipeline every local terminal
+/// uses. The only thing the test supplies is the agent (a shell that echoes
+/// what it reads) and the SSH server.
+#[test]
+#[ignore = "needs a cwcd binary: CWCD=… cargo test -p core --test remote_ssh -- --ignored"]
+fn a_remote_terminal_carries_what_is_typed_and_answers() {
+    restore_the_network();
+    let agent_dir = PathBuf::from(format!("/tmp/cwc-agent-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&agent_dir);
+    std::fs::create_dir_all(&agent_dir).expect("agent dir");
+    let agent = write_script(
+        &agent_dir,
+        "echo-agent",
+        "while read line; do case \"$line\" in size) stty size;; *) echo \"GOT:$line\";; esac; done",
+    );
+    let daemon = Daemon::start_with_agent("attach", None, agent.to_str().expect("utf8"));
+    let port = start_ssh_server();
+    learn_key(&daemon.dir, port);
+
+    let registry = Registry::new();
+    registry.attach(config(&daemon, port, "e2e"), Arc::new(RecordingSink::default()));
+    wait_for(Duration::from_secs(20), || {
+        registry.snapshots()[0].phase == Phase::Live
+    })
+    .expect("the stream should attach");
+
+    daemon.spawn_session("terminal");
+    wait_for(Duration::from_secs(20), || {
+        !registry.snapshots()[0].sessions.is_empty()
+    })
+    .expect("the spawned session should appear on the stream");
+    let id = registry.snapshots()[0].sessions[0].id;
+
+    // --- the terminal ------------------------------------------------------
+    let (cfg, known_hosts) = registry
+        .attach_config("e2e", id, 100, 30)
+        .expect("a live host must be able to open one of its terminals");
+    let mgr = core_lib::SessionManager::new();
+    let (local, mut chans) = mgr.create_ssh(cfg, known_hosts, 100, 30, None);
+    // The attach refuses an unknown key rather than prompting; the key is
+    // already trusted here, so nothing should arrive on this channel.
+    std::thread::spawn(move || while chans.prompt_rx.blocking_recv().is_some() {});
+
+    let screen = |what: &str| -> String {
+        mgr.snapshot(local)
+            .map(|(b, _)| String::from_utf8_lossy(&b).into_owned())
+            .unwrap_or_else(|e| format!("<no session: {e}> ({what})"))
+    };
+    let type_and_wait = |line: &[u8], want: &str| {
+        mgr.write(local, line).expect("a remote terminal takes input");
+        wait_for(Duration::from_secs(20), || screen("wait").contains(want)).unwrap_or_else(|_| {
+            panic!(
+                "typed {:?} and never saw {want:?}; the terminal held:\n{}",
+                String::from_utf8_lossy(line),
+                screen("fail")
+            )
+        });
+    };
+
+    // What was typed reaches the agent, and its answer comes back.
+    type_and_wait(b"hello-from-the-workbench\n", "GOT:hello-from-the-workbench");
+    // …and the pty is the size the attach asked for, not the one it opened at
+    // (`spawn` hardcodes 120x40, so 100x30 can only come from the attach).
+    type_and_wait(b"size\n", "30 100");
+
+    // --- and a resize is a command that answers, and that the agent sees ----
+    let addr = registry.addr_of("e2e", id).expect("address");
+    let reply = registry
+        .call("e2e", &["resize", &addr, "--cols", "77", "--rows", "21"])
+        .expect("resize");
+    assert!(
+        reply.contains("\"cols\": 77") && reply.contains("\"rows\": 21"),
+        "the daemon must answer with the size it actually set: {reply}"
+    );
+    type_and_wait(b"size\n", "21 77");
+
+    // --- the network goes away while someone is typing ---------------------
+    //
+    // The whole point of the daemon owning the process: an attach is a window,
+    // not a leash. Cutting it must leave the agent exactly where it was, still
+    // holding the state a person built up in it.
+    cut_the_network();
+    wait_for(Duration::from_secs(20), || mgr.is_alive(local) == Some(false))
+        .expect("the terminal should notice the connection is gone");
+    let _ = mgr.remove(local);
+    restore_the_network();
+
+    let (cfg, known_hosts) = registry
+        .attach_config("e2e", id, 77, 21)
+        .expect("the session is still there, so its terminal still opens");
+    let (again, mut chans2) = mgr.create_ssh(cfg, known_hosts, 77, 21, None);
+    std::thread::spawn(move || while chans2.prompt_rx.blocking_recv().is_some() {});
+    let screen2 = |_: &str| -> String {
+        mgr.snapshot(again)
+            .map(|(b, _)| String::from_utf8_lossy(&b).into_owned())
+            .unwrap_or_default()
+    };
+    // The replay proves it is the *same* run: this line was typed before the
+    // cut, and the agent's answer to it is still in the ring.
+    wait_for(Duration::from_secs(20), || {
+        screen2("replay").contains("GOT:hello-from-the-workbench")
+    })
+    .unwrap_or_else(|_| {
+        panic!(
+            "a re-attach must replay what the session already produced; it held:\n{}",
+            screen2("fail")
+        )
+    });
+    mgr.write(again, b"after-the-cut\n").expect("input again");
+    wait_for(Duration::from_secs(20), || {
+        screen2("after").contains("GOT:after-the-cut")
+    })
+    .unwrap_or_else(|_| {
+        panic!(
+            "the agent must have survived the cut and still be reading; it held:\n{}",
+            screen2("fail")
+        )
+    });
+
+    let _ = mgr.remove(again);
+    let _ = mgr.remove(local);
+    registry.detach("e2e");
+    let _ = std::fs::remove_dir_all(&agent_dir);
 }
