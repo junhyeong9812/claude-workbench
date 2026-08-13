@@ -78,7 +78,13 @@ vi.mock("@xterm/addon-fit", () => ({
 vi.mock("@xterm/xterm/css/xterm.css", () => ({}));
 
 import { RemoteHostPanel } from "./RemoteHostPanel";
-import { REMOTE_ID_BASE, type RemoteHostSnapshot, type RemoteSessionMeta } from "../state/remoteHosts";
+import {
+  useRemoteHosts,
+  REMOTE_ID_BASE,
+  type RemoteHostsView,
+  type RemoteHostSnapshot,
+  type RemoteSessionMeta,
+} from "../state/remoteHosts";
 
 (globalThis as unknown as { IS_REACT_ACT_ENVIRONMENT: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 class NoopResizeObserver {
@@ -251,33 +257,48 @@ describe("R1 — 빈 성공 응답이 자동 회수를 무한 반복시키지 �
 });
 
 describe("R17 — 회수가 병렬로 나가지 않는다", () => {
-  it("연속 클릭 N 회 → 실제 invoke 는 1회", async () => {
-    // `setFetching` 업데이터로 거는 가드는 **상태**에만 걸리고 호출에는 안 걸렸다.
+  it("같은 tick 안의 N 회 호출 → 실제 invoke 는 1회 (상태가 아니라 호출에 건 가드)", async () => {
+    // `setFetching` 업데이터로 거는 가드는 **상태**에만 걸리고 호출에는 안 걸렸다:
+    // `invoke` 가 그 바깥의 형제 문장이라 effect·수동 버튼·연속 클릭이 겹치면
+    // 같은 세션에 SSH 회수가 병렬로 나갔다. 상태는 렌더를 기다리므로, 같은 tick
+    // 안의 두 번째 호출은 첫 번째의 `fetching:true` 를 아직 보지 못한다.
     let release: (() => void) | undefined;
     routes.remote_timeline = () =>
       new Promise((resolve) => {
         release = () => resolve(emptyReply);
       });
-    await mount();
-    await openRow();
-    await flush(3);
-    const retry = () => findButton("원격에서 가져오기");
-    // 첫 자동 회수가 떠 있는 동안 버튼을 여러 번 누른다(같은 렌더 안에서 연속).
-    const btn = retry();
-    if (btn) {
-      await act(async () => {
-        btn.click();
-        btn.click();
-        btn.click();
-      });
+    let view: RemoteHostsView | undefined;
+    function Probe() {
+      view = useRemoteHosts(100_000); // 폴링은 이 테스트의 대상이 아니다
+      return null;
     }
+    await act(async () => {
+      root.render(<Probe />);
+    });
+    await flush(3);
+    await act(async () => {
+      view!.fetchBody("h1", SID);
+      view!.fetchBody("h1", SID);
+      view!.fetchBody("h1", SID);
+    });
     await flush(3);
     expect(calls("remote_timeline")).toBe(1);
+    // 답이 오기 전까지는 몇 번을 더 눌러도 하나뿐이다.
+    await act(async () => {
+      view!.fetchBody("h1", SID);
+    });
+    await flush(3);
+    expect(calls("remote_timeline")).toBe(1);
+    // …그리고 끝난 뒤에는 다시 나갈 수 있다(영구 잠금이 아니다).
     await act(async () => {
       release?.();
     });
-    await flush(10);
-    expect(calls("remote_timeline")).toBe(1);
+    await flush(5);
+    await act(async () => {
+      view!.fetchBody("h1", SID);
+    });
+    await flush(5);
+    expect(calls("remote_timeline")).toBe(2);
   });
 });
 
