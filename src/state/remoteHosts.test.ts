@@ -1,16 +1,26 @@
 import { describe, expect, it } from "vitest";
 import {
+  accountChoices,
+  attachGate,
   countsLabel,
+  defaultAccountId,
+  endedReason,
   fetchedToLive,
   isRemoteId,
+  killGate,
+  killLabel,
   mergeSeed,
   noticeBadge,
+  parseAccounts,
   phaseLabel,
   pickTimeline,
   resumeLabel,
   seenKey,
   seenSeqOf,
   shouldFetchBody,
+  shouldSendRemoteResize,
+  signalLabel,
+  spawnRequest,
   staleSeenKeys,
   toLiveTimeline,
   unseenNotices,
@@ -321,5 +331,191 @@ describe("원격 payload 읽기", () => {
     expect(live.turns).toEqual([]);
     expect(live.model).toBeNull();
     expect(live.ctxTokens).toBe(0);
+  });
+});
+
+describe("버튼이 할 수 있는 일 (R2b)", () => {
+  it("끝난 세션에는 종료도 터미널도 걸지 않는다 — 그리고 왜 못 누르는지 말한다", () => {
+    const running = meta({ state: "running", closed: false });
+    expect(killGate(running, false)).toEqual({
+      enabled: true,
+      hint: expect.stringContaining("종료 신호"),
+    });
+    expect(attachGate(running, false, false).enabled).toBe(true);
+
+    // 이미 끝난 세션: 신호를 보내면 데몬이 거절할 뿐이고, 붙을 pty도 없다.
+    for (const dead of [meta({ state: "exited", closed: true }), meta({ state: "exited", closed: false }), meta({ state: "running", closed: true })]) {
+      expect(killGate(dead, false).enabled).toBe(false);
+      expect(attachGate(dead, false, false).enabled).toBe(false);
+      // 비활성 이유가 비어 있으면 회색 버튼만 남는다 — 그게 조용한 손실이다.
+      expect(killGate(dead, false).hint).not.toBe("");
+      expect(attachGate(dead, false, false).hint).not.toBe("");
+    }
+  });
+
+  it("보내는 중이면 두 번 눌리지 않고, 이미 열린 터미널은 다시 열지 않는다", () => {
+    const running = meta({ state: "running", closed: false });
+    expect(killGate(running, true).enabled).toBe(false);
+    expect(killGate(running, true).hint).toContain("중");
+    expect(attachGate(running, true, false).enabled).toBe(false);
+    // 이 세션이 이미 아래에 떠 있다 — 다시 붙이면 채널만 하나 더 생긴다.
+    expect(attachGate(running, false, true).enabled).toBe(false);
+    expect(attachGate(running, false, true).hint).toContain("이미");
+  });
+});
+
+describe("계정 목록 읽기", () => {
+  const reply = {
+    response: "accounts",
+    accounts: [
+      { id: "work", agent: "claude", display_name: "회사", home: "/home/me/.claude-work" },
+      { id: "personal", agent: "claude", home: "/home/me/.claude", is_default: true },
+      { id: "cx", agent: "codex", display_name: "codex 기본" },
+      { agent: "claude", display_name: "id 없는 줄", home: "/home/me/.claude-x" },
+    ],
+  };
+
+  it("id 없는 줄은 버린다 — 고를 수 없는데 보이면 사용자를 속인다", () => {
+    const accounts = parseAccounts(reply);
+    expect(accounts.map((a) => a.id)).toEqual(["work", "personal", "cx"]);
+    // display_name 이 없으면 id 로 말한다(빈 옵션을 만들지 않는다).
+    expect(accounts.find((a) => a.id === "personal")?.displayName).toBe("personal");
+    expect(accounts.find((a) => a.id === "work")?.displayName).toBe("회사");
+    expect(accounts.find((a) => a.id === "personal")?.isDefault).toBe(true);
+    expect(accounts.find((a) => a.id === "work")?.isDefault).toBe(false);
+  });
+
+  it("응답이 기대와 다르면 빈 목록이다 — 던지지 않는다", () => {
+    expect(parseAccounts(null)).toEqual([]);
+    expect(parseAccounts({})).toEqual([]);
+    expect(parseAccounts({ accounts: "nope" })).toEqual([]);
+    expect(parseAccounts({ accounts: [null, 3, { id: "  " }] })).toEqual([]);
+  });
+
+  it("에이전트에 맞는 계정만 고르게 하고, 기본 계정을 먼저 세운다", () => {
+    const accounts = parseAccounts(reply);
+    expect(accountChoices(accounts, "claude").map((a) => a.id)).toEqual(["work", "personal"]);
+    expect(accountChoices(accounts, "codex").map((a) => a.id)).toEqual(["cx"]);
+    // is_default 가 있으면 그것, 없으면 첫 줄, 아무것도 없으면 "" (데몬 기본값).
+    expect(defaultAccountId(accounts, "claude")).toBe("personal");
+    expect(defaultAccountId(accounts, "codex")).toBe("cx");
+    expect(defaultAccountId([], "claude")).toBe("");
+    // 에이전트가 적히지 않은 계정은 어느 쪽에서도 고를 수 있다.
+    const anyAgent = parseAccounts({ accounts: [{ id: "shared" }] });
+    expect(accountChoices(anyAgent, "codex").map((a) => a.id)).toEqual(["shared"]);
+  });
+});
+
+describe("새 세션 요청 만들기", () => {
+  const known = ["work", "personal"];
+  const form = { agent: "claude", cwd: "/home/me/project", account: "work", label: "야간 작업" };
+
+  it("경로를 계정 자리에 밀어 넣을 수 없다 — 목록에 있는 id 만 지나간다", () => {
+    // 데몬이 경로 필드를 없앤(R1b) 것이 프런트에서 되살아나면 안 된다.
+    const smuggled = spawnRequest("h1", { ...form, account: "/home/me/.claude-other" }, known);
+    expect(smuggled.ok).toBe(false);
+    expect(smuggled.ok === false && smuggled.error).toContain("목록");
+    // 목록에 없는 평범한 문자열도 마찬가지다(오타 포함).
+    expect(spawnRequest("h1", { ...form, account: "wrok" }, known).ok).toBe(false);
+    // 빈 값은 "데몬 기본 계정"이라는 뜻이라 통과하고, null 로 나간다.
+    const dflt = spawnRequest("h1", { ...form, account: "" }, known);
+    expect(dflt.ok && dflt.args.account).toBeNull();
+  });
+
+  it("상대 경로로는 못 띄운다 — 어디서 도는지 모르는 에이전트를 만들지 않는다", () => {
+    const rel = spawnRequest("h1", { ...form, cwd: "project" }, known);
+    expect(rel.ok).toBe(false);
+    expect(rel.ok === false && rel.error).toContain("절대 경로");
+    const empty = spawnRequest("h1", { ...form, cwd: "   " }, known);
+    expect(empty.ok).toBe(false);
+    expect(empty.ok === false && empty.error).toContain("디렉터리");
+  });
+
+  it("아는 에이전트만, 그리고 공백은 다듬어 넘긴다", () => {
+    expect(spawnRequest("h1", { ...form, agent: "gemini" }, known).ok).toBe(false);
+    const r = spawnRequest(
+      "h1",
+      { agent: "codex", cwd: "  /srv/app  ", account: "", label: "  " },
+      known,
+    );
+    expect(r.ok && r.args).toEqual({
+      hostId: "h1",
+      agent: "codex",
+      cwd: "/srv/app",
+      account: null,
+      // 빈 라벨은 빈 문자열이 아니라 없음이다(데몬이 빈 라벨을 달지 않게).
+      label: null,
+    });
+    const full = spawnRequest("h1", form, known);
+    expect(full.ok && full.args).toEqual({
+      hostId: "h1",
+      agent: "claude",
+      cwd: "/home/me/project",
+      account: "work",
+      label: "야간 작업",
+    });
+    expect(spawnRequest("", form, known).ok).toBe(false);
+  });
+});
+
+describe("원격 pty 크기 보내기", () => {
+  it("퇴화 크기와 같은 크기를 원격까지 보내지 않는다", () => {
+    // 호스트가 0px 로 접히면 FitAddon 이 2×1 을 준다 — 그대로 보내면 원격
+    // 전체화면 TUI 가 실제로 2×1 이 되어 화면이 부서진다.
+    expect(shouldSendRemoteResize(null, { cols: 2, rows: 1 })).toBe(false);
+    expect(shouldSendRemoteResize(null, { cols: 9, rows: 24 })).toBe(false);
+    expect(shouldSendRemoteResize(null, { cols: 80, rows: 2 })).toBe(false);
+    expect(shouldSendRemoteResize(null, { cols: 80, rows: 24 })).toBe(true);
+    // 같은 값은 SSH 왕복만 늘린다 — 드래그가 멎은 뒤 한 번이면 된다.
+    expect(shouldSendRemoteResize({ cols: 80, rows: 24 }, { cols: 80, rows: 24 })).toBe(false);
+    expect(shouldSendRemoteResize({ cols: 80, rows: 24 }, { cols: 80, rows: 25 })).toBe(true);
+    // 레이아웃이 준 소수·NaN 은 pty 크기가 아니다.
+    expect(shouldSendRemoteResize(null, { cols: 80.5, rows: 24 })).toBe(false);
+    expect(shouldSendRemoteResize(null, { cols: Number.NaN, rows: 24 })).toBe(false);
+  });
+});
+
+describe("종료 결과 말하기", () => {
+  it("요청한 신호가 아니라 **전달된** 신호를 말한다", () => {
+    // 데몬은 프로세스 그룹이 이미 사라졌으면 SIGHUP 으로 갈아탄다.
+    expect(killLabel(15, 1)).toContain("SIGHUP(1)");
+    expect(killLabel(15, 1)).toContain("SIGTERM(15)");
+    expect(killLabel(15, 1)).toContain("요청");
+    // 요청대로 갔으면 굳이 두 번 말하지 않는다.
+    expect(killLabel(15, 15)).toBe("종료 신호를 보냈습니다 — SIGTERM(15)");
+    expect(killLabel(null, 9)).toContain("SIGKILL(9)");
+    // 모르는 번호도 숫자로는 말한다(침묵하지 않는다).
+    expect(signalLabel(37)).toBe("신호 37");
+  });
+});
+
+describe("원격 터미널이 멈춘 이유", () => {
+  it("정상 종료·비정상 종료·시작 실패가 서로 다른 말이 된다", () => {
+    const normal = endedReason({ code: 0, signal: null, detail: "" });
+    const failed = endedReason({ code: 2, signal: null, detail: "" });
+    const killed = endedReason({ code: null, signal: "SIGKILL", detail: "" });
+    // 시작조차 못 한 경우 — code·signal 이 없고 stderr 만 있다.
+    const refused = endedReason({
+      code: null,
+      signal: null,
+      detail: "cwcd: command not found",
+    });
+    expect(normal).toContain("정상");
+    expect(failed).toContain("exit 2");
+    expect(killed).toContain("SIGKILL");
+    expect(refused).toContain("cwcd: command not found");
+    expect(new Set([normal, failed, killed, refused]).size).toBe(4);
+  });
+
+  it("사유가 없어도 빈 줄을 내지 않는다 — 조용한 검은 상자가 이 이벤트의 이유다", () => {
+    const blank = endedReason({ code: null, signal: null, detail: "   " });
+    expect(blank).not.toBe("");
+    expect(blank).toContain("알 수 없");
+    // 여러 줄 stderr 는 한 줄로 눕히고, 길면 자른다(줄 하나에 실린다).
+    const multi = endedReason({ code: 1, signal: null, detail: "첫 줄\n  둘째 줄\n" });
+    expect(multi).toContain("첫 줄 둘째 줄");
+    expect(multi).not.toContain("\n");
+    const long = endedReason({ code: 1, signal: null, detail: "x".repeat(1000) });
+    expect(long.length).toBeLessThan(400);
   });
 });

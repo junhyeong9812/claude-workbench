@@ -291,6 +291,243 @@ export function toLiveTimeline(e: ClaudeTimelineEvent): RemoteLiveTimeline {
   };
 }
 
+// ---------------------------------------------------------------------------
+// R2b — 제어(스폰·종료·터미널)의 판단들. 전부 순수 함수다: 버튼이 무엇을 해도
+// 되는지, 크기를 언제 원격까지 보내는지, 끝난 이유를 뭐라고 말하는지가 여기
+// 있고 컴포넌트에는 배선만 남는다.
+// ---------------------------------------------------------------------------
+
+/** 버튼 한 개의 상태 — 왜 눌리지 않는지까지 같이 말한다(비활성 이유 없는 회색
+ * 버튼이 이 패널에서 가장 흔한 "조용한 손실"이다). */
+export interface ControlGate {
+  enabled: boolean;
+  hint: string;
+}
+
+/** `종료` 버튼. 이미 끝난 세션에 신호를 보내면 데몬이 거절할 뿐이라 막는다. */
+export function killGate(
+  s: Pick<RemoteSessionMeta, "state" | "closed">,
+  pending: boolean,
+): ControlGate {
+  if (s.closed || s.state === "exited") {
+    return { enabled: false, hint: "이미 끝난 세션입니다." };
+  }
+  if (pending) return { enabled: false, hint: "요청을 보내는 중…" };
+  return { enabled: true, hint: "이 세션에 종료 신호를 보냅니다." };
+}
+
+/** `터미널` 버튼. 끝난 세션에는 붙을 pty가 없다 — 붙였다면 검은 화면 하나가
+ * 늘 뿐이고, 그 세션의 내용은 행을 펼쳐 보는 쪽이 정본이다. */
+export function attachGate(
+  s: Pick<RemoteSessionMeta, "state" | "closed">,
+  pending: boolean,
+  shown: boolean,
+): ControlGate {
+  if (s.closed || s.state === "exited") {
+    return { enabled: false, hint: "끝난 세션은 터미널을 열 수 없습니다 — 행을 펼쳐 보세요." };
+  }
+  if (shown) return { enabled: false, hint: "이미 아래에 열려 있습니다." };
+  if (pending) return { enabled: false, hint: "터미널을 여는 중…" };
+  return { enabled: true, hint: "이 세션의 화면을 아래에 엽니다." };
+}
+
+/** 데몬이 발행하는 에이전트 홈 하나 — `remote_accounts` 응답의 한 줄. */
+export interface RemoteAccount {
+  id: string;
+  agent: string | null;
+  displayName: string;
+  home: string | null;
+  isDefault: boolean;
+}
+
+/**
+ * `remote_accounts` 응답 → 계정 목록.
+ *
+ * 백엔드가 데몬의 JSON을 그대로 넘겨주므로(스키마 고정 없음) 여기서 읽는다.
+ * **id 없는 줄은 버린다** — 스폰에 실제로 넣을 수 있는 것은 id뿐이고, 화면에만
+ * 보이고 고를 수 없는 줄은 사용자를 속인다.
+ */
+export function parseAccounts(v: unknown): RemoteAccount[] {
+  const raw = (v as { accounts?: unknown } | null)?.accounts;
+  if (!Array.isArray(raw)) return [];
+  const out: RemoteAccount[] = [];
+  for (const e of raw) {
+    const o = e as Record<string, unknown> | null;
+    const id = typeof o?.id === "string" ? o.id.trim() : "";
+    if (!id) continue;
+    const display = typeof o?.display_name === "string" ? o.display_name.trim() : "";
+    out.push({
+      id,
+      agent: typeof o?.agent === "string" ? o.agent : null,
+      displayName: display || id,
+      home: typeof o?.home === "string" ? o.home : null,
+      isDefault: o?.is_default === true,
+    });
+  }
+  return out;
+}
+
+/** 이 에이전트로 고를 수 있는 계정 — 에이전트가 적힌 계정은 그 에이전트에서만. */
+export function accountChoices(
+  accounts: readonly RemoteAccount[],
+  agent: string,
+): RemoteAccount[] {
+  return accounts.filter((a) => a.agent == null || a.agent === agent);
+}
+
+/** 처음 선택될 계정 id (`is_default` → 첫 줄 → 없음=데몬 기본값). */
+export function defaultAccountId(accounts: readonly RemoteAccount[], agent: string): string {
+  const choices = accountChoices(accounts, agent);
+  return (choices.find((a) => a.isDefault) ?? choices[0])?.id ?? "";
+}
+
+/** 새 세션 폼이 들고 있는 것 전부. 경로를 직접 넣는 칸은 **없다**(계정 참조). */
+export interface SpawnForm {
+  agent: string;
+  cwd: string;
+  /** 계정 **id**. 빈 문자열 = 데몬 기본 계정. */
+  account: string;
+  label: string;
+}
+
+/** `remote_spawn` 에 그대로 넘길 인자 (camelCase = 브리지 계약). */
+export interface SpawnArgs {
+  hostId: string;
+  agent: string;
+  cwd: string;
+  account: string | null;
+  label: string | null;
+}
+
+/** 새 세션을 만들 수 있는 에이전트 — 데몬의 `--agent` 가 아는 값. */
+export const SPAWN_AGENTS = ["claude", "codex"] as const;
+
+/**
+ * 폼 → 스폰 인자, 또는 사용자가 읽을 거절 사유.
+ *
+ * 계정은 **목록에 있는 id 여야 한다**. 경로를 타이핑해 넣을 수 있으면 계정
+ * 목록은 장식이 되고, 데몬이 경로 필드를 일부러 없앤(R1b) 이유가 프런트에서
+ * 되살아난다 — 그래서 아는 id 가 아니면 여기서 막는다.
+ *
+ * cwd 는 절대 경로만 받는다. 상대 경로는 데몬의 작업 디렉터리 기준으로 조용히
+ * 해석되어, 사용자가 의도한 곳이 아닌 데서 에이전트가 돌기 시작한다.
+ */
+export function spawnRequest(
+  hostId: string,
+  form: SpawnForm,
+  knownAccountIds: readonly string[],
+): { ok: true; args: SpawnArgs } | { ok: false; error: string } {
+  if (!hostId) return { ok: false, error: "호스트를 알 수 없습니다." };
+  const agent = form.agent.trim();
+  if (!(SPAWN_AGENTS as readonly string[]).includes(agent)) {
+    return { ok: false, error: "에이전트는 claude 또는 codex 여야 합니다." };
+  }
+  const cwd = form.cwd.trim();
+  if (!cwd) return { ok: false, error: "원격 작업 디렉터리를 입력하세요." };
+  if (!cwd.startsWith("/")) {
+    return {
+      ok: false,
+      error: "원격 작업 디렉터리는 절대 경로여야 합니다 (예: /home/me/project).",
+    };
+  }
+  const account = form.account.trim();
+  if (account && !knownAccountIds.includes(account)) {
+    return { ok: false, error: "계정 목록에 없는 계정입니다 — 목록에서 고르세요." };
+  }
+  const label = form.label.trim();
+  return {
+    ok: true,
+    args: { hostId, agent, cwd, account: account || null, label: label || null },
+  };
+}
+
+/** 크기가 멎었다고 보는 시간 — `remote_resize` 는 SSH 왕복 한 번이다. */
+export const REMOTE_RESIZE_DEBOUNCE_MS = 250;
+
+export interface TermSize {
+  cols: number;
+  rows: number;
+}
+
+/**
+ * 이 크기를 **원격 pty 까지** 보내야 하나.
+ *
+ * 두 가지를 막는다. 하나는 퇴화 크기: 호스트가 0px 로 접히면 FitAddon 이 2×1 을
+ * 주는데, 그대로 보내면 전체화면 TUI 가 실제로 2×1 로 리사이즈되어 원격 화면이
+ * 부서진다(로컬 터미널의 같은 백스톱). 다른 하나는 같은 값의 재전송 —
+ * 드래그 한 번이 왕복 수십 번이 되는 것을 막는다.
+ */
+export function shouldSendRemoteResize(last: TermSize | null, next: TermSize): boolean {
+  if (!Number.isInteger(next.cols) || !Number.isInteger(next.rows)) return false;
+  if (next.cols < 10 || next.rows < 3) return false;
+  if (last && last.cols === next.cols && last.rows === next.rows) return false;
+  return true;
+}
+
+/** 흔한 신호의 이름 — 숫자만 보이면 사용자가 무엇이 전달됐는지 알 수 없다. */
+const SIGNAL_NAMES: Record<number, string> = {
+  1: "SIGHUP",
+  2: "SIGINT",
+  9: "SIGKILL",
+  15: "SIGTERM",
+};
+
+/** `종료` 버튼이 요청하는 신호 — 에이전트에게 정리할 틈을 준다. */
+export const KILL_SIGNAL = 15;
+
+export function signalLabel(n: number): string {
+  const name = SIGNAL_NAMES[n];
+  return name ? `${name}(${n})` : `신호 ${n}`;
+}
+
+/**
+ * 종료 요청의 결과 한 줄 — **전달된 신호를 말한다**.
+ *
+ * 데몬은 프로세스 그룹이 이미 사라졌으면 요청한 신호 대신 `SIGHUP` 을 보내고
+ * 그 사실을 응답에 담는다. 요청한 값을 그대로 되읽으면 화면은 일어나지 않은 일을
+ * 말하게 된다.
+ */
+export function killLabel(requested: number | null, delivered: number): string {
+  if (requested == null || requested === delivered) {
+    return `종료 신호를 보냈습니다 — ${signalLabel(delivered)}`;
+  }
+  return `${signalLabel(requested)} 를 요청했지만 실제로 전달된 것은 ${signalLabel(delivered)} 입니다`;
+}
+
+/** `remote-terminal-ended` payload — 백엔드 `RemoteTerminalEnded`. */
+export interface RemoteTerminalEnded {
+  /** **로컬** 세션 id (`remote_attach` 가 돌려준 것). */
+  id: number;
+  host_id: string;
+  code: number | null;
+  signal: string | null;
+  detail: string;
+}
+
+/** 한 줄에 실을 수 있는 사유 길이 — 원격 stderr 는 4KB 까지 온다. */
+const DETAIL_MAX = 300;
+
+/**
+ * 원격 터미널이 멈춘 이유 한 줄.
+ *
+ * 이 이벤트가 따로 있는 이유가 그대로 이 함수의 이유다: "에이전트가 끝났다"와
+ * "`cwcd attach` 가 거절당했다"는 화면에서 똑같이 조용한 검은 상자로 끝난다.
+ * 그래서 **빈 문자열을 절대 돌려주지 않는다** — 사유가 없으면 없다고 말한다.
+ */
+export function endedReason(
+  e: Pick<RemoteTerminalEnded, "code" | "signal" | "detail">,
+): string {
+  const detail = (e.detail ?? "").replace(/\s+/g, " ").trim().slice(0, DETAIL_MAX);
+  let head: string;
+  if (e.signal) head = `원격 터미널이 신호 ${e.signal} 로 끝났습니다`;
+  else if (e.code === 0) head = "원격 터미널이 정상 종료되었습니다 (exit 0)";
+  else if (e.code != null) head = `원격 터미널이 exit ${e.code} 로 끝났습니다`;
+  else head = "원격 터미널이 끊겼습니다";
+  if (detail) return `${head} — ${detail}`;
+  if (e.signal == null && e.code == null) return `${head} — 사유를 알 수 없습니다`;
+  return head;
+}
+
 /**
  * 호스트 목록을 주기 조회하고, 원격 세션의 `claude-timeline`을 모은다.
  *
