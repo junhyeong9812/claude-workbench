@@ -642,7 +642,75 @@ sleep 600"#,
     .expect("silence on a live connection must end the window, not be waited out");
     let s = link.snapshot();
     assert!(
-        s.notices.iter().any(|n| n.message.contains("아무 것도 오지 않았습니다")),
+        s.notices.iter().any(|n| n.message.contains("프레임이 오지 않았습니다")),
+        "the staleness must be stated: {:?}",
+        s.notices.iter().map(|n| &n.message).collect::<Vec<_>>()
+    );
+
+    link.stop();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// **The dribbling link** — the half-open case that arriving bytes hide.
+///
+/// This is not the silent stream above: this peer keeps *writing*. It just never
+/// finishes a line, so no frame is ever decoded, `last_frame_at_ms` stays where
+/// it was, and the panel shows data that stopped being true. A watchdog reset by
+/// bytes is pushed back by every one of those characters and never fires — the
+/// screen goes stale for as long as the peer keeps dribbling, which is exactly
+/// the failure the watchdog was added for.
+#[test]
+#[ignore = "needs an SSH server: run with the other tests in this file"]
+fn a_stream_that_dribbles_bytes_without_ever_finishing_a_frame_is_stale_too() {
+    let (dir, port) = scratch("dribble");
+    // One hello, then a character every 100ms forever: the connection is up, the
+    // command is alive, bytes keep arriving, and not one of them is a frame.
+    let script = write_script(
+        &dir,
+        "dribble.sh",
+        r#"printf '{"frame":"hello","protocol":2,"daemon_version":"0.1.0","host":{"host_id":"h","hostname":"box","user":"u","os":"linux"},"epoch":"e1","resume":{"kind":"fresh"},"oldest_seq":1,"next_seq":1}\n'
+while :; do
+  printf x
+  sleep 0.1
+done"#,
+    );
+    let link = core_lib::remote::Link::start(
+        script_config(
+            &dir,
+            port,
+            "dribble",
+            &script,
+            LinkTimeouts {
+                stale_after: Duration::from_secs(5),
+                ..LinkTimeouts::default()
+            },
+        ),
+        Arc::new(RecordingSink::default()),
+    );
+
+    wait_for(Duration::from_secs(20), || link.snapshot().phase == Phase::Live)
+        .expect("the hello should attach");
+    let at_hello = link.snapshot().last_frame_at_ms.expect("a frame arrived");
+
+    // Well inside the deadline, with bytes arriving the whole time: the age the
+    // panel shows must not have moved either. The screen's clock and the
+    // watchdog's are the same clock — if bytes reset one they reset both, and
+    // then the panel says "1초 전" about a picture minutes old.
+    std::thread::sleep(Duration::from_secs(2));
+    assert_eq!(
+        link.snapshot().last_frame_at_ms,
+        Some(at_hello),
+        "bytes without a frame must not make the screen look fresh"
+    );
+
+    wait_for(Duration::from_secs(40), || {
+        let s = link.snapshot();
+        s.phase != Phase::Live && s.attempts >= 2
+    })
+    .expect("a peer that dribbles bytes must not hold the watchdog off forever");
+    let s = link.snapshot();
+    assert!(
+        s.notices.iter().any(|n| n.message.contains("프레임이 오지 않았습니다")),
         "the staleness must be stated: {:?}",
         s.notices.iter().map(|n| &n.message).collect::<Vec<_>>()
     );

@@ -79,8 +79,15 @@ pub struct LinkTimeouts {
     /// and says nothing leaves the connection perfectly healthy and the panel on
     /// "연결 중" forever. With a deadline it becomes a stated failure and a retry.
     pub hello_deadline: Duration,
-    /// How long the stream may go **without a single byte** before the link is
-    /// torn down and re-established.
+    /// How long the stream may go **without a complete frame** before the link
+    /// is torn down and re-established.
+    ///
+    /// Frames, not bytes: a peer that dribbles characters without ever finishing
+    /// a line leaves the screen exactly as stale as a silent one, and a watchdog
+    /// fed by arrival would be held off by it forever — which is the failure
+    /// this deadline exists to catch, not an exception to it. What counts is the
+    /// same event that moves [`super::host::Host::last_frame_at_ms`], so the age
+    /// the panel shows and the age the watchdog judges are one number.
     ///
     /// This is the whole of the workbench's liveness detection, and it exists
     /// because nothing else can do it: the observation window is *output-only*,
@@ -401,8 +408,12 @@ fn attach(
 
     let mut lines = LineReader::default();
     let started = Instant::now();
-    let mut last_byte_at = Instant::now();
     consume(&seed, &mut lines, state, sink)?;
+    // The staleness clock ticks on **frames**. Arriving bytes are not evidence
+    // that the daemon is still saying anything: a wedged writer that emits a
+    // character now and then never completes a line, so the screen goes on
+    // showing what it showed while the watchdog is pushed back every time.
+    let mut last_frame_at = Instant::now();
 
     loop {
         if cancel.load(Ordering::SeqCst) {
@@ -410,11 +421,10 @@ fn attach(
         }
         match rx.recv_timeout(Duration::from_millis(150)) {
             Ok(chunk) => {
-                last_byte_at = Instant::now();
-                if chunk.seq <= seed_seq {
-                    continue; // already in the seed
+                // `chunk.seq <= seed_seq` is already in the seed.
+                if chunk.seq > seed_seq && consume(&chunk.bytes, &mut lines, state, sink)? > 0 {
+                    last_frame_at = Instant::now();
                 }
-                consume(&chunk.bytes, &mut lines, state, sink)?;
             }
             Err(_) => {
                 if mgr.is_alive(id) == Some(false) {
@@ -426,26 +436,31 @@ fn attach(
                     }
                     return Err(side.verdict(state));
                 }
-                // The connection is *up*. That is not the same as the daemon
-                // still talking to us, and on an output-only stream it is the
-                // only thing the socket can tell us — hence both deadlines.
-                let live = state
-                    .lock()
-                    .unwrap_or_else(|p| p.into_inner())
-                    .made_progress();
-                if !live && started.elapsed() > cfg.timeouts.hello_deadline {
-                    return Err(Ended::Transient(format!(
-                        "원격 데몬이 {}초 안에 응답하지 않았습니다(cwcd stream 이 시작되지 않았거나 막혀 있습니다) — 다시 시도합니다.",
-                        cfg.timeouts.hello_deadline.as_secs()
-                    )));
-                }
-                if live && last_byte_at.elapsed() > cfg.timeouts.stale_after {
-                    return Err(Ended::Transient(format!(
-                        "원격 데몬에서 {}초 동안 아무 것도 오지 않았습니다(하트비트도 없음) — 연결은 살아 있지만 화면이 낡습니다. 다시 붙습니다.",
-                        cfg.timeouts.stale_after.as_secs()
-                    )));
-                }
             }
+        }
+        // Checked on **every** turn, not only on a quiet one: a stream that
+        // dribbles bytes keeps `recv_timeout` returning `Ok`, and a deadline
+        // that only ran when the channel went quiet would never run at all
+        // against exactly the peer it is meant to catch.
+        //
+        // The connection being *up* is not the same as the daemon still talking
+        // to us, and on an output-only stream it is the only thing the socket
+        // can tell us — hence both deadlines.
+        let live = state
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .made_progress();
+        if !live && started.elapsed() > cfg.timeouts.hello_deadline {
+            return Err(Ended::Transient(format!(
+                "원격 데몬이 {}초 안에 응답하지 않았습니다(cwcd stream 이 시작되지 않았거나 막혀 있습니다) — 다시 시도합니다.",
+                cfg.timeouts.hello_deadline.as_secs()
+            )));
+        }
+        if live && last_frame_at.elapsed() > cfg.timeouts.stale_after {
+            return Err(Ended::Transient(format!(
+                "원격 데몬에서 {}초 동안 프레임이 오지 않았습니다(하트비트도 없음) — 연결은 살아 있지만 화면이 낡습니다. 다시 붙습니다.",
+                cfg.timeouts.stale_after.as_secs()
+            )));
         }
     }
 }
@@ -499,12 +514,18 @@ impl LineReader {
 }
 
 /// Feed bytes through the line splitter and apply every complete line.
+///
+/// Returns **how many complete lines were applied** — precisely the events that
+/// move `Host::last_frame_at_ms`, which is why the staleness watchdog counts
+/// this and not arriving bytes: the age on screen and the age the watchdog
+/// judges have to be the same number, or the panel and the reconnect decision
+/// disagree about whether anything is still coming.
 fn consume(
     bytes: &[u8],
     lines: &mut LineReader,
     state: &Arc<Mutex<Host>>,
     sink: &Arc<dyn Sink>,
-) -> Result<(), Ended> {
+) -> Result<usize, Ended> {
     let (lines, dropped) = lines.feed(bytes);
     if dropped > 0 {
         state.lock().unwrap_or_else(|p| p.into_inner()).push_notice(
@@ -515,7 +536,11 @@ fn consume(
             None,
         );
     }
+    // An oversized line is deliberately *not* counted: it was dropped, no frame
+    // came of it, and `Host::last_frame_at_ms` did not move either.
+    let mut applied = 0usize;
     for line in lines {
+        applied += 1;
         let emits = {
             let mut h = state.lock().unwrap_or_else(|p| p.into_inner());
             match decode_frame(&line) {
@@ -534,7 +559,7 @@ fn consume(
             sink.emit(e);
         }
     }
-    Ok(())
+    Ok(applied)
 }
 
 /// Keeps the SSH session torn down on every exit path.
