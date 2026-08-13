@@ -860,10 +860,20 @@ body {
   padding: 6px 4px;
   background: var(--bg-alt);
   border-right: 1px solid var(--border);
-  overflow: hidden;
+  /* 세로로 넘치면 **스크롤**한다. `hidden` 이던 시절엔 창이 낮을 때 맨 아래
+     항목(⊟·셰브론)이 잘려 사이드바를 펼칠 수단 자체가 사라졌다 — 탭이 6개가
+     되면서 그 여유가 더 얇아졌다. 가로는 46px 고정이라 그대로 숨긴다. */
+  overflow-y: auto;
+  overflow-x: hidden;
+  scrollbar-width: none;
+}
+.activity-bar::-webkit-scrollbar {
+  width: 0;
 }
 .activity-item {
   position: relative;
+  /* 넘치는 상황에서 flex 가 항목을 눌러 아이콘·라벨이 겹치지 않게. */
+  flex: 0 0 auto;
   display: flex;
   flex-direction: column;
   align-items: center;
@@ -988,7 +998,7 @@ body {
 .sidebar-seg {
   min-width: 0;
   overflow: hidden;
-  flex-wrap: wrap; /* 5칸이 못 들어가면 2줄 — 아래 반쪽의 유일한 탭 전환 수단이라 잘리면 안 된다 */
+  flex-wrap: wrap; /* 6칸이 못 들어가면 2줄 — 아래 반쪽의 유일한 탭 전환 수단이라 잘리면 안 된다 */
 }
 .sidebar-seg-item {
   height: 20px;
@@ -5569,6 +5579,16 @@ body {
 }
 .remote-host-meta code {
   word-break: break-all;
+}
+/* "마지막 프레임 N초 전" — 연결이 살아 있어도 화면은 낡을 수 있다(워치독). */
+.remote-age {
+  font-variant-numeric: tabular-nums;
+}
+/* 종료된 세션의 본문 회수 — 문장 안에 놓이는 인라인 버튼. */
+.remote-fetch {
+  margin-left: 6px;
+  padding: 1px 6px;
+  font-size: 0.92em;
 }
 .remote-notices {
   display: flex;
