@@ -18,7 +18,13 @@
 //!    position and can be reported to the user.
 //! 2. **Unknown *fields* are ignored** (serde's default), which is what makes an
 //!    additive daemon change compatible. [`PROTOCOL`] is the guard for the
-//!    non-additive kind.
+//!    non-additive kind. A field the **producer always writes**, on the other
+//!    hand, is required here too: `#[serde(default)]` on such a field turns "the
+//!    daemon sent something this consumer could not read" into "the daemon said
+//!    zero / nothing", which is the silent-staleness failure this module exists
+//!    to prevent. Only fields the producer genuinely omits
+//!    (`skip_serializing_if`) carry a default — and where `None` means *no
+//!    change* (`model`, `last_usage`), that is the meaning the bridge preserves.
 //! 3. **A [`SessionKey`] is a name, never a number.** It is kept as the string
 //!    the daemon sent (`"k7"`), validated on the way in, and never ordered or
 //!    incremented. The same goes for [`Cursor`], which is passed back verbatim.
@@ -206,7 +212,9 @@ pub struct Snapshot {
 pub struct SessionSnapshot {
     #[serde(flatten)]
     pub session: SessionView,
-    #[serde(default)]
+    /// Required: the producer always writes it (`items_omitted` is how an empty
+    /// body is *stated*). Defaulting it here would make a snapshot this
+    /// workbench cannot read look like a host with nothing on it.
     pub items: Vec<TimelineItem>,
     /// The body (`items` *and* `turns`) was left out on purpose — a finished
     /// session. Not the same as "this session did nothing", which is why the
@@ -218,7 +226,8 @@ pub struct SessionSnapshot {
     pub model: Option<String>,
     #[serde(default)]
     pub last_usage: Option<TokenUsage>,
-    #[serde(default, with = "turn_map")]
+    /// Required, for the same reason as [`Self::items`] — the body's other half.
+    #[serde(with = "turn_map")]
     pub turns: BTreeMap<u64, String>,
 }
 
@@ -348,7 +357,8 @@ pub struct SessionView {
     #[serde(default)]
     pub pid: Option<u32>,
     pub state: SessionState,
-    #[serde(default)]
+    /// Required — the producer always writes it. A defaulted `0` here would
+    /// render as 1970 rather than as "this row could not be read".
     pub started_at_ms: u64,
     #[serde(default)]
     pub exited_at_ms: Option<u64>,
@@ -363,9 +373,10 @@ pub struct SessionView {
     /// The exact argv the daemon ran. **Not shown by the workbench**: a spawn
     /// request may carry a one-shot prompt, so this string is session content,
     /// not metadata (the daemon's own contract says as much about secrets).
-    #[serde(default)]
     pub argv: Vec<String>,
-    #[serde(default)]
+    /// How many timeline items the daemon holds for this session. Required, and
+    /// **used**: it is what makes a finished session whose body was omitted read
+    /// as "본문 생략됨 · N개" instead of "항목 0".
     pub timeline_len: usize,
     /// Present when the daemon recovered this session from a previous
     /// incarnation instead of starting it.
@@ -427,11 +438,11 @@ pub struct TimelineSliceReply {
     pub session_id: String,
     #[serde(default)]
     pub from_index: usize,
-    #[serde(default)]
+    /// Required — this reply *is* the recovery path, so a body that could not be
+    /// read must not arrive as an empty one.
     pub items: Vec<TimelineItem>,
-    #[serde(default)]
     pub total: usize,
-    #[serde(default, with = "turn_map")]
+    #[serde(with = "turn_map")]
     pub turns: BTreeMap<u64, String>,
     #[serde(default)]
     pub model: Option<String>,
@@ -582,8 +593,13 @@ fn decode_event(v: serde_json::Value) -> Result<Event, String> {
             struct S {
                 key: SessionKey,
                 session_id: String,
-                #[serde(default)]
+                /// Required (the producer always writes it). Defaulted, a delta
+                /// whose body this workbench cannot read would apply as a
+                /// perfectly normal empty delta **and advance the cursor past
+                /// it** — the loss would be silent and unrecoverable.
                 items: Vec<TimelineItem>,
+                /// `None` = *not changed by this delta* (the producer skips it),
+                /// which is the meaning `host` preserves.
                 #[serde(default)]
                 model: Option<String>,
                 #[serde(default)]
@@ -674,6 +690,15 @@ mod tests {
     const DELTA2: &str = r#"{"frame":"event","seq":6,"cursor":"0c44fa05437ccebd:6","ts_ms":1,"event":{"event":"timeline_delta","key":"k1","session_id":"5b6f21e0","items":[],"model":"claude-opus-5","last_usage":{"input":2,"output":5,"cache_read":15976,"cache_creation":15351}}}"#;
     const EXITED: &str = r#"{"frame":"event","seq":7,"cursor":"0c44fa05437ccebd:7","ts_ms":1,"event":{"event":"session_exited","key":"k1","session_id":"5b6f21e0","exit_code":0}}"#;
     const HEARTBEAT: &str = r#"{"frame":"heartbeat","cursor":"0c44fa05437ccebd:7","ts_ms":1786587026281,"running":0}"#;
+    /// `cwcd timeline <addr>` on a real finished session (same smoke).
+    const TIMELINE_REPLY: &str = r#"{"response":"timeline","key":"k2","session_id":"7699b5b5","from_index":0,
+                "items":[{"session_id":"7699b5b5","tool_call_id":"toolu_01Va","turn":1,"seq":0,
+                          "kind":"edit","title":"Write /tmp/r2a/work/hello.txt","locations":[],
+                          "project_label":null,"diffs":[],"content_text":null,"raw_input":null,
+                          "agent_status":"completed","write_status":"none","revision":1}],
+                "total":1,"turns":{"1":"Create a file named hello.txt"},
+                "model":"claude-opus-5",
+                "last_usage":{"input":2,"output":5,"cache_read":31000,"cache_creation":800}}"#;
 
     #[test]
     fn a_real_daemon_stream_decodes_end_to_end() {
@@ -752,6 +777,50 @@ mod tests {
         assert!(decode_frame(r#"{"seq":1}"#).is_err());
     }
 
+    /// The fields the producer **always** writes are required here too.
+    ///
+    /// Each of these was `#[serde(default)]` and therefore decoded happily into
+    /// a zero: a delta with no `items` became a normal empty delta (and the
+    /// cursor advanced past whatever it really carried), a session header with
+    /// no `timeline_len` became "0 items", and a recovery reply with no `items`
+    /// became "this finished session did nothing".
+    #[test]
+    fn a_field_the_producer_always_writes_is_required_not_defaulted() {
+        // timeline_delta without `items`.
+        let err = decode_frame(
+            r#"{"frame":"event","seq":1,"cursor":"e:1","ts_ms":1,"event":{"event":"timeline_delta","key":"k1","session_id":"s"}}"#,
+        )
+        .unwrap_err();
+        assert!(err.contains("items"), "{err}");
+
+        // A session header without `timeline_len` / `argv` / `started_at_ms`.
+        for missing in ["timeline_len", "argv", "started_at_ms"] {
+            let mut v: serde_json::Value = serde_json::from_str(SPAWNED).unwrap();
+            v["event"]["session"]
+                .as_object_mut()
+                .unwrap()
+                .remove(missing);
+            let err = decode_frame(&v.to_string())
+                .err()
+                .unwrap_or_else(|| panic!("`{missing}` must be required, not defaulted"));
+            assert!(err.contains(missing), "{err}");
+        }
+
+        // A snapshot whose body could not be read is not a host with nothing on
+        // it.
+        let snap = r#"{"frame":"snapshot","cursor":"e:1","taken_at_ms":1,"sessions":[{"key":"k1","session_id":"u","agent":"claude","cwd":"/w","state":"exited","started_at_ms":1,"argv":[],"timeline_len":3,"items_omitted":true,"turns":{}}]}"#;
+        assert!(decode_frame(snap).unwrap_err().contains("items"));
+
+        // The recovery reply's own body.
+        for missing in ["items", "total", "turns"] {
+            let mut v: serde_json::Value = serde_json::from_str(TIMELINE_REPLY).unwrap();
+            v.as_object_mut().unwrap().remove(missing);
+            let err = decode_response::<TimelineSliceReply>(&v.to_string())
+                .expect_err("a reply missing its body must be an error");
+            assert!(err.contains(missing), "{err}");
+        }
+    }
+
     #[test]
     fn a_session_key_is_a_name_not_a_number() {
         assert_eq!(SessionKey::parse("k7").unwrap().as_str(), "k7");
@@ -788,17 +857,7 @@ mod tests {
     /// every real one.
     #[test]
     fn a_timeline_slice_reply_decodes_with_its_string_keyed_turns() {
-        let slice: TimelineSliceReply = decode_response(
-            r#"{"response":"timeline","key":"k2","session_id":"7699b5b5","from_index":0,
-                "items":[{"session_id":"7699b5b5","tool_call_id":"toolu_01Va","turn":1,"seq":0,
-                          "kind":"edit","title":"Write /tmp/r2a/work/hello.txt","locations":[],
-                          "project_label":null,"diffs":[],"content_text":null,"raw_input":null,
-                          "agent_status":"completed","write_status":"none","revision":1}],
-                "total":1,"turns":{"1":"Create a file named hello.txt"},
-                "model":"claude-opus-5",
-                "last_usage":{"input":2,"output":5,"cache_read":31000,"cache_creation":800}}"#,
-        )
-        .expect("a finished session's body must be readable — it is the address `items_omitted` points at");
+        let slice: TimelineSliceReply = decode_response(TIMELINE_REPLY).expect("a finished session's body must be readable — it is the address `items_omitted` points at");
         assert_eq!(slice.key.as_str(), "k2");
         assert_eq!(slice.total, 1);
         assert_eq!(slice.items[0].title, "Write /tmp/r2a/work/hello.txt");
