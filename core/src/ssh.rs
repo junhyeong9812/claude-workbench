@@ -27,6 +27,7 @@
 //! — see [`ExecStdin::Stream`] for the measurement behind that.
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
@@ -232,28 +233,68 @@ pub struct SshChannels {
     pub exec_rx: mpsc::Receiver<ExecEvent>,
 }
 
+/// Nothing may be written yet — the server has not accepted the exec.
+const INPUT_PENDING: u8 = 0;
+/// The remote command is running and its stdin is reachable.
+const INPUT_ACCEPTED: u8 = 1;
+/// The channel is finished; there is no longer anything to write to.
+const INPUT_FINISHED: u8 = 2;
+
+/// When a session may be written to.
+///
+/// The rule is the same on all three: **a write is accepted only when this
+/// transport can actually carry it**. Anything else has to be refused at the
+/// call, because the alternative — `Ok` now, discarded later — is a promise of
+/// delivery that nothing downstream can retract.
+enum InputGate {
+    /// The interactive shell: its pty exists for the life of the session.
+    Open,
+    /// An [`ExecStdin::Eof`] exec — no remote stdin at all, ever (R0).
+    Never,
+    /// An [`ExecStdin::Stream`] exec: writable only between the server's
+    /// acceptance of the exec and the end of the channel. Both edges matter and
+    /// the leading one is the one that bit: `exec()` merely *queues* the
+    /// request, so acceptance is a full round trip after the session (and its
+    /// terminal, and its focus) exists.
+    WhileAccepted(Arc<AtomicU8>),
+}
+
 /// Manager-held handles for a live SSH session.
 pub struct SshHandle {
     input_tx: mpsc::Sender<Vec<u8>>,
     size_tx: watch::Sender<(u16, u16)>,
     cancel_tx: watch::Sender<bool>,
     join: Option<JoinHandle<()>>,
-    /// `true` for an [`ExecStdin::Eof`] session, which has **no remote stdin**.
-    /// Decided at handle creation so `send_input` rejects from the very first
-    /// call — dropping the receiver alone would only take effect once connect,
-    /// auth and channel-open finished, leaving an early window where writes were
-    /// accepted and then discarded (codex final audit P2). An
-    /// [`ExecStdin::Stream`] exec and the interactive shell both accept input.
-    output_only: bool,
+    /// What this session accepts, and when. Decided at handle creation so
+    /// `send_input` answers from the very first call — dropping the receiver
+    /// alone would only take effect once connect, auth and channel-open
+    /// finished, leaving an early window where writes were accepted and then
+    /// discarded (codex final audit P2; R2b review R8 for the duplex half).
+    input: InputGate,
 }
 
 impl SshHandle {
     /// Enqueue input (keystrokes). Never blocks the caller (F4); on a full queue
     /// or a closed session it returns an error instead of growing memory (D2).
+    ///
+    /// **A refusal, not a discard.** Every path that cannot deliver says so to
+    /// the caller — see [`InputGate`].
     pub fn send_input(&self, data: &[u8]) -> Result<(), String> {
         use mpsc::error::TrySendError;
-        if self.output_only {
-            return Err("exec session has no stdin (output-only)".into());
+        match &self.input {
+            InputGate::Never => return Err("exec session has no stdin (output-only)".into()),
+            InputGate::WhileAccepted(state) => match state.load(Ordering::SeqCst) {
+                INPUT_PENDING => {
+                    return Err(
+                        "remote command has not started yet (nothing can be written before the \
+                         server accepts the exec)"
+                            .into(),
+                    )
+                }
+                INPUT_FINISHED => return Err("remote command has ended".into()),
+                _ => {}
+            },
+            InputGate::Open => {}
         }
         match self.input_tx.try_send(data.to_vec()) {
             Ok(()) => Ok(()),
@@ -302,9 +343,17 @@ pub(crate) fn spawn_ssh(
     cols: u16,
     rows: u16,
 ) -> (SshHandle, SshChannels) {
-    // Read before `config` moves into the session thread: an output-only exec
-    // takes no input, and the handle must know that from its first moment.
-    let output_only = matches!(&config.exec, Some(spec) if spec.stdin == ExecStdin::Eof);
+    // Read before `config` moves into the session thread: what a session accepts
+    // has to be knowable from the handle's first moment, not once the connection
+    // has come up.
+    let (input, exec_gate) = match &config.exec {
+        None => (InputGate::Open, None),
+        Some(spec) if spec.stdin == ExecStdin::Eof => (InputGate::Never, None),
+        Some(_) => {
+            let state = Arc::new(AtomicU8::new(INPUT_PENDING));
+            (InputGate::WhileAccepted(Arc::clone(&state)), Some(state))
+        }
+    };
     let (input_tx, input_rx) = mpsc::channel::<Vec<u8>>(INPUT_QUEUE);
     let (size_tx, size_rx) = watch::channel((cols.max(1), rows.max(1)));
     let (cancel_tx, cancel_rx) = watch::channel(false);
@@ -336,7 +385,7 @@ pub(crate) fn spawn_ssh(
             };
             let mut cancel_rx = cancel_rx;
             tokio::select! {
-                res = run(&config, &shared, &known_hosts_path, &prompt_tx, &status_tx, &exec_tx, input_rx, size_rx) => {
+                res = run(&config, &shared, &known_hosts_path, &prompt_tx, &status_tx, &exec_tx, input_rx, size_rx, exec_gate) => {
                     if let Err(reason) = res {
                         let _ = status_tx.send(SshStatus::Failed(reason));
                     }
@@ -352,7 +401,7 @@ pub(crate) fn spawn_ssh(
             size_tx,
             cancel_tx,
             join: Some(join),
-            output_only,
+            input,
         },
         SshChannels {
             prompt_rx,
@@ -374,6 +423,9 @@ async fn run(
     exec_tx: &mpsc::Sender<ExecEvent>,
     mut input_rx: mpsc::Receiver<Vec<u8>>,
     mut size_rx: watch::Receiver<(u16, u16)>,
+    // The duplex exec's input gate — `Some` only for `ExecStdin::Stream`,
+    // which is the only mode whose write side has a moment it becomes legal.
+    exec_gate: Option<Arc<AtomicU8>>,
 ) -> Result<(), String> {
     let _ = status_tx.send(SshStatus::Connecting);
 
@@ -418,7 +470,7 @@ async fn run(
             }
             ExecStdin::Stream => Some(input_rx),
         };
-        return run_exec(channel, spec, shared, status_tx, exec_tx, input_rx).await;
+        return run_exec(channel, spec, shared, status_tx, exec_tx, input_rx, exec_gate).await;
     }
 
     let (cols, rows) = *size_rx.borrow();
@@ -505,6 +557,13 @@ async fn run(
 ///   mean `wait()` never yields a status, silently breaking the "exactly one
 ///   terminal event" contract while the thread and TCP connection stay pinned.
 /// - [`ExecStdin::Stream`] — `input_rx` is drained onto the channel, then EOF.
+///   Writes are only *accepted* while this transport can carry them
+///   ([`InputGate`]): before the server's `Success` the write side may not be
+///   touched at all, and after the channel ends there is nothing to touch. The
+///   residue this does not cover — bytes accepted while the command was running
+///   and still queued when the remote went away mid-session — is unavoidable
+///   loss (nobody can deliver them), and it is always accompanied by the
+///   terminal `Exit`/`Error` that says the command is gone.
 ///
 /// **Structure (the deadlock class):** the channel is [`russh::Channel::split`]
 /// into halves and driven by **two futures under one `join!`**. This is not a
@@ -533,6 +592,11 @@ async fn run_exec(
     status_tx: &mpsc::UnboundedSender<SshStatus>,
     exec_tx: &mpsc::Sender<ExecEvent>,
     input_rx: Option<mpsc::Receiver<Vec<u8>>>,
+    // Flipped to `INPUT_ACCEPTED` the moment the server accepts the exec and to
+    // `INPUT_FINISHED` when the channel ends, so `SshHandle::send_input` refuses
+    // outside that window instead of queueing for a writer that will never run.
+    // See `InputGate`.
+    gate: Option<Arc<AtomicU8>>,
 ) -> Result<(), String> {
     let (mut read, write) = channel.split();
 
@@ -586,6 +650,12 @@ async fn run_exec(
                 // and only now may anything be written to it.
                 Some(ChannelMsg::Success) => {
                     if let Some(tx) = start_tx.take() {
+                        // Opened for the caller at the same instant it is opened
+                        // for the writer — the two must not disagree about
+                        // whether a keystroke can be delivered.
+                        if let Some(g) = &gate {
+                            g.store(INPUT_ACCEPTED, Ordering::SeqCst);
+                        }
                         let _ = tx.send(());
                         let _ = status_tx.send(SshStatus::Ready);
                     }
@@ -611,7 +681,12 @@ async fn run_exec(
                 Some(_) => {}
             }
         }
-        // Release the writer however this ended (accepted, rejected, or gone).
+        // Release the writer however this ended (accepted, rejected, or gone) —
+        // and close the input gate with it, so a keystroke arriving after the
+        // command is gone is refused rather than queued for nobody.
+        if let Some(g) = &gate {
+            g.store(INPUT_FINISHED, Ordering::SeqCst);
+        }
         let _ = done_tx.send(true);
         (rejected, exit_code, exit_signal)
     };
@@ -1920,6 +1995,64 @@ W8CkSL2Yx++XP/fxFe/RAAAAD210LXRlc3QtaG9zdGtleQECAwQFBg==\n\
             session.close(channel)?;
             Ok(())
         }
+    }
+
+    /// **Nothing may be accepted before the remote command can receive it.**
+    ///
+    /// A duplex exec used to take input from its very first moment: `write`
+    /// answered `Ok`, the bytes sat in the input queue, and the writer — which
+    /// may not touch the channel until the server *accepts* the exec — returned
+    /// the instant the channel finished instead, taking the queue with it. So a
+    /// keystroke typed in the window between "the terminal opened" and "the
+    /// remote command started" was reported as delivered and then thrown away,
+    /// silently. The window is real: attaching focuses the terminal immediately,
+    /// while acceptance is a whole SSH round trip away.
+    ///
+    /// This is the same rule an output-only exec has had since R0 — refuse from
+    /// the first call rather than accept and discard — applied to the one
+    /// direction R2b opened.
+    #[test]
+    fn input_before_the_exec_is_accepted_is_refused_not_accepted_and_dropped() {
+        let port = serve_once(ExecRejectHandler);
+        let mgr = SessionManager::new();
+        let cfg = SshConfig {
+            host: "127.0.0.1".into(),
+            port,
+            username: "tester".into(),
+            auth: AuthMethod::Password("testpass".into()),
+            exec: Some(ExecSpec::duplex("attach")),
+        };
+        let (id, mut chans) = mgr.create_ssh(cfg, temp_known_hosts("exec_early_input"), 80, 24, None);
+
+        // The very first keystroke — connect, auth and the exec request have not
+        // even finished, so there is nowhere for it to go.
+        let early = mgr.write(id, b"typed-too-early");
+        assert!(
+            early.is_err(),
+            "input before the exec is accepted must be refused; accepting it means \
+             promising a delivery this transport cannot make"
+        );
+
+        // Drive the session to its (rejected) end, then check the other edge:
+        // once the command is gone, a write must not be accepted either.
+        let deadline = Instant::now() + Duration::from_millis(8000);
+        let mut ended = false;
+        while Instant::now() < deadline && !ended {
+            if let Ok(ch) = chans.prompt_rx.try_recv() {
+                let _ = ch.reply.send(HostKeyDecision::Accept);
+            }
+            if let Ok(ExecEvent::Error(_)) = chans.exec_rx.try_recv() {
+                ended = true;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(ended, "the rejected exec must still deliver its terminal Error");
+        assert!(
+            mgr.write(id, b"typed-too-late").is_err(),
+            "a finished command must refuse input rather than queue it for nobody"
+        );
+
+        let _ = mgr.remove(id);
     }
 
     /// A duplex exec carries typed bytes to the remote command — the plain
