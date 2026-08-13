@@ -467,6 +467,20 @@ pub struct KilledReply {
     pub signal: i32,
 }
 
+/// `cwcd resize <addr>` — the size the pty **actually has** afterwards.
+///
+/// Read rather than discarded, because a resize is the one control call whose
+/// failure is otherwise invisible: the daemon may clamp it, or refuse it for a
+/// session whose terminal is gone, and the caller's next frame looks the same
+/// either way. `exec_capture` alone cannot stand in for this — it only fails on
+/// *empty* stdout, so `{"response":"error",…}` is a perfectly good non-empty
+/// reply and used to arrive as `Ok(())`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+pub struct ResizedReply {
+    pub cols: u16,
+    pub rows: u16,
+}
+
 /// `cwcd timeline <addr>` — the recovery address a finished session's
 /// `items_omitted` points at.
 #[derive(Debug, Clone, PartialEq, Deserialize)]

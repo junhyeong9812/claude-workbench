@@ -31,7 +31,7 @@ use tauri::{AppHandle, Emitter, Manager, State};
 
 use core_lib::remote::host::Emit;
 use core_lib::remote::proto::{
-    decode_response, KilledReply, SessionsReply, SpawnedReply, TimelineSliceReply,
+    decode_response, KilledReply, ResizedReply, SessionsReply, SpawnedReply, TimelineSliceReply,
 };
 use core_lib::remote::{
     HostConfig, HostSnapshot, RemoteAuth, RemoteTimelinePayload, Registry, Sink,
@@ -321,6 +321,14 @@ pub fn remote_kill(
 /// resize that did not happen is visible instead of assumed. It costs one SSH
 /// round trip, so the caller should send settled sizes, not every frame of a
 /// drag.
+///
+/// The answer is **read**, and handed back as the size the pty now has. It was
+/// thrown away, which made the "answers" in the paragraph above untrue: the
+/// underlying `exec_capture` only fails on empty stdout, so a daemon that
+/// refused the resize — a finished session, an adopted one with no terminal —
+/// replied `{"response":"error",…}` and this returned `Ok(())`. Returning the
+/// size also gives the caller something to correct itself against, which a
+/// caller tracking "the last size I sent" cannot do.
 #[tauri::command]
 pub fn remote_resize(
     remote: State<'_, RemoteState>,
@@ -328,14 +336,26 @@ pub fn remote_resize(
     id: u64,
     cols: u16,
     rows: u16,
-) -> Result<(), AppError> {
+) -> Result<RemoteSize, AppError> {
     let addr = addr_of(&remote, &host_id, id)?;
     let (cols, rows) = (cols.max(1).to_string(), rows.max(1).to_string());
-    remote
+    let out = remote
         .registry
         .call(&host_id, &["resize", &addr, "--cols", &cols, "--rows", &rows])
         .map_err(AppError::new)?;
-    Ok(())
+    let size: ResizedReply = decode_response(&out).map_err(AppError::new)?;
+    Ok(RemoteSize {
+        cols: size.cols,
+        rows: size.rows,
+    })
+}
+
+/// The size a remote pty has after [`remote_resize`] — the daemon's answer, not
+/// the request.
+#[derive(Clone, Copy, Serialize)]
+pub struct RemoteSize {
+    pub cols: u16,
+    pub rows: u16,
 }
 
 /// Open a **terminal** onto a remote session, and file it in the app's own
