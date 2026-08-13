@@ -154,6 +154,10 @@ const emptyReply = {
   tokens: [],
   model: null,
   last_usage: null,
+  // 백엔드 `RemoteTimeline` 이 **항상** 쓰는 둘 — 소비자도 필수라 픽스처에도
+  // 있어야 한다(없으면 "계약이 깨졌다"로 드러나는 것이 맞다).
+  subagent: null,
+  subagents: [],
 };
 
 /** 커맨드별 응답 — 테스트마다 갈아 끼운다. */
@@ -855,5 +859,148 @@ describe("R7 — 항목 목록의 상한은 화면이 말한다", () => {
     // 가장 최근 것이 보이고 가장 오래된 것은 잘려 있다 — 상한이 실제로 최근 쪽이다.
     expect(text()).toContain("제목 c39");
     expect(text()).not.toContain("제목 c0 ");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// R7 (b) — 서브에이전트: 돌린 세션과 안 돌린 세션이 다르게 보인다
+//
+// 화면 단언 + **호출 단언** 둘 다다. 본문이 payload 로 오면 안 되고(메모리),
+// 자동 회수가 두 번 나가면 안 된다(R1 이 실측한 무한 SSH 루프).
+// ---------------------------------------------------------------------------
+
+function agentFrame(over: Record<string, unknown> = {}) {
+  return {
+    id: "a7c1d2e3",
+    parent: "call-2",
+    turn: 1,
+    total: 5,
+    completed: 3,
+    last_status: "in_progress",
+    sig: "42-7",
+    items: null,
+    ...over,
+  };
+}
+
+describe("R7 — 서브에이전트 메타가 화면에 닿는다", () => {
+  it("에이전트를 돌린 세션은 진행도와 함께 그 사실을 보인다", async () => {
+    routes.remote_hosts = async () => [liveSession()];
+    await mount();
+    await act(async () =>
+      emitEvent("claude-timeline", liveEvent({ subagents: [agentFrame()] })),
+    );
+    await openRow();
+    expect(text(), "에이전트가 화면 어디에도 없다").toContain("a7c1d2e");
+    expect(text(), "본문 없이도 진행도는 그려져야 한다").toContain("3/5");
+    expect(text()).toContain("진행 중");
+  });
+
+  it("에이전트가 없는 세션에는 그 줄 자체가 없다 — 빈 목록을 지어내지 않는다", async () => {
+    routes.remote_hosts = async () => [liveSession()];
+    await mount();
+    await act(async () => emitEvent("claude-timeline", liveEvent()));
+    await openRow();
+    expect(text()).not.toContain("서브에이전트");
+  });
+});
+
+describe("R7 — 본문은 펼칠 때 딱 한 번 당겨온다", () => {
+  it("payload 에는 본문이 없고, 펼치면 `remote_timeline` 이 그 에이전트로 나간다", async () => {
+    routes.remote_hosts = async () => [liveSession()];
+    routes.remote_timeline = async (args) =>
+      args.subagent === "a7c1d2e3"
+        ? {
+            ...emptyReply,
+            subagent: "a7c1d2e3",
+            subagents: [],
+            total: 1,
+            items: [tlItem("s1", 1, { content_text: "에이전트가 한 일" })],
+          }
+        : { ...emptyReply, subagent: null, subagents: [] };
+    await mount();
+    await act(async () =>
+      emitEvent("claude-timeline", liveEvent({ subagents: [agentFrame()] })),
+    );
+    await openRow();
+    // 아직 아무것도 안 눌렀다 — 본문은 payload 에 없으므로 화면에도 없다.
+    expect(text()).not.toContain("에이전트가 한 일");
+    expect(calls("remote_timeline")).toBe(0);
+
+    const caret = Array.from(container.querySelectorAll("button")).find((b) =>
+      (b.textContent ?? "").includes("a7c1d2e"),
+    ) as HTMLButtonElement;
+    expect(caret).toBeTruthy();
+    await act(async () => caret.click());
+    await flush(10);
+    expect(text(), "펼쳤는데 본문이 오지 않았다").toContain("에이전트가 한 일");
+    const args = invoke.mock.calls.find((c) => c[0] === "remote_timeline")?.[1] as
+      | Record<string, unknown>
+      | undefined;
+    expect(args?.subagent).toBe("a7c1d2e3");
+  });
+
+  it("자동 회수는 (세션·에이전트·서명)당 정확히 1회다 — 델타가 계속 와도", async () => {
+    routes.remote_hosts = async () => [liveSession()];
+    routes.remote_timeline = async () => ({
+      ...emptyReply,
+      subagent: "a7c1d2e3",
+      subagents: [],
+      // 빈 본문이 와도 다시 나가면 안 된다 — R1 이 무한 루프였던 조합.
+      items: [],
+    });
+    await mount();
+    await act(async () =>
+      emitEvent("claude-timeline", liveEvent({ subagents: [agentFrame()] })),
+    );
+    await openRow();
+    const caret = Array.from(container.querySelectorAll("button")).find((b) =>
+      (b.textContent ?? "").includes("a7c1d2e"),
+    ) as HTMLButtonElement;
+    await act(async () => caret.click());
+    await flush(10);
+    expect(calls("remote_timeline")).toBe(1);
+    // 같은 서명으로 델타가 여러 번 와도 회수는 늘지 않는다.
+    for (const total of [6, 7, 8]) {
+      // eslint-disable-next-line no-await-in-loop
+      await act(async () =>
+        emitEvent("claude-timeline", liveEvent({ subagents: [agentFrame({ total })] })),
+      );
+      // eslint-disable-next-line no-await-in-loop
+      await flush(5);
+    }
+    expect(calls("remote_timeline"), "빈 본문이 자동 회수를 재발화시켰다").toBe(1);
+  });
+});
+
+describe("R7 — 서브에이전트 회수가 실패해도 무한 재시도가 되지 않는다", () => {
+  it("실패는 화면에 뜨고, 다음 시도는 사용자 버튼에만 남는다", async () => {
+    routes.remote_hosts = async () => [liveSession()];
+    routes.remote_timeline = async () => {
+      throw new Error("ssh: connection refused");
+    };
+    await mount();
+    await act(async () =>
+      emitEvent("claude-timeline", liveEvent({ subagents: [agentFrame()] })),
+    );
+    await openRow();
+    const caret = Array.from(container.querySelectorAll("button")).find((b) =>
+      (b.textContent ?? "").includes("a7c1d2e"),
+    ) as HTMLButtonElement;
+    await act(async () => caret.click());
+    await flush(20);
+    expect(text(), "실패가 조용하다").toContain("connection refused");
+    // 실패한 뒤 effect 가 다시 도는 것이 R1 의 모양이었다 — 회차마다 새 SSH.
+    expect(calls("remote_timeline"), "실패가 자동 재시도 루프가 됐다").toBe(1);
+    // 델타가 계속 와도 마찬가지다.
+    for (const total of [6, 7, 8]) {
+      // eslint-disable-next-line no-await-in-loop
+      await act(async () =>
+        emitEvent("claude-timeline", liveEvent({ subagents: [agentFrame({ total })] })),
+      );
+      // eslint-disable-next-line no-await-in-loop
+      await flush(5);
+    }
+    expect(calls("remote_timeline")).toBe(1);
   });
 });

@@ -242,6 +242,37 @@ pub struct SessionSnapshot {
     pub dates: BTreeMap<u64, String>,
     #[serde(default, with = "turn_map")]
     pub tokens: BTreeMap<u64, TokenUsage>,
+    /// This session's subagents, meta only. Absent = the daemon reported none —
+    /// which, since R7, means it looked and found none rather than never looked.
+    #[serde(default)]
+    pub subagents: Vec<SubagentMeta>,
+}
+
+/// One subagent of a session, as **metadata**.
+///
+/// The daemon reports the counters and never the transcript: a finished agent's
+/// body was 77% of a local timeline payload and 5.22 GB of webview RSS, and the
+/// cure was deferred hydration — meta on the stream, body on demand. This type
+/// therefore has no `items` field, and the fetch address is
+/// `cwcd timeline <addr> --subagent <id>` ([`TimelineSliceReply::subagent`]).
+///
+/// `turn`/`total`/`completed` are required: the producer always writes them, and
+/// a defaulted `0` would draw a progress bar saying an agent did nothing.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct SubagentMeta {
+    pub id: String,
+    #[serde(default)]
+    pub parent: Option<String>,
+    pub turn: u64,
+    pub total: usize,
+    pub completed: usize,
+    #[serde(default)]
+    pub last_status: Option<crate::timeline::AgentStatus>,
+    /// The body cache key (`<len>-<mtime_ns>`). Absent when the daemon could not
+    /// stat the file — a consumer then treats a fetched body as always stale
+    /// rather than always fresh.
+    #[serde(default)]
+    pub sig: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -314,6 +345,10 @@ pub enum Event {
         answers: BTreeMap<u64, String>,
         dates: BTreeMap<u64, String>,
         tokens: BTreeMap<u64, TokenUsage>,
+        /// The whole current set when it changed, **empty when it did not** —
+        /// so a consumer merges rather than replaces (an empty list on an
+        /// unrelated delta would blink a session's agents out of existence).
+        subagents: Vec<SubagentMeta>,
     },
     Hook {
         key: SessionKey,
@@ -508,6 +543,14 @@ pub struct TimelineSliceReply {
     pub model: Option<String>,
     #[serde(default)]
     pub last_usage: Option<TokenUsage>,
+    /// Whose timeline this is — `None` = the session's own, `Some(id)` = that
+    /// subagent's. Echoed by the daemon so a reply cannot be mistaken for the
+    /// session body when both travel on this one command.
+    #[serde(default)]
+    pub subagent: Option<String>,
+    /// The session's agents, meta only — the same list the stream carries.
+    #[serde(default)]
+    pub subagents: Vec<SubagentMeta>,
 }
 
 /// A daemon reply that is an error rather than an answer.
@@ -842,6 +885,8 @@ fn decode_event(v: serde_json::Value) -> Result<Event, String> {
                 dates: BTreeMap<u64, String>,
                 #[serde(default, with = "turn_map")]
                 tokens: BTreeMap<u64, TokenUsage>,
+                #[serde(default)]
+                subagents: Vec<SubagentMeta>,
             }
             let s: S = serde_json::from_value(v).map_err(of)?;
             Event::TimelineDelta {
@@ -854,6 +899,7 @@ fn decode_event(v: serde_json::Value) -> Result<Event, String> {
                 answers: s.answers,
                 dates: s.dates,
                 tokens: s.tokens,
+                subagents: s.subagents,
             }
         }
         "hook" => {

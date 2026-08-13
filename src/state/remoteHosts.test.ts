@@ -24,7 +24,10 @@ import {
   shouldSendRemoteResize,
   signalLabel,
   spawnRequest,
+  shouldAutoLoadSubagent,
   staleSeenKeys,
+  subagentAttemptKey,
+  subagentBodyIsFresh,
   toLiveTimeline,
   turnMetaLabel,
   unseenNotices,
@@ -33,6 +36,7 @@ import {
   type RemoteLiveTimeline,
   type RemoteNotice,
   type RemoteSessionMeta,
+  type RemoteSubagentFrame,
 } from "./remoteHosts";
 import type { ClaudeTimelineEvent } from "../hooks/useClaudeTimeline";
 import type { TimelineItem } from "../types";
@@ -113,6 +117,7 @@ function live(items: number, turns: number): RemoteLiveTimeline {
     answers: [],
     dates: [],
     tokens: [],
+    subagents: [],
     model: null,
     ctxTokens: 0,
   };
@@ -319,6 +324,8 @@ describe("종료된 세션의 본문", () => {
       tokens: [[1, { input: 1, output: 2, cache_read: 0, cache_creation: 0 }]],
       model: "claude-opus-5",
       last_usage: { input: 2, output: 5, cache_read: 10, cache_creation: 3 },
+      subagent: null,
+      subagents: [],
     });
     expect(l.items.map((i) => i.tool_call_id)).toEqual(["a", "b"]);
     expect(l.turns).toEqual([[1, "질문"]]);
@@ -327,6 +334,7 @@ describe("종료된 세션의 본문", () => {
     expect(l.answers).toEqual([[1, "답변"]]);
     expect(l.dates).toEqual([[1, "2026-08-13"]]);
     expect(l.tokens).toEqual([[1, { input: 1, output: 2, cache_read: 0, cache_creation: 0 }]]);
+    expect(l.subagents).toEqual([]);
   });
 });
 
@@ -675,5 +683,80 @@ describe("R7 — 항목 목록의 잘림은 화면이 말한다", () => {
     // 다 보이면 할 말이 없다 — 없는 잘림을 지어내지 않는다.
     expect(itemCutNote(12, 12)).toBeNull();
     expect(itemCutNote(3, 12)).toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// R7 (b) — 서브에이전트: 메타는 밀고, 본문은 펼칠 때 당긴다
+// ---------------------------------------------------------------------------
+
+function frame(over: Partial<RemoteSubagentFrame> = {}): RemoteSubagentFrame {
+  return {
+    id: "a7",
+    parent: "call-2",
+    turn: 1,
+    total: 5,
+    completed: 3,
+    last_status: "in_progress",
+    sig: "42-7",
+    items: null,
+    ...over,
+  };
+}
+
+describe("R7 — 서브에이전트 메타는 필수다", () => {
+  it("생산자가 항상 쓰는 필드라 없으면 빈 목록이 아니라 예외다", () => {
+    const e = {
+      id: REMOTE_ID_BASE,
+      items: [],
+      turns: [],
+      answers: [],
+      dates: [],
+      tokens: [],
+      model: null,
+      last_usage: null,
+    } as unknown as ClaudeTimelineEvent;
+    // `?? []` 로 받으면 "에이전트를 안 돌렸다"와 "계약이 깨졌다"가 같은 화면이
+    // 된다 — R7 이 지적한 결함이 정확히 그 동일시였다.
+    expect(() => toLiveTimeline(e)).toThrow();
+  });
+});
+
+describe("R7 — 회수한 본문의 신선도는 파일 서명이 정한다", () => {
+  it("서명이 같을 때만 유효하고, 서명이 없으면 유효하다고 하지 않는다", () => {
+    const items = [item("s1", 1)];
+    expect(subagentBodyIsFresh({ sig: "42-7", items }, frame())).toBe(true);
+    // 에이전트가 재활성되어 전사가 달라지면 들고 있던 본문은 낡은 것이다.
+    expect(subagentBodyIsFresh({ sig: "42-7", items }, frame({ sig: "99-1" }))).toBe(false);
+    expect(subagentBodyIsFresh(undefined, frame())).toBe(false);
+    // 서명이 없으면 무효화할 방법이 없다 — 조용히 옛 본문을 보이지 않는다.
+    expect(subagentBodyIsFresh({ sig: null, items }, frame({ sig: null }))).toBe(false);
+  });
+});
+
+describe("R7 — 서브에이전트 자동 회수도 축이 **시도**다", () => {
+  it("한 번 시도했으면 다시 자동으로 나가지 않는다 (R1 무한 SSH 루프 재발 방지)", () => {
+    const idle = { attempted: false, fetching: false, failed: false };
+    expect(shouldAutoLoadSubagent(idle, false)).toBe(true);
+    // 시도했으면 — 성공이든 빈 응답이든 — 자동은 끝이다.
+    expect(shouldAutoLoadSubagent({ ...idle, attempted: true }, false)).toBe(false);
+    expect(shouldAutoLoadSubagent({ ...idle, fetching: true }, false)).toBe(false);
+    expect(shouldAutoLoadSubagent({ ...idle, failed: true }, false)).toBe(false);
+    // 이미 신선한 본문이 있으면 나갈 이유가 없다.
+    expect(shouldAutoLoadSubagent(idle, true)).toBe(false);
+  });
+
+  it("시도 표시는 **서명별**이라 재활성된 에이전트는 한 번 더 받고 거기서 멈춘다", () => {
+    const a = subagentAttemptKey(REMOTE_ID_BASE, frame());
+    const same = subagentAttemptKey(REMOTE_ID_BASE, frame());
+    const grown = subagentAttemptKey(REMOTE_ID_BASE, frame({ sig: "99-1" }));
+    const other = subagentAttemptKey(REMOTE_ID_BASE + 1, frame());
+    expect(a).toBe(same);
+    expect(a).not.toBe(grown);
+    expect(a).not.toBe(other);
+    // 서명이 없어도 키는 안정적이다 — 없으면 매번 새 키가 되어 루프가 된다.
+    expect(subagentAttemptKey(1, frame({ sig: null }))).toBe(
+      subagentAttemptKey(1, frame({ sig: null })),
+    );
   });
 });

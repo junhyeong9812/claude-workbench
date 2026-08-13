@@ -291,6 +291,10 @@ export interface RemoteTimelineReply {
   tokens: [number, TokenUsage][];
   model: string | null;
   last_usage: TokenUsage | null;
+  /** 이 응답이 **누구의** 본문인가 — null 이면 세션 자신, 아니면 그 에이전트. */
+  subagent: string | null;
+  /** 세션의 에이전트 목록(메타) — 회수 한 번이 두 질문에 답한다. */
+  subagents: RemoteSubagentFrame[];
 }
 
 /**
@@ -323,6 +327,7 @@ export function fetchedToLive(r: RemoteTimelineReply): RemoteLiveTimeline {
     tokens: required<[number, TokenUsage]>(r.tokens, "tokens", w),
     model: r.model ?? null,
     ctxTokens: u ? u.input + u.cache_read + u.cache_creation : 0,
+    subagents: required<RemoteSubagentFrame>(r.subagents, "subagents", w),
   };
 }
 
@@ -377,6 +382,93 @@ export function noticeBadge(
   return { count: unseen.length, level };
 }
 
+/**
+ * 한 서브에이전트의 프레임 — **메타뿐이다**.
+ *
+ * 로컬 payload 의 `SubagentFrame` 과 같은 모양이지만 `items` 는 원격에서
+ * **항상 null** 이다: 로컬은 진행 중 에이전트의 본문을 인라인으로 싣지만
+ * (파일 읽기 한 번), 원격에서 같은 짓을 하면 델타마다 SSH 로 전사를 다시
+ * 보내는 것이 된다 — 웹뷰 RSS 5.22GB 사고에 네트워크를 하나 더 낀 모양이다.
+ * 그래서 원격은 전부 지연 회수(deferred hydration)다.
+ */
+export interface RemoteSubagentFrame {
+  id: string;
+  /** 이 에이전트를 띄운 툴콜의 `tool_call_id`. 못 찾으면 null. */
+  parent: string | null;
+  turn: number;
+  /** 진행도 분모 — 본문이 없어도 헤더가 같은 숫자를 보인다. */
+  total: number;
+  completed: number;
+  last_status: string | null;
+  /** 본문 캐시 무효화 키(`<len>-<mtime_ns>`). 없으면 무효화할 수단이 없다. */
+  sig: string | null;
+  /** 원격에서는 언제나 null — "펼치면 가져와라"라는 뜻이다. */
+  items: TimelineItem[] | null;
+}
+
+/** 회수해 둔 본문 하나 — **어느 서명 아래** 받았는지까지 같이 든다. */
+export interface SubagentBody {
+  sig: string | null;
+  items: TimelineItem[];
+}
+
+/**
+ * 들고 있는 본문이 이 프레임에 대해 아직 유효한가.
+ *
+ * 서명(파일 len·mtime)이 정본이다. 로컬이 같은 판단에 `revision` 합 대신 파일
+ * 서명을 쓰는 이유가 그대로 여기에도 있다 — 에이전트가 재활성돼 전사가
+ * 재구축되면 개수·리비전은 우연히 같아질 수 있어도 서명은 달라진다.
+ * 서명이 **없으면** 유효하다고 하지 않는다: 무효화할 수단이 없는 캐시를
+ * 신선하다고 부르면, 바뀐 전사를 옛 본문으로 조용히 덮어 보이게 된다.
+ */
+export function subagentBodyIsFresh(
+  cached: SubagentBody | undefined,
+  f: Pick<RemoteSubagentFrame, "sig">,
+): boolean {
+  if (!cached) return false;
+  if (cached.sig === null || f.sig === null) return false;
+  return cached.sig === f.sig;
+}
+
+/**
+ * 이 에이전트의 본문을 **한 번 시도했나**를 세는 키.
+ *
+ * R1(빈 성공 응답 → 무한 SSH 루프)이 남긴 규칙 그대로 축은 *시도*다. 다만
+ * 서명을 키에 넣는다 — 재활성으로 전사가 실제로 달라졌으면 한 번 더 받아야
+ * 하고, 그것은 내용이 아니라 **생산자가 알려 준 사건**이라 루프가 되지 않는다.
+ * 서명이 없을 때 키가 매번 달라지면 그 자체가 루프이므로 고정 문자열로 접는다.
+ */
+export function subagentAttemptKey(
+  session: number,
+  f: Pick<RemoteSubagentFrame, "id" | "sig">,
+): string {
+  return `${session}/${f.id}#${f.sig ?? "-"}`;
+}
+
+/** 지금 자동으로 한 번 회수해도 되나 — 판정의 축은 **시도**다(R1). */
+export function shouldAutoLoadSubagent(
+  st: FetchAttemptState,
+  fresh: boolean,
+): boolean {
+  if (st.attempted || st.fetching || st.failed) return false;
+  return !fresh;
+}
+
+/** 접힌 에이전트 행의 한 줄 — 진행도와 상태. 본문 없이 메타만으로 그린다. */
+export function subagentLabel(f: RemoteSubagentFrame): string {
+  const status =
+    f.last_status === "completed"
+      ? "완료"
+      : f.last_status === "in_progress"
+        ? "진행 중"
+        : f.last_status === "error"
+          ? "오류"
+          : f.last_status === "pending"
+            ? "대기"
+            : "상태 미상";
+  return `${f.completed}/${f.total} · ${status}`;
+}
+
 /** 한 세션의 라이브 타임라인 — `claude-timeline` payload에서 화면이 쓰는 만큼. */
 export interface RemoteLiveTimeline {
   items: TimelineItem[];
@@ -388,6 +480,8 @@ export interface RemoteLiveTimeline {
   tokens: [number, TokenUsage][];
   model: string | null;
   ctxTokens: number;
+  /** 이 세션의 서브에이전트 — 메타만. 본문은 {@link RemoteSubagentFrame} 참조. */
+  subagents: RemoteSubagentFrame[];
 }
 
 /** payload → 라이브 타임라인 (순수).
@@ -406,6 +500,10 @@ export function toLiveTimeline(e: ClaudeTimelineEvent): RemoteLiveTimeline {
     tokens: required<[number, TokenUsage]>(e.tokens, "tokens", w),
     model: e.model ?? null,
     ctxTokens: u ? u.input + u.cache_read + u.cache_creation : 0,
+    // 생산자가 항상 쓴다(빈 배열이라도) — 그래서 필수다. `?? []` 로 받으면
+    // "에이전트를 안 돌렸다"와 "계약이 깨졌다"가 같은 화면이 되고, 그 동일시가
+    // 정확히 R7 이 지적한 결함이다.
+    subagents: required<RemoteSubagentFrame>(e.subagents, "subagents", w),
   };
 }
 
@@ -688,6 +786,18 @@ export interface RemoteHostsView {
   /** 지금 상태 seed 조회가 실패한 사유 — 빈 배열로 축소하지 않는다. */
   seedError: string | null;
   fetchBody: (hostId: string, id: number) => void;
+  /**
+   * 회수해 둔 서브에이전트 본문 — 키는 {@link subagentAttemptKey}.
+   *
+   * 세 맵이 전부 같은 키를 쓴다: 서명이 키에 들어 있으니 재활성된 에이전트는
+   * 자동으로 다른 칸이 되고, 옛 본문이 새 전사 자리에 남지 않는다.
+   */
+  subagentBodies: ReadonlyMap<string, SubagentBody>;
+  subagentFetching: ReadonlySet<string>;
+  /** 본문을 **시도한** 키 — 자동 회수가 (세션·에이전트·서명)당 한 번이라는 사실. */
+  subagentAttempted: ReadonlySet<string>;
+  subagentError: Record<string, string>;
+  fetchSubagentBody: (hostId: string, id: number, f: RemoteSubagentFrame) => void;
   /** 구독+seed 를 다시 세운다(구독 실패·seed 실패의 재시도). */
   retryStream: () => void;
   refresh: () => void;
@@ -718,6 +828,12 @@ export function useRemoteHosts(pollMs = 700): RemoteHostsView {
   const inFlightRef = useRef<Set<number>>(new Set());
   /** 회수를 시도한 적 있는 id — 자동 회수의 잠금(R1). */
   const attemptedRef = useRef<Set<number>>(new Set());
+  const [subagentBodies, setSubagentBodies] = useState<Map<string, SubagentBody>>(new Map());
+  const [subagentFetching, setSubagentFetching] = useState<Set<string>>(new Set());
+  const [subagentAttempted, setSubagentAttempted] = useState<Set<string>>(new Set());
+  const [subagentError, setSubagentError] = useState<Record<string, string>>({});
+  const subInFlightRef = useRef<Set<string>>(new Set());
+  const subAttemptedRef = useRef<Set<string>>(new Set());
 
   const refresh = useCallback(() => {
     void invoke<RemoteHostSnapshot[]>("remote_hosts")
@@ -777,6 +893,58 @@ export function useRemoteHosts(pollMs = 700): RemoteHostsView {
         });
       });
   }, []);
+
+  /**
+   * 한 서브에이전트의 본문을 회수한다 — deferred hydration 의 당기는 쪽.
+   *
+   * `fetchBody` 와 같은 방어선을 그대로 쓴다: 호출 자체에 건 ref 가드(R17)와
+   * **시도** 기준 잠금(R1). 다른 점은 키에 파일 서명이 들어간다는 것뿐이고,
+   * 그건 로컬이 lazy 본문 캐시를 무효화하는 키와 같은 것이다.
+   */
+  const fetchSubagentBody = useCallback(
+    (hostId: string, id: number, f: RemoteSubagentFrame) => {
+      const key = subagentAttemptKey(id, f);
+      if (subInFlightRef.current.has(key)) return;
+      subInFlightRef.current.add(key);
+      subAttemptedRef.current.add(key);
+      setSubagentAttempted(new Set(subAttemptedRef.current));
+      setSubagentFetching((prev) => {
+        if (prev.has(key)) return prev;
+        const next = new Set(prev);
+        next.add(key);
+        return next;
+      });
+      void invoke<RemoteTimelineReply>("remote_timeline", { hostId, id, subagent: f.id })
+        .then((r) => {
+          // 받아 온 본문에는 **그때의 서명**을 같이 붙인다 — 나중에 프레임의
+          // 서명이 달라지면 이 본문이 낡았다는 것을 알 수 있어야 한다.
+          setSubagentBodies((prev) =>
+            new Map(prev).set(key, { sig: f.sig, items: r.items ?? [] }),
+          );
+          setSubagentError((prev) => {
+            if (!(key in prev)) return prev;
+            const next = { ...prev };
+            delete next[key];
+            return next;
+          });
+        })
+        .catch((e) => {
+          setSubagentError((prev) => ({
+            ...prev,
+            [key]: errText(e, "서브에이전트 본문을 가져오지 못했습니다."),
+          }));
+        })
+        .finally(() => {
+          subInFlightRef.current.delete(key);
+          setSubagentFetching((prev) => {
+            const next = new Set(prev);
+            next.delete(key);
+            return next;
+          });
+        });
+    },
+    [],
+  );
 
   useEffect(() => {
     let disposed = false;
@@ -862,6 +1030,11 @@ export function useRemoteHosts(pollMs = 700): RemoteHostsView {
     streamError,
     seedError,
     fetchBody,
+    subagentBodies,
+    subagentFetching,
+    subagentAttempted,
+    subagentError,
+    fetchSubagentBody,
     retryStream,
     refresh,
   };

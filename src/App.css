@@ -5743,6 +5743,60 @@ body {
 .remote-item-cut {
   color: var(--st-warn, #f9e2af);
 }
+/* 서브에이전트 — 메타 한 줄이 접혀 있고, 펼치면 본문을 청구한다(R7 ⓑ).
+   본문을 payload 로 밀지 않는 것이 이 블록이 존재하는 이유다. */
+.remote-subagents {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding-top: 4px;
+}
+.remote-subagents-head {
+  color: var(--fg-dim);
+  font-size: 0.85em;
+}
+.remote-subagent {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+.remote-subagent-head {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+  min-width: 0;
+  background: none;
+  border: none;
+  padding: 1px 0;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+.remote-subagent-id {
+  flex: 0 0 auto;
+  font-family: var(--mono, monospace);
+}
+.remote-subagent-progress {
+  flex: 1 1 0;
+  min-width: 0;
+  color: var(--fg-dim);
+  font-size: 0.85em;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.remote-subagent-turn {
+  flex: 0 0 auto;
+  color: var(--fg-dim);
+  font-size: 0.85em;
+}
+.remote-subagent-body {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding-left: 14px;
+}
 .remote-kind {
   flex: 0 0 auto;
   width: 3.4em;

@@ -50,9 +50,13 @@ import {
   seenSeqOf,
   nextRemoteResize,
   shouldAutoFetchBody,
+  shouldAutoLoadSubagent,
   shouldFetchBody,
   spawnRequest,
   staleSeenKeys,
+  subagentAttemptKey,
+  subagentBodyIsFresh,
+  subagentLabel,
   turnMetaLabel,
   useRemoteHosts,
   KILL_SIGNAL,
@@ -63,7 +67,9 @@ import {
   type RemoteHostSnapshot,
   type RemoteLiveTimeline,
   type RemoteSessionMeta,
+  type RemoteSubagentFrame,
   type RemoteTerminalEnded,
+  type SubagentBody,
   type TermSize,
 } from "../state/remoteHosts";
 import {
@@ -85,7 +91,7 @@ import {
 import { decodePtyData, ptyEventName, pushPendingCapped } from "./pty";
 import { errText } from "../utils/error";
 import { xtermTheme } from "./xtermTheme";
-import type { SnapshotResult, TerminalOutputEvent } from "../types";
+import type { SnapshotResult, TerminalOutputEvent, TimelineItem } from "../types";
 import { AGENT_BADGE, KIND_LABEL } from "./TimelineView";
 
 /** 한 세션 아래에 한 번에 그리는 최근 아이템 수 — 사이드바 폭에 맞춘 상한. */
@@ -132,6 +138,11 @@ export function RemoteHostPanel() {
     streamError,
     seedError,
     fetchBody,
+    subagentBodies,
+    subagentFetching,
+    subagentAttempted,
+    subagentError,
+    fetchSubagentBody,
     retryStream,
     refresh,
   } = useRemoteHosts();
@@ -451,6 +462,13 @@ export function RemoteHostPanel() {
             attempted={attempted}
             fetchError={fetchError}
             onFetch={(id) => fetchBody(h.host_id, id)}
+            subs={{
+              bodies: subagentBodies,
+              fetching: subagentFetching,
+              attempted: subagentAttempted,
+              error: subagentError,
+              fetch: (id, f) => fetchSubagentBody(h.host_id, id, f),
+            }}
             seenSeq={seenSeqOf(h, seen)}
             onSeen={() =>
               setSeen((s) => ({
@@ -493,6 +511,7 @@ function HostCard({
   attempted,
   fetchError,
   onFetch,
+  subs,
   seenSeq,
   onSeen,
   openIds,
@@ -512,6 +531,7 @@ function HostCard({
   attempted: ReadonlySet<number>;
   fetchError: Record<number, string>;
   onFetch: (id: number) => void;
+  subs: SubagentAccess;
   seenSeq: number;
   onSeen: () => void;
   openIds: Record<number, boolean>;
@@ -622,6 +642,7 @@ function HostCard({
             attempted={attempted.has(s.id)}
             fetchError={fetchError[s.id]}
             onFetch={() => onFetch(s.id)}
+            subs={subs}
             open={!!openIds[s.id]}
             onToggle={() => onToggle(s.id)}
             busy={!!busy[s.id]}
@@ -644,6 +665,7 @@ function SessionRow({
   attempted,
   fetchError,
   onFetch,
+  subs,
   open,
   onToggle,
   busy,
@@ -660,6 +682,7 @@ function SessionRow({
   attempted: boolean;
   fetchError: string | undefined;
   onFetch: () => void;
+  subs: SubagentAccess;
   open: boolean;
   onToggle: () => void;
   busy: boolean;
@@ -679,6 +702,8 @@ function SessionRow({
   // 곳이 없었다(R7). 그려야 로컬 타임라인과 "같은 내용"이 된다.
   const dates = new Map(shown?.dates ?? []);
   const tokens = new Map(shown?.tokens ?? []);
+  // 메타만 온다 — 본문은 각 행이 펼칠 때 청구한다(deferred hydration).
+  const subagents = shown?.subagents ?? [];
   const model = shown?.model ?? s.model;
   const ctx = shown?.ctxTokens ?? s.ctx_tokens;
   const recoverable = shouldFetchBody(s, shown);
@@ -768,26 +793,17 @@ function SessionRow({
             );
           })}
           {items.slice(-ITEM_ROWS).map((it) => (
-            <Fragment key={it.tool_call_id}>
-              <p className="remote-item">
-                <span className="remote-kind">{KIND_LABEL[it.kind] ?? "·"}</span>
-                <span className="remote-item-title">{it.title}</span>
-                <span className="remote-item-status">{AGENT_BADGE[it.agent_status] ?? ""}</span>
-              </p>
-              {it.content_text ? (
-                <p className="remote-item-body">
-                  {it.content_text}
-                  {it.content_truncated ? (
-                    // 원격 아이템에는 `claude_item_detail` 같은 원문 주소가 아직
-                    // 없다 — 그래서 잘림은 **말로만** 갚는다. 말이 없으면 사용자는
-                    // 잘린 본문을 전부라고 읽는다.
-                    <span className="remote-item-cut"> …여기서 잘렸습니다</span>
-                  ) : null}
-                </p>
-              ) : null}
-            </Fragment>
+            <ItemLines key={it.tool_call_id} it={it} />
           ))}
           <CutNote note={itemCutNote(items.length, ITEM_ROWS)} />
+          {subagents.length > 0 ? (
+            <div className="remote-subagents">
+              <p className="remote-subagents-head">서브에이전트 {subagents.length}</p>
+              {subagents.map((f) => (
+                <SubagentRow key={f.id} sessionId={s.id} f={f} subs={subs} />
+              ))}
+            </div>
+          ) : null}
           {items.length === 0 && turns.length === 0 && !recoverable && !fetching ? (
             <p className="remote-empty">아직 받은 타임라인이 없습니다.</p>
           ) : null}
@@ -813,6 +829,141 @@ function LoadNote({ of, onRetry }: { of: Loadable<unknown>; onRetry: () => void 
       <button type="button" className="remote-fetch" onClick={onRetry}>
         다시 시도
       </button>
+    </div>
+  );
+}
+
+/**
+ * 항목 한 줄 + 그 본문. 세션 타임라인과 서브에이전트 본문이 **같은 것을 같게**
+ * 보여야 하므로 한 곳에 둔다 — 한쪽만 제목으로 남으면 그게 R7 이다.
+ */
+function ItemLines({ it }: { it: TimelineItem }) {
+  return (
+    <>
+      <p className="remote-item">
+        <span className="remote-kind">{KIND_LABEL[it.kind] ?? "·"}</span>
+        <span className="remote-item-title">{it.title}</span>
+        <span className="remote-item-status">{AGENT_BADGE[it.agent_status] ?? ""}</span>
+      </p>
+      {it.content_text ? (
+        <p className="remote-item-body">
+          {it.content_text}
+          {it.content_truncated ? (
+            // 원격 아이템에는 `claude_item_detail` 같은 원문 주소가 아직 없다 —
+            // 그래서 잘림은 **말로만** 갚는다. 말이 없으면 사용자는 잘린 본문을
+            // 전부라고 읽는다.
+            <span className="remote-item-cut"> …여기서 잘렸습니다</span>
+          ) : null}
+        </p>
+      ) : null}
+    </>
+  );
+}
+
+/**
+ * 서브에이전트 본문에 닿는 길 — 회수해 둔 것, 나가 있는 것, 실패한 것, 그리고
+ * 새로 청구하는 함수. 키는 전부 {@link subagentAttemptKey} 다.
+ */
+interface SubagentAccess {
+  bodies: ReadonlyMap<string, SubagentBody>;
+  fetching: ReadonlySet<string>;
+  attempted: ReadonlySet<string>;
+  error: Record<string, string>;
+  fetch: (id: number, f: RemoteSubagentFrame) => void;
+}
+
+/**
+ * 한 서브에이전트 — 접혀 있으면 메타만, 펼치면 본문을 **한 번** 당겨 온다.
+ *
+ * 로컬의 완료 프레임과 같은 모양이다: payload 는 진행도·상태만 싣고, 본문은
+ * 사용자가 실제로 볼 때 조회한다. 다른 점은 그 조회가 SSH 왕복이라는 것뿐이고,
+ * 그래서 자동 회수의 축이 내용이 아니라 **시도**여야 한다 — 내용 기준으로
+ * 쓰면 빈 본문이 effect 를 영원히 재발화시킨다(R1 실측: 5초에 1,400회 이상).
+ */
+function SubagentRow({
+  sessionId,
+  f,
+  subs,
+}: {
+  sessionId: number;
+  f: RemoteSubagentFrame;
+  subs: SubagentAccess;
+}) {
+  const [open, setOpen] = useState(false);
+  const key = subagentAttemptKey(sessionId, f);
+  const body = subs.bodies.get(key);
+  const fresh = subagentBodyIsFresh(body, f);
+  const err = subs.error[key];
+  const auto = shouldAutoLoadSubagent(
+    {
+      attempted: subs.attempted.has(key),
+      fetching: subs.fetching.has(key),
+      failed: err !== undefined,
+    },
+    fresh,
+  );
+
+  useEffect(() => {
+    if (open && auto) subs.fetch(sessionId, f);
+    // subs·f 는 렌더마다 새 객체라 의존성에서 뺀다(넣으면 매 렌더 재조회).
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [open, auto, sessionId]);
+
+  return (
+    <div className="remote-subagent">
+      <button
+        type="button"
+        className="remote-subagent-head"
+        onClick={() => setOpen((v) => !v)}
+        aria-expanded={open}
+      >
+        <span className="remote-caret">{open ? "▾" : "▸"}</span>
+        <span className="remote-subagent-id">{f.id.slice(0, 7)}</span>
+        <span className="remote-subagent-progress">{subagentLabel(f)}</span>
+        <span className="remote-subagent-turn">턴 {f.turn}</span>
+      </button>
+      {open ? (
+        <div className="remote-subagent-body">
+          {subs.fetching.has(key) ? (
+            <p className="remote-empty">원격에서 이 에이전트의 기록을 가져오는 중…</p>
+          ) : null}
+          {err ? (
+            <p className="remote-empty">
+              가져오지 못했습니다 — {err}
+              <button
+                type="button"
+                className="remote-fetch"
+                onClick={() => subs.fetch(sessionId, f)}
+              >
+                다시 시도
+              </button>
+            </p>
+          ) : null}
+          {body?.items.map((it) => (
+            <ItemLines key={it.tool_call_id} it={it} />
+          ))}
+          {body && body.items.length === 0 && !err ? (
+            <p className="remote-empty">이 에이전트의 기록이 비어 있습니다.</p>
+          ) : null}
+          {!body && !subs.fetching.has(key) && !err ? (
+            <p className="remote-empty">
+              본문은 펼칠 때 가져옵니다.
+              <button
+                type="button"
+                className="remote-fetch"
+                onClick={() => subs.fetch(sessionId, f)}
+              >
+                가져오기
+              </button>
+            </p>
+          ) : null}
+          {body && !fresh && f.sig !== null ? (
+            <p className="remote-cut" role="status">
+              이 에이전트의 기록이 그 뒤에 바뀌었습니다 — 보이는 것은 이전 회수본입니다.
+            </p>
+          ) : null}
+        </div>
+      ) : null}
     </div>
   );
 }

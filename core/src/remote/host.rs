@@ -22,13 +22,14 @@
 //!
 //! ## What is deliberately not translated
 //!
-//! `subagents` is still empty: the daemon tails **one** transcript per session
-//! and never opens `<uuid>/subagents/`, so a remote timeline shows a parallel
-//! agent's spawning tool call but not the agent's own items. Recorded as a
-//! known window; closing it is a change to the daemon's contract *and* to the
-//! payload-size behaviour the workbench had to fix once already (completed
-//! subagents' bodies were 77% of a local payload), so it is not a field this
-//! file can quietly start filling.
+//! `subagents` **was** empty until R7, and the way it stopped being empty is the
+//! part worth keeping in mind. The daemon now opens `<uuid>/subagents/` and
+//! reports each agent's counters; it never sends the transcripts. So this file
+//! translates meta into [`RemoteSubagentFrame`]s whose `items` is *always*
+//! `None`, and the body is fetched per agent when a user expands it
+//! (`remote_timeline` with a `subagent`). Filling `items` here would put a
+//! transcript into every `claude-timeline` emit — which is precisely the shape
+//! that measured 5.22 GB of webview RSS locally, with an SSH link added.
 //!
 //! `answers`, `dates` and per-turn `tokens` **were** in this list until R2b:
 //! the daemon folded them out of the transcript on every poll and dropped
@@ -102,8 +103,53 @@ pub struct RemoteTimelinePayload {
     pub tokens: Vec<(u64, TokenUsage)>,
     pub model: Option<String>,
     pub last_usage: Option<TokenUsage>,
-    /// Always empty — the daemon does not tail subagent transcripts.
-    pub subagents: Vec<serde_json::Value>,
+    /// This session's subagents — **meta only**, exactly like the local
+    /// payload's finished frames (see [`RemoteSubagentFrame`]).
+    pub subagents: Vec<RemoteSubagentFrame>,
+}
+
+/// One subagent's frame in a remote payload.
+///
+/// Field-for-field the local `SubagentFrame`
+/// (`src-tauri/src/commands/claude/timeline.rs`), so the frontend reads a remote
+/// agent with the same code it reads a local one — with one difference that is
+/// deliberate: `items` is **always `None`** here.
+///
+/// Locally, a *live* agent's body rides inline because a running agent is small
+/// and a fetch round-trip is a local file read. A remote fetch is an SSH
+/// round-trip, and a live agent's body would be re-sent on every delta over that
+/// link — the 5.22 GB accident with a network in the middle. So every remote
+/// frame is deferred: the meta draws the header, and the body is fetched once,
+/// when the user expands it (`remote_timeline` with a `subagent`).
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct RemoteSubagentFrame {
+    pub id: String,
+    pub parent: Option<String>,
+    pub turn: u64,
+    pub total: usize,
+    pub completed: usize,
+    pub last_status: Option<crate::timeline::AgentStatus>,
+    pub sig: Option<String>,
+    /// Always `None` — see the type's note. Present so the shape matches the
+    /// local frame the frontend already knows how to read.
+    pub items: Option<Vec<TimelineItem>>,
+}
+
+impl From<&proto::SubagentMeta> for RemoteSubagentFrame {
+    fn from(m: &proto::SubagentMeta) -> Self {
+        RemoteSubagentFrame {
+            id: m.id.clone(),
+            parent: m.parent.clone(),
+            turn: m.turn,
+            total: m.total,
+            completed: m.completed,
+            last_status: m.last_status,
+            sig: m.sig.clone(),
+            // Not "not yet filled": this field is how the payload says "ask for
+            // it". Filling it here is the one change this file must never make.
+            items: None,
+        }
+    }
 }
 
 /// One thing the bridge must do as a result of a frame. The transport turns
@@ -274,6 +320,9 @@ struct Session {
     answers: BTreeMap<u64, String>,
     dates: BTreeMap<u64, String>,
     tokens: BTreeMap<u64, TokenUsage>,
+    /// The session's subagents by id, meta only — merged rather than replaced,
+    /// because a delta that says nothing about them means "unchanged".
+    subagents: BTreeMap<String, proto::SubagentMeta>,
     model: Option<String>,
     last_usage: Option<TokenUsage>,
     body_omitted: bool,
@@ -292,6 +341,7 @@ impl Session {
             answers: BTreeMap::new(),
             dates: BTreeMap::new(),
             tokens: BTreeMap::new(),
+            subagents: BTreeMap::new(),
             model: None,
             last_usage: None,
             body_omitted: false,
@@ -325,7 +375,9 @@ impl Session {
             tokens: self.tokens.iter().map(|(k, v)| (*k, *v)).collect(),
             model: self.model.clone(),
             last_usage: self.last_usage,
-            subagents: Vec::new(),
+            // Discovery order is the daemon's; a BTreeMap by id is stable and
+            // that is what matters for a list that redraws every delta.
+            subagents: self.subagents.values().map(RemoteSubagentFrame::from).collect(),
         }
     }
 
@@ -788,6 +840,7 @@ impl Host {
                 answers,
                 dates,
                 tokens,
+                subagents,
             } = snap;
             // Reuse the existing id when we already knew this key, so a resync
             // does not make a viewer think its session was replaced.
@@ -812,6 +865,11 @@ impl Host {
                 sess.dates = dates;
                 sess.tokens = tokens;
             }
+            // Meta, not body: the daemon sends it even for a session whose body
+            // it left out, and it is the only thing that tells "ran no agents"
+            // apart from "we are not being told". Replaced, not merged — a
+            // snapshot is the authority about which agents exist.
+            sess.subagents = subagents.into_iter().map(|m| (m.id.clone(), m)).collect();
             sess.model = model;
             sess.last_usage = last_usage;
             sess.body_omitted = items_omitted;
@@ -914,6 +972,7 @@ impl Host {
                 answers,
                 dates,
                 tokens,
+                subagents,
                 ..
             } => {
                 if let Some(i) = self.index_of(&key) {
@@ -925,6 +984,12 @@ impl Host {
                     s.answers.extend(answers);
                     s.dates.extend(dates);
                     s.tokens.extend(tokens);
+                    // Empty = "nothing new about them", so merge by id. Taking
+                    // an omitted field as "there are none" would blink a
+                    // session's agents out on every unrelated delta.
+                    for m in subagents {
+                        s.subagents.insert(m.id.clone(), m);
+                    }
                     if model.is_some() {
                         s.model = model;
                     }
@@ -1178,6 +1243,89 @@ mod tests {
         assert_eq!((meta.items, meta.turns), (2, 2));
         assert_eq!(meta.ctx_tokens, 1 + 3 + 4);
         assert_eq!(meta.last_title.as_deref(), Some("run b"));
+    }
+
+    /// R7 ⓑ on the consumer side. The daemon now reports a session's subagents
+    /// as **metadata**; the payload must carry the same, with no body.
+    ///
+    /// The assertion that matters is the second one: `items` is `null` on every
+    /// frame and the payload's JSON contains no transcript text. That is the
+    /// 5.22 GB invariant, restated at this end of the wire — if a body ever
+    /// reaches this struct it reaches an `app.emit`, which is where the accident
+    /// happened.
+    #[test]
+    fn subagents_arrive_as_meta_and_their_bodies_never_reach_the_payload() {
+        let mut h = host();
+        h.apply(hello("e1", r#"{"kind":"fresh"}"#)).unwrap();
+        h.apply(spawned(1, "e1", "k1", "u1")).unwrap();
+
+        let out = h
+            .apply(delta(
+                2,
+                "e1",
+                "k1",
+                "u1",
+                r#""items":[],"subagents":[{"id":"a7","parent":"call-2","turn":1,"total":3,"completed":2,"last_status":"in_progress","sig":"42-7"}]"#,
+            ))
+            .unwrap();
+        let Emit::Timeline(p) = &out[0] else { panic!() };
+        assert_eq!(p.subagents.len(), 1, "an agent the daemon reported must reach the screen");
+        let f = &p.subagents[0];
+        assert_eq!(f.id, "a7");
+        assert_eq!(f.parent.as_deref(), Some("call-2"));
+        assert_eq!((f.turn, f.total, f.completed), (1, 3, 2));
+        assert_eq!(f.sig.as_deref(), Some("42-7"));
+        assert!(
+            f.items.is_none(),
+            "a frame that carries a body is the accident this design exists to prevent"
+        );
+        let json = serde_json::to_string(&p).unwrap();
+        assert!(json.contains(r#""items":null"#), "the local payload's shape is items: null|[…]");
+
+        // Later deltas update the counters in place — one agent, not three rows.
+        let out = h
+            .apply(delta(
+                3,
+                "e1",
+                "k1",
+                "u1",
+                r#""items":[],"subagents":[{"id":"a7","turn":1,"total":5,"completed":5,"last_status":"completed"}]"#,
+            ))
+            .unwrap();
+        let Emit::Timeline(p) = &out[0] else { panic!() };
+        assert_eq!(p.subagents.len(), 1);
+        assert_eq!((p.subagents[0].total, p.subagents[0].completed), (5, 5));
+
+        // Absent means "nothing new about them", never "there are none" — the
+        // producer omits the field on a delta that did not touch them.
+        let out = h.apply(delta(4, "e1", "k1", "u1", r#""items":[]"#)).unwrap();
+        let Emit::Timeline(p) = &out[0] else { panic!() };
+        assert_eq!(
+            p.subagents.len(),
+            1,
+            "an omitted field cleared the list — a session's agents would blink out on every \
+             delta that did not mention them"
+        );
+    }
+
+    /// A snapshot is what a late viewer (and every reconnect) rebuilds from, so
+    /// the same must hold there: agents present, bodies absent.
+    #[test]
+    fn a_snapshot_carries_a_sessions_agents_but_not_their_transcripts() {
+        let mut h = host();
+        h.apply(hello("e1", r#"{"kind":"fresh"}"#)).unwrap();
+        let out = h
+            .apply(
+                decode_frame(
+                    r#"{"frame":"snapshot","cursor":"e1:9","taken_at_ms":1,"sessions":[{"key":"k1","session_id":"u1","agent":"claude","cwd":"/w","state":"exited","started_at_ms":1,"argv":[],"timeline_len":4,"items":[],"items_omitted":true,"turns":{},"subagents":[{"id":"a7","turn":2,"total":4,"completed":4,"sig":"9-9"}]}]}"#,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        let Emit::Timeline(p) = &out[0] else { panic!() };
+        assert_eq!(p.subagents.len(), 1, "a finished session still ran its agents");
+        assert!(p.subagents[0].items.is_none());
+        assert_eq!(p.subagents[0].total, 4);
     }
 
     #[test]

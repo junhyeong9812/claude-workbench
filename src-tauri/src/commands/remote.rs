@@ -246,21 +246,37 @@ pub struct RemoteTimeline {
     pub tokens: Vec<(u64, core_lib::TokenUsage)>,
     pub model: Option<String>,
     pub last_usage: Option<core_lib::TokenUsage>,
+    /// Whose body this is — `None` = the session's own, `Some(id)` = that
+    /// subagent's. Echoed from the daemon so a late reply cannot be filed
+    /// against the session when both travel on this one command.
+    pub subagent: Option<String>,
+    /// The session's agents, meta only (the payload's own frames say the same;
+    /// this is here so one fetch answers both questions for a finished session).
+    pub subagents: Vec<core_lib::remote::RemoteSubagentFrame>,
 }
 
+/// One remote timeline, fetched on demand.
+///
+/// `subagent` is the **fetch half of deferred hydration**: the stream carries an
+/// agent's counters and never its transcript (see `RemoteSubagentFrame`), and
+/// this is the address that body has. Additive on the daemon's side too — the
+/// same `timeline` command with one more flag, not a new one.
 #[tauri::command]
 pub fn remote_timeline(
     remote: State<'_, RemoteState>,
     host_id: String,
     id: u64,
+    subagent: Option<String>,
 ) -> Result<RemoteTimeline, AppError> {
     let addr = remote.registry.addr_of(&host_id, id).ok_or_else(|| {
         AppError::new("이 세션의 원격 주소를 알 수 없습니다 — 연결이 끊겼거나 데몬이 다시 시작되었습니다.")
     })?;
-    let out = remote
-        .registry
-        .call(&host_id, &["timeline", &addr])
-        .map_err(AppError::new)?;
+    let mut argv: Vec<&str> = vec!["timeline", &addr];
+    if let Some(agent) = subagent.as_deref() {
+        argv.push("--subagent");
+        argv.push(agent);
+    }
+    let out = remote.registry.call(&host_id, &argv).map_err(AppError::new)?;
     let slice: TimelineSliceReply = decode_response(&out).map_err(AppError::new)?;
     Ok(RemoteTimeline {
         session_id: slice.session_id,
@@ -272,6 +288,8 @@ pub fn remote_timeline(
         tokens: slice.tokens.into_iter().collect(),
         model: slice.model,
         last_usage: slice.last_usage,
+        subagent: slice.subagent,
+        subagents: slice.subagents.iter().map(Into::into).collect(),
     })
 }
 

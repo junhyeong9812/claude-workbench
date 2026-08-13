@@ -37,7 +37,7 @@ use std::sync::{Arc, Mutex};
 
 pub use host::{
     namespaced_uuid, DaemonInfo, Emit, HostSnapshot, Notice, NoticeLevel, Phase,
-    RemoteTimelinePayload, ResumeOutcome, SessionMeta, REMOTE_ID_BASE,
+    RemoteSubagentFrame, RemoteTimelinePayload, ResumeOutcome, SessionMeta, REMOTE_ID_BASE,
 };
 pub use link::{HostConfig, Link, LinkTimeouts, RemoteAuth, Sink};
 
