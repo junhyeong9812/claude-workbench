@@ -790,6 +790,9 @@ function RemoteTerminalView({
     } catch {
       /* 아직 배치 전 — ResizeObserver 가 곧 맞춘다 */
     }
+    // `터미널` 을 누른 직후에만 뜨는 창이라 포커스를 가져온다 — 안 그러면 첫
+    // 키 입력이 사이드바로 가고 사용자는 터미널이 죽은 줄 안다.
+    term.focus();
 
     let disposed = false;
     let unOutput: UnlistenFn | undefined;
