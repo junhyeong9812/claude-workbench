@@ -267,6 +267,26 @@ export const idle = <T,>(): Loadable<T> => ({
   at: null,
 });
 
+/**
+ * 이 조각을 **자동으로** 한 번 읽어도 되나.
+ *
+ * 판정의 축이 *내용*이 아니라 *시도*인 것이 전부다. `!value` 로 쓰면 화면에 채울
+ * 것이 없는 응답(빈 폴더, 읽을 수 없는 모양)이 올 때마다 판정이 true 로 돌아와
+ * effect 가 다시 발화하고, 그 한 바퀴가 `Registry::call` → **새 SSH 연결 1회**다.
+ * R1 이 세션 타임라인에서 실측한 사고(빈 세션 하나에 5초 동안 1,400회 이상)이고,
+ * 이 화면을 만들면서 그대로 재현됐다 — React 가 "Maximum update depth exceeded"
+ * 로 멈출 때까지.
+ *
+ * `remoteHosts.ts` 의 `shouldAutoFetchBody` 와 같은 모양인 것은 우연이 아니다:
+ * 같은 사고의 같은 처방이고, **순수 함수로 꺼내 둬야** 되돌아갔을 때 테스트가
+ * 그것을 잡는다(컴포넌트 안에 인라인으로 두면 `act()` 의 마이크로태스크 순서가
+ * 루프를 가려 뮤테이션이 살아남는다 — 실제로 그랬다). 자동은 한 번, 그 뒤의
+ * 재시도는 사용자가 누르는 버튼에만 남는다.
+ */
+export function shouldAutoLoad(l: Loadable<unknown>): boolean {
+  return !l.attempted;
+}
+
 /** 화면에 보이는 것이 지금 것인지 — 오류가 있는데 값도 있으면 그 값은 과거다. */
 export function staleNote(l: Loadable<unknown>, now: number = Date.now()): string | null {
   if (!l.error || l.value == null || l.at == null) return null;

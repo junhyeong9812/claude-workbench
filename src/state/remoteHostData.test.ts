@@ -18,11 +18,13 @@ import {
   parentPath,
   relPath,
   rootsCutNote,
+  shouldAutoLoad,
   staleNote,
   GIT_ROOTS_CAVEAT,
   type RemoteDir,
   type RemoteDirEntry,
   type RemoteGitLog,
+  type Loadable,
   type RemoteGitRoots,
 } from "./remoteHostData";
 
@@ -212,6 +214,38 @@ describe("경로 — '위로' 가 루트 밖으로 나가지 않는다", () => {
   it("표시 경로는 루트 기준이다", () => {
     expect(relPath("/home/jun/p", "/home/jun/p")).toBe("");
     expect(relPath("/home/jun/p", "/home/jun/p/core/src")).toBe("core/src");
+  });
+});
+
+describe("자동 조회의 축은 내용이 아니라 시도다 (R1)", () => {
+  const slot = (over: Partial<Loadable<number>> = {}): Loadable<number> => ({
+    value: null,
+    error: null,
+    loading: false,
+    attempted: false,
+    at: null,
+    ...over,
+  });
+
+  it("아직 시도한 적 없으면 한 번 읽는다", () => {
+    expect(shouldAutoLoad(slot())).toBe(true);
+  });
+
+  /**
+   * **여기가 R1 이 사는 자리다.** 조회는 성공했는데 화면에 채울 것이 없다 —
+   * 빈 폴더, 읽을 수 없는 모양. `!value` 로 판정하면 이 상태가 영원히 "다시
+   * 읽어라"가 되고, 한 바퀴마다 새 SSH 연결이 나간다.
+   */
+  it("성공했는데 채울 것이 없어도 다시 읽지 않는다", () => {
+    expect(shouldAutoLoad(slot({ attempted: true, at: 1 }))).toBe(false);
+  });
+
+  it("실패해도 자동으로 되풀이하지 않는다 — 재시도는 버튼의 몫이다", () => {
+    expect(shouldAutoLoad(slot({ attempted: true, error: "읽지 못했습니다" }))).toBe(false);
+  });
+
+  it("나가 있는 조회를 두 번 보내지 않는다", () => {
+    expect(shouldAutoLoad(slot({ attempted: true, loading: true }))).toBe(false);
   });
 });
 

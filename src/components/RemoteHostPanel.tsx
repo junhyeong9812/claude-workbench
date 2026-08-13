@@ -72,6 +72,7 @@ import {
   parentPath,
   relPath,
   rootsCutNote,
+  shouldAutoLoad,
   staleNote,
   useRemoteHostData,
   GIT_ROOTS_CAVEAT,
@@ -830,14 +831,14 @@ function RemoteDataPanel({ hostId }: { hostId: string }) {
   // 사용자가 누르는 버튼에만 남는다 — 화면에 계속 떠 있으므로 잃는 것은 없다.
   useEffect(() => {
     if (!root) return;
-    if (tab === "tree" && !d.dir.attempted) openDir("");
+    if (tab === "tree" && shouldAutoLoad(d.dir)) openDir("");
     if (tab === "git") {
-      if (!d.status.attempted) reloadStatus();
-      if (!d.log.attempted) reloadLog();
+      if (shouldAutoLoad(d.status)) reloadStatus();
+      if (shouldAutoLoad(d.log)) reloadLog();
     }
     if (tab === "worktrees") {
-      if (!d.worktrees.attempted) reloadWorktrees();
-      if (!d.roots.attempted) reloadRoots();
+      if (shouldAutoLoad(d.worktrees)) reloadWorktrees();
+      if (shouldAutoLoad(d.roots)) reloadRoots();
     }
     // 조회 함수는 호출마다 새 클로저라 의존성에서 뺀다(넣으면 매 렌더 재조회).
     // eslint-disable-next-line react-hooks/exhaustive-deps

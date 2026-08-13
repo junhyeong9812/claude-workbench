@@ -560,7 +560,7 @@ describe("R2 — 자동 조회는 갈래당 한 번이다 (R1 이 남긴 규칙)
    * 만들면서 **그대로 재현됐다**(빈 응답을 주는 폴더 하나로). 축을 시도로 옮긴
    * 것을 여기서 못박는다.
    */
-  it("빈 응답이 와도 `remote_tree` 는 갈래당 정확히 1회다", async () => {
+  it("빈 폴더가 와도 `remote_tree` 는 갈래당 정확히 1회다", async () => {
     routes.remote_projects = async () => PROJECTS;
     routes.remote_tree = async () => ({
       root: "/home/jun/p",
@@ -575,6 +575,23 @@ describe("R2 — 자동 조회는 갈래당 한 번이다 (R1 이 남긴 규칙)
     await flush(30);
     expect(calls("remote_tree")).toBe(1);
     expect(text()).toContain("빈 폴더입니다");
+  });
+
+  /**
+   * **판정이 시도가 아니라 내용이면 여기서 무너진다.**
+   *
+   * 화면에 채울 것이 하나도 남지 않는 응답 — 이 워크벤치를 만드는 동안 실제로
+   * 밟은 상태다 — 이 오면 "값이 비었으니 다시 읽는다"가 영원히 참이 되고, 그
+   * 한 바퀴가 `Registry::call` → 새 SSH 연결 1회다(백오프도 지연도 없다).
+   * 화면은 멀쩡해 보이는 채로 원격 sshd 에 무제한 연결을 보낸다.
+   */
+  it("화면에 채울 것이 없는 응답도 재조회 루프가 되지 않는다", async () => {
+    routes.remote_projects = async () => PROJECTS;
+    routes.remote_tree = async () => null;
+    await mount();
+    await openData();
+    await flush(30);
+    expect(calls("remote_tree")).toBe(1);
   });
 
   it("실패해도 무한 재시도하지 않는다 — 재시도는 버튼에만 남는다", async () => {
