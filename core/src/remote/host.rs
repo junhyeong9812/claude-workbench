@@ -44,8 +44,8 @@ use serde::Serialize;
 use crate::timeline::{TimelineItem, TokenUsage};
 
 use super::proto::{
-    self, AdoptionOutcome, AgentKind, Envelope, Event, Frame, Gap, Hello, Resume, SessionKey,
-    SessionSnapshot, SessionState, SessionView, Snapshot,
+    self, AdoptionOutcome, AgentKind, Cursor, Envelope, Event, Frame, Gap, Hello, Resume,
+    SessionKey, SessionSnapshot, SessionState, SessionView, Snapshot,
 };
 
 /// Where remote session ids start. See the module docs; the only property that
@@ -175,6 +175,11 @@ pub struct SessionMeta {
     /// `true` when the daemon sent a header without a body (a finished session);
     /// its timeline is fetchable with `cwcd timeline <addr>`, not lost.
     pub body_omitted: bool,
+    /// How many items the **daemon** holds for this session, from the session
+    /// header. The difference between "this session did nothing" and "its body
+    /// was left out of the snapshot on purpose" is exactly this number, so the
+    /// UI shows it rather than the local `items` count when the body is omitted.
+    pub timeline_len: usize,
     pub turns: usize,
     pub items: usize,
     pub model: Option<String>,
@@ -200,6 +205,16 @@ pub struct HostSnapshot {
     /// Why the last attempt ended, when it ended badly.
     pub last_error: Option<String>,
     pub attempts: u32,
+    /// When **any** frame last arrived (this machine's clock, ms).
+    ///
+    /// The daemon heartbeats on an idle stream, so "no frame for a while" is a
+    /// liveness signal it gives away for free — and the only one there is, since
+    /// the observation window is output-only and a peer that vanishes produces
+    /// no error on it at all. Carried here so the screen can say how old it is
+    /// rather than looking equally alive either way.
+    pub last_frame_at_ms: Option<u64>,
+    /// Sessions the daemon reported running on its last heartbeat.
+    pub running: Option<usize>,
     pub sessions: Vec<SessionMeta>,
     pub notices: Vec<Notice>,
 }
@@ -314,6 +329,7 @@ impl Session {
                 .to_string()
             }),
             body_omitted: self.body_omitted,
+            timeline_len: self.view.timeline_len,
             turns: self.turns.len(),
             items: self.items.len(),
             model: self.model.clone(),
@@ -368,10 +384,19 @@ pub struct Host {
     phase: Phase,
     daemon: Option<DaemonInfo>,
     epoch: Option<String>,
-    cursor: Option<String>,
+    /// Kept as the daemon's [`Cursor`] rather than a bare string so its two
+    /// halves are available where they matter: a cursor that goes **backwards**
+    /// inside one epoch would silently rewind the stream on the next resume, and
+    /// nothing else in the protocol would report it.
+    cursor: Option<Cursor>,
     resume: Option<ResumeOutcome>,
     last_error: Option<String>,
     attempts: u32,
+    last_frame_at_ms: Option<u64>,
+    running: Option<usize>,
+    /// Whether *this* attempt got as far as a `Hello`. A connection that worked
+    /// resets the reconnect backoff; one that never got anywhere does not.
+    live_since_attempt: bool,
     /// Insertion order is the daemon's order (spawn order), which is what the
     /// list should show.
     sessions: Vec<Session>,
@@ -399,6 +424,9 @@ impl Host {
             resume: None,
             last_error: None,
             attempts: 0,
+            last_frame_at_ms: None,
+            running: None,
+            live_since_attempt: false,
             sessions: Vec::new(),
             notices: Vec::new(),
             notice_seq: 0,
@@ -415,7 +443,40 @@ impl Host {
     /// The cursor to resume from, if any. Handed to `cwcd stream --cursor`
     /// verbatim; it is the daemon's own string.
     pub fn cursor(&self) -> Option<&str> {
-        self.cursor.as_deref()
+        self.cursor.as_ref().map(Cursor::as_str)
+    }
+
+    /// When any frame last arrived, on this machine's clock. `None` before the
+    /// first one.
+    pub fn last_frame_at_ms(&self) -> Option<u64> {
+        self.last_frame_at_ms
+    }
+
+    /// Whether this attempt has reached a `Hello`.
+    pub fn made_progress(&self) -> bool {
+        self.live_since_attempt
+    }
+
+    /// Move the cursor forward. **Never backwards inside an epoch**: the daemon
+    /// carries the position explicitly so a consumer never synthesises one, and
+    /// a position that went down would be re-sent on the next resume and replay
+    /// events already applied — quietly, since a replayed delta merges
+    /// idempotently and looks like nothing happened. A new epoch is a different
+    /// stream and is taken as-is (`on_hello` clears the cursor for it anyway).
+    fn advance_cursor(&mut self, next: &Cursor) {
+        if let Some(cur) = &self.cursor {
+            if cur.epoch() == next.epoch() && next.seq() < cur.seq() {
+                let (from, to) = (cur.to_string(), next.to_string());
+                self.report_unknown(
+                    format!("rewind:{}", next.epoch()),
+                    format!(
+                        "데몬이 커서를 되돌렸습니다({from} → {to}) — 되감지 않고 현재 위치를 지킵니다."
+                    ),
+                );
+                return;
+            }
+        }
+        self.cursor = Some(next.clone());
     }
 
     /// The stream's epoch — the half of a [`proto::session_addr`] the daemon
@@ -440,6 +501,7 @@ impl Host {
 
     pub fn note_attempt(&mut self) {
         self.attempts = self.attempts.saturating_add(1);
+        self.live_since_attempt = false;
     }
 
     /// Record a transport-level failure and show it. Never silent: a connection
@@ -474,12 +536,24 @@ impl Host {
             phase: self.phase,
             daemon: self.daemon.clone(),
             resume: self.resume.clone(),
-            cursor: self.cursor.clone(),
+            cursor: self.cursor.as_ref().map(Cursor::to_string),
             last_error: self.last_error.clone(),
             attempts: self.attempts,
+            last_frame_at_ms: self.last_frame_at_ms,
+            running: self.running,
             sessions: self.sessions.iter().map(|s| s.meta(&self.host_id)).collect(),
             notices: self.notices.clone(),
         }
+    }
+
+    /// Every session's timeline as the frontend's `claude-timeline` payload.
+    ///
+    /// The same values the live events carry — this is what a viewer that
+    /// arrives *after* the events (a panel reopened, a tab returned to) is
+    /// seeded from, so a session that has stopped producing events is not a
+    /// permanently blank screen.
+    pub fn live_payloads(&self) -> Vec<RemoteTimelinePayload> {
+        self.sessions.iter().map(|s| s.payload()).collect()
     }
 
     /// Apply one decoded frame.
@@ -488,6 +562,10 @@ impl Host {
     /// cannot read, and reconnecting would only produce the same refusal in a
     /// loop.
     pub fn apply(&mut self, frame: Frame) -> Result<Vec<Emit>, Fatal> {
+        // Any frame at all is proof the other end is still there — that is what
+        // the transport's staleness watchdog reads, and it is recorded before
+        // the frame is interpreted so an unreadable one still counts as contact.
+        self.last_frame_at_ms = Some((self.now_ms)());
         match frame {
             Frame::Hello(h) => self.on_hello(h),
             Frame::Snapshot(s) => Ok(self.on_snapshot(s)),
@@ -497,7 +575,12 @@ impl Host {
             }
             Frame::Event(e) => Ok(self.on_event(e)),
             Frame::Heartbeat(h) => {
-                self.cursor = Some(h.cursor.to_string());
+                // The heartbeat's own payload, kept rather than dropped: it is
+                // the daemon's running-session count on an idle stream, which is
+                // how "nothing is happening there" is told apart from "nothing
+                // is reaching us".
+                self.running = Some(h.running);
+                self.advance_cursor(&h.cursor);
                 Ok(Vec::new())
             }
             Frame::Unknown { frame } => {
@@ -515,6 +598,7 @@ impl Host {
     /// A line the decoder could not read at all. Reported, and the cursor is
     /// deliberately left where it was.
     pub fn on_undecodable(&mut self, reason: String) {
+        self.last_frame_at_ms = Some((self.now_ms)());
         self.push_notice(
             NoticeLevel::Warn,
             format!("데몬이 보낸 줄을 읽지 못했습니다 — {reason}"),
@@ -571,6 +655,7 @@ impl Host {
         });
         self.phase = Phase::Live;
         self.last_error = None;
+        self.live_since_attempt = true;
         self.resume = Some(match h.resume {
             Resume::Continued { from_seq } => ResumeOutcome::Continued { from_seq },
             Resume::Fresh => ResumeOutcome::Fresh,
@@ -631,17 +716,19 @@ impl Host {
             sess.body_omitted = items_omitted;
             sess.closed = sess.view.state == SessionState::Exited;
             if items_omitted {
-                self.notice_seq += 1;
-                self.notices.push(Notice {
-                    seq: self.notice_seq,
-                    level: NoticeLevel::Info,
-                    message: format!(
-                        "종료된 세션 {}의 본문은 스냅샷에 실리지 않았습니다 — 필요하면 원격에서 따로 가져옵니다.",
-                        sess.view.key
+                // Through `push_notice`, not around it: this one fires per
+                // finished session per resync, so a host that gaps repeatedly
+                // would otherwise grow the list past `MAX_NOTICES` without
+                // bound — the one place the cap exists to stop.
+                let (id, key) = (sess.id, sess.view.key.to_string());
+                self.push_notice(
+                    NoticeLevel::Info,
+                    format!(
+                        "종료된 세션 {key}의 본문({}개)은 스냅샷에 실리지 않았습니다 — 펼치면 원격에서 가져옵니다.",
+                        sess.view.timeline_len
                     ),
-                    session: Some(sess.id),
-                    at_ms: (self.now_ms)(),
-                });
+                    Some(id),
+                );
             }
             out.push(Emit::Timeline(sess.payload()));
             kept.push(sess);
@@ -654,7 +741,7 @@ impl Host {
             out.push(Emit::Closed { id: gone.id });
         }
         self.sessions = kept;
-        self.cursor = Some(s.cursor.to_string());
+        self.advance_cursor(&s.cursor);
         out
     }
 
@@ -665,6 +752,27 @@ impl Host {
 
     fn index_of(&self, key: &SessionKey) -> Option<usize> {
         self.sessions.iter().position(|s| s.view.key == *key)
+    }
+
+    /// An event about a session this host has never been told about.
+    ///
+    /// It cannot be applied — there is nothing to apply it to — but it is never
+    /// dropped in silence: every kind says so, not just `timeline_delta`, since
+    /// a hook or an exit that vanishes is exactly as much of a hole as a delta.
+    /// Once per (session, kind), because the cause is usually structural (a
+    /// stream that skipped a spawn) and would otherwise repeat per event.
+    ///
+    /// The cursor still advances past it. The envelope carries a real position,
+    /// and refusing to move would replay the same unusable event forever on
+    /// every resume; the snapshot that follows any gap is what actually rebuilds
+    /// the list.
+    fn on_unknown_session(&mut self, key: &SessionKey, what: &str) {
+        self.report_unknown(
+            format!("unknown-session:{key}:{what}"),
+            format!(
+                "모르는 세션 {key}의 '{what}' 이벤트를 받았습니다 — 적용하지 못했습니다(뒤따르는 스냅샷이 목록을 다시 세웁니다)."
+            ),
+        );
     }
 
     fn on_event(&mut self, env: Envelope) -> Vec<Emit> {
@@ -688,6 +796,8 @@ impl Host {
                     if self.sessions[i].view.state == SessionState::Starting {
                         self.sessions[i].view.state = SessionState::Running;
                     }
+                } else {
+                    self.on_unknown_session(&key, "전사 위치");
                 }
             }
             Event::TimelineDelta {
@@ -713,14 +823,7 @@ impl Host {
                     s.body_omitted = false;
                     out.push(Emit::Timeline(s.payload()));
                 } else {
-                    // A delta for a session we never saw announced. The snapshot
-                    // that follows any gap would have carried it, so this means
-                    // the stream is inconsistent — say so rather than drop it.
-                    self.push_notice(
-                        NoticeLevel::Warn,
-                        format!("모르는 세션 {key}의 타임라인 변경을 받았습니다 — 무시했습니다."),
-                        None,
-                    );
+                    self.on_unknown_session(&key, "타임라인 변경");
                 }
             }
             Event::Hook { key, hook_event, .. } => {
@@ -728,6 +831,8 @@ impl Host {
                     self.sessions[i].last_hook = Some(hook_event.clone());
                     let uuid = namespaced_uuid(&self.host_id, &self.sessions[i].view.session_id);
                     out.push(Emit::Hook { uuid, event: hook_event });
+                } else {
+                    self.on_unknown_session(&key, "훅");
                 }
             }
             Event::SessionExited {
@@ -747,6 +852,8 @@ impl Host {
                     // it.
                     out.push(Emit::Timeline(s.payload()));
                     out.push(Emit::Closed { id: s.id });
+                } else {
+                    self.on_unknown_session(&key, "세션 종료");
                 }
             }
             Event::Notice { level, key, message } => {
@@ -771,8 +878,8 @@ impl Host {
         }
         // The envelope's own cursor, taken verbatim — the daemon carries it
         // explicitly so a consumer never has to synthesise one. Advanced only
-        // after the event has been applied.
-        self.cursor = Some(env.cursor.to_string());
+        // after the event has been applied, and never backwards.
+        self.advance_cursor(&env.cursor);
         out
     }
 }
@@ -920,6 +1027,108 @@ mod tests {
         assert!(n[0].message.contains("k9"), "{}", n[0].message);
     }
 
+    /// …and so is every **other** kind of event about a session we never saw.
+    /// Only `timeline_delta` used to say anything; a hook, an exit or a
+    /// transcript location for an unknown key disappeared without a trace while
+    /// the cursor moved past them.
+    #[test]
+    fn every_event_for_an_unknown_session_is_reported_not_only_deltas() {
+        let mut h = host();
+        h.apply(hello("e1", r#"{"kind":"fresh"}"#)).unwrap();
+        let lines = [
+            r#"{"frame":"event","seq":2,"cursor":"e1:2","ts_ms":1,"event":{"event":"hook","key":"k9","session_id":"u9","hook_event":"Stop"}}"#,
+            r#"{"frame":"event","seq":3,"cursor":"e1:3","ts_ms":1,"event":{"event":"session_exited","key":"k9","session_id":"u9","exit_code":0}}"#,
+            r#"{"frame":"event","seq":4,"cursor":"e1:4","ts_ms":1,"event":{"event":"transcript_located","key":"k9","session_id":"u9","path":"/t.jsonl"}}"#,
+        ];
+        for l in lines {
+            assert!(h.apply(decode_frame(l).unwrap()).unwrap().is_empty());
+        }
+        let n = h.snapshot().notices;
+        assert_eq!(n.len(), 3, "each kind must be named: {:?}", n.iter().map(|x| &x.message).collect::<Vec<_>>());
+        assert!(n.iter().all(|x| x.message.contains("k9")));
+        assert_eq!(h.cursor(), Some("e1:4"), "an unusable event must not stall the cursor");
+        // Once per (session, kind) — a structural break must not become a flood.
+        for (i, l) in lines.iter().enumerate() {
+            let seq = 5 + i as u64;
+            let l = l
+                .replacen(&format!("\"seq\":{}", i + 2), &format!("\"seq\":{seq}"), 1)
+                .replacen(&format!("\"e1:{}\"", i + 2), &format!("\"e1:{seq}\""), 1);
+            h.apply(decode_frame(&l).unwrap()).unwrap();
+        }
+        assert_eq!(h.snapshot().notices.len(), 3);
+    }
+
+    /// The cursor is the one piece of state that must never move backwards: a
+    /// lower position is re-sent on the next resume and replays events already
+    /// applied, and a replayed delta merges idempotently — so the rewind would
+    /// leave no trace at all.
+    #[test]
+    fn a_cursor_never_goes_backwards_inside_an_epoch() {
+        let mut h = host();
+        h.apply(hello("e1", r#"{"kind":"fresh"}"#)).unwrap();
+        h.apply(spawned(9, "e1", "k1", "u1")).unwrap();
+        assert_eq!(h.cursor(), Some("e1:9"));
+
+        // A heartbeat from a daemon that somehow rewound.
+        h.apply(
+            decode_frame(r#"{"frame":"heartbeat","cursor":"e1:3","ts_ms":1,"running":2}"#).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(h.cursor(), Some("e1:9"), "a rewind must not be followed");
+        assert!(h
+            .snapshot()
+            .notices
+            .iter()
+            .any(|n| n.message.contains("되돌렸습니다")));
+        // …and the heartbeat's own payload is not thrown away.
+        assert_eq!(h.snapshot().running, Some(2));
+
+        // Forward still moves.
+        h.apply(
+            decode_frame(r#"{"frame":"heartbeat","cursor":"e1:11","ts_ms":1,"running":0}"#).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(h.cursor(), Some("e1:11"));
+    }
+
+    /// Every frame — including one that could not be read — is contact with the
+    /// other end, and the transport's staleness watchdog reads exactly this.
+    #[test]
+    fn any_frame_records_that_the_other_end_is_still_there() {
+        let mut h = Host::with_clock("h1", "l", || 5_000);
+        assert_eq!(h.last_frame_at_ms(), None, "nothing has arrived yet");
+        h.apply(hello("e1", r#"{"kind":"fresh"}"#)).unwrap();
+        assert_eq!(h.last_frame_at_ms(), Some(5_000));
+        h.apply(Frame::Unknown { frame: "usage".into() }).unwrap();
+        assert_eq!(h.last_frame_at_ms(), Some(5_000));
+        h.on_undecodable("not JSON".into());
+        assert_eq!(h.last_frame_at_ms(), Some(5_000));
+        assert_eq!(h.snapshot().last_frame_at_ms, Some(5_000));
+    }
+
+    /// A reopened panel is seeded from what the bridge already holds — the
+    /// alternative is a session that stopped producing events showing a
+    /// permanently blank timeline.
+    #[test]
+    fn the_current_timeline_can_be_read_back_without_waiting_for_an_event() {
+        let mut h = host();
+        h.apply(hello("e1", r#"{"kind":"fresh"}"#)).unwrap();
+        h.apply(spawned(1, "e1", "k1", "u1")).unwrap();
+        h.apply(delta(
+            2,
+            "e1",
+            "k1",
+            "u1",
+            &format!(r#""items":[{}],"turns":{{"1":"q"}}"#, item("t1", "run a", None)),
+        ))
+        .unwrap();
+        let seed = h.live_payloads();
+        assert_eq!(seed.len(), 1);
+        assert_eq!(seed[0].items.len(), 1);
+        assert_eq!(seed[0].turns, vec![(1, "q".to_string())]);
+        assert_eq!(seed[0].id, h.snapshot().sessions[0].id);
+    }
+
     #[test]
     fn exit_emits_the_final_content_before_the_end_marker() {
         let mut h = host();
@@ -990,7 +1199,21 @@ mod tests {
         assert_eq!(s.sessions.len(), 1);
         assert_eq!(s.sessions[0].id, id1, "the same key keeps its id across a resync");
         assert!(s.sessions[0].body_omitted, "\"header only\" is not \"nothing happened\"");
+        assert_eq!(
+            s.sessions[0].timeline_len, 3,
+            "the header's own count is what makes \"omitted\" readable as \"3 items\" rather than \"0\""
+        );
         assert!(s.notices.iter().any(|n| n.session == Some(id1)));
+
+        // A host that gaps repeatedly re-sends that snapshot; the notice it
+        // produces goes through the cap like every other one.
+        for _ in 0..(MAX_NOTICES + 50) {
+            h.apply(decode_frame(snap).unwrap()).unwrap();
+        }
+        assert!(
+            h.snapshot().notices.len() <= MAX_NOTICES,
+            "an omitted-body notice must not grow the list without bound"
+        );
     }
 
     #[test]
