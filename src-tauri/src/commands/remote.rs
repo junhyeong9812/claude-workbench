@@ -370,6 +370,13 @@ fn addr_of(remote: &State<'_, RemoteState>, host_id: &str, id: u64) -> Result<St
 /// to name an agent home used to be a path field, which made the account list
 /// decoration, and it was removed from the wire for exactly that reason (R1b).
 /// Passing a path here would have to invent it back.
+///
+/// There is **no `prompt`**. The daemon takes one (`spawn --prompt …`) and this
+/// used to pass it through, unreachable — the form has no such field. Reviving
+/// it would put the user's first message on the remote command line, where
+/// every other account on that host reads it out of `ps`; the terminal sends the
+/// same text down the encrypted channel a moment later, so the leak buys
+/// nothing. If it is ever wanted, it belongs on stdin, not in argv.
 #[tauri::command]
 pub fn remote_spawn(
     remote: State<'_, RemoteState>,
@@ -378,16 +385,10 @@ pub fn remote_spawn(
     cwd: String,
     account: Option<String>,
     model: Option<String>,
-    prompt: Option<String>,
     label: Option<String>,
 ) -> Result<String, AppError> {
     let mut args: Vec<&str> = vec!["spawn", "--agent", &agent, "--cwd", &cwd];
-    for (flag, value) in [
-        ("--account", &account),
-        ("--model", &model),
-        ("--prompt", &prompt),
-        ("--label", &label),
-    ] {
+    for (flag, value) in [("--account", &account), ("--model", &model), ("--label", &label)] {
         if let Some(v) = value.as_deref() {
             if !v.is_empty() {
                 args.push(flag);

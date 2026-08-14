@@ -152,23 +152,16 @@ impl Registry {
         }
     }
 
-    /// Detach everything (app shutdown).
-    pub fn detach_all(&self) {
-        let taken = std::mem::take(&mut *self.links.lock().unwrap_or_else(|p| p.into_inner()));
-        let hosts: Vec<String> = self
-            .terminals
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .keys()
-            .cloned()
-            .collect();
-        for host in hosts {
-            self.close_terminals_of(&host);
-        }
-        for (_, link) in taken {
-            link.stop();
-        }
-    }
+    // There is deliberately no `detach_all`. One existed, labelled "(app
+    // shutdown)", and nothing ever called it — the run loop reaps PTY children
+    // (`SessionManager::kill_all`) and exits, which drops every socket this
+    // registry holds and lets the remote `sshd` tear down the `cwcd attach` it
+    // was serving. Wiring the missing call would have made shutdown *worse*:
+    // `Link::stop` **joins** its thread, and that thread can be inside an SSH
+    // connect for an unreachable host, so quitting would block on a machine that
+    // is not answering. This app has already shipped two fixes for a close that
+    // would not close; adding a join to the quit path to tidy up state the
+    // process is about to drop is not a trade it should make again.
 
     // -----------------------------------------------------------------------
     // Terminals opened onto a host (R2b `remote_attach`)
@@ -345,16 +338,19 @@ mod tests {
         assert_eq!(ids(&closed), vec![8]);
     }
 
+    /// Detaching one host is **one** host: the loop that closed every host's
+    /// terminals lived in a `detach_all` nobody called, and the rule that has to
+    /// hold in the app is this one.
     #[test]
-    fn shutdown_closes_every_hosts_terminals() {
+    fn detaching_one_host_leaves_the_others_driving() {
         let (reg, closed) = recording();
         reg.note_terminal("h1", 7);
         reg.note_terminal("h2", 9);
-        reg.detach_all();
-        let mut got = ids(&closed);
-        got.sort_unstable();
-        assert_eq!(got, vec![7, 9]);
-        assert!(reg.terminals("h1").is_empty() && reg.terminals("h2").is_empty());
+        reg.detach("h1");
+        assert_eq!(ids(&closed), vec![7]);
+        assert_eq!(reg.terminals("h2"), vec![9]);
+        reg.detach("h2");
+        assert_eq!(ids(&closed), vec![7, 9]);
     }
 
     /// Recording twice is not two terminals, and an unknown host has none —
