@@ -62,7 +62,7 @@ import {
   KILL_SIGNAL,
   REMOTE_RESIZE_DEBOUNCE_MS,
   SPAWN_AGENTS,
-  SUBAGENT_STALE_NOTE,
+  subagentFreshnessNote,
   type ControlGate,
   type RemoteAccount,
   type RemoteHostSnapshot,
@@ -72,7 +72,7 @@ import {
   type RemoteTerminalEnded,
   type TermSize,
 } from "../state/remoteHosts";
-import { isStale, shouldAutoFetch, type AutoFetch, type Fetched } from "../state/autoFetch";
+import { shouldAutoFetch, type AutoFetch, type Fetched } from "../state/autoFetch";
 import {
   dirCutNote,
   dirHasMore,
@@ -909,7 +909,7 @@ function SubagentRow({
   // **신선도는 자동 회수의 입력이 아니다.** 돌고 있는 에이전트는 델타마다 전사가
   // 자라 서명이 바뀌므로, "달라졌으니 다시 받자"를 자동으로 하면 그것이 곧
   // 델타당 SSH 왕복이다(L2-2). 달라졌다는 사실은 아래에서 **말로** 갚는다.
-  const stale = isStale(entry, f.sig);
+  const freshness = items ? subagentFreshnessNote(entry.sig, f.sig) : null;
   const auto = shouldAutoFetch(entry);
 
   useEffect(() => {
@@ -968,9 +968,9 @@ function SubagentRow({
           ) : null}
           {/* 바뀐 것은 **말하고**, 다시 받는 것은 사용자가 누른다 — 여기서 자동으로
               다시 받으면 진행 중인 에이전트의 델타마다 SSH 왕복이 나간다(L2-2). */}
-          {stale ? (
+          {freshness ? (
             <p className="remote-cut" role="status">
-              {SUBAGENT_STALE_NOTE}
+              {freshness}
               <button
                 type="button"
                 className="remote-fetch"

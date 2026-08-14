@@ -31,6 +31,7 @@ import {
   spawnRequest,
   staleSeenKeys,
   subagentBodyKey,
+  subagentFreshnessNote,
   toLiveTimeline,
   turnMetaLabel,
   unseenNotices,
@@ -751,6 +752,16 @@ describe("R7·L2-2 — 회수한 본문의 신선도는 파일 서명이 정한�
    * 회수"였다. 진행 중 에이전트는 델타마다 서명이 바뀌므로 그것이 곧 델타당
    * SSH 왕복 1회 + 전사 1벌 추가 상주였다(L2-2).
    */
+  it("모르는 것을 안다고 말하지 않는다 — 서명이 없으면 '바뀌었다'가 아니다", () => {
+    expect(subagentFreshnessNote("42-7", "42-7")).toBeNull();
+    expect(subagentFreshnessNote("42-7", "99-1")).toContain("바뀌었습니다");
+    // 서명이 없으면 바뀌었는지 **알 수 없는** 것이지 바뀐 것이 아니다 — 없는
+    // 잘림을 지어내던 것과 같은 종류의 거짓말이다(L2-11).
+    expect(subagentFreshnessNote(null, "99-1")).toContain("확인할 수단이 없습니다");
+    expect(subagentFreshnessNote("42-7", null)).toContain("확인할 수단이 없습니다");
+    expect(subagentFreshnessNote(null, null)).not.toContain("바뀌었습니다");
+  });
+
   it("낡아도 자동 회수는 다시 열리지 않는다 — 열리는 것은 화면의 버튼이다", () => {
     const stale = { ...body("42-7"), attempted: true };
     expect(isStale(stale, "99-1")).toBe(true);

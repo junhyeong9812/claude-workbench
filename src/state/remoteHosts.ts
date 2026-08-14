@@ -515,14 +515,27 @@ export function sessionOfBodyKey(key: string): number | null {
 }
 
 /**
- * 서명이 달라진 본문에 붙는 한 줄 — **자동으로 다시 받지 않는다**.
+ * 회수해 둔 본문 옆에 붙는 신선도 한 줄 — 붙일 말이 없으면 `null`.
  *
- * 다시 받는 판단이 화면(사람)에 있는 것이 재슬라이스의 요지다: 진행 중인
- * 에이전트는 델타마다 서명이 바뀌므로, "달라졌으니 다시 받자"를 자동으로 하면
- * 그것이 곧 델타당 SSH 왕복이다(L2-2).
+ * **자동으로 다시 받지 않는다.** 다시 받는 판단이 화면(사람)에 있는 것이
+ * 재슬라이스의 요지다: 진행 중인 에이전트는 델타마다 서명이 바뀌므로,
+ * "달라졌으니 다시 받자"를 자동으로 하면 그것이 곧 델타당 SSH 왕복이다(L2-2).
+ *
+ * 그리고 **모르는 것을 안다고 말하지 않는다**. 서명이 한쪽이라도 없으면 바뀌었는지
+ * 알 수 없는 것이지 바뀐 것이 아니다 — 없는 잘림을 지어내던 `dirCutNote`(L2-11)와
+ * 같은 종류의 거짓말이라, 그때는 "확인할 수단이 없다"고 적는다.
  */
-export const SUBAGENT_STALE_NOTE =
-  "이 에이전트의 기록이 그 뒤에 바뀌었습니다 — 보이는 것은 이전 회수본입니다.";
+export function subagentFreshnessNote(
+  cachedSig: string | null,
+  frameSig: string | null,
+): string | null {
+  if (cachedSig !== null && frameSig !== null) {
+    return cachedSig === frameSig
+      ? null
+      : "이 에이전트의 기록이 그 뒤에 바뀌었습니다 — 보이는 것은 이전 회수본입니다.";
+  }
+  return "이 기록이 그 뒤에 바뀌었는지 확인할 수단이 없습니다(서명 없음) — 보이는 것은 회수한 시점의 것입니다.";
+}
 
 /** 접힌 에이전트 행의 한 줄 — 진행도와 상태. 본문 없이 메타만으로 그린다. */
 export function subagentLabel(f: RemoteSubagentFrame): string {
