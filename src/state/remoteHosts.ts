@@ -729,7 +729,7 @@ export function killLabel(requested: number | null, delivered: number): string {
   return `${signalLabel(requested)} 를 요청했지만 실제로 전달된 것은 ${signalLabel(delivered)} 입니다`;
 }
 
-/** `remote-terminal-ended` payload — 백엔드 `RemoteTerminalEnded`. */
+/** `remote_terminal_end` 응답 — 백엔드 `RemoteTerminalEnded`. */
 export interface RemoteTerminalEnded {
   /** **로컬** 세션 id (`remote_attach` 가 돌려준 것). */
   id: number;

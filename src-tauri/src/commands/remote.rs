@@ -11,10 +11,20 @@
 //!
 //! The timeline streams, because it is a stream and because `claude-timeline`
 //! already exists to carry one. A connection's own state — attached, retrying,
-//! which sessions exist, what the daemon said — has no existing event, and
-//! inventing one would be a new frontend contract for a panel that is polled
-//! only while it is open. So it is a snapshot ([`remote_hosts`]) instead: no
-//! new event kind, and nothing to keep in sync.
+//! which sessions exist, what the daemon said, **why a terminal stopped** — has
+//! no existing event, and inventing one would be a new frontend contract for a
+//! panel that is polled only while it is open. So it is a snapshot
+//! ([`remote_hosts`], [`remote_terminal_end`]) instead: no new event kind, and
+//! nothing to keep in sync.
+//!
+//! That last one shipped as an event (`remote-terminal-ended`) and came back:
+//! the rule was never lifted, and following it turned out to be the better
+//! design anyway. Events have no replay, so a terminal that failed before its
+//! listener existed lost its reason forever and the frontend grew a subscribe-
+//! before-attach dance to narrow the window. State is readable late — by a panel
+//! mounted afterwards, or reopened — so the window closed instead of narrowing.
+//! `tests/remote_event_contract.rs` now states the rule that only a comment
+//! used to.
 //!
 //! ## Read-only, and narrowly so
 //!
@@ -24,7 +34,8 @@
 //! surface, and giving the frontend a general "run this on the remote host"
 //! command now would build it by accident.
 
-use std::sync::Arc;
+use std::collections::VecDeque;
+use std::sync::{Arc, Mutex};
 
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager, State};
@@ -40,10 +51,62 @@ use core_lib::remote::{
 
 use super::AppError;
 
-/// Managed state: every attached host.
+/// Managed state: every attached host, and why each remote terminal stopped.
 #[derive(Default)]
 pub struct RemoteState {
     registry: Registry,
+    ended: EndedTerminals,
+}
+
+/// How many ended terminals are remembered. One panel opens one terminal at a
+/// time, so this is a few dozen sessions of history — kept small on purpose,
+/// because a reason nobody has read within that many terminals is a reason
+/// nobody is going to read.
+const ENDED_CAP: usize = 32;
+
+/// Why remote terminals stopped, oldest first.
+///
+/// This is the R2a answer to "state with no event of its own": a snapshot the
+/// panel asks for, not a kind of event invented for it. It buys more than
+/// obedience to that rule. A Tauri event has no replay, so a terminal that died
+/// before its listener existed — a refused `cwcd attach`, a host that rejected
+/// the key — said its one sentence into an empty room and the screen kept a
+/// silent black box. Recorded state is readable *late*: by a panel mounted
+/// afterwards, by a panel that was closed and reopened, by the second look of a
+/// user who dismissed the first.
+#[derive(Default)]
+pub struct EndedTerminals(Mutex<VecDeque<RemoteTerminalEnded>>);
+
+impl EndedTerminals {
+    /// **The first reason is the true one.**
+    ///
+    /// A terminal can be told about twice: detaching the host closes it ("이
+    /// 호스트에서 떼어져…"), and closing it drops the SSH channel, which the
+    /// status relay then reports as the vaguer "연결이 끊어졌습니다". The
+    /// second one is a consequence of the first, so a store that overwrote
+    /// would leave the screen explaining the effect and not the cause. Two
+    /// relays inside one attach race the same way — this one rule covers both,
+    /// where there used to be an `AtomicBool` for the attach and a "keep the
+    /// first" rule in the frontend for the rest.
+    fn record(&self, e: RemoteTerminalEnded) {
+        let mut q = self.0.lock().unwrap_or_else(|p| p.into_inner());
+        if q.iter().any(|prev| prev.id == e.id) {
+            return;
+        }
+        q.push_back(e);
+        while q.len() > ENDED_CAP {
+            q.pop_front();
+        }
+    }
+
+    fn get(&self, id: u64) -> Option<RemoteTerminalEnded> {
+        self.0
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .iter()
+            .find(|e| e.id == id)
+            .cloned()
+    }
 }
 
 /// Teach the registry how to end a terminal — the one piece of the R15 contract
@@ -57,27 +120,24 @@ pub struct RemoteState {
 /// shipped in: "떼기" removed the card while the terminal kept carrying
 /// keystrokes to the remote agent.
 ///
-/// The order inside is deliberate. The reason is emitted **before** the session
+/// The order inside is deliberate. The reason is recorded **before** the session
 /// is removed, because removing it tears down the SSH channel and the status
 /// relay in [`remote_attach`] then reports the vaguer "연결이 끊어졌습니다".
-/// Both reach the panel; the first one is the true one, and the panel keeps the
-/// first (the same rule the `said` flag applies inside one attach).
+/// Both are offered; [`EndedTerminals::record`] keeps the first, which is the
+/// true one.
 pub fn install_terminal_closer(app: &AppHandle) {
     let handle = app.clone();
     app.state::<RemoteState>()
         .registry
         .on_close_terminal(move |host_id, id| {
-            let _ = handle.emit(
-                "remote-terminal-ended",
-                RemoteTerminalEnded {
-                    id,
-                    host_id: host_id.to_string(),
-                    code: None,
-                    signal: None,
-                    detail: "이 호스트에서 떼어져 터미널을 닫았습니다 — 원격 세션은 계속 돕니다."
-                        .to_string(),
-                },
-            );
+            handle.state::<RemoteState>().ended.record(RemoteTerminalEnded {
+                id,
+                host_id: host_id.to_string(),
+                code: None,
+                signal: None,
+                detail: "이 호스트에서 떼어져 터미널을 닫았습니다 — 원격 세션은 계속 돕니다."
+                    .to_string(),
+            });
             let _ = handle.state::<core_lib::SessionManager>().remove(id);
         });
 }
@@ -470,11 +530,12 @@ pub fn remote_attach(
             }
         });
     }
-    // Whichever of the two relays below gets to the end first is the one that
-    // speaks, and the other stays quiet: a terminal that stopped once must not
-    // be reported as having stopped twice, and the *first* reason is the real
-    // one (the connection failing is why the exec never ran, not the reverse).
-    let said = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    // Whichever of the two relays below gets to the end first is the one the
+    // store keeps: a terminal that stopped once must not be reported as having
+    // stopped twice, and the *first* reason is the real one (the connection
+    // failing is why the exec never ran, not the reverse). That rule lives in
+    // `EndedTerminals::record` now — it has to cover the detach path too, which
+    // is a different thread entirely and never saw this attach's flag.
 
     // `exec_rx` is bounded and its sender blocks: held-but-undrained, it would
     // stall the read loop and, on a duplex session, the write direction with it.
@@ -483,7 +544,6 @@ pub fn remote_attach(
     {
         let app = app.clone();
         let host = host_id.clone();
-        let said = Arc::clone(&said);
         let mut exec_rx = channels.exec_rx;
         std::thread::spawn(move || {
             let mut stderr = String::new();
@@ -495,9 +555,8 @@ pub fn remote_attach(
                         }
                     }
                     core_lib::ssh::ExecEvent::Exit { code, signal } => {
-                        emit_terminal_ended(
+                        record_terminal_ended(
                             &app,
-                            &said,
                             local_id,
                             &host,
                             code,
@@ -506,7 +565,7 @@ pub fn remote_attach(
                         );
                     }
                     core_lib::ssh::ExecEvent::Error(msg) => {
-                        emit_terminal_ended(&app, &said, local_id, &host, None, None, &msg);
+                        record_terminal_ended(&app, local_id, &host, None, None, &msg);
                     }
                 }
             }
@@ -525,7 +584,6 @@ pub fn remote_attach(
     {
         let app = app.clone();
         let host = host_id.clone();
-        let said = Arc::clone(&said);
         let mut status_rx = channels.status_rx;
         std::thread::spawn(move || {
             while let Some(s) = status_rx.blocking_recv() {
@@ -540,16 +598,16 @@ pub fn remote_attach(
                         "원격 호스트와의 연결이 끊어졌습니다.".to_string()
                     }
                 };
-                emit_terminal_ended(&app, &said, local_id, &host, None, None, &detail);
+                record_terminal_ended(&app, local_id, &host, None, None, &detail);
             }
         });
     }
     Ok(local_id)
 }
 
-/// Say once that a remote terminal is over. See the `said` flag in
-/// [`remote_attach`]: two relays watch two different ways for it to end, and a
-/// panel that is told twice would report the second, vaguer reason.
+/// Write down that a remote terminal is over. Two relays watch two different
+/// ways for it to end, and the store keeps whichever spoke first — see
+/// [`EndedTerminals::record`].
 ///
 /// This is also where the registry **forgets** the terminal. It has to be: a
 /// terminal that ended on its own (the agent exited, `cwcd attach` was refused,
@@ -557,37 +615,35 @@ pub fn remote_attach(
 /// and a later detach would then close whatever id the session manager has since
 /// handed out. That is the class R1a shipped — a detach that `SIGKILL`ed an
 /// unrelated session — and the only thing standing between it and here is this
-/// line.
-fn emit_terminal_ended(
+/// line. Outside the "first one wins" rule on purpose: whichever relay speaks,
+/// both know the terminal is over, and forgetting twice is a no-op while
+/// forgetting never is not.
+fn record_terminal_ended(
     app: &AppHandle,
-    said: &Arc<std::sync::atomic::AtomicBool>,
     id: u64,
     host_id: &str,
     code: Option<u32>,
     signal: Option<String>,
     detail: &str,
 ) {
-    // Outside the `said` guard: whichever relay speaks, both know the terminal
-    // is over, and forgetting twice is a no-op while forgetting never is not.
-    app.state::<RemoteState>().registry.forget_terminal(id);
-    if said.swap(true, std::sync::atomic::Ordering::SeqCst) {
-        return;
-    }
-    let _ = app.emit(
-        "remote-terminal-ended",
-        RemoteTerminalEnded {
-            id,
-            host_id: host_id.to_string(),
-            code,
-            signal,
-            detail: detail.to_string(),
-        },
-    );
+    let state = app.state::<RemoteState>();
+    state.registry.forget_terminal(id);
+    state.ended.record(RemoteTerminalEnded {
+        id,
+        host_id: host_id.to_string(),
+        code,
+        signal,
+        detail: detail.to_string(),
+    });
 }
 
-/// Why a remote terminal stopped. Its own event kind because there is no other
-/// way to tell "the agent exited" from "`cwcd attach` was refused" — both leave
-/// the same silent terminal otherwise.
+/// Why a remote terminal stopped — the answer to [`remote_terminal_end`].
+///
+/// Recorded rather than emitted: there is no existing event that carries a
+/// reason (`claude-session-closed` is a bare id, and widening it would change a
+/// contract five local consumers read), and inventing one is the thing R2a ④
+/// forbids. It has to be said *somehow*, because "the agent exited" and
+/// "`cwcd attach` was refused" leave the same silent black box otherwise.
 #[derive(Clone, Serialize)]
 pub struct RemoteTerminalEnded {
     pub id: u64,
@@ -595,6 +651,19 @@ pub struct RemoteTerminalEnded {
     pub code: Option<u32>,
     pub signal: Option<String>,
     pub detail: String,
+}
+
+/// Why one remote terminal stopped, or `None` while it is still running.
+///
+/// Polled by the panel that owns the terminal, on the same footing as
+/// [`remote_hosts`]: a question asked while the panel is open, rather than a
+/// broadcast the panel must have been listening for at the right moment.
+#[tauri::command]
+pub fn remote_terminal_end(
+    remote: State<'_, RemoteState>,
+    id: u64,
+) -> Option<RemoteTerminalEnded> {
+    remote.ended.get(id)
 }
 
 /// The accounts (agent homes) a host publishes — the input to [`remote_spawn`].
@@ -789,6 +858,55 @@ pub fn remote_sessions(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn ended(id: u64, detail: &str) -> RemoteTerminalEnded {
+        RemoteTerminalEnded {
+            id,
+            host_id: "h1".into(),
+            code: None,
+            signal: None,
+            detail: detail.into(),
+        }
+    }
+
+    /// **The cause, not the consequence.**
+    ///
+    /// Detaching a host closes its terminal ("떼어져 닫았습니다") and *that*
+    /// drops the SSH channel, which the status relay reports as "연결이
+    /// 끊어졌습니다". Both are true; only the first explains anything. A store
+    /// that took the last write would leave the screen describing the effect of
+    /// the user's own click as if it were an unexplained disconnection.
+    #[test]
+    fn the_first_reason_is_the_one_kept() {
+        let store = EndedTerminals::default();
+        store.record(ended(7, "이 호스트에서 떼어져 터미널을 닫았습니다"));
+        store.record(ended(7, "원격 호스트와의 연결이 끊어졌습니다."));
+        assert_eq!(
+            store.get(7).expect("the terminal's reason").detail,
+            "이 호스트에서 떼어져 터미널을 닫았습니다"
+        );
+        // …and a *different* terminal is a different answer, not an overwrite.
+        store.record(ended(8, "exit 127"));
+        assert_eq!(store.get(8).expect("another terminal").detail, "exit 127");
+        assert!(store.get(9).is_none(), "a terminal still running has no reason yet");
+    }
+
+    /// The store is bounded. It is read by polling and never emptied by the
+    /// reader, so without a cap it is the same unbounded webview-side growth
+    /// this project already paid for once, moved to the backend.
+    #[test]
+    fn the_store_keeps_the_newest_and_forgets_the_oldest() {
+        let store = EndedTerminals::default();
+        for id in 0..(ENDED_CAP as u64 + 10) {
+            store.record(ended(id, "끝"));
+        }
+        assert_eq!(store.0.lock().unwrap().len(), ENDED_CAP);
+        assert!(store.get(0).is_none(), "the oldest reasons are dropped first");
+        assert!(
+            store.get(ENDED_CAP as u64 + 9).is_some(),
+            "the newest reason — the one somebody is about to ask for — is kept"
+        );
+    }
 
     /// A missing secret must be **nothing**, never an empty string.
     ///

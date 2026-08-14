@@ -306,20 +306,9 @@ describe("R17 — 회수가 병렬로 나가지 않는다", () => {
   });
 });
 
-describe("R3 — 구독보다 먼저 발행된 종료 사유가 유실되지 않는다", () => {
-  it("attach 가 돌아오기 **전에** 온 종료 이벤트도 화면에 뜬다", async () => {
-    routes.remote_hosts = async () => [snapshot([session({ state: "running", closed: false })])];
-    // 빠른 connect/auth/exec 실패: 백엔드가 attach 응답보다 먼저 사유를 낸다.
-    routes.remote_attach = async () => {
-      emitEvent("remote-terminal-ended", {
-        id: LOCAL_ID,
-        host_id: "h1",
-        code: null,
-        signal: null,
-        detail: "cwcd: command not found",
-      });
-      return LOCAL_ID;
-    };
+describe("R3·R16 — 열기보다 먼저 끝난 터미널도 이유를 말한다", () => {
+  /** 터미널을 하나 연다 (세션 하나짜리 호스트). */
+  async function openTerminal() {
     await mount();
     const btn = findButton("터미널");
     expect(btn?.disabled).toBe(false);
@@ -327,22 +316,72 @@ describe("R3 — 구독보다 먼저 발행된 종료 사유가 유실되지 않
       btn!.click();
     });
     await flush(20);
+  }
+
+  it("attach 가 돌아오기 **전에** 끝난 터미널의 사유도 화면에 뜬다", async () => {
+    routes.remote_hosts = async () => [snapshot([session({ state: "running", closed: false })])];
+    // 빠른 connect/auth/exec 실패: 백엔드는 attach 가 돌아오기 전에 사유를
+    // 기록해 둔다. 이벤트였을 때는 여기서 영구 유실됐다(replay 없음).
+    routes.remote_terminal_end = async (a) =>
+      a.id === LOCAL_ID
+        ? { id: LOCAL_ID, host_id: "h1", code: 127, signal: null, detail: "cwcd: command not found" }
+        : null;
+    await openTerminal();
     expect(text()).toContain("cwcd: command not found");
   });
 
-  it("종료 사유 구독이 attach 요청보다 먼저 걸린다", async () => {
+  it("살아 있는 터미널에는 종료 줄이 붙지 않는다", async () => {
     routes.remote_hosts = async () => [snapshot([session({ state: "running", closed: false })])];
-    let subscribedAtAttach = false;
-    routes.remote_attach = async () => {
-      subscribedAtAttach = (bus.handlers.get("remote-terminal-ended")?.size ?? 0) > 0;
-      return LOCAL_ID;
-    };
+    routes.remote_terminal_end = async () => null; // 아직 돌고 있다
+    await openTerminal();
+    expect(text()).not.toContain("원격 터미널");
+  });
+
+  /**
+   * 사유는 **그 터미널의 것**이다.
+   *
+   * 하나가 끝난 뒤 다른 세션의 터미널을 열면, 앞의 사유를 그대로 달고 열린
+   * 화면은 살아 있는 세션을 죽은 것으로 보이게 한다 — 그리고 그 줄은 xterm 에
+   * 실제로 찍힌다.
+   */
+  it("앞 터미널의 종료 사유가 다음 터미널로 넘어가지 않는다", async () => {
+    const other = session({ id: SID + 1, key: "h1/efgh", state: "running", closed: false });
+    routes.remote_hosts = async () => [
+      snapshot([session({ state: "running", closed: false }), other]),
+    ];
+    routes.remote_attach = async (a) => (a.id === SID ? LOCAL_ID : LOCAL_ID + 1);
+    // 첫 터미널만 끝났다. 둘째는 돌고 있다.
+    routes.remote_terminal_end = async (a) =>
+      a.id === LOCAL_ID
+        ? { id: LOCAL_ID, host_id: "h1", code: 1, signal: null, detail: "먼저 열었던 터미널이 끝났다" }
+        : null;
     await mount();
-    await act(async () => {
-      findButton("터미널")!.click();
-    });
-    await flush(10);
-    expect(subscribedAtAttach).toBe(true);
+    const buttons = () =>
+      Array.from(container.querySelectorAll("button")).filter(
+        (b) => (b.textContent ?? "").trim() === "터미널",
+      ) as HTMLButtonElement[];
+    await act(async () => buttons()[0].click());
+    await flush(20);
+    expect(text()).toContain("먼저 열었던 터미널이 끝났다");
+
+    await act(async () => buttons()[1].click());
+    await flush(20);
+    expect(text(), "다음 터미널이 앞의 사유를 달고 열렸다").not.toContain(
+      "먼저 열었던 터미널이 끝났다",
+    );
+  });
+
+  /**
+   * **새 이벤트 종류를 만들지 않는다**(R2a ④). 백엔드 쪽은
+   * `tests/remote_event_contract.rs` 가 지키고, 여기서는 소비자 쪽을 지킨다 —
+   * 패널이 구독하는 이름이 곧 계약이다.
+   */
+  it("패널은 이미 있던 이벤트만 구독한다", async () => {
+    routes.remote_hosts = async () => [snapshot([session({ state: "running", closed: false })])];
+    await openTerminal();
+    expect(new Set(bus.order)).toEqual(
+      new Set(["claude-timeline", "claude-session-closed", `terminal-output-${LOCAL_ID}`]),
+    );
   });
 });
 
@@ -383,11 +422,19 @@ describe("R18 — 구독 실패가 무음화되지 않는다", () => {
     expect(text()).toContain("listen(claude-timeline) 실패");
   });
 
-  it("종료 사유 구독이 실패해도 조용하지 않다", async () => {
-    bus.failing.add("remote-terminal-ended");
+  it("종료 사유 조회가 실패해도 조용하지 않다", async () => {
+    routes.remote_hosts = async () => [snapshot([session({ state: "running", closed: false })])];
+    routes.remote_terminal_end = async () => {
+      throw new Error("상태를 읽지 못했습니다");
+    };
     await mount();
-    await flush(10);
-    expect(text()).toContain("listen(remote-terminal-ended) 실패");
+    await act(async () => {
+      findButton("터미널")!.click();
+    });
+    await flush(20);
+    // 못 물어봤다는 사실이 안 보이면, 이 경로가 없애려던 그 화면(사유 없는
+    // 검은 상자)이 그대로 돌아온다.
+    expect(text()).toContain("상태를 읽지 못했습니다");
   });
 });
 
@@ -399,37 +446,39 @@ describe("R15 — 떼기 뒤 터미널이 살아 있는 것처럼 보이지 않�
   /**
    * 한 터미널이 두 번 말할 수 있다: 백엔드의 closer 가 "떼어져 닫았습니다"를 낸
    * 뒤, 그 때문에 세션이 사라지면서 SSH 상태 릴레이가 "연결이 끊어졌습니다"를
-   * 잇달아 낸다. 나중 것으로 덮으면 화면은 **원인이 아니라 결과**를 말한다 —
-   * 백엔드가 한 attach 안에서 `said` 플래그로 지키는 규칙과 같은 규칙이다.
+   * 잇달아 낸다. **어느 것을 지키는지의 규칙은 백엔드에 있다**(`EndedTerminals::
+   * record` = 첫 사유가 진짜다 — `commands/remote.rs` 의 rust 테스트). 여기서
+   * 보는 것은 그 답이 실제로 사용자에게 닿느냐다.
    */
-  it("떼기 사유가 뒤따라온 막연한 사유에 덮이지 않는다", async () => {
+  it("떼기 사유가 터미널과 화면에 닿는다", async () => {
     routes.remote_hosts = async () => [snapshot([session({ state: "running", closed: false })])];
+    routes.remote_terminal_end = async () => null;
     await mount();
     await act(async () => {
       findButton("터미널")!.click();
     });
     await flush(10);
+    expect(text()).not.toContain("떼어져");
 
-    await act(async () => {
-      emitEvent("remote-terminal-ended", {
-        id: LOCAL_ID,
-        host_id: "h1",
-        code: null,
-        signal: null,
-        detail: "이 호스트에서 떼어져 터미널을 닫았습니다 — 원격 세션은 계속 돕니다.",
-      });
-      // …그리고 그 결과로 SSH 채널이 죽으면서 나오는, 덜 정확한 두 번째 사유.
-      emitEvent("remote-terminal-ended", {
-        id: LOCAL_ID,
-        host_id: "h1",
-        code: null,
-        signal: null,
-        detail: "원격 호스트와의 연결이 끊어졌습니다.",
-      });
+    // 사용자가 "떼기"를 누르고, 백엔드가 그 사유를 기록한 뒤의 조회.
+    routes.remote_terminal_end = async () => ({
+      id: LOCAL_ID,
+      host_id: "h1",
+      code: null,
+      signal: null,
+      detail: "이 호스트에서 떼어져 터미널을 닫았습니다 — 원격 세션은 계속 돕니다.",
     });
-    await flush(10);
+    await act(async () => {
+      findButton("떼기")!.click();
+    });
+    // 한 틱 뒤에 본다 — 사유는 **다음 조회**에서 온다. 마운트 순간만 훑는
+    // 단언은 폴링이 아예 안 돌아도 통과한다(앞 슬라이스가 그렇게 속았다).
+    await act(async () => {
+      await new Promise((r) => setTimeout(r, 900));
+    });
+    await flush(20);
     expect(text()).toContain("떼어져 터미널을 닫았습니다");
-    expect(text()).not.toContain("연결이 끊어졌습니다");
+    expect(written.text.join("")).toContain("떼어져 터미널을 닫았습니다");
   });
 });
 

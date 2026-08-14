@@ -97,6 +97,14 @@ import { AGENT_BADGE, KIND_LABEL } from "./TimelineView";
 /** 한 세션 아래에 한 번에 그리는 최근 아이템 수 — 사이드바 폭에 맞춘 상한. */
 const ITEM_ROWS = 12;
 
+/**
+ * 열린 터미널의 종료 사유를 다시 묻는 간격.
+ *
+ * 호스트 목록과 같은 주기다(둘 다 이 패널이 열려 있는 동안만 돈다). SSH 왕복이
+ * 아니라 **앱 안의 상태 조회**라 값이 싸고, 답이 오면 그 즉시 멈춘다.
+ */
+const ENDED_POLL_MS = 700;
+
 function ts(ms: number): string {
   if (!ms) return "";
   try {
@@ -173,52 +181,57 @@ export function RemoteHostPanel() {
   const putTerm = useCallback((t: AttachedTerm | null) => {
     termRef.current = t;
     setTerm(t);
+    // 사유는 **그 터미널의 것**이다. 다음 터미널이 앞 터미널의 종료 사유를 달고
+    // 열리면 살아 있는 세션이 죽은 것처럼 보인다.
+    setEnded(null);
+    setEndedError(null);
   }, []);
   /** attach 세대 — 왕복 중에 다른 attach 나 닫기가 끼어들었는지. */
   const attachSeq = useRef(0);
 
   /**
-   * 로컬 세션 id → 그 원격 터미널이 멈춘 이유. **패널이** 들고 있다.
+   * 지금 열려 있는 터미널이 멈춘 이유 — **물어서** 안다.
    *
-   * 터미널 컴포넌트가 마운트한 뒤에 구독하면 늦는다: connect/auth/exec 이 빨리
-   * 실패하면 `remote-terminal-ended` 는 `remote_attach` 가 **돌아오기 전에**
-   * 발행되고, Tauri 이벤트에는 replay 가 없어 사유가 영구 유실된다 — 화면에는 빈
-   * 터미널만 남는다. 그래서 구독을 패널 마운트로 끌어올리고(그래서 어떤 attach
-   * 보다도 먼저다), `attach` 는 이 구독이 실제로 걸린 뒤에야 요청을 보낸다.
-   * 늦게 마운트한 터미널 뷰는 여기 적힌 값을 읽는다(= 늦게 붙어도 사유를 얻는다).
+   * 이것이 이벤트였을 때(`remote-terminal-ended`) 두 가지가 걸렸다. 하나는 계약:
+   * R2a ④ 는 새 프론트 이벤트 종류를 금지하고, 대응하는 이벤트가 없는 상태는
+   * 스냅샷 조회로 만든다(`remote_hosts` 가 그것이다). 다른 하나는 결함: Tauri
+   * 이벤트에는 replay 가 없어 **구독보다 먼저** 발행된 사유가 영구 유실됐고,
+   * connect/auth/exec 이 빨리 실패하면 그게 정확히 일어났다 — 화면에는 조용한
+   * 검은 상자만 남는다. 구독을 패널 마운트로 끌어올려 창을 좁혔지만 창은 남았다
+   * (패널이 언마운트된 사이에 온 사유).
+   *
+   * 상태로 두면 **늦게 읽어도 읽힌다**: 백엔드가 기록해 두고 여기서 물어본다.
+   * 그래서 순서를 맞출 일이 없고 창도 없다. 값이 오면 폴링은 멈춘다(끝난 이유는
+   * 두 번 바뀌지 않는다).
    */
-  const [endedById, setEndedById] = useState<Record<number, string>>({});
+  const [ended, setEnded] = useState<string | null>(null);
   const [endedError, setEndedError] = useState<string | null>(null);
-  /** 구독이 걸렸다는 사실 자체 — `attach` 가 이것을 기다린다. */
-  const endedReady = useRef<Promise<void> | null>(null);
+  const termId = term?.localId ?? null;
   useEffect(() => {
-    let disposed = false;
-    let un: UnlistenFn | undefined;
-    endedReady.current = (async () => {
-      try {
-        un = await listen<RemoteTerminalEnded>("remote-terminal-ended", (e) => {
-          // **첫 사유가 진짜다.** 한 터미널이 두 번 말할 수 있다: 호스트를 떼면
-          // 백엔드가 "떼어져 닫았습니다"를 먼저 내고, 그 때문에 세션이 사라지면
-          // SSH 상태 릴레이가 뒤이어 "연결이 끊어졌습니다"를 낸다. 나중 것으로
-          // 덮으면 화면은 원인이 아니라 결과를 말하게 된다 — 백엔드가 한 attach
-          // 안에서 `said` 플래그로 지키는 규칙과 같은 규칙이다.
-          setEndedById((m) => (e.payload.id in m ? m : { ...m, [e.payload.id]: endedReason(e.payload) }));
+    if (termId == null || ended != null) return;
+    let alive = true;
+    const ask = () => {
+      invoke<RemoteTerminalEnded | null>("remote_terminal_end", { id: termId })
+        .then((e) => {
+          if (!alive) return;
+          setEndedError(null);
+          // 백엔드가 **첫 사유**를 지킨다(떼기 사유가 뒤따르는 "연결이
+          // 끊어졌습니다"에 덮이지 않는다) — 여기서는 온 것을 그대로 쓴다.
+          if (e) setEnded(endedReason(e));
+        })
+        .catch((err) => {
+          // 못 물어봤다는 사실 자체를 말한다. 조용히 두면 이 경로가 없애려던
+          // 그 화면(사유 없는 검은 상자)이 그대로 돌아온다(R18).
+          if (alive) setEndedError(errText(err, "종료 사유를 읽지 못했습니다."));
         });
-        if (disposed) {
-          un?.();
-          un = undefined;
-        }
-      } catch (e) {
-        // 구독 실패를 잡지 않으면 unhandled rejection 하나와 조용한 검은 상자만
-        // 남는다 — 이 이벤트가 애초에 없애려던 바로 그 화면이다(R18).
-        setEndedError(errText(e, "원격 터미널 종료 사유를 구독하지 못했습니다."));
-      }
-    })();
-    return () => {
-      disposed = true;
-      un?.();
     };
-  }, []);
+    ask();
+    const t = window.setInterval(ask, ENDED_POLL_MS);
+    return () => {
+      alive = false;
+      window.clearInterval(t);
+    };
+  }, [termId, ended]);
   // 패널이 사라질 때 SSH exec 채널을 남기지 않는다. **원격 세션은 죽지 않는다** —
   // 닫는 것은 이 관찰 창(로컬 세션)뿐이고, 에이전트는 데몬이 계속 소유한다.
   useEffect(
@@ -237,17 +250,10 @@ export function RemoteHostPanel() {
     // 세대를 올려, 왕복 중인 attach 가 돌아와 방금 닫은 창을 되살리지 않게.
     attachSeq.current += 1;
     const t = termRef.current;
-    if (t) {
-      invoke("terminal_close", { id: t.localId }).catch(() => {});
-      // 사용자가 읽고 닫은 사유는 여기서 치운다(로컬 id 는 재사용되지 않으므로
-      // 다음 터미널과 겹칠 일이 없다 — 남겨 두면 쌓이기만 한다).
-      setEndedById((m) => {
-        if (!(t.localId in m)) return m;
-        const next = { ...m };
-        delete next[t.localId];
-        return next;
-      });
-    }
+    if (t) invoke("terminal_close", { id: t.localId }).catch(() => {});
+    // 사유는 `putTerm` 이 함께 치운다. 백엔드의 기록은 남지만 상한이 있고
+    // (`ENDED_CAP`), 남아 있는 편이 낫다 — 같은 터미널을 다시 열 수는 없어도
+    // 패널을 닫았다 연 사용자는 그 사유를 다시 물을 수 있다.
     putTerm(null);
   }, [putTerm]);
 
@@ -262,9 +268,9 @@ export function RemoteHostPanel() {
       // 끝날 때까지 남는다.
       const mine = ++attachSeq.current;
       try {
-        // 종료 사유 구독이 **걸린 뒤에** 요청한다. 빠른 실패는 attach 응답보다
-        // 먼저 이벤트를 내고, Tauri 이벤트는 replay 되지 않는다.
-        await endedReady.current;
+        // 사유 구독을 먼저 걸어 두는 순서 맞추기가 여기 있었다. 이제 사유는
+        // 기록돼 있고 열린 뒤에 물어보므로, attach 보다 먼저 끝난 터미널도
+        // 첫 조회에서 그대로 읽힌다.
         // 처음 크기는 짐작이고, 첫 정착 크기가 곧바로 로컬·원격 양쪽을 고친다.
         const localId = await invoke<number>("remote_attach", {
           hostId,
@@ -438,7 +444,7 @@ export function RemoteHostPanel() {
         ) : null}
         {endedError ? (
           <div className="claudeterm-refine-note" role="alert">
-            원격 터미널 종료 사유를 구독하지 못했습니다 — {endedError}
+            원격 터미널이 멈춘 이유를 읽지 못했습니다 — {endedError}
           </div>
         ) : null}
         {connections.length === 0 ? (
@@ -495,7 +501,7 @@ export function RemoteHostPanel() {
           remoteId={term.remoteId}
           localId={term.localId}
           sessionKey={term.sessionKey}
-          ended={endedById[term.localId] ?? null}
+          ended={ended}
           onClose={closeTerm}
         />
       ) : null}
@@ -1426,9 +1432,8 @@ function NewSessionForm({ hostId, onSpawned }: { hostId: string; onSpawned: () =
  *
  * 다른 것은 두 가지다. 크기는 두 곳으로 간다 — `terminal_resize` 는 로컬 장부,
  * 실제 pty 는 데몬이 들고 있어 `remote_resize` 가 SSH 왕복 한 번으로 바꾼다(그래서
- * 멎은 크기만 보낸다). 그리고 끝났을 때는 `remote-terminal-ended` 가 사유를 주므로
- * 그것을 화면에 찍는다 — 이 이벤트가 따로 있는 이유가 조용한 검은 상자를 없애는
- * 것이다.
+ * 멎은 크기만 보낸다). 그리고 끝났을 때는 패널이 `remote_terminal_end` 로 물어 온
+ * 사유를 받아 화면에 찍는다 — 조용한 검은 상자를 없애는 것이 그 경로의 이유다.
  */
 function RemoteTerminalView({
   hostId,
@@ -1508,9 +1513,9 @@ function RemoteTerminalView({
       // 구독 **먼저** — 스냅샷 왕복 동안 나온 바이트는 이벤트로만 오고, 스냅샷에는
       // 없다(로컬 터미널과 같은 계약).
       //
-      // 종료 사유(`remote-terminal-ended`)는 여기서 구독하지 않는다: 이 컴포넌트는
-      // `remote_attach` 가 **돌아온 뒤에야** 마운트되므로, 빠른 실패의 사유는 이미
-      // 지나갔다(R3). 패널이 마운트 때 구독해 두고 `ended` 로 내려 준다.
+      // 종료 사유는 여기서 묻지 않는다: 이 컴포넌트는 `remote_attach` 가 돌아온
+      // 뒤에야 마운트되고, 사유는 그보다 먼저 확정될 수 있다. 패널이 물어
+      // (`remote_terminal_end`) `ended` 로 내려 준다.
       try {
         unOutput = await listen<TerminalOutputEvent>(ptyEventName(localId), (e) => {
           if (!ready) {
