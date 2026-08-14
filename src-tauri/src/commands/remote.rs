@@ -99,6 +99,26 @@ impl EndedTerminals {
         }
     }
 
+    /// A local session id that has just been handed to a **new** terminal.
+    ///
+    /// Ids come from a counter in the session manager and are reused, so the
+    /// reason filed under one is only this terminal's while this terminal is the
+    /// one holding it. Without this line the store answered a live terminal's
+    /// poll with the previous terminal's last words — and then, by the "first
+    /// one wins" rule above, refused to record the reason that was actually
+    /// this terminal's, forever. That is the R1a class: a stale id acted on as
+    /// though it were the current one.
+    ///
+    /// Called by [`remote_attach`] the moment it has the id, which is before
+    /// either relay of that attach exists and therefore before anything can race
+    /// it.
+    fn opened(&self, id: u64) {
+        self.0
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .retain(|e| e.id != id);
+    }
+
     fn get(&self, id: u64) -> Option<RemoteTerminalEnded> {
         self.0
             .lock()
@@ -513,6 +533,12 @@ pub fn remote_attach(
             )
         })?;
     let (local_id, channels) = mgr.create_ssh(config, known_hosts, cols, rows, None);
+    // The id came out of a counter, so some earlier terminal may have held it
+    // and left its reason behind. That reason is not this terminal's, and
+    // leaving it in place would answer this terminal's poll with a sentence
+    // about one that closed before it existed — while blocking its own reason
+    // from ever being written. Cleared here, before either relay below exists.
+    remote.ended.opened(local_id);
     // File it under the host **before** anything can fail: from here on the
     // registry is the only place that knows this terminal belongs to `host_id`,
     // and a detach that does not know cannot close it (R15).
@@ -919,6 +945,39 @@ mod tests {
         store.record(ended(8, "exit 127"));
         assert_eq!(store.get(8).expect("another terminal").detail, "exit 127");
         assert!(store.get(9).is_none(), "a terminal still running has no reason yet");
+    }
+
+    /// **An id the manager handed out again is a different terminal.**
+    ///
+    /// Local session ids come from a counter and are reused. While the store
+    /// kept the first reason for an id forever, a terminal that opened on a
+    /// recycled id answered `remote_terminal_end` with the *previous*
+    /// terminal's reason — a live terminal reported as dead, and its own real
+    /// reason refused later by the same "first one wins" rule, so it could
+    /// never be recorded at all. This is the R1a class (a stale id acted on as
+    /// if it were the current one), and the comment on `record_terminal_ended`
+    /// already takes id reuse as a fact.
+    #[test]
+    fn a_recycled_id_is_a_new_terminal_and_not_the_old_ones_reason() {
+        let store = EndedTerminals::default();
+        store.record(ended(7, "이 호스트에서 떼어져 터미널을 닫았습니다"));
+
+        // The session manager hands 7 out again. `remote_attach` says so the
+        // moment it has the id — before either relay can speak.
+        store.opened(7);
+        assert!(
+            store.get(7).is_none(),
+            "a terminal that is still running was told it had already ended, with a sentence \
+             about a terminal that closed before it existed"
+        );
+
+        // …and its own reason is recordable, instead of being swallowed as a
+        // second write for an id that already had one.
+        store.record(ended(7, "원격 호스트에 연결하지 못했습니다: refused"));
+        assert_eq!(
+            store.get(7).expect("this terminal's own reason").detail,
+            "원격 호스트에 연결하지 못했습니다: refused"
+        );
     }
 
     /// The store is bounded. It is read by polling and never emptied by the

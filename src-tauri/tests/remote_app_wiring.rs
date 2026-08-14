@@ -138,6 +138,14 @@ fn opening_a_remote_terminal_files_it_under_its_host() {
         "`remote_attach` opens a terminal onto a host without telling the registry, so a later \
          detach cannot close it — the exact state R15 was filed for:\n{attach}"
     );
+    // …and the reason filed under that id belongs to whoever held it *before*.
+    // `EndedTerminals` proves it clears one when told; only this line tells it.
+    assert!(
+        attach.contains(".opened("),
+        "`remote_attach` takes an id the session manager recycled without clearing the reason \
+         left on it, so the new terminal answers \"why did you stop\" with the previous \
+         terminal's last words and can never record its own:\n{attach}"
+    );
 }
 
 /// …and one that ended on its own must be **unfiled**, or a later detach closes
