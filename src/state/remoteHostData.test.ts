@@ -18,15 +18,14 @@ import {
   parentPath,
   relPath,
   rootsCutNote,
-  shouldAutoLoad,
   staleNote,
   GIT_ROOTS_CAVEAT,
   type RemoteDir,
   type RemoteDirEntry,
   type RemoteGitLog,
-  type Loadable,
   type RemoteGitRoots,
 } from "./remoteHostData";
+import { shouldAutoFetch, type Fetched } from "./autoFetch";
 
 function entry(name: string, over: Partial<RemoteDirEntry> = {}): RemoteDirEntry {
   return {
@@ -94,6 +93,39 @@ describe("트리 — 페이지가 폴더 전체인 척하지 않는다", () => {
     const d = dir({ entries: [entry("a")], total: 900, truncated: false });
     expect(dirHasMore(d)).toBe(true);
     expect(dirCutNote(d)).toContain("900");
+  });
+
+  /**
+   * **없는 잘림을 지어내지 않는다** (L2-11).
+   *
+   * 마지막 페이지에 `truncated:true` 가 실려 오면(생산자가 "상한만큼 읽었다"를
+   * 그대로 말하는 흔한 모양) 개수는 이미 다 왔다고 말하는데 화면은 "더 있다"를
+   * 지어낸다. 그리고 「더 보기」는 `from == total` 로 조회한다 — 사용자는 누를
+   * 것이 있는데 아무것도 오지 않는 화면을 본다. 개수가 정본이고, 플래그는 개수를
+   * 믿을 수 없을 때의 백스톱이다.
+   */
+  it("마지막 페이지의 `truncated` 로 없는 잘림을 지어내지 않는다", () => {
+    const d = dir({ entries: [entry("a"), entry("b")], from_index: 0, total: 2, truncated: true });
+    expect(dirHasMore(d)).toBe(false);
+    expect(dirCutNote(d)).toBeNull();
+  });
+
+  it("이어 붙인 마지막 페이지에서도 마찬가지다", () => {
+    const first = dir({ entries: [entry("a")], from_index: 0, total: 2, truncated: true });
+    const last = dir({ entries: [entry("b")], from_index: 1, total: 2, truncated: true });
+    const m = appendDirPage(first, last);
+    expect(m.ok).toBe(true);
+    if (!m.ok) return;
+    expect(dirHasMore(m.value)).toBe(false);
+    expect(dirCutNote(m.value)).toBeNull();
+  });
+
+  /** 개수를 믿을 수 없을 때(본 것이 `total` 보다 많다)는 플래그가 백스톱이다. */
+  it("total 이 개수와 모순이면 truncated 를 백스톱으로 쓴다", () => {
+    const d = dir({ entries: [entry("a"), entry("b")], from_index: 0, total: 0, truncated: true });
+    expect(dirHasMore(d)).toBe(true);
+    const quiet = dir({ entries: [entry("a")], from_index: 0, total: 0, truncated: false });
+    expect(dirHasMore(quiet)).toBe(false);
   });
 
   it("두 번째 페이지 뒤에도 남은 것이 있으면 계속 말한다", () => {
@@ -218,8 +250,9 @@ describe("경로 — '위로' 가 루트 밖으로 나가지 않는다", () => {
 });
 
 describe("자동 조회의 축은 내용이 아니라 시도다 (R1)", () => {
-  const slot = (over: Partial<Loadable<number>> = {}): Loadable<number> => ({
+  const slot = (over: Partial<Fetched<number>> = {}): Fetched<number> => ({
     value: null,
+    sig: null,
     error: null,
     loading: false,
     attempted: false,
@@ -228,7 +261,7 @@ describe("자동 조회의 축은 내용이 아니라 시도다 (R1)", () => {
   });
 
   it("아직 시도한 적 없으면 한 번 읽는다", () => {
-    expect(shouldAutoLoad(slot())).toBe(true);
+    expect(shouldAutoFetch(slot())).toBe(true);
   });
 
   /**
@@ -237,15 +270,15 @@ describe("자동 조회의 축은 내용이 아니라 시도다 (R1)", () => {
    * 읽어라"가 되고, 한 바퀴마다 새 SSH 연결이 나간다.
    */
   it("성공했는데 채울 것이 없어도 다시 읽지 않는다", () => {
-    expect(shouldAutoLoad(slot({ attempted: true, at: 1 }))).toBe(false);
+    expect(shouldAutoFetch(slot({ attempted: true, at: 1 }))).toBe(false);
   });
 
   it("실패해도 자동으로 되풀이하지 않는다 — 재시도는 버튼의 몫이다", () => {
-    expect(shouldAutoLoad(slot({ attempted: true, error: "읽지 못했습니다" }))).toBe(false);
+    expect(shouldAutoFetch(slot({ attempted: true, error: "읽지 못했습니다" }))).toBe(false);
   });
 
   it("나가 있는 조회를 두 번 보내지 않는다", () => {
-    expect(shouldAutoLoad(slot({ attempted: true, loading: true }))).toBe(false);
+    expect(shouldAutoFetch(slot({ attempted: true, loading: true }))).toBe(false);
   });
 });
 
@@ -253,15 +286,15 @@ describe("낡은 화면 — 오류가 떴는데 값이 남아 있으면 그 값�
   it("언제 것인지 말한다", () => {
     const now = 1_000_000;
     expect(
-      staleNote({ value: 1, error: "읽지 못했습니다", loading: false, attempted: true, at: now - 5000 }, now),
+      staleNote({ value: 1, sig: null, error: "읽지 못했습니다", loading: false, attempted: true, at: now - 5000 }, now),
     ).toContain("5초 전");
     expect(
-      staleNote({ value: 1, error: "읽지 못했습니다", loading: false, attempted: true, at: now - 180_000 }, now),
+      staleNote({ value: 1, sig: null, error: "읽지 못했습니다", loading: false, attempted: true, at: now - 180_000 }, now),
     ).toContain("3분 전");
   });
 
   it("오류가 없거나 값이 없으면 할 말이 없다", () => {
-    expect(staleNote({ value: 1, error: null, loading: false, attempted: true, at: 1 })).toBeNull();
-    expect(staleNote({ value: null, error: "x", loading: false, attempted: true, at: null })).toBeNull();
+    expect(staleNote({ value: 1, sig: null, error: null, loading: false, attempted: true, at: 1 })).toBeNull();
+    expect(staleNote({ value: null, sig: null, error: "x", loading: false, attempted: true, at: null })).toBeNull();
   });
 });

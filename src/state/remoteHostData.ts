@@ -19,9 +19,11 @@
  * 원격에서 재생산하지 않는 것이 이 모듈의 계약이고, 그래서 잘림 판정은
  * 플래그 **하나에만** 의존하지 않는다(개수로도 따로 센다).
  */
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { errText } from "../utils/error";
+import { useAutoFetch, type Fetched, type Merge } from "./autoFetch";
+
+export type { Fetched, Merge } from "./autoFetch";
 
 // ---------------------------------------------------------------------------
 // 응답 타입 — 백엔드 `core::remote::proto` 의 것과 같은 모양
@@ -144,18 +146,26 @@ export const GIT_ROOTS_CAVEAT =
 // 잘림 — 화면이 말해야 하는 것들
 // ---------------------------------------------------------------------------
 
-/** 이 페이지 뒤로 더 있나. **플래그와 개수 둘 다** 본다. */
+/**
+ * 이 페이지 뒤로 더 있나 — **개수가 정본이고 플래그는 백스톱이다**.
+ *
+ * 둘 다 보는 이유는 그대로다: 생산자가 `truncated` 를 빠뜨려도 `from_index +
+ * 보인 개수 < total` 이 같은 사실을 말한다(신호가 하나뿐인 곳에서는 그 하나가
+ * 사라지는 순간 화면이 조용해진다). 다만 **순서가 있다**.
+ *
+ * `truncated || 개수` 로 OR 하면 마지막 페이지에 `truncated:true` 가 실려 올 때
+ * (생산자가 "상한만큼 읽었다"를 그대로 말하는 흔한 모양) **없는 잘림을 지어낸다**
+ * — 그리고 「더 보기」는 `from == total` 로 조회해 아무것도 못 가져온다. 그래서
+ * 개수를 믿을 수 있으면 개수로 판정하고, 개수가 스스로 모순일 때만
+ * (`total < 지금까지 본 것`) 플래그를 백스톱으로 쓴다.
+ */
 export function dirHasMore(d: RemoteDir): boolean {
-  return d.truncated || d.from_index + d.entries.length < d.total;
+  const shown = d.from_index + d.entries.length;
+  if (d.total >= shown) return shown < d.total;
+  return d.truncated;
 }
 
-/**
- * "N개 중 M개만 보이고 있습니다" — 없으면 `null`.
- *
- * 플래그 하나에 기대지 않는 것이 핵심이다. 생산자가 `truncated` 를 빠뜨려도
- * `from_index + 보인 개수 < total` 이 같은 사실을 말한다. 잘림 신호가 하나뿐인
- * 곳에서는 그 하나가 사라지는 순간 화면이 조용해진다.
- */
+/** "N개 중 M개만 보이고 있습니다" — 없으면 `null`. */
 export function dirCutNote(d: RemoteDir): string | null {
   if (!dirHasMore(d)) return null;
   const shown = d.from_index + d.entries.length;
@@ -185,8 +195,6 @@ export function logHasMore(p: RemoteGitLog): boolean {
 // ---------------------------------------------------------------------------
 // 페이지 이어 붙이기 — **구멍은 이어 붙이지 않는다**
 // ---------------------------------------------------------------------------
-
-export type Merge<T> = { ok: true; value: T } | { ok: false; error: string };
 
 /**
  * 트리의 다음 페이지를 붙인다.
@@ -239,56 +247,8 @@ export function appendLogPage(prev: RemoteGitLog | null, page: RemoteGitLog): Me
   };
 }
 
-/** 한 화면 조각의 상태 — 값·오류·진행·**시도 여부**·마지막으로 성공한 시각. */
-export interface Loadable<T> {
-  value: T | null;
-  error: string | null;
-  loading: boolean;
-  /**
-   * 이 조각을 **읽으려 시도한 적이 있나**(성공·빈 응답·실패 전부 포함).
-   *
-   * 자동 조회의 판정 축이 *내용*이 아니라 *시도*인 이유는 R1 에서 실측됐다:
-   * "값이 비었으면 다시 읽는다" 는 성공했는데 빈 응답이 온 순간 판정이 true 로
-   * 돌아와 effect 가 재발화하고, 그 한 바퀴가 **새 SSH 연결 1회**다(백오프도
-   * 지연도 없다 — 빈 세션 하나에 5초 동안 1,400회 이상이 측정됐다). 여기서도
-   * 같은 모양이 재현됐다: 빈 응답을 돌려주는 폴더 하나가 원격 sshd 에 무제한
-   * 연결을 보낸다. 자동은 갈래당 한 번이고, 그 뒤의 재시도는 버튼에만 남는다.
-   */
-  attempted: boolean;
-  /** 마지막 성공 시각(ms). 오류가 떠도 값이 남아 있을 때 "언제 것인지"를 말한다. */
-  at: number | null;
-}
-
-export const idle = <T,>(): Loadable<T> => ({
-  value: null,
-  error: null,
-  loading: false,
-  attempted: false,
-  at: null,
-});
-
-/**
- * 이 조각을 **자동으로** 한 번 읽어도 되나.
- *
- * 판정의 축이 *내용*이 아니라 *시도*인 것이 전부다. `!value` 로 쓰면 화면에 채울
- * 것이 없는 응답(빈 폴더, 읽을 수 없는 모양)이 올 때마다 판정이 true 로 돌아와
- * effect 가 다시 발화하고, 그 한 바퀴가 `Registry::call` → **새 SSH 연결 1회**다.
- * R1 이 세션 타임라인에서 실측한 사고(빈 세션 하나에 5초 동안 1,400회 이상)이고,
- * 이 화면을 만들면서 그대로 재현됐다 — React 가 "Maximum update depth exceeded"
- * 로 멈출 때까지.
- *
- * `remoteHosts.ts` 의 `shouldAutoFetchBody` 와 같은 모양인 것은 우연이 아니다:
- * 같은 사고의 같은 처방이고, **순수 함수로 꺼내 둬야** 되돌아갔을 때 테스트가
- * 그것을 잡는다(컴포넌트 안에 인라인으로 두면 `act()` 의 마이크로태스크 순서가
- * 루프를 가려 뮤테이션이 살아남는다 — 실제로 그랬다). 자동은 한 번, 그 뒤의
- * 재시도는 사용자가 누르는 버튼에만 남는다.
- */
-export function shouldAutoLoad(l: Loadable<unknown>): boolean {
-  return !l.attempted;
-}
-
 /** 화면에 보이는 것이 지금 것인지 — 오류가 있는데 값도 있으면 그 값은 과거다. */
-export function staleNote(l: Loadable<unknown>, now: number = Date.now()): string | null {
+export function staleNote(l: Fetched<unknown>, now: number = Date.now()): string | null {
   if (!l.error || l.value == null || l.at == null) return null;
   const secs = Math.max(0, Math.round((now - l.at) / 1000));
   return secs < 60
@@ -333,7 +293,7 @@ export function parentPath(root: string, path: string): string | null {
 
 export interface RemoteHostDataView {
   /** 이 호스트가 발행하는 프로젝트 — 나머지 모든 조회의 `root`. */
-  projects: Loadable<RemoteProjects>;
+  projects: Fetched<RemoteProjects>;
   root: string;
   setRoot: (root: string) => void;
   reloadProjects: (refresh?: boolean) => void;
@@ -341,23 +301,39 @@ export interface RemoteHostDataView {
   /** 지금 보고 있는 폴더(빈 문자열 = 루트 자신). */
   path: string;
   openDir: (path: string) => void;
-  dir: Loadable<RemoteDir>;
+  dir: Fetched<RemoteDir>;
   moreDir: () => void;
   reloadDir: () => void;
 
-  status: Loadable<RemoteGitStatus>;
+  status: Fetched<RemoteGitStatus>;
   reloadStatus: () => void;
 
-  log: Loadable<RemoteGitLog>;
+  log: Fetched<RemoteGitLog>;
   moreLog: () => void;
   reloadLog: () => void;
 
-  worktrees: Loadable<RemoteWorktrees>;
+  worktrees: Fetched<RemoteWorktrees>;
   reloadWorktrees: () => void;
 
-  roots: Loadable<RemoteGitRoots>;
+  roots: Fetched<RemoteGitRoots>;
   reloadRoots: () => void;
 }
+
+/**
+ * 조회 하나의 **주소**.
+ *
+ * 이것이 자동 회수 원시({@link useAutoFetch})의 잠금 키다 — 가리키는 대상만
+ * 들어간다. 앞선 판에서는 잠금 키가 `slot`("dir"/"status") **하나뿐**이라 root 가
+ * 없었고, 그래서 A 를 읽는 중에 B 를 고르면 B 요청이 in-flight 가드에 걸려 **말없이
+ * 삼켜졌다**(상태 갱신 0 · `attempted` 는 이미 true 라 자동 재조회도 없다). 늦게
+ * 온 A 응답은 B 라벨 아래 그려졌다. 주소가 키에 들어 있으면 그 일이 일어날 수 없다.
+ */
+const SEP = "\u0000";
+export const projectsKey = (hostId: string): string => `projects${SEP}${hostId}`;
+export const dirKey = (hostId: string, root: string, path: string): string =>
+  `dir${SEP}${hostId}${SEP}${root}${SEP}${path}`;
+export const repoKey = (slot: string, hostId: string, root: string): string =>
+  `${slot}${SEP}${hostId}${SEP}${root}`;
 
 /**
  * 한 호스트의 데이터 조회.
@@ -371,74 +347,38 @@ export interface RemoteHostDataView {
  * 없게 한다 — 앞 슬라이스가 `hostsError`/`hostsAt` 으로 세운 결 그대로다.
  */
 export function useRemoteHostData(hostId: string): RemoteHostDataView {
-  const [projects, setProjects] = useState<Loadable<RemoteProjects>>(idle);
   const [root, setRootState] = useState("");
   const [path, setPath] = useState("");
-  const [dir, setDir] = useState<Loadable<RemoteDir>>(idle);
-  const [status, setStatus] = useState<Loadable<RemoteGitStatus>>(idle);
-  const [log, setLog] = useState<Loadable<RemoteGitLog>>(idle);
-  const [worktrees, setWorktrees] = useState<Loadable<RemoteWorktrees>>(idle);
-  const [roots, setRoots] = useState<Loadable<RemoteGitRoots>>(idle);
-
-  /** 나가 있는 조회 — 같은 조각에 왕복이 겹쳐 나가지 않게(R17 의 결). */
-  const inFlight = useRef<Set<string>>(new Set());
-
-  const run = useCallback(
-    <T,>(
-      slot: string,
-      set: (f: (prev: Loadable<T>) => Loadable<T>) => void,
-      call: () => Promise<T>,
-      merge: (prev: T | null, got: T) => Merge<T>,
-    ) => {
-      if (inFlight.current.has(slot)) return;
-      inFlight.current.add(slot);
-      // 시도했다는 사실은 **호출 시점에** 남는다. 응답을 보고 정하면 빈 응답이
-      // 곧바로 재조회를 부른다(R1).
-      set((p) => ({ ...p, loading: true, attempted: true }));
-      void call()
-        .then((got) => {
-          set((p) => {
-            const m = merge(p.value, got);
-            return m.ok
-              ? { value: m.value, error: null, loading: false, attempted: true, at: Date.now() }
-              : { ...p, error: m.error, loading: false, attempted: true };
-          });
-        })
-        .catch((e) => {
-          // 값은 남기고 사유를 얹는다 — 빈 배열로 축소하면 "없음"이 되고, 그건
-          // 이 패널에서 가장 나쁜 거짓말이다.
-          set((p) => ({
-            ...p,
-            error: errText(e, "원격에서 읽지 못했습니다."),
-            loading: false,
-            attempted: true,
-          }));
-        })
-        .finally(() => {
-          inFlight.current.delete(slot);
-        });
-    },
-    [],
-  );
-
-  const replace = <T,>(_prev: T | null, got: T): Merge<T> => ({ ok: true, value: got });
+  // 갈래마다 자동 회수 원시 하나. 잠금·in-flight·세대·캐시 규칙은 전부 그 안에
+  // 있고(`autoFetch.ts`), 여기 남은 것은 **주소를 어떻게 쓰나**뿐이다.
+  const projectStore = useAutoFetch<RemoteProjects>();
+  const dirStore = useAutoFetch<RemoteDir>();
+  const statusStore = useAutoFetch<RemoteGitStatus>();
+  const logStore = useAutoFetch<RemoteGitLog>();
+  const worktreeStore = useAutoFetch<RemoteWorktrees>();
+  const rootStore = useAutoFetch<RemoteGitRoots>();
 
   const reloadProjects = useCallback(
     (refresh = false) => {
       if (!hostId) return;
-      run<RemoteProjects>("projects", setProjects, () =>
-        invoke<RemoteProjects>("remote_projects", { hostId, refresh }), replace);
+      projectStore.run({
+        key: projectsKey(hostId),
+        args: refresh ? "refresh" : "",
+        call: () => invoke<RemoteProjects>("remote_projects", { hostId, refresh }),
+      });
     },
-    [hostId, run],
+    [hostId, projectStore],
   );
 
   const loadDir = useCallback(
     (at: string, from: number) => {
       if (!hostId || !root) return;
-      run<RemoteDir>(
-        "dir",
-        setDir,
-        () =>
+      dirStore.run({
+        key: dirKey(hostId, root, at),
+        // 페이지 번호는 **인자**다 — 주소가 아니다. 여기에 두면 같은 폴더의 다음
+        // 페이지가 앞 페이지와 합쳐지지 않고(교체) 이어 붙기가 제대로 돈다.
+        args: String(from),
+        call: () =>
           invoke<RemoteDir>("remote_tree", {
             hostId,
             root,
@@ -446,53 +386,56 @@ export function useRemoteHostData(hostId: string): RemoteHostDataView {
             from,
             limit: TREE_PAGE,
           }),
-        (prev, got) => (from === 0 ? { ok: true, value: got } : appendDirPage(prev, got)),
-      );
+        merge: (prev, got) => (from === 0 ? { ok: true, value: got } : appendDirPage(prev, got)),
+      });
     },
-    [hostId, root, run],
+    [dirStore, hostId, root],
   );
 
   const openDir = useCallback(
     (at: string) => {
       if (!hostId || !root) return;
       setPath(at);
-      // `idle` 이 아니라 **시도한 채로** 비운다. 새 폴더의 첫 페이지를 기다리는
-      // 동안 자동 조회 판정이 "아직 안 읽었다"로 돌아가면, 그 판정이 사용자를
-      // 루트로 되돌려 보낸다(그리고 그 왕복이 무한히 돈다).
-      setDir({ value: null, error: null, loading: true, attempted: true, at: null });
+      // 보고 있는 폴더는 하나다 — 다른 폴더의 칸은 버린다. 버리면 **세대가 올라가**
+      // 그 폴더로 나가 있던 회수의 늦은 답이 새 폴더 아래 그려지지 않는다.
+      dirStore.retain((k) => k === dirKey(hostId, root, at));
       loadDir(at, 0);
     },
-    [hostId, loadDir, root],
+    [dirStore, hostId, loadDir, root],
   );
 
+  const dir = dirStore.get(dirKey(hostId, root, path));
+
   const moreDir = useCallback(() => {
-    const d = dir.value;
+    const d = dirStore.get(dirKey(hostId, root, path)).value;
     if (!d) return;
     loadDir(path, d.from_index + d.entries.length);
-  }, [dir.value, loadDir, path]);
+  }, [dirStore, hostId, loadDir, path, root]);
 
   const reloadDir = useCallback(() => loadDir(path, 0), [loadDir, path]);
 
   const reloadStatus = useCallback(() => {
     if (!hostId || !root) return;
-    run<RemoteGitStatus>("status", setStatus, () =>
-      invoke<RemoteGitStatus>("remote_git_status", { hostId, root }), replace);
-  }, [hostId, root, run]);
+    statusStore.run({
+      key: repoKey("status", hostId, root),
+      call: () => invoke<RemoteGitStatus>("remote_git_status", { hostId, root }),
+    });
+  }, [hostId, root, statusStore]);
 
   const loadLog = useCallback(
     (cursor: string | null) => {
       if (!hostId || !root) return;
-      run<RemoteGitLog>(
-        "log",
-        setLog,
-        () =>
-          invoke<RemoteGitLog>("remote_git_log", { hostId, root, limit: LOG_PAGE, cursor }),
-        (prev, got) => (cursor ? appendLogPage(prev, got) : { ok: true, value: got }),
-      );
+      logStore.run({
+        key: repoKey("log", hostId, root),
+        args: cursor ?? "",
+        call: () => invoke<RemoteGitLog>("remote_git_log", { hostId, root, limit: LOG_PAGE, cursor }),
+        merge: (prev, got) => (cursor ? appendLogPage(prev, got) : { ok: true, value: got }),
+      });
     },
-    [hostId, root, run],
+    [hostId, logStore, root],
   );
 
+  const log = logStore.get(repoKey("log", hostId, root));
   const reloadLog = useCallback(() => loadLog(null), [loadLog]);
   const moreLog = useCallback(() => {
     const c = log.value?.next_cursor;
@@ -501,26 +444,36 @@ export function useRemoteHostData(hostId: string): RemoteHostDataView {
 
   const reloadWorktrees = useCallback(() => {
     if (!hostId || !root) return;
-    run<RemoteWorktrees>("worktrees", setWorktrees, () =>
-      invoke<RemoteWorktrees>("remote_worktrees", { hostId, root }), replace);
-  }, [hostId, root, run]);
+    worktreeStore.run({
+      key: repoKey("worktrees", hostId, root),
+      call: () => invoke<RemoteWorktrees>("remote_worktrees", { hostId, root }),
+    });
+  }, [hostId, root, worktreeStore]);
 
   const reloadRoots = useCallback(() => {
     if (!hostId || !root) return;
-    run<RemoteGitRoots>("roots", setRoots, () =>
-      invoke<RemoteGitRoots>("remote_git_roots", { hostId, root }), replace);
-  }, [hostId, root, run]);
+    rootStore.run({
+      key: repoKey("roots", hostId, root),
+      call: () => invoke<RemoteGitRoots>("remote_git_roots", { hostId, root }),
+    });
+  }, [hostId, root, rootStore]);
 
-  /** 프로젝트를 고르면 그 아래 것들은 전부 다른 저장소의 것이 된다 — 지운다. */
-  const setRoot = useCallback((next: string) => {
-    setRootState(next);
-    setPath("");
-    setDir(idle);
-    setStatus(idle);
-    setLog(idle);
-    setWorktrees(idle);
-    setRoots(idle);
-  }, []);
+  /**
+   * 프로젝트를 고르면 그 아래 것들은 전부 다른 저장소의 것이 된다 — 버린다.
+   *
+   * 버리는 것이 곧 세대를 올리는 것이라, 앞 프로젝트로 나가 있던 조회의 늦은
+   * 답이 새 프로젝트 라벨 아래 그려지지 않는다.
+   */
+  const setRoot = useCallback(
+    (next: string) => {
+      setRootState(next);
+      setPath("");
+      for (const s of [dirStore, statusStore, logStore, worktreeStore, rootStore]) {
+        s.retain(() => false);
+      }
+    },
+    [dirStore, logStore, rootStore, statusStore, worktreeStore],
+  );
 
   // 패널을 펼치면 프로젝트 목록 한 번. 그 뒤는 사용자가 누를 때만이다.
   useEffect(() => {
@@ -528,7 +481,7 @@ export function useRemoteHostData(hostId: string): RemoteHostDataView {
   }, [reloadProjects]);
 
   return {
-    projects,
+    projects: projectStore.get(projectsKey(hostId)),
     root,
     setRoot,
     reloadProjects,
@@ -537,14 +490,14 @@ export function useRemoteHostData(hostId: string): RemoteHostDataView {
     dir,
     moreDir,
     reloadDir,
-    status,
+    status: statusStore.get(repoKey("status", hostId, root)),
     reloadStatus,
     log,
     moreLog,
     reloadLog,
-    worktrees,
+    worktrees: worktreeStore.get(repoKey("worktrees", hostId, root)),
     reloadWorktrees,
-    roots,
+    roots: rootStore.get(repoKey("roots", hostId, root)),
     reloadRoots,
   };
 }
