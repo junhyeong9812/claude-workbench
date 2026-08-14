@@ -60,6 +60,23 @@ const BACKOFF_MAX: Duration = Duration::from_secs(15);
 /// that never sends a newline holding memory forever.
 const MAX_LINE: usize = 64 * 1024 * 1024;
 
+/// How many frames may be lost **here** with no snapshot in between before the
+/// loss is treated as deterministic rather than as a blip.
+///
+/// Ending the attach on a local loss is right when the loss was a one-off: the
+/// next attach is a fresh one, its snapshot rebuilds what was missed, and the
+/// count below goes back to zero. It is exactly wrong when the byte that cannot
+/// be read is *in that snapshot*, because then every reconnect fails at the same
+/// place, having made no progress, and one turn of the loop is one SSH
+/// connection to the host — forever, at ≤15s intervals. Two of this diff's own
+/// changes can put it there (a required field on `proto::SubagentMeta`, a
+/// snapshot line over [`MAX_LINE`]), and the larger the host's state grows the
+/// more certain the second becomes.
+///
+/// So the loop gets a bound. Past it, what happens depends on what was lost —
+/// see [`consume`].
+const DETERMINISTIC_AFTER: u32 = 3;
+
 /// Bound on one short command's stdout. Also the reply collector's ring size,
 /// which is the point: this is the number the code actually enforces, and a
 /// reply that reaches it is reported as **truncated** rather than handed to the
@@ -577,10 +594,28 @@ fn consume(
         let message = format!(
             "원격 스트림의 한 줄이 너무 길어 {dropped}바이트를 버렸습니다(무엇이 들어 있었는지 알 수 없습니다)"
         );
-        state
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .on_local_loss(message.clone());
+        let losses = {
+            let mut h = state.lock().unwrap_or_else(|p| p.into_inner());
+            h.on_local_loss(message.clone());
+            h.losses_since_snapshot()
+        };
+        // …unless the rebuild has already been tried and did not work. Reading
+        // past a *drop* is not an option the way it is for an unreadable line:
+        // the length is unknown, so what is gone cannot be named, and the one
+        // thing that could rebuild it is the snapshot that keeps failing. What
+        // is left is to stop with the reason on screen, which is strictly better
+        // than an invisible loop that opens an SSH connection every few seconds
+        // and never gets anywhere. Re-connecting the host clears it.
+        if losses >= DETERMINISTIC_AFTER {
+            let reason = format!(
+                "{message}. 다시 붙어 전체 상태를 받는 것을 {DETERMINISTIC_AFTER}번 시도했지만 같은 자리에서 계속 실패합니다 — 재접속을 멈춥니다(원격 데몬 버전을 확인한 뒤 다시 연결하세요)."
+            );
+            state
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .fail(Phase::Failed, reason);
+            return Err(Ended::Fatal);
+        }
         return Err(Ended::Transient(message));
     }
     // An oversized line is deliberately *not* counted: it was dropped, no frame
@@ -602,9 +637,24 @@ fn consume(
                 // *before* the hole, so their positions still stand.
                 Err(reason) => {
                     h.on_undecodable(reason.clone());
-                    return Err(Ended::Transient(format!(
-                        "데몬이 보낸 줄을 읽지 못했습니다 — {reason}"
-                    )));
+                    if h.losses_since_snapshot() < DETERMINISTIC_AFTER {
+                        return Err(Ended::Transient(format!(
+                            "데몬이 보낸 줄을 읽지 못했습니다 — {reason}"
+                        )));
+                    }
+                    // Reconnecting has been tried and did not work: the same
+                    // line comes back on every fresh stream, so ending the
+                    // attach again buys nothing and costs an SSH connection a
+                    // second. Read past it instead — and *this* loss can be read
+                    // past, which is the whole difference from a drop above: the
+                    // line boundary is intact, so exactly one frame is missing
+                    // and everything after it is still a frame. It stays a gap
+                    // (`on_undecodable` holds the cursor, so no position past the
+                    // hole is ever committed, and the resync is still owed), the
+                    // user has been told, and the panel goes on updating from
+                    // what does decode instead of freezing behind a reconnect
+                    // that cannot succeed.
+                    Vec::new()
                 }
             }
         };
@@ -1091,6 +1141,114 @@ mod tests {
             None,
             "nothing behind the hole may commit a position — the snapshot rebuilds instead"
         );
+    }
+
+    /// A hand-built snapshot whose `subagents[0]` has no `turn` — one of the two
+    /// paths this diff opened into the loop below (`proto::SubagentMeta` made
+    /// `turn`/`total`/`completed` required, so one missing field fails the whole
+    /// `SessionSnapshot`). Anything the decoder refuses does the same thing here;
+    /// this one is written the way it would really arrive.
+    const BAD_SNAPSHOT: &str = r#"{"frame":"snapshot","cursor":"e1:9","taken_at_ms":1,"sessions":[{"key":"k1","session_id":"u1","agent":"claude","cwd":"/w","state":"exited","started_at_ms":1,"argv":[],"timeline_len":4,"items":[],"items_omitted":true,"turns":{},"subagents":[{"id":"a7","total":4,"completed":4}]}]}"#;
+
+    /// **A loss that a reconnect cannot fix must stop being reconnected for.**
+    ///
+    /// Ending the attach on an unreadable line is right once: the next attach is
+    /// a fresh one and its snapshot rebuilds what was missed. But a resync
+    /// *forces* a fresh attach, and a fresh attach opens with the whole snapshot
+    /// — so when the frame that cannot be read is the snapshot, every reconnect
+    /// fails at the same place having made no progress, at one SSH connection
+    /// per turn, forever. The bigger the host's state, the more certain that is.
+    ///
+    /// So after [`DETERMINISTIC_AFTER`] rebuilds that did not happen, the line is
+    /// read past instead. It stays a gap — the cursor is still withheld, the user
+    /// has still been told — and the link stays up.
+    #[test]
+    fn a_frame_that_never_decodes_stops_ending_the_attach_and_is_read_past() {
+        let (state, sink, _) = fresh_host();
+        let batch = format!("{HELLO}\n{BAD_SNAPSHOT}\n{SPAWNED}\n");
+
+        // Every attach is a fresh one (that is what the resync asked for), and
+        // every fresh one brings the same snapshot back.
+        for round in 1..DETERMINISTIC_AFTER {
+            let mut lines = LineReader::default();
+            let err = consume(batch.as_bytes(), &mut lines, &state, &sink).unwrap_err();
+            assert!(
+                matches!(err, Ended::Transient(_)),
+                "round {round}: the first losses must still ask for a rebuild, which is what \
+                 fixes an ordinary blip"
+            );
+        }
+
+        // The rebuild has now demonstrably not worked.
+        let mut lines = LineReader::default();
+        consume(batch.as_bytes(), &mut lines, &state, &sink)
+            .expect("the link must stay up instead of reconnecting on the same byte forever");
+
+        let h = state.lock().unwrap();
+        assert!(h.needs_resync(), "the frame is still missing — reading past it is not forgiving it");
+        assert_eq!(h.cursor(), None, "and no position past the hole may be committed");
+        assert_eq!(
+            h.snapshot().sessions.len(),
+            1,
+            "the frames after the unreadable one are frames: reading them is what keeps the \
+             panel alive while the gap stands"
+        );
+        assert!(h.snapshot().notices.iter().any(|n| n.message.contains("읽지 못했습니다")));
+    }
+
+    /// The same bound for a line that was **dropped** — but the other answer.
+    ///
+    /// A drop has no length: what was in it cannot be named, and unlike an
+    /// unreadable line there is no intact frame boundary to read past to a known
+    /// state. The only thing that could rebuild it is the snapshot that keeps
+    /// failing. So the link stops and says why, which is what an operator can act
+    /// on, instead of opening an SSH connection every few seconds to make the
+    /// same discovery. (A snapshot line over `MAX_LINE` is the reachable case,
+    /// and it grows *more* likely as the host's state grows.)
+    #[test]
+    fn a_line_too_long_to_read_that_comes_back_every_time_stops_the_retry_loop() {
+        let (state, sink, _) = fresh_host();
+        let monster = vec![b'x'; MAX_LINE + 1];
+
+        for round in 1..DETERMINISTIC_AFTER {
+            let mut lines = LineReader::default();
+            consume(format!("{HELLO}\n").as_bytes(), &mut lines, &state, &sink).expect("hello");
+            let err = consume(&monster, &mut lines, &state, &sink).unwrap_err();
+            assert!(matches!(err, Ended::Transient(_)), "round {round}: a first drop is retried");
+        }
+
+        let mut lines = LineReader::default();
+        consume(format!("{HELLO}\n").as_bytes(), &mut lines, &state, &sink).expect("hello");
+        let err = consume(&monster, &mut lines, &state, &sink).unwrap_err();
+        assert!(
+            matches!(err, Ended::Fatal),
+            "a drop that survives every rebuild must stop the loop, not feed it: {err:?}"
+        );
+
+        let h = state.lock().unwrap();
+        assert_eq!(h.phase(), Phase::Failed, "a stopped link must not look like a connecting one");
+        let last = h.snapshot().last_error.expect("the reason is on screen");
+        assert!(last.contains("재접속을 멈춥니다"), "{last}");
+    }
+
+    /// …and a rebuild that **works** clears the count, so an unlucky host does
+    /// not accumulate its way to a stop over hours of ordinary blips.
+    #[test]
+    fn a_snapshot_that_arrives_puts_the_loss_count_back_to_zero() {
+        let (state, sink, _) = fresh_host();
+        let good_snapshot = r#"{"frame":"snapshot","cursor":"e1:9","taken_at_ms":1,"sessions":[]}"#;
+
+        for _ in 0..(DETERMINISTIC_AFTER * 3) {
+            let mut lines = LineReader::default();
+            let batch = format!("{HELLO}\n{good_snapshot}\nthis-is-not-json\n");
+            let err = consume(batch.as_bytes(), &mut lines, &state, &sink).unwrap_err();
+            assert!(
+                matches!(err, Ended::Transient(_)),
+                "each of these losses was fixed by the rebuild that followed it, so each is a \
+                 blip and must go on being retried"
+            );
+        }
+        assert_eq!(state.lock().unwrap().losses_since_snapshot(), 1);
     }
 
     #[test]

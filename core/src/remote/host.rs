@@ -484,6 +484,9 @@ pub struct Host {
     /// set the cursor is neither handed out nor advanced — see
     /// [`Self::on_local_loss`].
     resync_required: bool,
+    /// How many frames have been lost **here** since a snapshot last rebuilt
+    /// this state. See [`Self::losses_since_snapshot`].
+    losses_since_snapshot: u32,
     resume: Option<ResumeOutcome>,
     last_error: Option<String>,
     attempts: u32,
@@ -518,6 +521,7 @@ impl Host {
             epoch: None,
             cursor: None,
             resync_required: false,
+            losses_since_snapshot: 0,
             resume: None,
             last_error: None,
             attempts: 0,
@@ -733,6 +737,7 @@ impl Host {
     pub fn on_local_loss(&mut self, message: impl Into<String>) {
         let message = message.into();
         self.resync_required = true;
+        self.losses_since_snapshot = self.losses_since_snapshot.saturating_add(1);
         self.resume = Some(ResumeOutcome::Gap { message: message.clone() });
         self.push_notice(
             NoticeLevel::Warn,
@@ -745,6 +750,22 @@ impl Host {
     /// rebuild. While it is `true` the cursor is not handed out and not moved.
     pub fn needs_resync(&self) -> bool {
         self.resync_required
+    }
+
+    /// How many frames have been lost **here** since a snapshot last rebuilt
+    /// this state — reset by [`Self::on_snapshot`] and by nothing else.
+    ///
+    /// This is how a blip is told from a **deterministic** loss, and the
+    /// difference decides whether reconnecting is a fix or a treadmill. A resync
+    /// makes the next attach a fresh one, and a fresh attach opens with the whole
+    /// snapshot; so if the byte that could not be read lives *in that snapshot*,
+    /// every reconnect fails at the same place, having made no progress, at the
+    /// cost of one SSH connection per turn — and the bigger the host's state
+    /// grows, the more certain that becomes. A count that only a rebuilt world
+    /// clears is exactly the signal for "reconnecting has been tried and did not
+    /// work"; the transport reads it in `link::consume`.
+    pub fn losses_since_snapshot(&self) -> u32 {
+        self.losses_since_snapshot
     }
 
     fn report_unknown(&mut self, tag: String, message: String) {
@@ -902,8 +923,11 @@ impl Host {
         self.sessions = kept;
         // A snapshot **is** the resync: it carries the whole world, so whatever
         // was lost locally is either back or gone on the daemon too, and the
-        // position it comes with is trustworthy again.
+        // position it comes with is trustworthy again. It is also the only thing
+        // that can say a reconnect *worked*, which is why the loss count starts
+        // over here and nowhere else.
         self.resync_required = false;
+        self.losses_since_snapshot = 0;
         self.advance_cursor(&s.cursor);
         out
     }
