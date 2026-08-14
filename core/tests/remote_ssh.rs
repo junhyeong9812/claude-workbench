@@ -528,7 +528,7 @@ fn a_dropped_connection_resumes_with_no_gap_while_the_host_keeps_working() {
         Some(first.id)
     );
 
-    registry.detach_all();
+    registry.detach("e2e");
 }
 
 /// When the daemon's ring moves past our cursor, the loss is **stated** and the
@@ -583,7 +583,7 @@ fn an_evicted_cursor_is_reported_and_the_screen_is_rebuilt() {
     })
     .expect("the snapshot after a gap must rebuild the list");
 
-    registry.detach_all();
+    registry.detach("gap");
 }
 
 /// A host whose "daemon" is a shell script — everything on the workbench side is
@@ -863,7 +863,13 @@ printf '","sessions":[]}\n'"#,
 }
 
 /// A line this workbench cannot read must not stop the stream in silence: the
-/// bad line is named and the loop keeps going.
+/// bad line is named, the attach ends, and the loop comes back for a **fresh**
+/// stream rather than resuming past the hole (R9 — a lost line may have been a
+/// snapshot, and a resumed cursor tells the daemon it was delivered).
+///
+/// A frame *kind* from a newer daemon is a different thing and keeps its old
+/// behaviour: it decodes, so nothing was lost, and the stream reads on. Hence
+/// the order the script prints them in.
 #[test]
 #[ignore = "needs an SSH server: run with the other tests in this file"]
 fn a_stream_of_nonsense_is_reported_and_retried() {
@@ -874,12 +880,13 @@ fn a_stream_of_nonsense_is_reported_and_retried() {
     let port = start_ssh_server();
     learn_key(&dir, port);
 
-    // The two ways a stream goes wrong: a line that is not a frame at all, and
-    // a frame kind from a newer daemon.
+    // The two ways a stream goes wrong: a frame kind from a newer daemon (read,
+    // reported, read on) and a line that is not a frame at all (loss — the
+    // attach ends there, so it is printed last).
     let script = dir.join("junk.sh");
     std::fs::write(
         &script,
-        "#!/bin/sh\nprintf 'not json\\n{\"frame\":\"usage_delta\"}\\n'\n",
+        "#!/bin/sh\nprintf '{\"frame\":\"usage_delta\"}\\nnot json\\n'\n",
     )
     .expect("script");
     #[cfg(unix)]
@@ -908,7 +915,92 @@ fn a_stream_of_nonsense_is_reported_and_retried() {
         messages.iter().any(|m| m.contains("usage_delta")),
         "a frame kind from the future must be named: {messages:?}"
     );
+    assert!(
+        messages.iter().any(|m| m.contains("전체 상태를 다시 받습니다")),
+        "an unreadable line must ask to be rebuilt, not be shrugged off: {messages:?}"
+    );
+    assert_eq!(
+        s.cursor, None,
+        "no position may be handed back while a resync is owed: {:?}",
+        s.cursor
+    );
     drop(link);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// **A frame this workbench cannot read must not become an endless reconnect.**
+///
+/// The test above prints its junk once, so the attach ends because the command
+/// ended — which is why it never showed this. Here the script says the same thing
+/// on *every* connection, which is what a real daemon does: an unreadable line
+/// makes the workbench owe a resync, a resync forces the next attach to be a
+/// fresh one, and a fresh attach opens with the whole snapshot. So if the frame
+/// that cannot be read is the snapshot, every reconnect fails at the same place
+/// having made no progress — and one turn of that loop is one SSH connection to
+/// the host, forever, on a state that only grows more likely to trigger it.
+///
+/// The snapshot here is short one required field (`subagents[0].turn`), which is
+/// one of the two ways this became reachable.
+#[test]
+#[ignore = "needs an SSH server: run with the other tests in this file"]
+fn a_snapshot_that_never_decodes_is_read_past_instead_of_reconnected_forever() {
+    let (dir, port) = scratch("badsnap");
+    // Every connection: the same hello, the same unreadable snapshot, then the
+    // channel held open the way a real `cwcd stream` holds it.
+    let script = write_script(
+        &dir,
+        "badsnap.sh",
+        r#"printf '{"frame":"hello","protocol":2,"daemon_version":"0.1.0","host":{"host_id":"h","hostname":"box","user":"u","os":"linux"},"epoch":"e1","resume":{"kind":"fresh"},"oldest_seq":1,"next_seq":1}\n'
+printf '{"frame":"snapshot","cursor":"e1:9","taken_at_ms":1,"sessions":[{"key":"k1","session_id":"u1","agent":"claude","cwd":"/w","state":"exited","started_at_ms":1,"argv":[],"timeline_len":4,"items":[],"items_omitted":true,"turns":{},"subagents":[{"id":"a7","total":4,"completed":4}]}]}\n'
+sleep 600"#,
+    );
+    let link = core_lib::remote::Link::start(
+        script_config(
+            &dir,
+            port,
+            "badsnap",
+            &script,
+            LinkTimeouts {
+                // Long, so that what this test measures is the reconnect loop and
+                // not the staleness watchdog: the peer is deliberately quiet
+                // after its two lines.
+                stale_after: Duration::from_secs(300),
+                ..LinkTimeouts::default()
+            },
+        ),
+        Arc::new(RecordingSink::default()),
+    );
+
+    // The first losses are still retried — that is what fixes an ordinary blip.
+    wait_for(Duration::from_secs(30), || link.snapshot().attempts >= 3)
+        .expect("an unreadable frame must be retried a few times first");
+    let settled = link.snapshot().attempts;
+
+    // …and then it stops. Ten seconds is a dozen turns of a loop whose backoff
+    // resets on every hello (this peer says hello every time, so it never grows).
+    std::thread::sleep(Duration::from_secs(10));
+    let s = link.snapshot();
+    assert!(
+        s.attempts <= settled + 1,
+        "the link is still reconnecting on the same byte: {settled} attempts, then {} ten \
+         seconds later — every one of them a new SSH connection to the host",
+        s.attempts
+    );
+    assert_eq!(
+        s.phase,
+        Phase::Live,
+        "reading past the frame must leave the link up, not parked in a retry"
+    );
+    // Read past, not forgiven: the frame is still missing, so no position may be
+    // handed back, and the user has been told which line it was.
+    assert_eq!(s.cursor, None, "no position past the hole may be resumed from");
+    assert!(
+        s.notices.iter().any(|n| n.message.contains("읽지 못했습니다")),
+        "the unreadable frame must still be named: {:?}",
+        s.notices.iter().map(|n| &n.message).collect::<Vec<_>>()
+    );
+
+    link.stop();
     let _ = std::fs::remove_dir_all(&dir);
 }
 

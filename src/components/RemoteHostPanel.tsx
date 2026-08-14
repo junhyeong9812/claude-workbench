@@ -38,6 +38,7 @@ import {
   countsLabel,
   defaultAccountId,
   endedReason,
+  itemCutNote,
   killGate,
   killLabel,
   noticeBadge,
@@ -47,30 +48,61 @@ import {
   resumeLabel,
   seenKey,
   seenSeqOf,
+  sessionCountNote,
   nextRemoteResize,
+  sessionBodyKey,
+  shouldAutoFetchBody,
   shouldFetchBody,
   spawnRequest,
   staleSeenKeys,
+  subagentBodyKey,
+  subagentLabel,
+  turnMetaLabel,
   useRemoteHosts,
   KILL_SIGNAL,
   REMOTE_RESIZE_DEBOUNCE_MS,
   SPAWN_AGENTS,
+  subagentFreshnessNote,
   type ControlGate,
   type RemoteAccount,
   type RemoteHostSnapshot,
   type RemoteLiveTimeline,
   type RemoteSessionMeta,
+  type RemoteSubagentFrame,
   type RemoteTerminalEnded,
   type TermSize,
 } from "../state/remoteHosts";
+import { shouldAutoFetch, type AutoFetch, type Fetched } from "../state/autoFetch";
+import {
+  dirCutNote,
+  dirHasMore,
+  logCutNote,
+  logHasMore,
+  parentPath,
+  relPath,
+  rootsCutNote,
+  staleNote,
+  useRemoteHostData,
+  GIT_ROOTS_CAVEAT,
+  type RemoteDataTab,
+  type RemoteHostDataView,
+} from "../state/remoteHostData";
 import { decodePtyData, ptyEventName, pushPendingCapped } from "./pty";
 import { errText } from "../utils/error";
 import { xtermTheme } from "./xtermTheme";
-import type { SnapshotResult, TerminalOutputEvent } from "../types";
+import type { SnapshotResult, TerminalOutputEvent, TimelineItem } from "../types";
 import { AGENT_BADGE, KIND_LABEL } from "./TimelineView";
 
 /** 한 세션 아래에 한 번에 그리는 최근 아이템 수 — 사이드바 폭에 맞춘 상한. */
 const ITEM_ROWS = 12;
+
+/**
+ * 열린 터미널의 종료 사유를 다시 묻는 간격.
+ *
+ * 호스트 목록과 같은 주기다(둘 다 이 패널이 열려 있는 동안만 돈다). SSH 왕복이
+ * 아니라 **앱 안의 상태 조회**라 값이 싸고, 답이 오면 그 즉시 멈춘다.
+ */
+const ENDED_POLL_MS = 700;
 
 function ts(ms: number): string {
   if (!ms) return "";
@@ -101,7 +133,20 @@ interface AttachedTerm {
 
 export function RemoteHostPanel() {
   const connections = useAppStore((s) => s.savedConnections);
-  const { hosts, live, fetched, fetching, fetchError, fetchBody, refresh } = useRemoteHosts();
+  const {
+    hosts,
+    live,
+    bodies,
+    agentBodies,
+    hostsError,
+    hostsAt,
+    streamError,
+    seedError,
+    fetchBody,
+    fetchSubagentBody,
+    retryStream,
+    refresh,
+  } = useRemoteHosts();
   const [connecting, setConnecting] = useState(false);
   const [pick, setPick] = useState<string>("");
   const [cwcd, setCwcd] = useState("");
@@ -129,13 +174,70 @@ export function RemoteHostPanel() {
   const putTerm = useCallback((t: AttachedTerm | null) => {
     termRef.current = t;
     setTerm(t);
+    // 사유는 **그 터미널의 것**이다. 다음 터미널이 앞 터미널의 종료 사유를 달고
+    // 열리면 살아 있는 세션이 죽은 것처럼 보인다.
+    setEnded(null);
+    setEndedError(null);
   }, []);
   /** attach 세대 — 왕복 중에 다른 attach 나 닫기가 끼어들었는지. */
   const attachSeq = useRef(0);
-  // 패널이 사라질 때 SSH exec 채널을 남기지 않는다. **원격 세션은 죽지 않는다** —
-  // 닫는 것은 이 관찰 창(로컬 세션)뿐이고, 에이전트는 데몬이 계속 소유한다.
+
+  /**
+   * 지금 열려 있는 터미널이 멈춘 이유 — **물어서** 안다.
+   *
+   * 이것이 이벤트였을 때(`remote-terminal-ended`) 두 가지가 걸렸다. 하나는 계약:
+   * R2a ④ 는 새 프론트 이벤트 종류를 금지하고, 대응하는 이벤트가 없는 상태는
+   * 스냅샷 조회로 만든다(`remote_hosts` 가 그것이다). 다른 하나는 결함: Tauri
+   * 이벤트에는 replay 가 없어 **구독보다 먼저** 발행된 사유가 영구 유실됐고,
+   * connect/auth/exec 이 빨리 실패하면 그게 정확히 일어났다 — 화면에는 조용한
+   * 검은 상자만 남는다. 구독을 패널 마운트로 끌어올려 창을 좁혔지만 창은 남았다
+   * (패널이 언마운트된 사이에 온 사유).
+   *
+   * 상태로 두면 **늦게 읽어도 읽힌다**: 백엔드가 기록해 두고 여기서 물어본다.
+   * 그래서 순서를 맞출 일이 없고 창도 없다. 값이 오면 폴링은 멈춘다(끝난 이유는
+   * 두 번 바뀌지 않는다).
+   */
+  const [ended, setEnded] = useState<string | null>(null);
+  const [endedError, setEndedError] = useState<string | null>(null);
+  const termId = term?.localId ?? null;
+  useEffect(() => {
+    if (termId == null || ended != null) return;
+    let alive = true;
+    const ask = () => {
+      invoke<RemoteTerminalEnded | null>("remote_terminal_end", { id: termId })
+        .then((e) => {
+          if (!alive) return;
+          setEndedError(null);
+          // 백엔드가 **첫 사유**를 지킨다(떼기 사유가 뒤따르는 "연결이
+          // 끊어졌습니다"에 덮이지 않는다) — 여기서는 온 것을 그대로 쓴다.
+          if (e) setEnded(endedReason(e));
+        })
+        .catch((err) => {
+          // 못 물어봤다는 사실 자체를 말한다. 조용히 두면 이 경로가 없애려던
+          // 그 화면(사유 없는 검은 상자)이 그대로 돌아온다(R18).
+          if (alive) setEndedError(errText(err, "종료 사유를 읽지 못했습니다."));
+        });
+    };
+    ask();
+    const t = window.setInterval(ask, ENDED_POLL_MS);
+    return () => {
+      alive = false;
+      window.clearInterval(t);
+    };
+  }, [termId, ended]);
+  /**
+   * 패널이 사라질 때 SSH exec 채널을 남기지 않는다. **원격 세션은 죽지 않는다** —
+   * 닫는 것은 이 관찰 창(로컬 세션)뿐이고, 에이전트는 데몬이 계속 소유한다.
+   *
+   * ref 를 닫는 것만으로는 부족하다: `터미널` 을 누르고 **바로** 탭을 옮기면
+   * 여기는 아직 빈 ref 를 보고 지나가고, 뒤늦게 도착한 `remote_attach` 가 ref 를
+   * 채운다 — 닫을 코드는 이미 지나간 뒤라 그 SSH exec 채널과 원격 attach 는
+   * 세션이 끝날 때까지 남는다(데몬 쪽 연결 슬롯도 같이). 그래서 **언마운트도
+   * 세대를 올린다** — 늦게 온 attach 는 자기가 진 것을 알고 스스로 닫는다.
+   */
   useEffect(
     () => () => {
+      attachSeq.current += 1;
       const t = termRef.current;
       if (t) invoke("terminal_close", { id: t.localId }).catch(() => {});
     },
@@ -151,6 +253,9 @@ export function RemoteHostPanel() {
     attachSeq.current += 1;
     const t = termRef.current;
     if (t) invoke("terminal_close", { id: t.localId }).catch(() => {});
+    // 사유는 `putTerm` 이 함께 치운다. 백엔드의 기록은 남지만 상한이 있고
+    // (`ENDED_CAP`), 남아 있는 편이 낫다 — 같은 터미널을 다시 열 수는 없어도
+    // 패널을 닫았다 연 사용자는 그 사유를 다시 물을 수 있다.
     putTerm(null);
   }, [putTerm]);
 
@@ -165,6 +270,9 @@ export function RemoteHostPanel() {
       // 끝날 때까지 남는다.
       const mine = ++attachSeq.current;
       try {
+        // 사유 구독을 먼저 걸어 두는 순서 맞추기가 여기 있었다. 이제 사유는
+        // 기록돼 있고 열린 뒤에 물어보므로, attach 보다 먼저 끝난 터미널도
+        // 첫 조회에서 그대로 읽힌다.
         // 처음 크기는 짐작이고, 첫 정착 크기가 곧바로 로컬·원격 양쪽을 고친다.
         const localId = await invoke<number>("remote_attach", {
           hostId,
@@ -310,6 +418,37 @@ export function RemoteHostPanel() {
             </button>
           </div>
         ) : null}
+        {hostsError ? (
+          <div className="claudeterm-refine-note" role="alert">
+            호스트 목록을 읽지 못했습니다 — {hostsError}
+            {hostsAt ? ` (마지막으로 읽은 시각 ${ts(hostsAt)} — 아래 내용은 그때 것입니다)` : ""}
+            <button type="button" className="remote-fetch" onClick={refresh}>
+              다시 시도
+            </button>
+          </div>
+        ) : null}
+        {streamError ? (
+          <div className="claudeterm-refine-note" role="alert">
+            원격 이벤트를 받지 못하고 있습니다 — {streamError}
+            <button type="button" className="remote-fetch" onClick={retryStream}>
+              다시 시도
+            </button>
+          </div>
+        ) : null}
+        {seedError ? (
+          <div className="claudeterm-refine-note" role="alert">
+            지금 상태를 받아오지 못했습니다 — {seedError} (끝난 세션은 이벤트를 내지 않으므로 이대로면
+            빈 화면입니다)
+            <button type="button" className="remote-fetch" onClick={retryStream}>
+              다시 시도
+            </button>
+          </div>
+        ) : null}
+        {endedError ? (
+          <div className="claudeterm-refine-note" role="alert">
+            원격 터미널이 멈춘 이유를 읽지 못했습니다 — {endedError}
+          </div>
+        ) : null}
         {connections.length === 0 ? (
           <p className="remote-empty">
             저장된 SSH 연결이 없습니다. 터미널 ＋ 메뉴에서 SSH로 한 번 접속해 두면 여기에 나옵니다
@@ -326,10 +465,12 @@ export function RemoteHostPanel() {
             key={h.host_id}
             host={h}
             live={live}
-            fetched={fetched}
-            fetching={fetching}
-            fetchError={fetchError}
+            bodies={bodies}
             onFetch={(id) => fetchBody(h.host_id, id)}
+            subs={{
+              of: (id, f) => agentBodies.get(subagentBodyKey(h.host_id, id, f.id)),
+              fetch: (id, f) => fetchSubagentBody(h.host_id, id, f),
+            }}
             seenSeq={seenSeqOf(h, seen)}
             onSeen={() =>
               setSeen((s) => ({
@@ -356,6 +497,7 @@ export function RemoteHostPanel() {
           remoteId={term.remoteId}
           localId={term.localId}
           sessionKey={term.sessionKey}
+          ended={ended}
           onClose={closeTerm}
         />
       ) : null}
@@ -366,10 +508,9 @@ export function RemoteHostPanel() {
 function HostCard({
   host,
   live,
-  fetched,
-  fetching,
-  fetchError,
+  bodies,
   onFetch,
+  subs,
   seenSeq,
   onSeen,
   openIds,
@@ -384,10 +525,10 @@ function HostCard({
 }: {
   host: RemoteHostSnapshot;
   live: Map<number, RemoteLiveTimeline>;
-  fetched: Map<number, RemoteLiveTimeline>;
-  fetching: ReadonlySet<number>;
-  fetchError: Record<number, string>;
+  /** 회수해 둔 세션 본문 전체 — 이 카드는 자기 세션의 칸만 꺼내 쓴다. */
+  bodies: AutoFetch<RemoteLiveTimeline>;
   onFetch: (id: number) => void;
+  subs: SubagentAccess;
   seenSeq: number;
   onSeen: () => void;
   openIds: Record<number, boolean>;
@@ -405,6 +546,23 @@ function HostCard({
   const resume = resumeLabel(host.resume);
   const age = ageLabel(host.last_frame_at_ms);
   const [spawning, setSpawning] = useState(false);
+  const [showData, setShowData] = useState(false);
+  /**
+   * "호스트에 직접 물어본" 결과 한 줄 — 사용자가 누를 때만 나간다.
+   *
+   * 폴링에 얹지 않는다: 스트림 밖의 SSH 왕복이라, 자동으로 돌면 R1 이 실측한
+   * "화면은 멀쩡한데 원격 sshd 에 연결이 계속 나가는" 모양을 그대로 되만든다.
+   */
+  const [ask, setAsk] = useState<{ busy: boolean; note: string | null }>({
+    busy: false,
+    note: null,
+  });
+  const askHost = () => {
+    setAsk({ busy: true, note: null });
+    invoke<number>("remote_sessions", { hostId: host.host_id })
+      .then((n) => setAsk({ busy: false, note: sessionCountNote(n, host.sessions.length) }))
+      .catch((e) => setAsk({ busy: false, note: errText(e, "호스트에 묻지 못했습니다.") }));
+  };
   return (
     <section className="remote-host">
       <header className="remote-host-head">
@@ -417,18 +575,39 @@ function HostCard({
         <button
           type="button"
           className="remote-new"
+          onClick={() => setShowData((v) => !v)}
+          title="이 호스트의 프로젝트·파일트리·Git·워크트리를 봅니다 (읽기 전용)"
+          aria-expanded={showData}
+        >
+          {showData ? "데이터 접기" : "데이터"}
+        </button>
+        <button
+          type="button"
+          className="remote-new"
           onClick={() => setSpawning((v) => !v)}
           title="이 호스트에서 에이전트를 새로 띄웁니다"
           aria-expanded={spawning}
         >
           {spawning ? "새 세션 접기" : "새 세션"}
         </button>
+        <button
+          type="button"
+          className="remote-new"
+          onClick={askHost}
+          disabled={ask.busy}
+          title="스트림을 거치지 않고 데몬에 세션 수를 직접 묻습니다 — 화면이 뒤처졌는지 확인용"
+        >
+          {ask.busy ? "묻는 중…" : "호스트에 확인"}
+        </button>
         <button type="button" onClick={onDisconnect} title="이 호스트에서 떼기">
           떼기
         </button>
       </header>
 
+      {ask.note ? <div className="remote-host-meta">{ask.note}</div> : null}
+
       {spawning ? <NewSessionForm hostId={host.host_id} onSpawned={onSpawned} /> : null}
+      {showData ? <RemoteDataPanel hostId={host.host_id} /> : null}
 
       <div className="remote-host-meta">
         {host.daemon ? (
@@ -482,10 +661,9 @@ function HostCard({
             key={s.id}
             s={s}
             live={live.get(s.id)}
-            fetched={fetched.get(s.id)}
-            fetching={fetching.has(s.id)}
-            fetchError={fetchError[s.id]}
+            body={bodies.get(sessionBodyKey(host.host_id, s.id))}
             onFetch={() => onFetch(s.id)}
+            subs={subs}
             open={!!openIds[s.id]}
             onToggle={() => onToggle(s.id)}
             busy={!!busy[s.id]}
@@ -503,10 +681,9 @@ function HostCard({
 function SessionRow({
   s,
   live,
-  fetched,
-  fetching,
-  fetchError,
+  body,
   onFetch,
+  subs,
   open,
   onToggle,
   busy,
@@ -517,10 +694,10 @@ function SessionRow({
 }: {
   s: RemoteSessionMeta;
   live: RemoteLiveTimeline | undefined;
-  fetched: RemoteLiveTimeline | undefined;
-  fetching: boolean;
-  fetchError: string | undefined;
+  /** 회수해 둔 이 세션의 본문 한 칸 — 값·오류·진행·시도가 함께 있다. */
+  body: Fetched<RemoteLiveTimeline>;
   onFetch: () => void;
+  subs: SubagentAccess;
   open: boolean;
   onToggle: () => void;
   busy: boolean;
@@ -530,25 +707,39 @@ function SessionRow({
   onKill: () => void;
   onAttach: () => void;
 }) {
-  const shown = pickTimeline(live, fetched);
+  const shown = pickTimeline(live, body.value ?? undefined);
+  const fetching = body.loading;
+  const fetchError = body.error;
   const items = shown?.items ?? [];
   const turns = shown?.turns ?? [];
   // 턴 → 답변. 데몬은 R2b 부터 이것을 실어 보내는데 화면이 버리고 있었다 —
   // 그래서 "로컬과 같은 내용"이라던 원격 타임라인에 질문만 있었다.
   const answers = new Map(shown?.answers ?? []);
+  // 날짜·턴별 토큰도 마찬가지였다 — payload 에 실려 상태까지 들어왔는데 그리는
+  // 곳이 없었다(R7). 그려야 로컬 타임라인과 "같은 내용"이 된다.
+  const dates = new Map(shown?.dates ?? []);
+  const tokens = new Map(shown?.tokens ?? []);
+  // 메타만 온다 — 본문은 각 행이 펼칠 때 청구한다(deferred hydration).
+  const subagents = shown?.subagents ?? [];
   const model = shown?.model ?? s.model;
   const ctx = shown?.ctxTokens ?? s.ctx_tokens;
   const recoverable = shouldFetchBody(s, shown);
+  // 자동 회수는 **세션당 한 번**이다. 회수가 성공했는데 본문이 비면(끝났지만
+  // 아무것도 하지 않은 세션) `recoverable` 은 계속 true 라, "내용이 비었나"로
+  // 재시도를 정하면 effect 가 무한히 재발화하며 매 회차가 새 SSH 연결이 된다.
+  // 판정의 축은 내용이 아니라 **시도**다(R1).
+  const autoFetch = shouldAutoFetchBody(s, shown, body);
 
-  // 펼치면 가져온다. 데몬은 끝난 세션의 본문을 스냅샷에 싣지 않고
+  // 펼치면 한 번 가져온다. 데몬은 끝난 세션의 본문을 스냅샷에 싣지 않고
   // (`items_omitted`) 앞으로도 이벤트를 내지 않으므로, 자동 조회가 없으면
   // 사용자는 "따로 가져올 수 있습니다"라는 문장만 읽고 아무것도 못 본다.
   // 보관 기간이 지나면 데몬이 NotFound 로 답하고, 그 사유가 화면에 뜬다.
+  // 그 뒤의 재시도는 아래 버튼 — 사용자가 누를 때만 나간다.
   useEffect(() => {
-    if (open && recoverable && !fetching && fetchError === undefined) onFetch();
+    if (open && autoFetch) onFetch();
     // onFetch 는 호출마다 새 클로저라 의존성에서 뺀다(넣으면 매 렌더 재조회).
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [open, recoverable, fetching, fetchError]);
+  }, [open, autoFetch]);
 
   return (
     <li className={`remote-session${s.closed ? " remote-session-closed" : ""}`}>
@@ -580,7 +771,7 @@ function SessionRow({
       {open ? (
         <div className="remote-timeline">
           {fetching ? <p className="remote-empty">원격에서 본문을 가져오는 중…</p> : null}
-          {fetchError ? (
+          {fetchError !== null ? (
             <p className="remote-empty">
               본문을 가져오지 못했습니다 — {fetchError}
               <button type="button" className="remote-fetch" onClick={onFetch}>
@@ -596,33 +787,504 @@ function SessionRow({
               </button>
             </p>
           ) : null}
-          {turns.map(([n, text]) => (
-            <Fragment key={`t${n}`}>
-              <p className="remote-turn">
-                <span className="remote-turn-no">Q{n}</span>
-                {text}
-              </p>
-              {answers.has(n) ? (
-                <p className="remote-answer">
-                  <span className="remote-turn-no">A{n}</span>
-                  {answers.get(n)}
+          {turns.map(([n, text]) => {
+            const meta = turnMetaLabel(n, dates, tokens);
+            return (
+              <Fragment key={`t${n}`}>
+                <p className="remote-turn">
+                  <span className="remote-turn-no">Q{n}</span>
+                  {text}
                 </p>
-              ) : null}
-            </Fragment>
-          ))}
+                {answers.has(n) ? (
+                  <p className="remote-answer">
+                    <span className="remote-turn-no">A{n}</span>
+                    {answers.get(n)}
+                  </p>
+                ) : null}
+                {meta ? <p className="remote-turn-meta">{meta}</p> : null}
+              </Fragment>
+            );
+          })}
           {items.slice(-ITEM_ROWS).map((it) => (
-            <p key={it.tool_call_id} className="remote-item">
-              <span className="remote-kind">{KIND_LABEL[it.kind] ?? "·"}</span>
-              <span className="remote-item-title">{it.title}</span>
-              <span className="remote-item-status">{AGENT_BADGE[it.agent_status] ?? ""}</span>
-            </p>
+            <ItemLines key={it.tool_call_id} it={it} />
           ))}
+          <CutNote note={itemCutNote(items.length, ITEM_ROWS)} />
+          {subagents.length > 0 ? (
+            <div className="remote-subagents">
+              <p className="remote-subagents-head">서브에이전트 {subagents.length}</p>
+              {subagents.map((f) => (
+                <SubagentRow key={f.id} sessionId={s.id} f={f} subs={subs} />
+              ))}
+            </div>
+          ) : null}
           {items.length === 0 && turns.length === 0 && !recoverable && !fetching ? (
             <p className="remote-empty">아직 받은 타임라인이 없습니다.</p>
           ) : null}
         </div>
       ) : null}
     </li>
+  );
+}
+
+/**
+ * 조회 하나의 실패·낡음을 말하는 줄. 값은 남기고 사유를 얹는다.
+ *
+ * 앞 슬라이스가 `hostsError`/`hostsAt` 으로 세운 결 그대로다: 실패를 빈 값으로
+ * 축소하면 화면은 "없음"을 정직한 답으로 보이고, 아무도 계약이 깨진 줄 모른다.
+ */
+function LoadNote({ of, onRetry }: { of: Fetched<unknown>; onRetry: () => void }) {
+  if (!of.error) return null;
+  const stale = staleNote(of);
+  return (
+    <div className="claudeterm-refine-note" role="alert">
+      원격에서 읽지 못했습니다 — {of.error}
+      {stale ? ` (${stale})` : ""}
+      <button type="button" className="remote-fetch" onClick={onRetry}>
+        다시 시도
+      </button>
+    </div>
+  );
+}
+
+/**
+ * 항목 한 줄 + 그 본문. 세션 타임라인과 서브에이전트 본문이 **같은 것을 같게**
+ * 보여야 하므로 한 곳에 둔다 — 한쪽만 제목으로 남으면 그게 R7 이다.
+ */
+function ItemLines({ it }: { it: TimelineItem }) {
+  return (
+    <>
+      <p className="remote-item">
+        <span className="remote-kind">{KIND_LABEL[it.kind] ?? "·"}</span>
+        <span className="remote-item-title">{it.title}</span>
+        <span className="remote-item-status">{AGENT_BADGE[it.agent_status] ?? ""}</span>
+      </p>
+      {it.content_text ? (
+        <p className="remote-item-body">
+          {it.content_text}
+          {it.content_truncated ? (
+            // 원격 아이템에는 `claude_item_detail` 같은 원문 주소가 아직 없다 —
+            // 그래서 잘림은 **말로만** 갚는다. 말이 없으면 사용자는 잘린 본문을
+            // 전부라고 읽는다.
+            <span className="remote-item-cut"> …여기서 잘렸습니다</span>
+          ) : null}
+        </p>
+      ) : null}
+    </>
+  );
+}
+
+/**
+ * 서브에이전트 본문에 닿는 길 — **주소 하나에 칸 하나**({@link subagentBodyKey}).
+ *
+ * 값·오류·진행·시도가 한 칸에 함께 있다(`Fetched`). 앞 판은 그 넷이 서로 다른
+ * 네 컬렉션에 흩어져 있었고 키에는 파일 서명이 들어 있었다 — 그래서 돌고 있는
+ * 에이전트의 델타마다 칸이 통째로 새로 생겼다(L2-2).
+ */
+interface SubagentAccess {
+  of: (id: number, f: RemoteSubagentFrame) => Fetched<TimelineItem[]>;
+  fetch: (id: number, f: RemoteSubagentFrame) => void;
+}
+
+/**
+ * 한 서브에이전트 — 접혀 있으면 메타만, 펼치면 본문을 **한 번** 당겨 온다.
+ *
+ * 로컬의 완료 프레임과 같은 모양이다: payload 는 진행도·상태만 싣고, 본문은
+ * 사용자가 실제로 볼 때 조회한다. 다른 점은 그 조회가 SSH 왕복이라는 것뿐이고,
+ * 그래서 자동 회수의 축이 내용이 아니라 **시도**여야 한다 — 내용 기준으로
+ * 쓰면 빈 본문이 effect 를 영원히 재발화시킨다(R1 실측: 5초에 1,400회 이상).
+ */
+function SubagentRow({
+  sessionId,
+  f,
+  subs,
+}: {
+  sessionId: number;
+  f: RemoteSubagentFrame;
+  subs: SubagentAccess;
+}) {
+  const [open, setOpen] = useState(false);
+  const entry = subs.of(sessionId, f);
+  const items = entry.value;
+  const err = entry.error;
+  // **신선도는 자동 회수의 입력이 아니다.** 돌고 있는 에이전트는 델타마다 전사가
+  // 자라 서명이 바뀌므로, "달라졌으니 다시 받자"를 자동으로 하면 그것이 곧
+  // 델타당 SSH 왕복이다(L2-2). 달라졌다는 사실은 아래에서 **말로** 갚는다.
+  const freshness = items ? subagentFreshnessNote(entry.sig, f.sig) : null;
+  const auto = shouldAutoFetch(entry);
+
+  useEffect(() => {
+    if (open && auto) subs.fetch(sessionId, f);
+    // subs·f 는 렌더마다 새 객체라 의존성에서 뺀다(넣으면 매 렌더 재조회).
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [open, auto, sessionId]);
+
+  return (
+    <div className="remote-subagent">
+      <button
+        type="button"
+        className="remote-subagent-head"
+        onClick={() => setOpen((v) => !v)}
+        aria-expanded={open}
+      >
+        <span className="remote-caret">{open ? "▾" : "▸"}</span>
+        <span className="remote-subagent-id">{f.id.slice(0, 7)}</span>
+        <span className="remote-subagent-progress">{subagentLabel(f)}</span>
+        <span className="remote-subagent-turn">턴 {f.turn}</span>
+      </button>
+      {open ? (
+        <div className="remote-subagent-body">
+          {entry.loading ? (
+            <p className="remote-empty">원격에서 이 에이전트의 기록을 가져오는 중…</p>
+          ) : null}
+          {err !== null ? (
+            <p className="remote-empty">
+              가져오지 못했습니다 — {err}
+              <button
+                type="button"
+                className="remote-fetch"
+                onClick={() => subs.fetch(sessionId, f)}
+              >
+                다시 시도
+              </button>
+            </p>
+          ) : null}
+          {(items ?? []).map((it) => (
+            <ItemLines key={it.tool_call_id} it={it} />
+          ))}
+          {items && items.length === 0 && err === null ? (
+            <p className="remote-empty">이 에이전트의 기록이 비어 있습니다.</p>
+          ) : null}
+          {!items && !entry.loading && err === null ? (
+            <p className="remote-empty">
+              본문은 펼칠 때 가져옵니다.
+              <button
+                type="button"
+                className="remote-fetch"
+                onClick={() => subs.fetch(sessionId, f)}
+              >
+                가져오기
+              </button>
+            </p>
+          ) : null}
+          {/* 바뀐 것은 **말하고**, 다시 받는 것은 사용자가 누른다 — 여기서 자동으로
+              다시 받으면 진행 중인 에이전트의 델타마다 SSH 왕복이 나간다(L2-2). */}
+          {freshness ? (
+            <p className="remote-cut" role="status">
+              {freshness}
+              <button
+                type="button"
+                className="remote-fetch"
+                onClick={() => subs.fetch(sessionId, f)}
+              >
+                다시 가져오기
+              </button>
+            </p>
+          ) : null}
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+/** 잘림 한 줄 — 있으면 반드시 보인다. 없으면 아무 자리도 차지하지 않는다. */
+function CutNote({ note, onMore }: { note: string | null; onMore?: () => void }) {
+  if (!note) return null;
+  return (
+    <p className="remote-cut" role="status">
+      {note}
+      {onMore ? (
+        <button type="button" className="remote-fetch" onClick={onMore}>
+          더 보기
+        </button>
+      ) : null}
+    </p>
+  );
+}
+
+/**
+ * 한 호스트의 **데이터** — 프로젝트·파일트리·Git·워크트리 (R2, 읽기 전용).
+ *
+ * 로컬 트리·GitPanel·WorktreePanel 을 재사용하지 않는다(명세 ④). 저 셋은 로컬
+ * 정본이고 원격 차원을 끼워 넣는 회귀 위험이 얻는 것보다 크다 — 같은 정보를
+ * 보이되 뷰 모델을 따로 둔다. 최상위 호스트 탭·표면 트리의 host 차원은 여전히
+ * R3 의 몫이라, 이 뷰는 **원격 패널 안**을 넘지 않는다.
+ *
+ * 폴링하지 않는다. 한 번의 조회가 SSH 왕복 한 번이고, 자동 반복에는 상한이
+ * 있어야 한다(R1 이 남긴 규칙) — 갈래를 열 때 한 번 읽고 그 뒤는 새로고침이다.
+ */
+function RemoteDataPanel({ hostId }: { hostId: string }) {
+  const d = useRemoteHostData(hostId);
+  const [tab, setTab] = useState<RemoteDataTab>("tree");
+  const { root, openDir, reloadStatus, reloadLog, reloadWorktrees, reloadRoots } = d;
+
+  // 갈래를 처음 열면 한 번 읽는다. 판정의 축은 **내용이 아니라 시도**다(R1):
+  // "값이 비었으면 다시 읽는다" 로 쓰면 빈 응답이 정상적으로 오는 순간 판정이
+  // true 로 돌아와 effect 가 무한히 재발화하고, 그 한 바퀴가 새 SSH 연결 1회다.
+  // 이 화면에서도 실제로 재현됐다(빈 폴더 하나 → 무한 재조회). 그 뒤의 재시도는
+  // 사용자가 누르는 버튼에만 남는다 — 화면에 계속 떠 있으므로 잃는 것은 없다.
+  useEffect(() => {
+    if (!root) return;
+    if (tab === "tree" && shouldAutoFetch(d.dir)) openDir("");
+    if (tab === "git") {
+      if (shouldAutoFetch(d.status)) reloadStatus();
+      if (shouldAutoFetch(d.log)) reloadLog();
+    }
+    if (tab === "worktrees") {
+      if (shouldAutoFetch(d.worktrees)) reloadWorktrees();
+      if (shouldAutoFetch(d.roots)) reloadRoots();
+    }
+    // 조회 함수는 호출마다 새 클로저라 의존성에서 뺀다(넣으면 매 렌더 재조회).
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [
+    root,
+    tab,
+    d.dir.attempted,
+    d.status.attempted,
+    d.log.attempted,
+    d.worktrees.attempted,
+    d.roots.attempted,
+  ]);
+
+  const projects = d.projects.value;
+  return (
+    <div className="remote-data">
+      <div className="remote-data-head">
+        <select
+          value={root}
+          onChange={(e) => d.setRoot(e.target.value)}
+          aria-label="원격 프로젝트"
+          disabled={d.projects.loading && !projects}
+        >
+          <option value="">
+            {d.projects.loading && !projects
+              ? "프로젝트 읽는 중…"
+              : projects && projects.projects.length === 0
+                ? "이 호스트가 발행한 프로젝트가 없습니다"
+                : "프로젝트 선택…"}
+          </option>
+          {(projects?.projects ?? []).map((p) => (
+            <option key={p.path} value={p.path} title={p.path}>
+              {p.name}
+              {p.branch ? ` (${p.branch})` : ""}
+            </option>
+          ))}
+        </select>
+        <button
+          type="button"
+          className="remote-fetch"
+          onClick={() => d.reloadProjects(true)}
+          title="호스트의 프로젝트 목록을 캐시 없이 다시 읽습니다"
+        >
+          목록 새로고침
+        </button>
+      </div>
+      <LoadNote of={d.projects} onRetry={() => d.reloadProjects(true)} />
+      {/* 프로젝트가 0개인 것은 정상적인 답이고 설정을 못 읽은 것은 아니다 —
+          데몬이 그 차이를 `notes` 로 말해 주므로 그대로 보인다. */}
+      {(projects?.notes ?? []).map((n) => (
+        <p key={n} className="remote-cut" role="status">
+          호스트 메모: {n}
+        </p>
+      ))}
+
+      {!root ? (
+        <p className="remote-empty">프로젝트를 고르면 그 트리·Git·워크트리를 봅니다.</p>
+      ) : (
+        <>
+          <div className="remote-data-tabs">
+            {(
+              [
+                ["tree", "파일"],
+                ["git", "Git"],
+                ["worktrees", "워크트리"],
+              ] as const
+            ).map(([id, label]) => (
+              <button
+                key={id}
+                type="button"
+                className={`remote-data-tab${tab === id ? " remote-data-tab-on" : ""}`}
+                aria-pressed={tab === id}
+                onClick={() => setTab(id)}
+              >
+                {label}
+              </button>
+            ))}
+          </div>
+          {tab === "tree" ? <RemoteTreeView d={d} /> : null}
+          {tab === "git" ? <RemoteGitView d={d} /> : null}
+          {tab === "worktrees" ? <RemoteWorktreeView d={d} /> : null}
+        </>
+      )}
+    </div>
+  );
+}
+
+/** 폴더 하나씩 — 로컬 트리를 흉내 내지 않고, 페이지가 폴더 전체인 척하지도 않는다. */
+function RemoteTreeView({ d }: { d: RemoteHostDataView }) {
+  const dir = d.dir.value;
+  const up = parentPath(d.root, d.path);
+  return (
+    <div className="remote-data-body">
+      <div className="remote-crumb">
+        <button
+          type="button"
+          className="remote-fetch"
+          disabled={up === null}
+          onClick={() => (up === null ? undefined : d.openDir(up))}
+          title={up === null ? "여기가 프로젝트 루트입니다." : "한 단계 위로"}
+        >
+          위로
+        </button>
+        <code title={d.path || d.root}>{relPath(d.root, d.path) || "/"}</code>
+        <button type="button" className="remote-fetch" onClick={d.reloadDir}>
+          새로고침
+        </button>
+      </div>
+      <LoadNote of={d.dir} onRetry={d.reloadDir} />
+      {d.dir.loading && !dir ? <p className="remote-empty">읽는 중…</p> : null}
+      {dir ? (
+        <>
+          <ul className="remote-tree">
+            {dir.entries.map((e) => (
+              <li
+                key={e.path}
+                className={`remote-tree-row${e.is_ignored ? " remote-tree-ignored" : ""}`}
+              >
+                {e.is_dir ? (
+                  <button type="button" className="remote-tree-dir" onClick={() => d.openDir(e.path)}>
+                    📁 {e.name}
+                  </button>
+                ) : (
+                  <span className="remote-tree-file">📄 {e.name}</span>
+                )}
+              </li>
+            ))}
+          </ul>
+          {dir.entries.length === 0 ? <p className="remote-empty">빈 폴더입니다.</p> : null}
+          {/* 더 있는데 안 보여주면 화면이 그것을 말한다 — 페이지가 폴더 전체처럼
+              보이는 것이 이 경로의 무음 유실이다. */}
+          <CutNote note={dirCutNote(dir)} onMore={dirHasMore(dir) ? d.moreDir : undefined} />
+        </>
+      ) : null}
+    </div>
+  );
+}
+
+/** 상태 + 히스토리. 로컬 GitPanel 은 건드리지 않는다 — 여기 있는 것은 읽기뿐이다. */
+function RemoteGitView({ d }: { d: RemoteHostDataView }) {
+  const s = d.status.value;
+  const log = d.log.value;
+  return (
+    <div className="remote-data-body">
+      <LoadNote of={d.status} onRetry={d.reloadStatus} />
+      {s ? (
+        s.is_repo ? (
+          <div className="remote-git-head">
+            <strong>{s.branch}</strong>
+            {s.upstream ? <span>↑{s.ahead} ↓{s.behind} · {s.upstream}</span> : <span>업스트림 없음</span>}
+            {s.merging ? <span className="remote-git-flag">머지 중</span> : null}
+            {s.reverting ? <span className="remote-git-flag">리버트 중</span> : null}
+            <button type="button" className="remote-fetch" onClick={d.reloadStatus}>
+              새로고침
+            </button>
+          </div>
+        ) : (
+          <p className="remote-empty">이 프로젝트는 git 저장소가 아닙니다.</p>
+        )
+      ) : null}
+      {s?.is_repo ? (
+        <ul className="remote-changes">
+          {s.changes.length === 0 ? <li className="remote-empty">변경 없음</li> : null}
+          {s.changes.map((c) => (
+            <li
+              key={`${c.staged ? "s" : "w"}:${c.path}`}
+              className={`remote-change${c.conflicted ? " remote-change-conflict" : ""}`}
+            >
+              <span className="remote-change-code">{c.code}</span>
+              <span className="remote-change-path" title={c.path}>
+                {c.path}
+              </span>
+              {c.staged ? <span className="remote-change-staged">staged</span> : null}
+            </li>
+          ))}
+        </ul>
+      ) : null}
+
+      <LoadNote of={d.log} onRetry={d.reloadLog} />
+      {log ? (
+        <>
+          <ul className="remote-commits">
+            {log.commits.length === 0 ? <li className="remote-empty">커밋이 없습니다.</li> : null}
+            {log.commits.map((c) => (
+              <li key={c.hash} className="remote-commit">
+                <code>{c.short}</code>
+                <span className="remote-commit-subject" title={c.subject}>
+                  {c.subject}
+                </span>
+                <span className="remote-commit-meta">
+                  {c.author} · {c.date}
+                </span>
+              </li>
+            ))}
+          </ul>
+          {/* 주소가 있는 잘림에만 버튼이 붙는다. 주소 없는 잘림(데몬 페이징 상한)은
+              누를 것이 없다는 사실까지 문장이 말한다. */}
+          <CutNote note={logCutNote(log)} onMore={logHasMore(log) ? d.moreLog : undefined} />
+        </>
+      ) : null}
+    </div>
+  );
+}
+
+/** 워크트리 + 하위 저장소. 여기가 이 화면에서 잘림이 가장 조용한 자리다. */
+function RemoteWorktreeView({ d }: { d: RemoteHostDataView }) {
+  const w = d.worktrees.value;
+  const r = d.roots.value;
+  return (
+    <div className="remote-data-body">
+      <LoadNote of={d.worktrees} onRetry={d.reloadWorktrees} />
+      {w ? (
+        <ul className="remote-worktrees">
+          {w.worktrees.length === 0 ? <li className="remote-empty">워크트리가 없습니다.</li> : null}
+          {w.worktrees.map((t) => (
+            <li key={t.path} className="remote-worktree">
+              <span className="remote-worktree-branch">{t.branch}</span>
+              {t.is_main ? <span className="remote-worktree-main">main</span> : null}
+              <code title={t.path}>{t.path}</code>
+              <span className="remote-commit-meta">{t.head.slice(0, 7)}</span>
+            </li>
+          ))}
+        </ul>
+      ) : null}
+
+      <div className="remote-crumb">
+        <span>하위 저장소</span>
+        <button type="button" className="remote-fetch" onClick={d.reloadRoots}>
+          다시 스캔
+        </button>
+      </div>
+      <LoadNote of={d.roots} onRetry={d.reloadRoots} />
+      {r ? (
+        <>
+          <ul className="remote-worktrees">
+            {r.roots.length === 0 ? <li className="remote-empty">하위 저장소가 없습니다.</li> : null}
+            {r.roots.map((g) => (
+              <li key={g.path} className="remote-worktree">
+                <span className="remote-worktree-branch">{g.branch}</span>
+                <code title={g.path}>{g.path}</code>
+              </li>
+            ))}
+          </ul>
+          {/* 이어받을 주소가 **없는** 잘림 — 그래서 "더 보기"가 아니라 사실만 적는다. */}
+          <CutNote note={rootsCutNote(r)} />
+          {/* …그리고 응답으로는 알 수 없는 절단(2만 디렉터리)은 늘 말한다. 이
+              프로젝트에 등재된 무음 유실이 바로 그것이다. */}
+          <p className="remote-cut" role="status">
+            {GIT_ROOTS_CAVEAT}
+          </p>
+        </>
+      ) : null}
+    </div>
   );
 }
 
@@ -782,27 +1444,35 @@ function NewSessionForm({ hostId, onSpawned }: { hostId: string; onSpawned: () =
  *
  * 다른 것은 두 가지다. 크기는 두 곳으로 간다 — `terminal_resize` 는 로컬 장부,
  * 실제 pty 는 데몬이 들고 있어 `remote_resize` 가 SSH 왕복 한 번으로 바꾼다(그래서
- * 멎은 크기만 보낸다). 그리고 끝났을 때는 `remote-terminal-ended` 가 사유를 주므로
- * 그것을 화면에 찍는다 — 이 이벤트가 따로 있는 이유가 조용한 검은 상자를 없애는
- * 것이다.
+ * 멎은 크기만 보낸다). 그리고 끝났을 때는 패널이 `remote_terminal_end` 로 물어 온
+ * 사유를 받아 화면에 찍는다 — 조용한 검은 상자를 없애는 것이 그 경로의 이유다.
  */
 function RemoteTerminalView({
   hostId,
   remoteId,
   localId,
   sessionKey,
+  ended,
   onClose,
 }: {
   hostId: string;
   remoteId: number;
   localId: number;
   sessionKey: string;
+  /** 이 터미널이 멈춘 이유 — 패널이 구독해 둔 것(늦게 마운트해도 읽는다). */
+  ended: string | null;
   onClose: () => void;
 }) {
   const hostRef = useRef<HTMLDivElement | null>(null);
   const termRef = useRef<Terminal | null>(null);
-  const [ended, setEnded] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  /** 같은 사유를 두 번 찍지 않는다(리렌더마다 한 줄씩 늘지 않게). */
+  const saidRef = useRef<string | null>(null);
+  useEffect(() => {
+    if (!ended || saidRef.current === ended) return;
+    saidRef.current = ended;
+    termRef.current?.write(`\r\n\x1b[2m[${ended}]\x1b[0m\r\n`);
+  }, [ended]);
 
   const theme = useAppStore((s) => s.theme);
   const termColors = useAppStore((s) => s.termColors);
@@ -839,7 +1509,6 @@ function RemoteTerminalView({
 
     let disposed = false;
     let unOutput: UnlistenFn | undefined;
-    let unEnded: UnlistenFn | undefined;
     let ready = false;
     let lastApplied = 0;
     let pendingTotal = 0;
@@ -855,22 +1524,26 @@ function RemoteTerminalView({
     void (async () => {
       // 구독 **먼저** — 스냅샷 왕복 동안 나온 바이트는 이벤트로만 오고, 스냅샷에는
       // 없다(로컬 터미널과 같은 계약).
-      unOutput = await listen<TerminalOutputEvent>(ptyEventName(localId), (e) => {
-        if (!ready) {
-          const r = pushPendingCapped(pending, e.payload, pendingTotal);
-          pendingTotal = r.total;
-          pendingDropped ||= r.dropped;
-        } else applyLive(e.payload);
-      });
-      unEnded = await listen<RemoteTerminalEnded>("remote-terminal-ended", (e) => {
-        if (e.payload.id !== localId) return;
-        const reason = endedReason(e.payload);
-        if (!disposed) term.write(`\r\n\x1b[2m[${reason}]\x1b[0m\r\n`);
-        setEnded(reason);
-      });
+      //
+      // 종료 사유는 여기서 묻지 않는다: 이 컴포넌트는 `remote_attach` 가 돌아온
+      // 뒤에야 마운트되고, 사유는 그보다 먼저 확정될 수 있다. 패널이 물어
+      // (`remote_terminal_end`) `ended` 로 내려 준다.
+      try {
+        unOutput = await listen<TerminalOutputEvent>(ptyEventName(localId), (e) => {
+          if (!ready) {
+            const r = pushPendingCapped(pending, e.payload, pendingTotal);
+            pendingTotal = r.total;
+            pendingDropped ||= r.dropped;
+          } else applyLive(e.payload);
+        });
+      } catch (e) {
+        // 구독이 실패하면 스냅샷 단계까지 가더라도 이후 출력이 한 바이트도 오지
+        // 않는다 — 멈춘 화면을 살아 있는 것으로 보이게 두지 않는다(R18).
+        if (!disposed) setError(errText(e, "터미널 출력을 구독하지 못했습니다."));
+        return;
+      }
       if (disposed) {
         unOutput?.();
-        unEnded?.();
         return;
       }
       try {
@@ -969,7 +1642,6 @@ function RemoteTerminalView({
       onData.dispose();
       onResize.dispose();
       unOutput?.();
-      unEnded?.();
       term.dispose();
       termRef.current = null;
     };

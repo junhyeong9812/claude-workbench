@@ -242,6 +242,37 @@ pub struct SessionSnapshot {
     pub dates: BTreeMap<u64, String>,
     #[serde(default, with = "turn_map")]
     pub tokens: BTreeMap<u64, TokenUsage>,
+    /// This session's subagents, meta only. Absent = the daemon reported none —
+    /// which, since R7, means it looked and found none rather than never looked.
+    #[serde(default)]
+    pub subagents: Vec<SubagentMeta>,
+}
+
+/// One subagent of a session, as **metadata**.
+///
+/// The daemon reports the counters and never the transcript: a finished agent's
+/// body was 77% of a local timeline payload and 5.22 GB of webview RSS, and the
+/// cure was deferred hydration — meta on the stream, body on demand. This type
+/// therefore has no `items` field, and the fetch address is
+/// `cwcd timeline <addr> --subagent <id>` ([`TimelineSliceReply::subagent`]).
+///
+/// `turn`/`total`/`completed` are required: the producer always writes them, and
+/// a defaulted `0` would draw a progress bar saying an agent did nothing.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct SubagentMeta {
+    pub id: String,
+    #[serde(default)]
+    pub parent: Option<String>,
+    pub turn: u64,
+    pub total: usize,
+    pub completed: usize,
+    #[serde(default)]
+    pub last_status: Option<crate::timeline::AgentStatus>,
+    /// The body cache key (`<len>-<mtime_ns>`). Absent when the daemon could not
+    /// stat the file — a consumer then treats a fetched body as always stale
+    /// rather than always fresh.
+    #[serde(default)]
+    pub sig: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -314,6 +345,10 @@ pub enum Event {
         answers: BTreeMap<u64, String>,
         dates: BTreeMap<u64, String>,
         tokens: BTreeMap<u64, TokenUsage>,
+        /// The whole current set when it changed, **empty when it did not** —
+        /// so a consumer merges rather than replaces (an empty list on an
+        /// unrelated delta would blink a session's agents out of existence).
+        subagents: Vec<SubagentMeta>,
     },
     Hook {
         key: SessionKey,
@@ -508,6 +543,14 @@ pub struct TimelineSliceReply {
     pub model: Option<String>,
     #[serde(default)]
     pub last_usage: Option<TokenUsage>,
+    /// Whose timeline this is — `None` = the session's own, `Some(id)` = that
+    /// subagent's. Echoed by the daemon so a reply cannot be mistaken for the
+    /// session body when both travel on this one command.
+    #[serde(default)]
+    pub subagent: Option<String>,
+    /// The session's agents, meta only — the same list the stream carries.
+    #[serde(default)]
+    pub subagents: Vec<SubagentMeta>,
 }
 
 /// A daemon reply that is an error rather than an answer.
@@ -515,6 +558,169 @@ pub struct TimelineSliceReply {
 pub struct ErrorReply {
     pub code: String,
     pub message: String,
+}
+
+// ---------------------------------------------------------------------------
+// Host provider (R2) — the development context around a host's sessions
+// ---------------------------------------------------------------------------
+//
+// The daemon has published these since R1b; this is the consumer half. Two
+// rules govern every type below, and they are the reason the shapes are not
+// simply `serde_json::Value`:
+//
+// 1. **A field the producer always writes is required here.** `total`,
+//    `from_index`, `entries`, `commits`, `roots`, `worktrees` — a `#[serde(default)]`
+//    on any of them turns "this consumer could not read the reply" into "the
+//    directory is empty" / "there are no commits", which is the exact silent
+//    staleness this module's header forbids.
+// 2. **Every truncation flag is carried, never dropped.** The daemon's own
+//    contract is "what was cut is said, with the address for the rest"
+//    (`DirListing::truncated` + `from_index`, `GitLogPage::next_cursor`,
+//    `GitRootListing::at_cap`). Dropping the flag on the way through would turn
+//    a page into "the whole thing" one layer below where anyone can see it — the
+//    workbench's own registered silent truncation (`git_roots`) is that failure,
+//    and reproducing it over SSH is not an option.
+//
+// These flags are omitted when false (`skip_serializing_if` on the producer), so
+// they — and only they — carry a default.
+
+/// One project a host publishes. `path` is canonical, so it is the `root` every
+/// other command here takes.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ProjectEntryView {
+    pub path: String,
+    pub name: String,
+    #[serde(default)]
+    pub branch: Option<String>,
+    /// `explicit` | `workbench` | `scan` — kept as the string the daemon sent.
+    /// A source this workbench has not heard of must still name itself on
+    /// screen rather than fail the whole listing.
+    pub source: String,
+    #[serde(default)]
+    pub project_types: Vec<crate::ProjectType>,
+}
+
+/// `cwcd projects`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ProjectsReply {
+    pub projects: Vec<ProjectEntryView>,
+    #[serde(default)]
+    pub scanned: Vec<String>,
+    /// How the list was produced — a scan that hit its cap, a root that does not
+    /// exist, a state file that could not be read. **An empty project list is a
+    /// legitimate answer and an unreadable configuration is not**; without these
+    /// the two look identical, so they are carried to the screen.
+    #[serde(default)]
+    pub notes: Vec<String>,
+}
+
+/// `cwcd tree <root>` — one **page** of a directory.
+///
+/// `entries` is a window into a listing of `total`, starting at `from_index`.
+/// The next page is `from_index + entries.len()`; `truncated` says there is one.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DirReply {
+    pub root: String,
+    pub path: String,
+    /// `crate::DirEntry` verbatim — a remote tree and a local one are the same
+    /// bytes, `is_ignored` included.
+    pub entries: Vec<crate::DirEntry>,
+    pub from_index: usize,
+    pub total: usize,
+    #[serde(default)]
+    pub truncated: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FileChangeView {
+    pub path: String,
+    pub code: String,
+    pub staged: bool,
+    pub conflicted: bool,
+}
+
+/// `cwcd git-status <root>`. Not paged and not capped — the whole status.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GitStatusReply {
+    pub is_repo: bool,
+    pub branch: String,
+    pub upstream: Option<String>,
+    pub ahead: u32,
+    pub behind: u32,
+    pub has_remote: bool,
+    pub merging: bool,
+    pub reverting: bool,
+    pub changes: Vec<FileChangeView>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CommitView {
+    pub hash: String,
+    pub short: String,
+    #[serde(default)]
+    pub parents: Vec<String>,
+    pub author: String,
+    pub date: String,
+    #[serde(default)]
+    pub refs: String,
+    pub subject: String,
+}
+
+/// `cwcd git-log <root>` — one page, newest first.
+///
+/// `next_cursor` is opaque and handed back verbatim. `truncated` **without** a
+/// cursor is the daemon's one addressless truncation on this command (history
+/// past its 50 000-commit paging limit) — a case the screen has to name, since
+/// there is nothing to press.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GitLogReply {
+    pub root: String,
+    pub commits: Vec<CommitView>,
+    #[serde(default)]
+    pub truncated: bool,
+    #[serde(default)]
+    pub next_cursor: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct WorktreeView {
+    pub path: String,
+    pub head: String,
+    pub branch: String,
+    pub is_main: bool,
+}
+
+/// `cwcd worktrees <root>`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct WorktreesReply {
+    pub root: String,
+    pub worktrees: Vec<WorktreeView>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GitRootView {
+    pub path: String,
+    pub branch: String,
+}
+
+/// `cwcd git-roots <root>` — every git root at or under a project.
+///
+/// `at_cap` is the scanner's 200-repository stop, and it has **no
+/// continuation**: the scan takes no offset, so the way to see past it is a
+/// narrower `root`. Carried anyway, because the alternative is a round number
+/// the user has to guess the meaning of.
+///
+/// The same scanner also gives up after 20 000 visited directories and returns
+/// a plain list — that stop is invisible on the wire, in this workbench's own
+/// `git::git_roots`, and is the project's registered silent truncation. Nothing
+/// here can flag it; it is named so that no one reads `at_cap: false` as
+/// "complete".
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GitRootsReply {
+    pub root: String,
+    pub roots: Vec<GitRootView>,
+    #[serde(default)]
+    pub at_cap: bool,
 }
 
 /// Decode one `Response` JSON object by its `response` tag.
@@ -679,6 +885,8 @@ fn decode_event(v: serde_json::Value) -> Result<Event, String> {
                 dates: BTreeMap<u64, String>,
                 #[serde(default, with = "turn_map")]
                 tokens: BTreeMap<u64, TokenUsage>,
+                #[serde(default)]
+                subagents: Vec<SubagentMeta>,
             }
             let s: S = serde_json::from_value(v).map_err(of)?;
             Event::TimelineDelta {
@@ -691,6 +899,7 @@ fn decode_event(v: serde_json::Value) -> Result<Event, String> {
                 answers: s.answers,
                 dates: s.dates,
                 tokens: s.tokens,
+                subagents: s.subagents,
             }
         }
         "hook" => {
@@ -952,5 +1161,137 @@ mod tests {
         let ok: SessionsReply =
             decode_response(r#"{"response":"sessions","sessions":[]}"#).unwrap();
         assert!(ok.sessions.is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // Host provider (R2) — the lines below are the daemon's own output, taken
+    // from a live `cwcd serve` over the socket.
+    // -----------------------------------------------------------------------
+
+    const DIR_REPLY: &str = r#"{"response":"dir","root":"/home/jun/project/claude-workbench","path":"/home/jun/project/claude-workbench/core","entries":[{"name":"src","path":"/home/jun/project/claude-workbench/core/src","is_dir":true,"project_types":[],"is_ignored":false},{"name":"target","path":"/home/jun/project/claude-workbench/core/target","is_dir":true,"project_types":[],"is_ignored":true},{"name":"Cargo.toml","path":"/home/jun/project/claude-workbench/core/Cargo.toml","is_dir":false,"project_types":[],"is_ignored":false}],"from_index":0,"total":3}"#;
+
+    #[test]
+    fn a_directory_page_decodes_with_the_dim_flag_a_local_tree_uses() {
+        let d: DirReply = decode_response(DIR_REPLY).expect("a remote tree is a local tree's bytes");
+        assert_eq!(d.total, 3);
+        assert_eq!(d.from_index, 0);
+        assert!(!d.truncated, "a whole directory omits the flag");
+        assert_eq!(d.entries.len(), 3);
+        assert!(d.entries[0].is_dir);
+        assert!(
+            d.entries[1].is_ignored,
+            "`is_ignored` is the flag the local tree dims with — it must survive the wire"
+        );
+    }
+
+    /// **A page must not be able to look like the whole directory.**
+    ///
+    /// `truncated` and `total` together are the only thing standing between
+    /// "showing 200 of 4 000" and a screen that says nothing. A `#[serde(default)]`
+    /// on `total`, or a dropped `truncated`, would make the cut invisible one
+    /// layer below anywhere it could be noticed.
+    #[test]
+    fn a_truncated_directory_page_says_so_and_says_how_much_is_missing() {
+        let d: DirReply = decode_response(
+            r#"{"response":"dir","root":"/r","path":"/r","entries":[{"name":"a","path":"/r/a","is_dir":false}],"from_index":0,"total":4000,"truncated":true}"#,
+        )
+        .unwrap();
+        assert!(d.truncated);
+        assert_eq!(d.total, 4000);
+        assert_eq!(d.from_index + d.entries.len(), 1, "the next page starts here");
+    }
+
+    /// A reply whose count could not be read is an **error**, never a zero.
+    ///
+    /// This is the whole reason these fields carry no default: "the daemon sent
+    /// something this consumer cannot read" and "the directory is empty" must
+    /// not arrive as the same value.
+    #[test]
+    fn a_directory_page_without_its_total_is_refused_not_read_as_empty() {
+        let err = decode_response::<DirReply>(
+            r#"{"response":"dir","root":"/r","path":"/r","entries":[],"from_index":0}"#,
+        )
+        .unwrap_err();
+        assert!(err.contains("total"), "the missing field must be named: {err}");
+        let err = decode_response::<DirReply>(
+            r#"{"response":"dir","root":"/r","path":"/r","from_index":0,"total":0}"#,
+        )
+        .unwrap_err();
+        assert!(err.contains("entries"), "{err}");
+    }
+
+    #[test]
+    fn a_git_status_reply_decodes_whole() {
+        let s: GitStatusReply = decode_response(
+            r#"{"response":"git_status","is_repo":true,"branch":"feature/remote-r2-review-fixes","upstream":null,"ahead":0,"behind":0,"has_remote":true,"merging":false,"reverting":false,"changes":[{"path":"core/src/remote/proto.rs","code":"M","staged":false,"conflicted":false}]}"#,
+        )
+        .unwrap();
+        assert!(s.is_repo && s.has_remote);
+        assert_eq!(s.branch, "feature/remote-r2-review-fixes");
+        assert_eq!(s.changes[0].path, "core/src/remote/proto.rs");
+        // A repo that is not one is a fact, not an absence: `is_repo:false` must
+        // survive rather than decode as "no changes".
+        let none: GitStatusReply = decode_response(
+            r#"{"response":"git_status","is_repo":false,"branch":"","upstream":null,"ahead":0,"behind":0,"has_remote":false,"merging":false,"reverting":false,"changes":[]}"#,
+        )
+        .unwrap();
+        assert!(!none.is_repo);
+    }
+
+    /// The two truncations `git-log` can report, and they are different answers.
+    #[test]
+    fn a_git_log_page_carries_both_kinds_of_truncation() {
+        let more: GitLogReply = decode_response(
+            r#"{"response":"git_log","root":"/r","commits":[{"hash":"4dc8e5a0","short":"4dc8e5a","parents":["e56cc06"],"author":"jun","date":"2026-08-13","refs":"HEAD","subject":"fix(remote)"}],"truncated":true,"next_cursor":"c1"}"#,
+        )
+        .unwrap();
+        assert!(more.truncated);
+        assert_eq!(more.next_cursor.as_deref(), Some("c1"), "there is an address for the rest");
+
+        // Past the daemon's paging limit: cut, and nothing to press.
+        let capped: GitLogReply = decode_response(
+            r#"{"response":"git_log","root":"/r","commits":[],"truncated":true}"#,
+        )
+        .unwrap();
+        assert!(capped.truncated && capped.next_cursor.is_none());
+
+        let whole: GitLogReply =
+            decode_response(r#"{"response":"git_log","root":"/r","commits":[]}"#).unwrap();
+        assert!(!whole.truncated && whole.next_cursor.is_none(), "the end of the history");
+    }
+
+    #[test]
+    fn worktrees_and_git_roots_decode_and_git_roots_keeps_its_cap_flag() {
+        let w: WorktreesReply = decode_response(
+            r#"{"response":"worktrees","root":"/r","worktrees":[{"path":"/r","head":"4dc8e5a","branch":"main","is_main":true}]}"#,
+        )
+        .unwrap();
+        assert!(w.worktrees[0].is_main);
+
+        let r: GitRootsReply = decode_response(
+            r#"{"response":"git_roots","root":"/r","roots":[{"path":"/r","branch":"main"}],"at_cap":true}"#,
+        )
+        .unwrap();
+        assert!(
+            r.at_cap,
+            "the 200-repo stop has no continuation, so the flag is the only way it can be said"
+        );
+        let plain: GitRootsReply =
+            decode_response(r#"{"response":"git_roots","root":"/r","roots":[]}"#).unwrap();
+        assert!(!plain.at_cap);
+    }
+
+    /// A project listing's `notes` are how "no projects" is told apart from
+    /// "the configuration could not be read".
+    #[test]
+    fn a_project_listing_keeps_the_notes_that_explain_an_empty_one() {
+        let p: ProjectsReply = decode_response(
+            r#"{"response":"projects","projects":[],"notes":["CWC_PROJECT_ROOTS entry /nope does not exist"]}"#,
+        )
+        .unwrap();
+        assert!(p.projects.is_empty());
+        assert_eq!(p.notes.len(), 1, "an empty list with a reason is not an empty list");
+        let err = decode_response::<ProjectsReply>(r#"{"response":"projects"}"#).unwrap_err();
+        assert!(err.contains("projects"), "{err}");
     }
 }

@@ -4,9 +4,11 @@ import {
   attachGate,
   countsLabel,
   defaultAccountId,
+  droppableIds,
   endedReason,
   fetchedToLive,
   isRemoteId,
+  itemCutNote,
   killGate,
   killLabel,
   mergeSeed,
@@ -17,20 +19,30 @@ import {
   resumeLabel,
   seenKey,
   seenSeqOf,
+  sessionCountNote,
+  expectSubagent,
+  sessionBodyKey,
+  sessionOfBodyKey,
+  shouldAutoFetchBody,
   shouldFetchBody,
   nextRemoteResize,
   shouldSendRemoteResize,
   signalLabel,
   spawnRequest,
   staleSeenKeys,
+  subagentBodyKey,
+  subagentFreshnessNote,
   toLiveTimeline,
+  turnMetaLabel,
   unseenNotices,
   REMOTE_ID_BASE,
   type RemoteHostSnapshot,
   type RemoteLiveTimeline,
   type RemoteNotice,
   type RemoteSessionMeta,
+  type RemoteSubagentFrame,
 } from "./remoteHosts";
+import { idleFetch, isStale, shouldAutoFetch } from "./autoFetch";
 import type { ClaudeTimelineEvent } from "../hooks/useClaudeTimeline";
 import type { TimelineItem } from "../types";
 
@@ -110,6 +122,7 @@ function live(items: number, turns: number): RemoteLiveTimeline {
     answers: [],
     dates: [],
     tokens: [],
+    subagents: [],
     model: null,
     ctxTokens: 0,
   };
@@ -273,6 +286,32 @@ describe("종료된 세션의 본문", () => {
     expect(shouldFetchBody(meta({ timeline_len: 0 }), undefined)).toBe(false);
   });
 
+  it("자동 회수는 **내용**이 아니라 **시도**로 정해진다 (R1)", () => {
+    const empty = live(0, 0);
+    const fresh = idleFetch<RemoteLiveTimeline>();
+    const s = meta({ body_omitted: true, timeline_len: 0 });
+    // 처음 펼쳤을 때는 가져온다.
+    expect(shouldAutoFetchBody(s, undefined, fresh)).toBe(true);
+    // …그리고 회수가 **성공했는데 본문이 비어도** 다시 가져가지 않는다. 이게
+    // 무한 SSH 루프가 살던 자리다: `shouldFetchBody` 는 여전히 true 를 돌려주고
+    // (가져올 수는 있으니까) 그것만으로 자동 회수를 정하면 effect 가 영원히
+    // 재발화한다 — 실측 1,400회 이상/5초, 매 회차가 새 SSH 연결.
+    expect(shouldFetchBody(s, empty)).toBe(true);
+    expect(shouldAutoFetchBody(s, empty, { ...fresh, attempted: true })).toBe(false);
+    // 나가 있는 회수가 있거나 지난 회수가 실패로 끝났으면 자동으로 또 걸지 않는다
+    // (원시가 시도 시점에 `attempted` 를 세우므로 그 둘은 언제나 시도 이후다).
+    expect(shouldAutoFetchBody(s, undefined, { ...fresh, attempted: true, loading: true })).toBe(
+      false,
+    );
+    expect(
+      shouldAutoFetchBody(s, undefined, { ...fresh, attempted: true, error: "ssh 실패" }),
+    ).toBe(false);
+    // 데몬에도 없는 것은 여전히 가져올 곳이 없다.
+    expect(shouldAutoFetchBody(meta({ timeline_len: 0 }), undefined, fresh)).toBe(false);
+    // 본문이 실제로 있으면 애초에 회수 대상이 아니다.
+    expect(shouldAutoFetchBody(s, live(3, 1), fresh)).toBe(false);
+  });
+
   it("갭 뒤 빈 스냅샷이 방금 가져온 본문을 지우지 않는다", () => {
     const body = live(7, 2);
     // 끝난 세션은 갭마다 빈 payload가 다시 온다.
@@ -295,6 +334,8 @@ describe("종료된 세션의 본문", () => {
       tokens: [[1, { input: 1, output: 2, cache_read: 0, cache_creation: 0 }]],
       model: "claude-opus-5",
       last_usage: { input: 2, output: 5, cache_read: 10, cache_creation: 3 },
+      subagent: null,
+      subagents: [],
     });
     expect(l.items.map((i) => i.tool_call_id)).toEqual(["a", "b"]);
     expect(l.turns).toEqual([[1, "질문"]]);
@@ -303,6 +344,7 @@ describe("종료된 세션의 본문", () => {
     expect(l.answers).toEqual([[1, "답변"]]);
     expect(l.dates).toEqual([[1, "2026-08-13"]]);
     expect(l.tokens).toEqual([[1, { input: 1, output: 2, cache_read: 0, cache_creation: 0 }]]);
+    expect(l.subagents).toEqual([]);
   });
 });
 
@@ -343,6 +385,46 @@ describe("원격 payload 읽기", () => {
     expect(live.answers).toEqual([[1, "답변"]]);
     expect(live.dates).toEqual([[1, "2026-08-13"]]);
     expect(live.tokens).toEqual([[1, { input: 3, output: 4, cache_read: 0, cache_creation: 0 }]]);
+  });
+
+  it("생산자가 항상 쓰는 필드가 빠지면 **드러낸다** — 빈 타임라인으로 감추지 않는다 (R12)", () => {
+    // Rust 는 `turns`·`answers`·`dates`·`tokens`·`items` 를 항상 직렬화하고 키
+    // 집합까지 테스트로 못박았다. 그래서 안 온 것은 "없다"가 아니라 계약이 깨진
+    // 것이다 — `?? []` 로 흡수하면 이름 변경·생산자 정지가 예외 대신 **조용한 빈
+    // 타임라인**이 되고, 화면은 "아무 일도 없었다"를 정직한 답으로 보인다.
+    const full: ClaudeTimelineEvent = {
+      id: REMOTE_ID_BASE + 3,
+      items: [],
+      turns: [],
+      answers: [],
+      dates: [],
+      tokens: [],
+      subagents: [],
+    };
+    for (const missing of ["items", "turns", "answers", "dates", "tokens"] as const) {
+      const broken = { ...full } as Record<string, unknown>;
+      delete broken[missing];
+      expect(() => toLiveTimeline(broken as unknown as ClaudeTimelineEvent)).toThrow(missing);
+    }
+    // 회수 경로(`remote_timeline` 응답)도 같은 계약이다.
+    const reply = {
+      session_id: "u",
+      total: 0,
+      items: [],
+      turns: [],
+      answers: [],
+      dates: [],
+      tokens: [],
+      model: null,
+      last_usage: null,
+    };
+    for (const missing of ["items", "turns", "answers", "dates", "tokens"] as const) {
+      const broken = { ...reply } as Record<string, unknown>;
+      delete broken[missing];
+      expect(() => fetchedToLive(broken as never)).toThrow(missing);
+    }
+    // 배열이 아닌 값(이름은 같은데 형이 바뀐 경우)도 같다.
+    expect(() => toLiveTimeline({ ...full, turns: null } as never)).toThrow("turns");
   });
 
   it("데몬이 보내지 않는 것은 지어내지 않는다", () => {
@@ -571,5 +653,224 @@ describe("원격 터미널이 멈춘 이유", () => {
     expect(multi).not.toContain("\n");
     const long = endedReason({ code: 1, signal: null, detail: "x".repeat(1000) });
     expect(long.length).toBeLessThan(400);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// R7 (a) — 원격 타임라인이 로컬과 "같은 내용"을 보인다: 날짜·턴별 토큰·본문·잘림
+// ---------------------------------------------------------------------------
+
+describe("R7 — 턴의 날짜와 토큰이 화면에 닿는다", () => {
+  it("날짜와 토큰이 한 줄로 합쳐지고, 둘 다 없으면 줄을 만들지 않는다", () => {
+    const dates = new Map([[1, "2026-08-13"]]);
+    const tokens = new Map([
+      [1, { input: 100, output: 20, cache_read: 5, cache_creation: 7 }],
+    ]);
+    const both = turnMetaLabel(1, dates, tokens);
+    expect(both).toContain("2026-08-13");
+    // ↑ = 새로 처리한 컨텍스트(input + cache_creation), ↓ = 생성 출력 —
+    // 로컬 `sumTokenTotals` 와 같은 정의여야 두 화면이 다른 숫자를 말하지 않는다.
+    expect(both).toContain("107");
+    expect(both).toContain("20");
+    // 날짜만·토큰만·아무것도 없음 — 셋이 서로 다른 답이다.
+    expect(turnMetaLabel(1, dates, new Map())).toBe("2026-08-13");
+    expect(turnMetaLabel(1, new Map(), tokens)).not.toContain("2026");
+    expect(turnMetaLabel(9, dates, tokens)).toBeNull();
+  });
+
+  it("0 토큰은 숫자를 만들어 내지 않는다", () => {
+    const zero = new Map([[1, { input: 0, output: 0, cache_read: 0, cache_creation: 0 }]]);
+    expect(turnMetaLabel(1, new Map(), zero)).toBeNull();
+  });
+});
+
+describe("R7 — 항목 목록의 잘림은 화면이 말한다", () => {
+  it("최근 N 개만 그렸으면 전체 개수와 함께 그 사실이 문장으로 나온다", () => {
+    const note = itemCutNote(57, 12);
+    expect(note).not.toBeNull();
+    expect(note).toContain("57");
+    expect(note).toContain("12");
+    // 다 보이면 할 말이 없다 — 없는 잘림을 지어내지 않는다.
+    expect(itemCutNote(12, 12)).toBeNull();
+    expect(itemCutNote(3, 12)).toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// R7 (b) — 서브에이전트: 메타는 밀고, 본문은 펼칠 때 당긴다
+// ---------------------------------------------------------------------------
+
+function frame(over: Partial<RemoteSubagentFrame> = {}): RemoteSubagentFrame {
+  return {
+    id: "a7",
+    parent: "call-2",
+    turn: 1,
+    total: 5,
+    completed: 3,
+    last_status: "in_progress",
+    sig: "42-7",
+    items: null,
+    ...over,
+  };
+}
+
+describe("R7 — 서브에이전트 메타는 필수다", () => {
+  it("생산자가 항상 쓰는 필드라 없으면 빈 목록이 아니라 예외다", () => {
+    const e = {
+      id: REMOTE_ID_BASE,
+      items: [],
+      turns: [],
+      answers: [],
+      dates: [],
+      tokens: [],
+      model: null,
+      last_usage: null,
+    } as unknown as ClaudeTimelineEvent;
+    // `?? []` 로 받으면 "에이전트를 안 돌렸다"와 "계약이 깨졌다"가 같은 화면이
+    // 된다 — R7 이 지적한 결함이 정확히 그 동일시였다.
+    expect(() => toLiveTimeline(e)).toThrow();
+  });
+});
+
+describe("R7·L2-2 — 회수한 본문의 신선도는 파일 서명이 정한다 (그러나 키는 아니다)", () => {
+  const body = (sig: string | null) => ({ ...idleFetch<TimelineItem[]>(), value: [item("s1", 1)], sig });
+
+  it("서명이 다르면 낡았다고 말하고, 서명이 없으면 신선하다고 하지 않는다", () => {
+    expect(isStale(body("42-7"), "42-7")).toBe(false);
+    // 에이전트가 재활성되어 전사가 달라지면 들고 있던 본문은 낡은 것이다.
+    expect(isStale(body("42-7"), "99-1")).toBe(true);
+    // 무효화할 방법이 없으면 조용히 옛 본문을 신선한 척 보이지 않는다.
+    expect(isStale(body(null), null)).toBe(true);
+    // 들고 있는 게 없으면 낡음도 없다(그때는 "가져오기"가 답이다).
+    expect(isStale(idleFetch<TimelineItem[]>(), "42-7")).toBe(false);
+  });
+
+  /**
+   * **핵심**: 낡음은 자동 회수의 입력이 아니다.
+   *
+   * 앞 판은 서명이 잠금 키 안에 있어서, 낡음이 곧 "새 칸 = 시도 안 함 = 자동
+   * 회수"였다. 진행 중 에이전트는 델타마다 서명이 바뀌므로 그것이 곧 델타당
+   * SSH 왕복 1회 + 전사 1벌 추가 상주였다(L2-2).
+   */
+  it("모르는 것을 안다고 말하지 않는다 — 서명이 없으면 '바뀌었다'가 아니다", () => {
+    expect(subagentFreshnessNote("42-7", "42-7")).toBeNull();
+    expect(subagentFreshnessNote("42-7", "99-1")).toContain("바뀌었습니다");
+    // 서명이 없으면 바뀌었는지 **알 수 없는** 것이지 바뀐 것이 아니다 — 없는
+    // 잘림을 지어내던 것과 같은 종류의 거짓말이다(L2-11).
+    expect(subagentFreshnessNote(null, "99-1")).toContain("확인할 수단이 없습니다");
+    expect(subagentFreshnessNote("42-7", null)).toContain("확인할 수단이 없습니다");
+    expect(subagentFreshnessNote(null, null)).not.toContain("바뀌었습니다");
+  });
+
+  it("낡아도 자동 회수는 다시 열리지 않는다 — 열리는 것은 화면의 버튼이다", () => {
+    const stale = { ...body("42-7"), attempted: true };
+    expect(isStale(stale, "99-1")).toBe(true);
+    expect(shouldAutoFetch(stale)).toBe(false);
+  });
+});
+
+describe("L2-2 — 본문의 주소에는 **가변 서명이 없다**", () => {
+  it("같은 (호스트·세션·에이전트)는 서명이 어떻든 같은 칸이다", () => {
+    // 프레임의 서명이 무엇이든 주소는 `f.id` 만 쓴다.
+    expect(frame({ sig: "1-1" }).id).toBe(frame({ sig: "2-2" }).id);
+    const a = subagentBodyKey("h1", REMOTE_ID_BASE, "a7");
+    expect(a).toBe(subagentBodyKey("h1", REMOTE_ID_BASE, "a7"));
+    // 다른 에이전트·다른 세션·다른 호스트는 다른 칸이다.
+    expect(a).not.toBe(subagentBodyKey("h1", REMOTE_ID_BASE, "b8"));
+    expect(a).not.toBe(subagentBodyKey("h1", REMOTE_ID_BASE + 1, "a7"));
+    expect(a).not.toBe(subagentBodyKey("h2", REMOTE_ID_BASE, "a7"));
+  });
+
+  it("세션 본문의 주소도 (호스트·세션)뿐이다", () => {
+    expect(sessionBodyKey("h1", 5)).toBe(sessionBodyKey("h1", 5));
+    expect(sessionBodyKey("h1", 5)).not.toBe(sessionBodyKey("h1", 6));
+  });
+});
+
+describe("L2-5 — 에코된 `subagent` 를 소비자가 검증한다", () => {
+  it("물어본 자리와 다른 응답은 예외로 드러난다", () => {
+    expect(() => expectSubagent({ subagent: null }, null)).not.toThrow();
+    expect(() => expectSubagent({ subagent: "a7" }, "a7")).not.toThrow();
+    // 늦은 응답이 세션에 편입되는 것이 이 필드가 막으려던 것이다.
+    expect(() => expectSubagent({ subagent: "a7" }, null)).toThrow(/다른 자리의 것/);
+    expect(() => expectSubagent({ subagent: null }, "a7")).toThrow(/다른 자리의 것/);
+    expect(() => expectSubagent({ subagent: "b8" }, "a7")).toThrow(/다른 자리의 것/);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// R10 — 만들었으나 소비자가 없던 표면: 화면에 닿거나, 없어지거나
+// ---------------------------------------------------------------------------
+
+describe("R10 — 호스트에 직접 물어본 세션 수", () => {
+  /**
+   * 스트림이 뒤처졌는지 호스트가 한가한지를 **화면에서** 가를 수단.
+   *
+   * 이 판정이 없으면 빈 목록은 두 가지를 동시에 뜻한다: 호스트에 아무것도 안
+   * 돌거나, 이 워크벤치가 놓쳤거나. 둘은 사용자가 해야 할 일이 정반대다.
+   */
+  it("같으면 같다고, 다르면 무엇이 다른지 숫자로 말한다", () => {
+    const same = sessionCountNote(3, 3);
+    expect(same).toContain("3");
+    expect(same).not.toContain("뒤처");
+
+    const behind = sessionCountNote(5, 2);
+    expect(behind).toContain("5");
+    expect(behind).toContain("2");
+    expect(behind, "다르다는 사실이 말이 되어 나오지 않는다").toMatch(/뒤처|놓친/);
+    // 반대 방향(화면이 더 많이 아는 것)도 침묵하지 않는다 — 데몬이 정리한 세션을
+    // 이 화면만 아직 들고 있는 경우다.
+    expect(sessionCountNote(0, 2)).toMatch(/뒤처|놓친/);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// R14 — 사라진 세션의 payload 가 패널 수명 내내 남지 않는다
+// ---------------------------------------------------------------------------
+
+describe("R14 — 호스트 목록에서 사라진 세션의 자리 치우기", () => {
+  /**
+   * **끝난 세션과 사라진 세션은 다르다.**
+   *
+   * `claude-session-closed` 는 *끝났다*는 말이라 목록에 그대로 남는다(카드가
+   * 보이고 사용자가 마지막 내용을 읽는다) — 그 신호로 지우면 화면에 떠 있는
+   * 세션의 본문이 사라진다. 지울 수 있는 것은 **호스트 목록에 더는 없는** id
+   * 뿐이고, 그때는 그릴 카드 자체가 없다.
+   */
+  it("목록에 있는 id 는 끝났어도 지우지 않는다", () => {
+    const known = new Set([1, 2]);
+    const first = droppableIds([1, 2], known, new Set());
+    expect(first.drop.size).toBe(0);
+    expect(first.missing.size).toBe(0);
+  });
+
+  /**
+   * 한 번 안 보이는 것으로는 지우지 않는다. 폴링 응답은 이벤트보다 낡을 수
+   * 있어서(방금 생긴 세션이 스냅샷에는 아직 없다), 첫 실종은 경합과 구별되지
+   * 않는다. 연속 두 번이면 경합이 아니다.
+   */
+  it("연속 두 번 사라진 뒤에 지운다 — 낡은 스냅샷과 진짜 소멸을 가른다", () => {
+    const known = new Set([1]);
+    const first = droppableIds([1, 9], known, new Set());
+    expect(first.drop.size, "한 번 안 보였다고 지우면 방금 생긴 세션을 지운다").toBe(0);
+    expect(first.missing).toEqual(new Set([9]));
+
+    // 다음 폴링에서도 없다 — 이제는 정말 없는 것이다.
+    const second = droppableIds([1, 9], known, first.missing);
+    expect(second.drop).toEqual(new Set([9]));
+
+    // 그 사이에 돌아오면(스냅샷이 따라잡았다) 표시는 지워진다.
+    const back = droppableIds([1, 9], new Set([1, 9]), first.missing);
+    expect(back.drop.size).toBe(0);
+    expect(back.missing.size).toBe(0);
+  });
+
+  it("본문 주소에서 세션 id 를 읽는다 — 같은 규칙으로 치우려면", () => {
+    expect(sessionOfBodyKey(subagentBodyKey("h1", REMOTE_ID_BASE + 5, "a7"))).toBe(
+      REMOTE_ID_BASE + 5,
+    );
+    expect(sessionOfBodyKey(sessionBodyKey("h1", REMOTE_ID_BASE + 5))).toBe(REMOTE_ID_BASE + 5);
+    // 모르는 모양이면 **아무 세션도 아니다** — 0 을 돌려주면 id 0 의 본문을 지운다.
+    expect(sessionOfBodyKey("망가진키")).toBeNull();
   });
 });

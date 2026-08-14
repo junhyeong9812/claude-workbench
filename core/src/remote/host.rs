@@ -22,13 +22,14 @@
 //!
 //! ## What is deliberately not translated
 //!
-//! `subagents` is still empty: the daemon tails **one** transcript per session
-//! and never opens `<uuid>/subagents/`, so a remote timeline shows a parallel
-//! agent's spawning tool call but not the agent's own items. Recorded as a
-//! known window; closing it is a change to the daemon's contract *and* to the
-//! payload-size behaviour the workbench had to fix once already (completed
-//! subagents' bodies were 77% of a local payload), so it is not a field this
-//! file can quietly start filling.
+//! `subagents` **was** empty until R7, and the way it stopped being empty is the
+//! part worth keeping in mind. The daemon now opens `<uuid>/subagents/` and
+//! reports each agent's counters; it never sends the transcripts. So this file
+//! translates meta into [`RemoteSubagentFrame`]s whose `items` is *always*
+//! `None`, and the body is fetched per agent when a user expands it
+//! (`remote_timeline` with a `subagent`). Filling `items` here would put a
+//! transcript into every `claude-timeline` emit — which is precisely the shape
+//! that measured 5.22 GB of webview RSS locally, with an SSH link added.
 //!
 //! `answers`, `dates` and per-turn `tokens` **were** in this list until R2b:
 //! the daemon folded them out of the transcript on every poll and dropped
@@ -102,8 +103,53 @@ pub struct RemoteTimelinePayload {
     pub tokens: Vec<(u64, TokenUsage)>,
     pub model: Option<String>,
     pub last_usage: Option<TokenUsage>,
-    /// Always empty — the daemon does not tail subagent transcripts.
-    pub subagents: Vec<serde_json::Value>,
+    /// This session's subagents — **meta only**, exactly like the local
+    /// payload's finished frames (see [`RemoteSubagentFrame`]).
+    pub subagents: Vec<RemoteSubagentFrame>,
+}
+
+/// One subagent's frame in a remote payload.
+///
+/// Field-for-field the local `SubagentFrame`
+/// (`src-tauri/src/commands/claude/timeline.rs`), so the frontend reads a remote
+/// agent with the same code it reads a local one — with one difference that is
+/// deliberate: `items` is **always `None`** here.
+///
+/// Locally, a *live* agent's body rides inline because a running agent is small
+/// and a fetch round-trip is a local file read. A remote fetch is an SSH
+/// round-trip, and a live agent's body would be re-sent on every delta over that
+/// link — the 5.22 GB accident with a network in the middle. So every remote
+/// frame is deferred: the meta draws the header, and the body is fetched once,
+/// when the user expands it (`remote_timeline` with a `subagent`).
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct RemoteSubagentFrame {
+    pub id: String,
+    pub parent: Option<String>,
+    pub turn: u64,
+    pub total: usize,
+    pub completed: usize,
+    pub last_status: Option<crate::timeline::AgentStatus>,
+    pub sig: Option<String>,
+    /// Always `None` — see the type's note. Present so the shape matches the
+    /// local frame the frontend already knows how to read.
+    pub items: Option<Vec<TimelineItem>>,
+}
+
+impl From<&proto::SubagentMeta> for RemoteSubagentFrame {
+    fn from(m: &proto::SubagentMeta) -> Self {
+        RemoteSubagentFrame {
+            id: m.id.clone(),
+            parent: m.parent.clone(),
+            turn: m.turn,
+            total: m.total,
+            completed: m.completed,
+            last_status: m.last_status,
+            sig: m.sig.clone(),
+            // Not "not yet filled": this field is how the payload says "ask for
+            // it". Filling it here is the one change this file must never make.
+            items: None,
+        }
+    }
 }
 
 /// One thing the bridge must do as a result of a frame. The transport turns
@@ -274,6 +320,9 @@ struct Session {
     answers: BTreeMap<u64, String>,
     dates: BTreeMap<u64, String>,
     tokens: BTreeMap<u64, TokenUsage>,
+    /// The session's subagents by id, meta only — merged rather than replaced,
+    /// because a delta that says nothing about them means "unchanged".
+    subagents: BTreeMap<String, proto::SubagentMeta>,
     model: Option<String>,
     last_usage: Option<TokenUsage>,
     body_omitted: bool,
@@ -292,6 +341,7 @@ impl Session {
             answers: BTreeMap::new(),
             dates: BTreeMap::new(),
             tokens: BTreeMap::new(),
+            subagents: BTreeMap::new(),
             model: None,
             last_usage: None,
             body_omitted: false,
@@ -325,7 +375,9 @@ impl Session {
             tokens: self.tokens.iter().map(|(k, v)| (*k, *v)).collect(),
             model: self.model.clone(),
             last_usage: self.last_usage,
-            subagents: Vec::new(),
+            // Discovery order is the daemon's; a BTreeMap by id is stable and
+            // that is what matters for a list that redraws every delta.
+            subagents: self.subagents.values().map(RemoteSubagentFrame::from).collect(),
         }
     }
 
@@ -428,6 +480,13 @@ pub struct Host {
     /// inside one epoch would silently rewind the stream on the next resume, and
     /// nothing else in the protocol would report it.
     cursor: Option<Cursor>,
+    /// Set when a frame was lost **here** (dropped or unreadable). While it is
+    /// set the cursor is neither handed out nor advanced — see
+    /// [`Self::on_local_loss`].
+    resync_required: bool,
+    /// How many frames have been lost **here** since a snapshot last rebuilt
+    /// this state. See [`Self::losses_since_snapshot`].
+    losses_since_snapshot: u32,
     resume: Option<ResumeOutcome>,
     last_error: Option<String>,
     attempts: u32,
@@ -461,6 +520,8 @@ impl Host {
             daemon: None,
             epoch: None,
             cursor: None,
+            resync_required: false,
+            losses_since_snapshot: 0,
             resume: None,
             last_error: None,
             attempts: 0,
@@ -482,7 +543,14 @@ impl Host {
 
     /// The cursor to resume from, if any. Handed to `cwcd stream --cursor`
     /// verbatim; it is the daemon's own string.
+    ///
+    /// `None` while a resync is owed ([`Self::on_local_loss`]): a position that
+    /// is past a hole in this state is worse than no position at all, because
+    /// handing it back tells the daemon the missing events were delivered.
     pub fn cursor(&self) -> Option<&str> {
+        if self.resync_required {
+            return None;
+        }
         self.cursor.as_ref().map(Cursor::as_str)
     }
 
@@ -504,6 +572,11 @@ impl Host {
     /// idempotently and looks like nothing happened. A new epoch is a different
     /// stream and is taken as-is (`on_hello` clears the cursor for it anyway).
     fn advance_cursor(&mut self, next: &Cursor) {
+        // A hole was punched in this state; every position after it is a claim
+        // this workbench cannot back up. Held until a snapshot rebuilds it.
+        if self.resync_required {
+            return;
+        }
         if let Some(cur) = &self.cursor {
             if cur.epoch() == next.epoch() && next.seq() < cur.seq() {
                 let (from, to) = (cur.to_string(), next.to_string());
@@ -577,7 +650,10 @@ impl Host {
             phase: self.phase,
             daemon: self.daemon.clone(),
             resume: self.resume.clone(),
-            cursor: self.cursor.as_ref().map(Cursor::to_string),
+            // What the next attach would resume from — `None` while a resync is
+            // owed, so the screen and the transport never disagree about
+            // whether this connection has a position it can stand behind.
+            cursor: self.cursor().map(str::to_string),
             last_error: self.last_error.clone(),
             attempts: self.attempts,
             last_frame_at_ms: self.last_frame_at_ms,
@@ -636,15 +712,60 @@ impl Host {
         }
     }
 
-    /// A line the decoder could not read at all. Reported, and the cursor is
-    /// deliberately left where it was.
+    /// A line the decoder could not read at all.
     pub fn on_undecodable(&mut self, reason: String) {
         self.last_frame_at_ms = Some((self.now_ms)());
+        self.on_local_loss(format!("데몬이 보낸 줄을 읽지 못했습니다 — {reason}"));
+    }
+
+    /// A frame that was lost **on this side** — dropped by the reader for being
+    /// over-long, or unreadable by the decoder — promoted to a gap.
+    ///
+    /// The daemon's own [`Gap`] and this one are the same event seen from two
+    /// ends: some events did not reach this state, and nothing but a fresh
+    /// snapshot can say what they were. So it takes the same path — the position
+    /// stops being committed ([`Self::cursor`] answers `None` until a snapshot
+    /// rebuilds the world), which is what turns a permanent silent loss into a
+    /// reconnect that fixes itself.
+    ///
+    /// The cost is stated rather than hidden: while a resync is owed, a
+    /// reconnect starts from *now* instead of resuming, so events that happen
+    /// between the two attaches are not replayed. That is the trade the
+    /// protocol already makes for a daemon-side gap, and it is strictly better
+    /// than the alternative it replaces — resuming past the hole, which told the
+    /// daemon those events were delivered.
+    pub fn on_local_loss(&mut self, message: impl Into<String>) {
+        let message = message.into();
+        self.resync_required = true;
+        self.losses_since_snapshot = self.losses_since_snapshot.saturating_add(1);
+        self.resume = Some(ResumeOutcome::Gap { message: message.clone() });
         self.push_notice(
             NoticeLevel::Warn,
-            format!("데몬이 보낸 줄을 읽지 못했습니다 — {reason}"),
+            format!("{message} — 이어받지 않고 전체 상태를 다시 받습니다."),
             None,
         );
+    }
+
+    /// Whether this state is known to be missing something a snapshot must
+    /// rebuild. While it is `true` the cursor is not handed out and not moved.
+    pub fn needs_resync(&self) -> bool {
+        self.resync_required
+    }
+
+    /// How many frames have been lost **here** since a snapshot last rebuilt
+    /// this state — reset by [`Self::on_snapshot`] and by nothing else.
+    ///
+    /// This is how a blip is told from a **deterministic** loss, and the
+    /// difference decides whether reconnecting is a fix or a treadmill. A resync
+    /// makes the next attach a fresh one, and a fresh attach opens with the whole
+    /// snapshot; so if the byte that could not be read lives *in that snapshot*,
+    /// every reconnect fails at the same place, having made no progress, at the
+    /// cost of one SSH connection per turn — and the bigger the host's state
+    /// grows, the more certain that becomes. A count that only a rebuilt world
+    /// clears is exactly the signal for "reconnecting has been tried and did not
+    /// work"; the transport reads it in `link::consume`.
+    pub fn losses_since_snapshot(&self) -> u32 {
+        self.losses_since_snapshot
     }
 
     fn report_unknown(&mut self, tag: String, message: String) {
@@ -740,6 +861,7 @@ impl Host {
                 answers,
                 dates,
                 tokens,
+                subagents,
             } = snap;
             // Reuse the existing id when we already knew this key, so a resync
             // does not make a viewer think its session was replaced.
@@ -764,6 +886,11 @@ impl Host {
                 sess.dates = dates;
                 sess.tokens = tokens;
             }
+            // Meta, not body: the daemon sends it even for a session whose body
+            // it left out, and it is the only thing that tells "ran no agents"
+            // apart from "we are not being told". Replaced, not merged — a
+            // snapshot is the authority about which agents exist.
+            sess.subagents = subagents.into_iter().map(|m| (m.id.clone(), m)).collect();
             sess.model = model;
             sess.last_usage = last_usage;
             sess.body_omitted = items_omitted;
@@ -794,6 +921,13 @@ impl Host {
             out.push(Emit::Closed { id: gone.id });
         }
         self.sessions = kept;
+        // A snapshot **is** the resync: it carries the whole world, so whatever
+        // was lost locally is either back or gone on the daemon too, and the
+        // position it comes with is trustworthy again. It is also the only thing
+        // that can say a reconnect *worked*, which is why the loss count starts
+        // over here and nowhere else.
+        self.resync_required = false;
+        self.losses_since_snapshot = 0;
         self.advance_cursor(&s.cursor);
         out
     }
@@ -862,6 +996,7 @@ impl Host {
                 answers,
                 dates,
                 tokens,
+                subagents,
                 ..
             } => {
                 if let Some(i) = self.index_of(&key) {
@@ -873,6 +1008,12 @@ impl Host {
                     s.answers.extend(answers);
                     s.dates.extend(dates);
                     s.tokens.extend(tokens);
+                    // Empty = "nothing new about them", so merge by id. Taking
+                    // an omitted field as "there are none" would blink a
+                    // session's agents out on every unrelated delta.
+                    for m in subagents {
+                        s.subagents.insert(m.id.clone(), m);
+                    }
                     if model.is_some() {
                         s.model = model;
                     }
@@ -1128,6 +1269,89 @@ mod tests {
         assert_eq!(meta.last_title.as_deref(), Some("run b"));
     }
 
+    /// R7 ⓑ on the consumer side. The daemon now reports a session's subagents
+    /// as **metadata**; the payload must carry the same, with no body.
+    ///
+    /// The assertion that matters is the second one: `items` is `null` on every
+    /// frame and the payload's JSON contains no transcript text. That is the
+    /// 5.22 GB invariant, restated at this end of the wire — if a body ever
+    /// reaches this struct it reaches an `app.emit`, which is where the accident
+    /// happened.
+    #[test]
+    fn subagents_arrive_as_meta_and_their_bodies_never_reach_the_payload() {
+        let mut h = host();
+        h.apply(hello("e1", r#"{"kind":"fresh"}"#)).unwrap();
+        h.apply(spawned(1, "e1", "k1", "u1")).unwrap();
+
+        let out = h
+            .apply(delta(
+                2,
+                "e1",
+                "k1",
+                "u1",
+                r#""items":[],"subagents":[{"id":"a7","parent":"call-2","turn":1,"total":3,"completed":2,"last_status":"in_progress","sig":"42-7"}]"#,
+            ))
+            .unwrap();
+        let Emit::Timeline(p) = &out[0] else { panic!() };
+        assert_eq!(p.subagents.len(), 1, "an agent the daemon reported must reach the screen");
+        let f = &p.subagents[0];
+        assert_eq!(f.id, "a7");
+        assert_eq!(f.parent.as_deref(), Some("call-2"));
+        assert_eq!((f.turn, f.total, f.completed), (1, 3, 2));
+        assert_eq!(f.sig.as_deref(), Some("42-7"));
+        assert!(
+            f.items.is_none(),
+            "a frame that carries a body is the accident this design exists to prevent"
+        );
+        let json = serde_json::to_string(&p).unwrap();
+        assert!(json.contains(r#""items":null"#), "the local payload's shape is items: null|[…]");
+
+        // Later deltas update the counters in place — one agent, not three rows.
+        let out = h
+            .apply(delta(
+                3,
+                "e1",
+                "k1",
+                "u1",
+                r#""items":[],"subagents":[{"id":"a7","turn":1,"total":5,"completed":5,"last_status":"completed"}]"#,
+            ))
+            .unwrap();
+        let Emit::Timeline(p) = &out[0] else { panic!() };
+        assert_eq!(p.subagents.len(), 1);
+        assert_eq!((p.subagents[0].total, p.subagents[0].completed), (5, 5));
+
+        // Absent means "nothing new about them", never "there are none" — the
+        // producer omits the field on a delta that did not touch them.
+        let out = h.apply(delta(4, "e1", "k1", "u1", r#""items":[]"#)).unwrap();
+        let Emit::Timeline(p) = &out[0] else { panic!() };
+        assert_eq!(
+            p.subagents.len(),
+            1,
+            "an omitted field cleared the list — a session's agents would blink out on every \
+             delta that did not mention them"
+        );
+    }
+
+    /// A snapshot is what a late viewer (and every reconnect) rebuilds from, so
+    /// the same must hold there: agents present, bodies absent.
+    #[test]
+    fn a_snapshot_carries_a_sessions_agents_but_not_their_transcripts() {
+        let mut h = host();
+        h.apply(hello("e1", r#"{"kind":"fresh"}"#)).unwrap();
+        let out = h
+            .apply(
+                decode_frame(
+                    r#"{"frame":"snapshot","cursor":"e1:9","taken_at_ms":1,"sessions":[{"key":"k1","session_id":"u1","agent":"claude","cwd":"/w","state":"exited","started_at_ms":1,"argv":[],"timeline_len":4,"items":[],"items_omitted":true,"turns":{},"subagents":[{"id":"a7","turn":2,"total":4,"completed":4,"sig":"9-9"}]}]}"#,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        let Emit::Timeline(p) = &out[0] else { panic!() };
+        assert_eq!(p.subagents.len(), 1, "a finished session still ran its agents");
+        assert!(p.subagents[0].items.is_none());
+        assert_eq!(p.subagents[0].total, 4);
+    }
+
     #[test]
     fn a_late_delta_for_an_unknown_session_is_reported_not_dropped() {
         let mut h = host();
@@ -1217,6 +1441,67 @@ mod tests {
         h.on_undecodable("not JSON".into());
         assert_eq!(h.last_frame_at_ms(), Some(5_000));
         assert_eq!(h.snapshot().last_frame_at_ms, Some(5_000));
+    }
+
+    /// **A line lost on this side is a gap like any other.**
+    ///
+    /// A line the reader dropped (too long) or the decoder could not read might
+    /// have been a `session_spawned`, a delta — or a whole snapshot. Nothing
+    /// says which, and a warning does not bring it back: while the cursor went
+    /// on advancing past the hole, the daemon considered those events delivered
+    /// and a reconnect resumed *after* them, so the loss was permanent and
+    /// invisible. Promoted to the consumer's own gap, it takes the path the
+    /// protocol already has for loss — hold the position, ask for a fresh
+    /// stream, be rebuilt by the snapshot that follows one.
+    #[test]
+    fn a_line_lost_on_this_side_holds_the_cursor_and_asks_to_be_rebuilt() {
+        let mut h = host();
+        h.apply(hello("e1", r#"{"kind":"fresh"}"#)).unwrap();
+        h.apply(spawned(1, "e1", "k1", "u1")).unwrap();
+        assert_eq!(h.cursor(), Some("e1:1"));
+        assert!(!h.needs_resync());
+
+        h.on_undecodable("not JSON".into());
+
+        assert!(h.needs_resync(), "an unreadable line is a gap, not a shrug");
+        assert_eq!(
+            h.cursor(),
+            None,
+            "resuming past the hole is what made the loss permanent — the next attach must be fresh"
+        );
+        assert_eq!(h.snapshot().cursor, None, "and the screen must say the same thing");
+        assert!(
+            matches!(h.snapshot().resume, Some(ResumeOutcome::Gap { .. })),
+            "the user sees the same 'being rebuilt' state a daemon-side gap produces"
+        );
+        assert!(h.snapshot().notices.iter().any(|n| n.level == NoticeLevel::Warn));
+
+        // A late event on the dying attach must not commit a position past the
+        // loss either — the abort is the transport's job, this is the belt.
+        h.apply(spawned(5, "e1", "k2", "u2")).unwrap();
+        assert_eq!(h.cursor(), None, "nothing may be committed past a hole");
+
+        // The resync is what clears it: a snapshot is the whole world, so its
+        // own position is trustworthy again.
+        let snap = r#"{"frame":"snapshot","cursor":"e1:9","taken_at_ms":1,"sessions":[]}"#;
+        h.apply(decode_frame(snap).unwrap()).unwrap();
+        assert!(!h.needs_resync(), "the snapshot rebuilt the world");
+        assert_eq!(h.cursor(), Some("e1:9"), "…and its position is the one to resume from");
+    }
+
+    /// The same for a line the *reader* dropped (over-long), which arrives here
+    /// as [`Host::on_local_loss`] rather than as a decode error.
+    #[test]
+    fn a_dropped_line_is_the_same_gap_as_an_unreadable_one() {
+        let mut h = host();
+        h.apply(hello("e1", r#"{"kind":"fresh"}"#)).unwrap();
+        h.apply(spawned(1, "e1", "k1", "u1")).unwrap();
+        h.on_local_loss("한 줄이 너무 길어 버렸습니다");
+        assert!(h.needs_resync());
+        assert_eq!(h.cursor(), None);
+        let s = h.snapshot();
+        assert!(matches!(s.resume, Some(ResumeOutcome::Gap { .. })));
+        assert!(s.notices.last().unwrap().message.contains("너무 길어"));
     }
 
     /// A notice `seq` only means something **inside one attachment**, so the
