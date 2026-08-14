@@ -158,40 +158,22 @@ fn state_types_in(line: &str) -> Vec<String> {
     out
 }
 
-/// Every `State<…>` written in a signature, with the file and the line it was
-/// written on, so a failure names the place to fix.
-fn requested() -> Vec<(String, String)> {
+/// Every `#[tauri::command]` signature in the tree, as `(file, line number, the
+/// code on that line)` — from the `fn` to the line where its parameter list
+/// closes again.
+///
+/// **Both scans below read exactly these lines**, and that is the point. While
+/// the type scan read the whole tree and the word count read only command
+/// signatures, the first was a *superset* of the second: two helper functions
+/// take a `State` too, so the type scan could miss up to two command parameters
+/// and still clear a `>=` floor. A floor a mistake can sink into is not a floor.
+/// Over one and the same region the two counts must come out **equal**, and any
+/// notation the type scan cannot read makes them differ.
+fn command_signatures() -> (usize, Vec<(PathBuf, usize, String)>) {
     let mut files = Vec::new();
     rust_files(&src(), &mut files);
     files.sort();
-    let mut out = Vec::new();
-    for file in files {
-        let text = std::fs::read_to_string(&file).expect("read");
-        for (i, line) in text.lines().enumerate() {
-            for ty in state_types_in(line) {
-                out.push((ty, format!("{}:{}", file.display(), i + 1)));
-            }
-        }
-    }
-    out
-}
-
-/// How many command signatures name `State`, counted by a **different rule**:
-/// the bare word inside a `#[tauri::command]` function's parameter list, with no
-/// angle brackets involved at all.
-///
-/// This is the floor the parse above is held to. `requested.len() >= 20` only
-/// ever proved the scan had found *something*: a notation it could not read
-/// dropped silently out of both the list and the check, which is precisely the
-/// fail-open this file exists to prevent — in the file that exists to prevent
-/// it. Two counts derived from unrelated rules cannot fail that way together.
-///
-/// Returns `(commands, state parameters)`.
-fn command_state_parameters() -> (usize, usize) {
-    let mut files = Vec::new();
-    rust_files(&src(), &mut files);
-    files.sort();
-    let (mut commands, mut params) = (0usize, 0usize);
+    let (mut commands, mut out) = (0usize, Vec::new());
     for file in files {
         let text = std::fs::read_to_string(&file).expect("read");
         let lines: Vec<&str> = text.lines().map(code_only).collect();
@@ -206,7 +188,7 @@ fn command_state_parameters() -> (usize, usize) {
             };
             let mut depth = 0usize;
             let mut seen_paren = false;
-            for line in &lines[i + start..] {
+            for (j, line) in lines[i + start..].iter().enumerate() {
                 for c in line.chars() {
                     match c {
                         '(' => {
@@ -217,18 +199,53 @@ fn command_state_parameters() -> (usize, usize) {
                         _ => {}
                     }
                 }
-                // A `State` in the parameter list, counted as a bare word.
-                params += line
-                    .split(|c: char| !(c.is_alphanumeric() || c == '_'))
-                    .filter(|w| *w == "State")
-                    .count();
+                out.push((file.clone(), i + start + j + 1, (*line).to_string()));
                 if seen_paren && depth == 0 {
                     break;
                 }
             }
         }
     }
-    (commands, params)
+    (commands, out)
+}
+
+/// Every `State<…>` a **command** asks for, with the file and the line it was
+/// written on, so a failure names the place to fix.
+///
+/// Commands and nothing else: Tauri resolves `State<T>` by `TypeId` when it
+/// dispatches an invoke, so a plain helper that takes a `State` was handed one
+/// by the command that called it and has no lookup of its own to get wrong.
+/// Reading those too made this list a superset of the count that holds it up —
+/// see [`command_signatures`].
+fn requested(signatures: &[(PathBuf, usize, String)]) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for (file, line_no, line) in signatures {
+        for ty in state_types_in(line) {
+            out.push((ty, format!("{}:{}", file.display(), line_no)));
+        }
+    }
+    out
+}
+
+/// How many command signatures name `State`, counted by a **different rule**:
+/// the bare word inside a `#[tauri::command]` function's parameter list, with no
+/// angle brackets involved at all.
+///
+/// This is what the parse above is held to. `requested.len() >= 20` only ever
+/// proved the scan had found *something*: a notation it could not read dropped
+/// silently out of both the list and the check, which is precisely the fail-open
+/// this file exists to prevent — in the file that exists to prevent it. Two
+/// counts derived from unrelated rules over the same lines cannot fail that way
+/// together.
+fn state_words_in(signatures: &[(PathBuf, usize, String)]) -> usize {
+    signatures
+        .iter()
+        .map(|(_, _, line)| {
+            line.split(|c: char| !(c.is_alphanumeric() || c == '_'))
+                .filter(|w| *w == "State")
+                .count()
+        })
+        .sum()
 }
 
 /// **The scan must read every way a state parameter is written.**
@@ -260,8 +277,9 @@ fn the_scan_reads_every_way_a_state_parameter_is_written() {
 #[test]
 fn every_state_a_command_asks_for_is_one_that_was_managed() {
     let managed = managed();
-    let requested = requested();
-    let (commands, state_params) = command_state_parameters();
+    let (commands, signatures) = command_signatures();
+    let requested = requested(&signatures);
+    let state_params = state_words_in(&signatures);
     assert!(
         commands >= 50,
         "only {commands} `#[tauri::command]` were found — the scan is reading the wrong thing"
@@ -270,14 +288,18 @@ fn every_state_a_command_asks_for_is_one_that_was_managed() {
         state_params >= 20,
         "only {state_params} command parameters name `State` — the scan is reading the wrong thing"
     );
-    // The floor that has teeth: every `State` a command declares must have been
-    // *read* by the parse above. A notation it cannot handle drops out of
-    // `requested` while this count, made by an unrelated rule, does not move.
-    assert!(
-        requested.len() >= state_params,
-        "the scan read {} state parameters but command signatures declare {state_params} — a \
-         notation is being skipped, so this test would pass over exactly the mismatch it exists \
-         to catch:\n  read: {requested:#?}",
+    // The check that has teeth: every `State` a command declares must have been
+    // *read* by the parse above — no more and no fewer. A notation the parse
+    // cannot handle drops out of `requested` while this count, made by an
+    // unrelated rule over the same lines, does not move. `>=` left slack for
+    // exactly that mistake, because the parse used to read the whole tree
+    // (helpers included) and so ran ahead of the count it was measured against.
+    assert_eq!(
+        requested.len(),
+        state_params,
+        "the scan read {} state parameters but command signatures declare {state_params} — one \
+         of the two rules is skipping something, so this test would pass over exactly the \
+         mismatch it exists to catch:\n  read: {requested:#?}",
         requested.len()
     );
     let unmanaged: Vec<_> = requested
