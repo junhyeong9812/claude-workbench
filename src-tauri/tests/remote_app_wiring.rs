@@ -105,8 +105,21 @@ fn the_app_installs_the_closer_the_registry_cannot_install_itself() {
     );
     assert!(
         installer.contains("remove("),
-        "the closer must actually end the session — an emit alone leaves the terminal typing \
-         into the remote agent:\n{installer}"
+        "the closer must actually end the session — recording a reason alone leaves the terminal \
+         typing into the remote agent:\n{installer}"
+    );
+    // …and the reason has to be written down **first**. Removing the session
+    // tears down the SSH channel, and the status relay then offers the vaguer
+    // "연결이 끊어졌습니다" — which, since the store keeps whichever arrives
+    // first, would become the sentence the user is shown for their own click.
+    let (record, remove) = (
+        installer.find(".record(").expect("the closer records the reason"),
+        installer.find("remove(").expect("the closer removes the session"),
+    );
+    assert!(
+        record < remove,
+        "the reason is recorded after the session is torn down, so the vaguer reason wins the \
+         race and the screen explains the effect instead of the cause:\n{installer}"
     );
 }
 
@@ -132,8 +145,8 @@ fn opening_a_remote_terminal_files_it_under_its_host() {
 #[test]
 fn a_terminal_that_ended_is_forgotten_before_its_id_can_be_reused() {
     let remote = code_of("commands/remote.rs");
-    let ended = body_of(&remote, "fn emit_terminal_ended(")
-        .expect("`emit_terminal_ended` is gone — the forget has no home and this test no subject");
+    let ended = body_of(&remote, "fn record_terminal_ended(")
+        .expect("`record_terminal_ended` is gone — the forget has no home and this test no subject");
     assert!(
         ended.contains("forget_terminal"),
         "a terminal that ended on its own stays filed under its host. The session manager hands \

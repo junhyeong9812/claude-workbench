@@ -528,7 +528,7 @@ fn a_dropped_connection_resumes_with_no_gap_while_the_host_keeps_working() {
         Some(first.id)
     );
 
-    registry.detach_all();
+    registry.detach("e2e");
 }
 
 /// When the daemon's ring moves past our cursor, the loss is **stated** and the
@@ -583,7 +583,7 @@ fn an_evicted_cursor_is_reported_and_the_screen_is_rebuilt() {
     })
     .expect("the snapshot after a gap must rebuild the list");
 
-    registry.detach_all();
+    registry.detach("gap");
 }
 
 /// A host whose "daemon" is a shell script — everything on the workbench side is
