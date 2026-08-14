@@ -48,6 +48,7 @@ import {
   resumeLabel,
   seenKey,
   seenSeqOf,
+  sessionCountNote,
   nextRemoteResize,
   shouldAutoFetchBody,
   shouldAutoLoadSubagent,
@@ -556,6 +557,22 @@ function HostCard({
   const age = ageLabel(host.last_frame_at_ms);
   const [spawning, setSpawning] = useState(false);
   const [showData, setShowData] = useState(false);
+  /**
+   * "호스트에 직접 물어본" 결과 한 줄 — 사용자가 누를 때만 나간다.
+   *
+   * 폴링에 얹지 않는다: 스트림 밖의 SSH 왕복이라, 자동으로 돌면 R1 이 실측한
+   * "화면은 멀쩡한데 원격 sshd 에 연결이 계속 나가는" 모양을 그대로 되만든다.
+   */
+  const [ask, setAsk] = useState<{ busy: boolean; note: string | null }>({
+    busy: false,
+    note: null,
+  });
+  const askHost = () => {
+    setAsk({ busy: true, note: null });
+    invoke<number>("remote_sessions", { hostId: host.host_id })
+      .then((n) => setAsk({ busy: false, note: sessionCountNote(n, host.sessions.length) }))
+      .catch((e) => setAsk({ busy: false, note: errText(e, "호스트에 묻지 못했습니다.") }));
+  };
   return (
     <section className="remote-host">
       <header className="remote-host-head">
@@ -583,10 +600,21 @@ function HostCard({
         >
           {spawning ? "새 세션 접기" : "새 세션"}
         </button>
+        <button
+          type="button"
+          className="remote-new"
+          onClick={askHost}
+          disabled={ask.busy}
+          title="스트림을 거치지 않고 데몬에 세션 수를 직접 묻습니다 — 화면이 뒤처졌는지 확인용"
+        >
+          {ask.busy ? "묻는 중…" : "호스트에 확인"}
+        </button>
         <button type="button" onClick={onDisconnect} title="이 호스트에서 떼기">
           떼기
         </button>
       </header>
+
+      {ask.note ? <div className="remote-host-meta">{ask.note}</div> : null}
 
       {spawning ? <NewSessionForm hostId={host.host_id} onSpawned={onSpawned} /> : null}
       {showData ? <RemoteDataPanel hostId={host.host_id} /> : null}

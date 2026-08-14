@@ -18,6 +18,7 @@ import {
   resumeLabel,
   seenKey,
   seenSeqOf,
+  sessionCountNote,
   shouldAutoFetchBody,
   shouldFetchBody,
   nextRemoteResize,
@@ -758,5 +759,31 @@ describe("R7 — 서브에이전트 자동 회수도 축이 **시도**다", () =
     expect(subagentAttemptKey(1, frame({ sig: null }))).toBe(
       subagentAttemptKey(1, frame({ sig: null })),
     );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// R10 — 만들었으나 소비자가 없던 표면: 화면에 닿거나, 없어지거나
+// ---------------------------------------------------------------------------
+
+describe("R10 — 호스트에 직접 물어본 세션 수", () => {
+  /**
+   * 스트림이 뒤처졌는지 호스트가 한가한지를 **화면에서** 가를 수단.
+   *
+   * 이 판정이 없으면 빈 목록은 두 가지를 동시에 뜻한다: 호스트에 아무것도 안
+   * 돌거나, 이 워크벤치가 놓쳤거나. 둘은 사용자가 해야 할 일이 정반대다.
+   */
+  it("같으면 같다고, 다르면 무엇이 다른지 숫자로 말한다", () => {
+    const same = sessionCountNote(3, 3);
+    expect(same).toContain("3");
+    expect(same).not.toContain("뒤처");
+
+    const behind = sessionCountNote(5, 2);
+    expect(behind).toContain("5");
+    expect(behind).toContain("2");
+    expect(behind, "다르다는 사실이 말이 되어 나오지 않는다").toMatch(/뒤처|놓친/);
+    // 반대 방향(화면이 더 많이 아는 것)도 침묵하지 않는다 — 데몬이 정리한 세션을
+    // 이 화면만 아직 들고 있는 경우다.
+    expect(sessionCountNote(0, 2)).toMatch(/뒤처|놓친/);
   });
 });

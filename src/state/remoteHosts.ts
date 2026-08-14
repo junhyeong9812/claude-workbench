@@ -547,6 +547,23 @@ export function attachGate(
   return { enabled: true, hint: "이 세션의 화면을 아래에 엽니다." };
 }
 
+/**
+ * 호스트에 **직접 물어본** 세션 수와 화면이 아는 수를 나란히 놓는 한 줄.
+ *
+ * 빈 목록은 두 가지를 동시에 뜻한다 — 호스트에 아무것도 안 돌거나, 이 워크벤치가
+ * 놓쳤거나. 사용자가 해야 할 일이 정반대인데 화면은 같다. `remote_sessions` 는
+ * 스트림을 거치지 않고 데몬에 묻는 유일한 경로라 그 둘을 가른다.
+ *
+ * 어느 쪽이 옳다고 말하지 않는다. 말할 수 있는 것은 두 숫자가 다르다는 사실과
+ * 각각이 무엇인지뿐이고, 그 이상은 이 화면이 알 수 없다.
+ */
+export function sessionCountNote(daemon: number, shown: number): string {
+  if (daemon === shown) {
+    return `호스트가 지금 답한 세션 ${daemon}개 — 이 화면이 아는 수와 같습니다.`;
+  }
+  return `호스트는 세션 ${daemon}개라고 답했고 이 화면은 ${shown}개를 알고 있습니다 — 스트림이 뒤처졌거나 놓친 프레임이 있습니다(다시 붙으면 전체를 새로 받습니다).`;
+}
+
 /** 데몬이 발행하는 에이전트 홈 하나 — `remote_accounts` 응답의 한 줄. */
 export interface RemoteAccount {
   id: string;
