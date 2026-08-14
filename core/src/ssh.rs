@@ -27,7 +27,7 @@
 //! — see [`ExecStdin::Stream`] for the measurement behind that.
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
@@ -168,6 +168,16 @@ pub enum ExecEvent {
     Exit {
         code: Option<u32>,
         signal: Option<String>,
+        /// How many bytes of input this session accepted from the caller and
+        /// never managed to put on the wire — normally `0`.
+        ///
+        /// It exists because the alternative is silence. A keystroke is taken
+        /// into a queue before the transport can carry it (that queue is what
+        /// makes typing into a just-opened terminal work), and if the command
+        /// ends before the queue drains, those bytes are gone with no one to
+        /// tell. `Ok` from the write and nothing afterwards is a delivery the
+        /// caller has no way to doubt, so the count travels with the end.
+        undelivered: u64,
     },
     /// The exec could not run to a normal exit — the server **rejected** the exec
     /// request, or the request could not be sent. This is a terminal event too.
@@ -233,30 +243,31 @@ pub struct SshChannels {
     pub exec_rx: mpsc::Receiver<ExecEvent>,
 }
 
-/// Nothing may be written yet — the server has not accepted the exec.
-const INPUT_PENDING: u8 = 0;
-/// The remote command is running and its stdin is reachable.
-const INPUT_ACCEPTED: u8 = 1;
-/// The channel is finished; there is no longer anything to write to.
-const INPUT_FINISHED: u8 = 2;
-
 /// When a session may be written to.
 ///
-/// The rule is the same on all three: **a write is accepted only when this
-/// transport can actually carry it**. Anything else has to be refused at the
-/// call, because the alternative — `Ok` now, discarded later — is a promise of
-/// delivery that nothing downstream can retract.
+/// The rule is the same on all three: **a write is accepted only while this
+/// transport still has somewhere to put it** — and *queued* is somewhere, as
+/// long as something will drain the queue. What must never happen is the third
+/// case: accepted, then dropped without a word. That one is answered by
+/// counting (see [`run_exec`]), not by refusing.
 enum InputGate {
     /// The interactive shell: its pty exists for the life of the session.
     Open,
     /// An [`ExecStdin::Eof`] exec — no remote stdin at all, ever (R0).
     Never,
-    /// An [`ExecStdin::Stream`] exec: writable only between the server's
-    /// acceptance of the exec and the end of the channel. Both edges matter and
-    /// the leading one is the one that bit: `exec()` merely *queues* the
-    /// request, so acceptance is a full round trip after the session (and its
-    /// terminal, and its focus) exists.
-    WhileAccepted(Arc<AtomicU8>),
+    /// An [`ExecStdin::Stream`] exec: writable until the channel ends.
+    ///
+    /// Before the server *accepts* the exec the writer may not touch the
+    /// channel, but the caller may still write: those bytes wait in the input
+    /// queue and go out the moment the writer is released. That window is the
+    /// ordinary case, not an edge — attaching focuses the terminal immediately
+    /// while acceptance is a whole SSH round trip away, so refusing there
+    /// refuses the first thing a person types.
+    ///
+    /// Once the channel has ended there is nothing left to drain the queue, so
+    /// a write is refused at the call. Whatever is still queued at that moment
+    /// is counted and reported with the terminal event.
+    UntilEnded(Arc<AtomicBool>),
 }
 
 /// Manager-held handles for a live SSH session.
@@ -269,7 +280,7 @@ pub struct SshHandle {
     /// `send_input` answers from the very first call — dropping the receiver
     /// alone would only take effect once connect, auth and channel-open
     /// finished, leaving an early window where writes were accepted and then
-    /// discarded (codex final audit P2; R2b review R8 for the duplex half).
+    /// discarded (codex final audit P2).
     input: InputGate,
 }
 
@@ -277,24 +288,18 @@ impl SshHandle {
     /// Enqueue input (keystrokes). Never blocks the caller (F4); on a full queue
     /// or a closed session it returns an error instead of growing memory (D2).
     ///
-    /// **A refusal, not a discard.** Every path that cannot deliver says so to
-    /// the caller — see [`InputGate`].
+    /// **Never a silent discard.** A path that can no longer deliver refuses
+    /// here; a path that can only deliver *later* queues and, if later never
+    /// comes, says how much was lost with the terminal event — see
+    /// [`InputGate`] and [`run_exec`].
     pub fn send_input(&self, data: &[u8]) -> Result<(), String> {
         use mpsc::error::TrySendError;
         match &self.input {
             InputGate::Never => return Err("exec session has no stdin (output-only)".into()),
-            InputGate::WhileAccepted(state) => match state.load(Ordering::SeqCst) {
-                INPUT_PENDING => {
-                    return Err(
-                        "remote command has not started yet (nothing can be written before the \
-                         server accepts the exec)"
-                            .into(),
-                    )
-                }
-                INPUT_FINISHED => return Err("remote command has ended".into()),
-                _ => {}
-            },
-            InputGate::Open => {}
+            InputGate::UntilEnded(ended) if ended.load(Ordering::SeqCst) => {
+                return Err("remote command has ended".into())
+            }
+            InputGate::UntilEnded(_) | InputGate::Open => {}
         }
         match self.input_tx.try_send(data.to_vec()) {
             Ok(()) => Ok(()),
@@ -350,8 +355,8 @@ pub(crate) fn spawn_ssh(
         None => (InputGate::Open, None),
         Some(spec) if spec.stdin == ExecStdin::Eof => (InputGate::Never, None),
         Some(_) => {
-            let state = Arc::new(AtomicU8::new(INPUT_PENDING));
-            (InputGate::WhileAccepted(Arc::clone(&state)), Some(state))
+            let ended = Arc::new(AtomicBool::new(false));
+            (InputGate::UntilEnded(Arc::clone(&ended)), Some(ended))
         }
     };
     let (input_tx, input_rx) = mpsc::channel::<Vec<u8>>(INPUT_QUEUE);
@@ -424,8 +429,8 @@ async fn run(
     mut input_rx: mpsc::Receiver<Vec<u8>>,
     mut size_rx: watch::Receiver<(u16, u16)>,
     // The duplex exec's input gate — `Some` only for `ExecStdin::Stream`,
-    // which is the only mode whose write side has a moment it becomes legal.
-    exec_gate: Option<Arc<AtomicU8>>,
+    // which is the only mode whose write side has a moment it stops existing.
+    exec_gate: Option<Arc<AtomicBool>>,
 ) -> Result<(), String> {
     let _ = status_tx.send(SshStatus::Connecting);
 
@@ -557,13 +562,17 @@ async fn run(
 ///   mean `wait()` never yields a status, silently breaking the "exactly one
 ///   terminal event" contract while the thread and TCP connection stay pinned.
 /// - [`ExecStdin::Stream`] — `input_rx` is drained onto the channel, then EOF.
-///   Writes are only *accepted* while this transport can carry them
-///   ([`InputGate`]): before the server's `Success` the write side may not be
-///   touched at all, and after the channel ends there is nothing to touch. The
-///   residue this does not cover — bytes accepted while the command was running
-///   and still queued when the remote went away mid-session — is unavoidable
-///   loss (nobody can deliver them), and it is always accompanied by the
-///   terminal `Exit`/`Error` that says the command is gone.
+///   The write side may not be touched before the server's `Success`, so bytes
+///   written before then wait in the queue and go out when it opens — the wait
+///   is the delivery, and that window is where the first keystroke of every
+///   attach lands ([`InputGate`]).
+///
+///   **What does not get through is counted.** However this ends — rejection, a
+///   send that fails, the channel going away mid-session — the queue is closed
+///   and drained, and the byte total rides out on the terminal event
+///   ([`ExecEvent::Exit::undelivered`], or the text of [`ExecEvent::Error`]).
+///   Some of that loss is unavoidable (nobody can deliver to a command that is
+///   gone); none of it is silent, which is the whole difference.
 ///
 /// **Structure (the deadlock class):** the channel is [`russh::Channel::split`]
 /// into halves and driven by **two futures under one `join!`**. This is not a
@@ -592,12 +601,12 @@ async fn run_exec(
     status_tx: &mpsc::UnboundedSender<SshStatus>,
     exec_tx: &mpsc::Sender<ExecEvent>,
     input_rx: Option<mpsc::Receiver<Vec<u8>>>,
-    // Flipped to `INPUT_ACCEPTED` the moment the server accepts the exec and to
-    // `INPUT_FINISHED` when the channel ends, so `SshHandle::send_input` refuses
-    // outside that window instead of queueing for a writer that will never run.
-    // See `InputGate`.
-    gate: Option<Arc<AtomicU8>>,
+    // Set the moment the channel ends, so `SshHandle::send_input` refuses from
+    // then on instead of queueing for a writer that has already gone. See
+    // `InputGate`.
+    gate: Option<Arc<AtomicBool>>,
 ) -> Result<(), String> {
+    let mut input_rx = input_rx;
     let (mut read, write) = channel.split();
 
     // want_reply=true so a server that rejects the exec surfaces as
@@ -609,7 +618,13 @@ async fn run_exec(
         .await
         .is_err()
     {
-        let msg = "failed to start remote command".to_string();
+        // Nothing will ever drain the input queue, so close it (later writes are
+        // refused rather than queued) and say what was already in it.
+        if let Some(g) = &gate {
+            g.store(true, Ordering::SeqCst);
+        }
+        let stranded = input_rx.as_mut().map(undelivered_bytes).unwrap_or(0);
+        let msg = format!("failed to start remote command{}", lost_note(stranded));
         // Transmission failure is still a terminal outcome for the consumer (F4).
         let _ = exec_tx.send(ExecEvent::Error(msg.clone())).await;
         return Err(msg);
@@ -650,12 +665,6 @@ async fn run_exec(
                 // and only now may anything be written to it.
                 Some(ChannelMsg::Success) => {
                     if let Some(tx) = start_tx.take() {
-                        // Opened for the caller at the same instant it is opened
-                        // for the writer — the two must not disagree about
-                        // whether a keystroke can be delivered.
-                        if let Some(g) = &gate {
-                            g.store(INPUT_ACCEPTED, Ordering::SeqCst);
-                        }
                         let _ = tx.send(());
                         let _ = status_tx.send(SshStatus::Ready);
                     }
@@ -682,10 +691,11 @@ async fn run_exec(
             }
         }
         // Release the writer however this ended (accepted, rejected, or gone) —
-        // and close the input gate with it, so a keystroke arriving after the
-        // command is gone is refused rather than queued for nobody.
+        // and close the input gate *first*, so a keystroke arriving after the
+        // command is gone is refused rather than queued behind the writer's
+        // final count.
         if let Some(g) = &gate {
-            g.store(INPUT_FINISHED, Ordering::SeqCst);
+            g.store(true, Ordering::SeqCst);
         }
         let _ = done_tx.send(true);
         (rejected, exit_code, exit_signal)
@@ -693,46 +703,65 @@ async fn run_exec(
 
     let writer = async move {
         let mut done_rx = done_rx;
-        // Nothing may be written before the server accepts the exec. If the
-        // channel ends first (rejection, teardown), there is nothing to write.
-        tokio::select! {
-            accepted = start_rx => {
-                if accepted.is_err() {
-                    return;
+        // Bytes this session took from the caller and could not put on the wire.
+        // Every early exit below leaves through the same drain at the end, so
+        // there is no path that ends the writer without counting.
+        let mut undelivered: u64 = 0;
+        'writing: {
+            // Nothing may be written before the server accepts the exec —
+            // anything typed meanwhile is waiting in `input_rx` and goes out
+            // below. If the channel ends first (rejection, teardown), nothing is
+            // written at all and that queue is exactly what did not get through.
+            tokio::select! {
+                accepted = start_rx => {
+                    if accepted.is_err() {
+                        break 'writing;
+                    }
+                }
+                _ = done_rx.changed() => break 'writing,
+            }
+            let Some(rx) = input_rx.as_mut() else {
+                // Output-only: say "no stdin" as EOF, not as silence.
+                let _ = write.eof().await;
+                break 'writing;
+            };
+            loop {
+                let msg = tokio::select! {
+                    m = rx.recv() => m,
+                    _ = done_rx.changed() => break 'writing,
+                };
+                // `None` = every sender dropped, i.e. the session is going away.
+                let Some(bytes) = msg else { break };
+                let len = bytes.len() as u64;
+                // This is the await that parks on the send window. It is safe here
+                // only because `reader` above is a *separate* future that keeps
+                // draining the channel while this one waits (see the fn docs).
+                let sent = tokio::select! {
+                    r = write.data(&bytes[..]) => r.is_ok(),
+                    // Taken out of the queue and never put on the wire: this one
+                    // is only counted here, so it must be counted here.
+                    _ = done_rx.changed() => {
+                        undelivered += len;
+                        break 'writing;
+                    }
+                };
+                if !sent {
+                    undelivered += len;
+                    break 'writing;
                 }
             }
-            _ = done_rx.changed() => return,
-        }
-        let Some(mut input_rx) = input_rx else {
-            // Output-only: say "no stdin" as EOF, not as silence.
             let _ = write.eof().await;
-            return;
-        };
-        loop {
-            let msg = tokio::select! {
-                m = input_rx.recv() => m,
-                _ = done_rx.changed() => return,
-            };
-            // `None` = every sender dropped, i.e. the session is going away.
-            let Some(bytes) = msg else { break };
-            // This is the await that parks on the send window. It is safe here
-            // only because `reader` above is a *separate* future that keeps
-            // draining the channel while this one waits (see the fn docs).
-            let sent = tokio::select! {
-                r = write.data(&bytes[..]) => r.is_ok(),
-                _ = done_rx.changed() => return,
-            };
-            if !sent {
-                return;
-            }
         }
-        let _ = write.eof().await;
+        if let Some(rx) = input_rx.as_mut() {
+            undelivered += undelivered_bytes(rx);
+        }
+        undelivered
     };
 
-    let ((rejected, exit_code, exit_signal), ()) = tokio::join!(reader, writer);
+    let ((rejected, exit_code, exit_signal), undelivered) = tokio::join!(reader, writer);
 
     if rejected {
-        let msg = "server rejected the exec request".to_string();
+        let msg = format!("server rejected the exec request{}", lost_note(undelivered));
         let _ = exec_tx.send(ExecEvent::Error(msg.clone())).await;
         return Err(msg);
     }
@@ -742,9 +771,34 @@ async fn run_exec(
         .send(ExecEvent::Exit {
             code: exit_code,
             signal: exit_signal,
+            undelivered,
         })
         .await;
     Ok(())
+}
+
+/// Close the input queue and total up what is still sitting in it.
+///
+/// **Closing first is what makes the number final.** After `close()` a
+/// `try_send` fails, so nothing can slip in behind the count and vanish
+/// unreported; everything sent before it is still there to be counted.
+fn undelivered_bytes(rx: &mut mpsc::Receiver<Vec<u8>>) -> u64 {
+    rx.close();
+    let mut total = 0;
+    while let Ok(bytes) = rx.try_recv() {
+        total += bytes.len() as u64;
+    }
+    total
+}
+
+/// The clause appended to a terminal reason when input did not get through —
+/// empty when it all did, so the ordinary end reads exactly as it always has.
+fn lost_note(undelivered: u64) -> String {
+    if undelivered == 0 {
+        String::new()
+    } else {
+        format!(" ({undelivered} bytes of input never reached the remote command)")
+    }
 }
 
 /// Canonical short name for a terminating signal. russh's `Sig::name()` accessor
@@ -1034,7 +1088,11 @@ mod tests {
         while let Ok(e) = chans.exec_rx.try_recv() {
             exec_events.push(match e {
                 ExecEvent::Stderr(b) => format!("stderr {} bytes", b.len()),
-                ExecEvent::Exit { code, signal } => format!("exit {code:?}/{signal:?}"),
+                ExecEvent::Exit {
+                    code,
+                    signal,
+                    undelivered,
+                } => format!("exit {code:?}/{signal:?}/{undelivered}"),
                 ExecEvent::Error(m) => format!("error {m}"),
             });
         }
@@ -1353,7 +1411,7 @@ W8CkSL2Yx++XP/fxFe/RAAAAD210LXRlc3QtaG9zdGtleQECAwQFBg==\n\
             }
             match chans.exec_rx.try_recv() {
                 Ok(ExecEvent::Stderr(b)) => out.stderr.extend_from_slice(&b),
-                Ok(ExecEvent::Exit { code, signal }) => {
+                Ok(ExecEvent::Exit { code, signal, .. }) => {
                     out.exit = Some((code, signal));
                     terminal = true;
                 }
@@ -1663,7 +1721,7 @@ W8CkSL2Yx++XP/fxFe/RAAAAD210LXRlc3QtaG9zdGtleQECAwQFBg==\n\
             let _ = chans.status_rx.try_recv();
             match chans.exec_rx.try_recv() {
                 Ok(ExecEvent::Stderr(b)) => stderr_total += b.len(),
-                Ok(ExecEvent::Exit { code, signal }) => exit = Some((code, signal)),
+                Ok(ExecEvent::Exit { code, signal, .. }) => exit = Some((code, signal)),
                 Ok(ExecEvent::Error(e)) => panic!("unexpected exec error: {e}"),
                 Err(mpsc::error::TryRecvError::Disconnected) => break,
                 Err(mpsc::error::TryRecvError::Empty) => {}
@@ -1889,7 +1947,7 @@ W8CkSL2Yx++XP/fxFe/RAAAAD210LXRlc3QtaG9zdGtleQECAwQFBg==\n\
         let (id, mut chans) = mgr.create_ssh(cfg, temp_known_hosts("exec_duplex"), 80, 24, None);
 
         let mut ready = false;
-        let mut exit: Option<(Option<u32>, Option<String>)> = None;
+        let mut exit: Option<(Option<u32>, Option<String>, u64)> = None;
         let mut sent = 0usize;
         let payload = vec![b'i'; IN_CHUNK];
         let deadline = Instant::now() + Duration::from_millis(20_000);
@@ -1906,7 +1964,11 @@ W8CkSL2Yx++XP/fxFe/RAAAAD210LXRlc3QtaG9zdGtleQECAwQFBg==\n\
                 sent += 1;
             }
             match chans.exec_rx.try_recv() {
-                Ok(ExecEvent::Exit { code, signal }) => exit = Some((code, signal)),
+                Ok(ExecEvent::Exit {
+                    code,
+                    signal,
+                    undelivered,
+                }) => exit = Some((code, signal, undelivered)),
                 Ok(ExecEvent::Error(e)) => panic!("exec failed: {e}"),
                 Ok(_) => {}
                 Err(mpsc::error::TryRecvError::Disconnected) => break,
@@ -1922,8 +1984,9 @@ W8CkSL2Yx++XP/fxFe/RAAAAD210LXRlc3QtaG9zdGtleQECAwQFBg==\n\
         assert_eq!(sent, IN_CHUNKS, "the whole payload must be handed over");
         assert_eq!(
             exit,
-            Some((Some(0), None)),
-            "no terminal event within the deadline = the write direction wedged \
+            Some((Some(0), None, 0)),
+            "no terminal event within the deadline = the write direction wedged, and a \
+             non-zero residue = input the session took and never carried \
              (input delivered so far: {got_in}/{expect_in})"
         );
         assert_eq!(got_in, expect_in, "every byte typed must reach the remote");
@@ -1997,22 +2060,23 @@ W8CkSL2Yx++XP/fxFe/RAAAAD210LXRlc3QtaG9zdGtleQECAwQFBg==\n\
         }
     }
 
-    /// **Nothing may be accepted before the remote command can receive it.**
+    /// **Input that never arrives is reported, not swallowed.**
     ///
-    /// A duplex exec used to take input from its very first moment: `write`
-    /// answered `Ok`, the bytes sat in the input queue, and the writer — which
-    /// may not touch the channel until the server *accepts* the exec — returned
-    /// the instant the channel finished instead, taking the queue with it. So a
-    /// keystroke typed in the window between "the terminal opened" and "the
-    /// remote command started" was reported as delivered and then thrown away,
-    /// silently. The window is real: attaching focuses the terminal immediately,
-    /// while acceptance is a whole SSH round trip away.
+    /// A duplex exec takes input from its very first moment, and it has to: the
+    /// writer may not touch the channel until the server *accepts* the exec,
+    /// which is a whole SSH round trip after the terminal opened and took focus,
+    /// so the first thing a person types necessarily lands in the queue and is
+    /// carried when the writer is released. Refusing there — the shape this bug
+    /// was first "fixed" with — refuses ordinary typing.
     ///
-    /// This is the same rule an output-only exec has had since R0 — refuse from
-    /// the first call rather than accept and discard — applied to the one
-    /// direction R2b opened.
+    /// The queue is only a promise while something will drain it. When the exec
+    /// is **rejected** nothing ever will, and what stays in it used to disappear
+    /// with the writer after `write` had already answered `Ok`. So the terminal
+    /// `Error` carries the count: an unavoidable loss that is at least said out
+    /// loud. Past the end there is nowhere left to put anything, and only there
+    /// is refusing at the call the right answer.
     #[test]
-    fn input_before_the_exec_is_accepted_is_refused_not_accepted_and_dropped() {
+    fn input_that_cannot_be_delivered_is_counted_into_the_reason() {
         let port = serve_once(ExecRejectHandler);
         let mgr = SessionManager::new();
         let cfg = SshConfig {
@@ -2025,28 +2089,30 @@ W8CkSL2Yx++XP/fxFe/RAAAAD210LXRlc3QtaG9zdGtleQECAwQFBg==\n\
         let (id, mut chans) = mgr.create_ssh(cfg, temp_known_hosts("exec_early_input"), 80, 24, None);
 
         // The very first keystroke — connect, auth and the exec request have not
-        // even finished, so there is nowhere for it to go.
-        let early = mgr.write(id, b"typed-too-early");
-        assert!(
-            early.is_err(),
-            "input before the exec is accepted must be refused; accepting it means \
-             promising a delivery this transport cannot make"
-        );
+        // even finished. It is taken (that is the point) and waits in the queue.
+        mgr.write(id, b"typed-too-early")
+            .expect("a duplex exec takes input from its first moment — the queue is the wait");
 
-        // Drive the session to its (rejected) end, then check the other edge:
-        // once the command is gone, a write must not be accepted either.
+        // This server rejects the exec, so nothing will ever drain that queue.
         let deadline = Instant::now() + Duration::from_millis(8000);
-        let mut ended = false;
-        while Instant::now() < deadline && !ended {
+        let mut reason: Option<String> = None;
+        while Instant::now() < deadline && reason.is_none() {
             if let Ok(ch) = chans.prompt_rx.try_recv() {
                 let _ = ch.reply.send(HostKeyDecision::Accept);
             }
-            if let Ok(ExecEvent::Error(_)) = chans.exec_rx.try_recv() {
-                ended = true;
+            if let Ok(ExecEvent::Error(m)) = chans.exec_rx.try_recv() {
+                reason = Some(m);
             }
             thread::sleep(Duration::from_millis(5));
         }
-        assert!(ended, "the rejected exec must still deliver its terminal Error");
+        let reason = reason.expect("the rejected exec must still deliver its terminal Error");
+        assert!(
+            reason.contains("15 bytes"),
+            "the reason must say how much input never got there (15 = \"typed-too-early\"), \
+             or the loss is exactly as silent as before: {reason}"
+        );
+
+        // The other edge: once the command is gone there is nothing to queue for.
         assert!(
             mgr.write(id, b"typed-too-late").is_err(),
             "a finished command must refuse input rather than queue it for nobody"
