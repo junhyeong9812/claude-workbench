@@ -1086,3 +1086,66 @@ describe("R7 — 서브에이전트 회수가 실패해도 무한 재시도가 �
     expect(calls("remote_timeline")).toBe(1);
   });
 });
+
+// ---------------------------------------------------------------------------
+// R14 — 사라진 세션의 payload 가 패널 수명 내내 남지 않는다
+//
+// 이 repo 가 이미 크게 물린 클래스다(웹뷰 RSS 5.22GB — 원인은 payload 보유였다).
+// 그런데 **끝난 세션의 마지막 내용은 읽을 수 있어야 한다**: 그래서 축은 종료가
+// 아니라 호스트 목록에서의 부재다.
+// ---------------------------------------------------------------------------
+
+describe("R14 — 호스트 목록에서 사라진 세션의 자리를 치운다", () => {
+  /** 폴링을 손으로 돌린다 — `refresh()` 한 번 = 폴링 한 번. */
+  async function poll(view: RemoteHostsView) {
+    await act(async () => {
+      view.refresh();
+    });
+    await flush(5);
+  }
+
+  it("사라진 세션의 타임라인·서브에이전트 본문이 (연속 두 번 뒤) 치워진다", async () => {
+    let present = true;
+    routes.remote_hosts = async () => [snapshot(present ? [session()] : [])];
+    routes.remote_timeline = async () => ({
+      ...emptyReply,
+      subagent: "a7c1d2e3",
+      items: [tlItem("s1", 1, { content_text: "에이전트가 한 일" })],
+    });
+    let view: RemoteHostsView | undefined;
+    function Probe() {
+      view = useRemoteHosts(100_000); // 폴링은 이 테스트가 직접 돌린다
+      return null;
+    }
+    await act(async () => {
+      root.render(<Probe />);
+    });
+    await flush(5);
+    await act(async () => {
+      emitEvent(
+        "claude-timeline",
+        liveEvent({ items: [tlItem("c1", 1, { content_text: "커다란 본문" })] }),
+      );
+      view!.fetchSubagentBody("h1", SID, agentFrame() as never);
+    });
+    await flush(10);
+    expect(view!.live.size).toBe(1);
+    expect(view!.subagentBodies.size).toBe(1);
+
+    // 세션이 끝났을 뿐이면(목록에 남아 있다) 몇 번을 폴링해도 그대로다 —
+    // 사용자가 그 카드를 펼쳐 마지막 내용을 읽는다.
+    await act(async () => emitEvent("claude-session-closed", SID));
+    await poll(view!);
+    await poll(view!);
+    expect(view!.live.size, "끝난 세션의 본문까지 지웠다").toBe(1);
+
+    // 데몬이 정리해 목록에서 없어졌다. 첫 폴링은 낡은 스냅샷과 구별되지 않는다.
+    present = false;
+    await poll(view!);
+    expect(view!.live.size, "한 번 안 보인 것으로 지우면 방금 생긴 세션도 지운다").toBe(1);
+
+    await poll(view!);
+    expect(view!.live.size, "사라진 세션의 payload 가 패널 수명 내내 남는다").toBe(0);
+    expect(view!.subagentBodies.size, "서브에이전트 전사가 남았다").toBe(0);
+  });
+});

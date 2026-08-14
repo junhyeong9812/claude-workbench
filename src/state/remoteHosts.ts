@@ -367,6 +367,58 @@ export function mergeSeed(
   return next;
 }
 
+/**
+ * 들고 있는 타임라인 중 **버려도 되는** id, 그리고 이번에 안 보인 id.
+ *
+ * 패널이 열려 있는 동안 `live`/`fetched` 는 늘기만 했다. 항목 하나가 최대 수 KB
+ * 이고 세션은 계속 생기므로, 이 프로젝트가 이미 크게 물린 클래스(웹뷰 RSS
+ * 5.22GB — 원인은 payload 보유였다)를 원격 패널이 그대로 다시 만든다.
+ *
+ * 그런데 **끝난 세션과 사라진 세션은 다르다**. `claude-session-closed` 는 "끝났다"
+ * 는 말이고 그 세션은 호스트 목록에 그대로 남는다(카드가 보이고 사용자가 마지막
+ * 내용을 읽는다 — 원래 핸들러가 아무것도 안 지운 이유가 이것이다). 그래서 축은
+ * 종료가 아니라 **호스트 목록에서의 부재**다: 데몬이 정리했거나 epoch 이 바뀌어
+ * 주소가 무효해진 세션은 그릴 카드 자체가 없고, 회수할 주소도 없다.
+ *
+ * 한 번 안 보인 것으로는 지우지 않는다. 폴링 응답은 이벤트보다 낡을 수 있어서
+ * (막 생긴 세션이 그 스냅샷에는 아직 없다) 첫 실종은 경합과 구별되지 않는다.
+ * 연속 두 번이면 경합이 아니다.
+ */
+export function droppableIds(
+  held: Iterable<number>,
+  known: ReadonlySet<number>,
+  missedBefore: ReadonlySet<number>,
+): { missing: Set<number>; drop: Set<number> } {
+  const missing = new Set<number>();
+  const drop = new Set<number>();
+  for (const id of held) {
+    if (known.has(id)) continue;
+    missing.add(id);
+    if (missedBefore.has(id)) drop.add(id);
+  }
+  return { missing, drop };
+}
+
+/** 지금 어느 호스트든 목록에 올려 둔 세션 id 전부. */
+export function knownSessionIds(hosts: readonly RemoteHostSnapshot[]): Set<number> {
+  const out = new Set<number>();
+  for (const h of hosts) for (const s of h.sessions) out.add(s.id);
+  return out;
+}
+
+/**
+ * 서브에이전트 본문 키({@link subagentAttemptKey})가 어느 세션의 것인가.
+ *
+ * 모양이 다르면 **null** 이다. 못 읽은 키에 0 을 돌려주면 세션 0 의 본문으로
+ * 취급돼 엉뚱한 자리가 지워진다 — 모르면 건드리지 않는 편이 맞다.
+ */
+export function sessionOfSubagentKey(key: string): number | null {
+  const head = key.split("/", 1)[0];
+  if (!/^\d+$/.test(head)) return null;
+  const n = Number(head);
+  return Number.isSafeInteger(n) ? n : null;
+}
+
 /** 이 호스트가 지금 사용자에게 알릴 게 있나 (배지 판정). */
 export function noticeBadge(
   notices: readonly RemoteNotice[],
@@ -852,6 +904,22 @@ export function useRemoteHosts(pollMs = 700): RemoteHostsView {
   const subInFlightRef = useRef<Set<string>>(new Set());
   const subAttemptedRef = useRef<Set<string>>(new Set());
 
+  /**
+   * 지금 들고 있는 것의 거울 — 정리 판정이 렌더 밖에서 읽는다.
+   *
+   * 상태를 updater 안에서 읽으면서 그 안에 부수효과(연속 실종 표시)를 두면
+   * StrictMode 의 이중 호출에 무너진다. 판정은 effect 에서 한 번, 적용만
+   * updater 로.
+   */
+  const liveRef = useRef(live);
+  liveRef.current = live;
+  const fetchedRef = useRef(fetched);
+  fetchedRef.current = fetched;
+  const bodiesRef = useRef(subagentBodies);
+  bodiesRef.current = subagentBodies;
+  /** 직전 폴링에서 목록에 없던 id — 연속 두 번이라야 지운다. */
+  const missingRef = useRef<Set<number>>(new Set());
+
   const refresh = useCallback(() => {
     void invoke<RemoteHostSnapshot[]>("remote_hosts")
       .then((v) => {
@@ -871,6 +939,66 @@ export function useRemoteHosts(pollMs = 700): RemoteHostsView {
     const t = window.setInterval(refresh, pollMs);
     return () => window.clearInterval(t);
   }, [refresh, pollMs]);
+
+  /**
+   * 호스트 목록이 새로 올 때마다, 그 목록에 더는 없는 세션의 자리를 치운다.
+   *
+   * `hosts` 는 폴링이 **성공**할 때만 새 배열이 된다 — 실패하면 이전 목록이
+   * 그대로 남고(그리고 화면이 그 사실을 말한다), 이 effect 도 돌지 않는다.
+   * 낡은 목록을 근거로 지우지 않는다는 뜻이다.
+   */
+  useEffect(() => {
+    const known = knownSessionIds(hosts);
+    const held = new Set<number>([...liveRef.current.keys(), ...fetchedRef.current.keys()]);
+    const { missing, drop } = droppableIds(held, known, missingRef.current);
+    missingRef.current = missing;
+    if (drop.size === 0) return;
+    const keep = <V,>(m: Map<number, V>) => {
+      const next = new Map(m);
+      for (const id of drop) next.delete(id);
+      return next;
+    };
+    setLive(keep);
+    setFetched(keep);
+    for (const id of drop) {
+      livenedRef.current.delete(id);
+      attemptedRef.current.delete(id);
+    }
+    setAttempted(new Set(attemptedRef.current));
+    setFetchError((prev) => {
+      const next = { ...prev };
+      for (const id of drop) delete next[id];
+      return next;
+    });
+    // 서브에이전트 본문도 같은 규칙으로 — 세션이 사라졌으면 그 에이전트의
+    // 전사도 그릴 곳이 없다(가장 큰 payload 가 여기 있다).
+    const goneKeys = (keys: Iterable<string>) => {
+      const out = new Set<string>();
+      for (const k of keys) {
+        const id = sessionOfSubagentKey(k);
+        if (id != null && drop.has(id)) out.add(k);
+      }
+      return out;
+    };
+    const bodyKeys = goneKeys(bodiesRef.current.keys());
+    if (bodyKeys.size > 0) {
+      setSubagentBodies((prev) => {
+        const next = new Map(prev);
+        for (const k of bodyKeys) next.delete(k);
+        return next;
+      });
+    }
+    const attemptKeys = goneKeys(subAttemptedRef.current);
+    if (attemptKeys.size > 0) {
+      for (const k of attemptKeys) subAttemptedRef.current.delete(k);
+      setSubagentAttempted(new Set(subAttemptedRef.current));
+      setSubagentError((prev) => {
+        const next = { ...prev };
+        for (const k of attemptKeys) delete next[k];
+        return next;
+      });
+    }
+  }, [hosts]);
 
   const retryStream = useCallback(() => setStreamNonce((n) => n + 1), []);
 
@@ -985,7 +1113,9 @@ export function useRemoteHosts(pollMs = 700): RemoteHostsView {
         });
         unClosed = await listen<number>("claude-session-closed", (e) => {
           // 종료 표시는 스냅샷의 `closed`가 갖는다. 여기서는 아무것도 지우지
-          // 않는다 — 마지막 내용은 남아 있어야 사용자가 읽을 수 있다.
+          // 않는다 — 마지막 내용은 남아 있어야 사용자가 읽을 수 있고, 끝난
+          // 세션은 **목록에 그대로 남는다**(데몬이 정리하기 전까지). 자리를
+          // 치우는 축은 종료가 아니라 목록에서의 부재다({@link droppableIds}).
           if (!isRemoteId(e.payload)) return;
           refresh();
         });

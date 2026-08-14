@@ -4,6 +4,7 @@ import {
   attachGate,
   countsLabel,
   defaultAccountId,
+  droppableIds,
   endedReason,
   fetchedToLive,
   isRemoteId,
@@ -19,6 +20,7 @@ import {
   seenKey,
   seenSeqOf,
   sessionCountNote,
+  sessionOfSubagentKey,
   shouldAutoFetchBody,
   shouldFetchBody,
   nextRemoteResize,
@@ -785,5 +787,54 @@ describe("R10 — 호스트에 직접 물어본 세션 수", () => {
     // 반대 방향(화면이 더 많이 아는 것)도 침묵하지 않는다 — 데몬이 정리한 세션을
     // 이 화면만 아직 들고 있는 경우다.
     expect(sessionCountNote(0, 2)).toMatch(/뒤처|놓친/);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// R14 — 사라진 세션의 payload 가 패널 수명 내내 남지 않는다
+// ---------------------------------------------------------------------------
+
+describe("R14 — 호스트 목록에서 사라진 세션의 자리 치우기", () => {
+  /**
+   * **끝난 세션과 사라진 세션은 다르다.**
+   *
+   * `claude-session-closed` 는 *끝났다*는 말이라 목록에 그대로 남는다(카드가
+   * 보이고 사용자가 마지막 내용을 읽는다) — 그 신호로 지우면 화면에 떠 있는
+   * 세션의 본문이 사라진다. 지울 수 있는 것은 **호스트 목록에 더는 없는** id
+   * 뿐이고, 그때는 그릴 카드 자체가 없다.
+   */
+  it("목록에 있는 id 는 끝났어도 지우지 않는다", () => {
+    const known = new Set([1, 2]);
+    const first = droppableIds([1, 2], known, new Set());
+    expect(first.drop.size).toBe(0);
+    expect(first.missing.size).toBe(0);
+  });
+
+  /**
+   * 한 번 안 보이는 것으로는 지우지 않는다. 폴링 응답은 이벤트보다 낡을 수
+   * 있어서(방금 생긴 세션이 스냅샷에는 아직 없다), 첫 실종은 경합과 구별되지
+   * 않는다. 연속 두 번이면 경합이 아니다.
+   */
+  it("연속 두 번 사라진 뒤에 지운다 — 낡은 스냅샷과 진짜 소멸을 가른다", () => {
+    const known = new Set([1]);
+    const first = droppableIds([1, 9], known, new Set());
+    expect(first.drop.size, "한 번 안 보였다고 지우면 방금 생긴 세션을 지운다").toBe(0);
+    expect(first.missing).toEqual(new Set([9]));
+
+    // 다음 폴링에서도 없다 — 이제는 정말 없는 것이다.
+    const second = droppableIds([1, 9], known, first.missing);
+    expect(second.drop).toEqual(new Set([9]));
+
+    // 그 사이에 돌아오면(스냅샷이 따라잡았다) 표시는 지워진다.
+    const back = droppableIds([1, 9], new Set([1, 9]), first.missing);
+    expect(back.drop.size).toBe(0);
+    expect(back.missing.size).toBe(0);
+  });
+
+  it("서브에이전트 본문의 키에서 세션 id 를 읽는다 — 같은 규칙으로 치우려면", () => {
+    const key = subagentAttemptKey(REMOTE_ID_BASE + 5, { id: "a7", sig: "42-7" });
+    expect(sessionOfSubagentKey(key)).toBe(REMOTE_ID_BASE + 5);
+    // 모르는 모양이면 **아무 세션도 아니다** — 0 을 돌려주면 id 0 의 본문을 지운다.
+    expect(sessionOfSubagentKey("망가진키")).toBeNull();
   });
 });
