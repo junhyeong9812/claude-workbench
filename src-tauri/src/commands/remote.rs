@@ -555,14 +555,18 @@ pub fn remote_attach(
                             stderr.push_str(&String::from_utf8_lossy(&b));
                         }
                     }
-                    core_lib::ssh::ExecEvent::Exit { code, signal } => {
+                    core_lib::ssh::ExecEvent::Exit {
+                        code,
+                        signal,
+                        undelivered,
+                    } => {
                         record_terminal_ended(
                             &app,
                             local_id,
                             &host,
                             code,
                             signal,
-                            stderr.trim(),
+                            &exit_detail(stderr.trim(), undelivered),
                         );
                     }
                     core_lib::ssh::ExecEvent::Error(msg) => {
@@ -636,6 +640,31 @@ fn record_terminal_ended(
         signal,
         detail: detail.to_string(),
     });
+}
+
+/// What the panel is told when a terminal ends: the keystrokes that never got
+/// there — only when there were any — and then the command's own last words.
+///
+/// A terminal that ends while the user's last line is still queued has one
+/// symptom on screen: the line was typed and nothing happened. `core::ssh`
+/// counts those bytes rather than dropping them quietly (`ExecEvent::Exit`);
+/// this is where the count becomes a sentence, joined to the reason the panel
+/// already asks for instead of a second thing it must listen for.
+///
+/// **The loss goes first, and that is not a style choice.** `endedReason` in the
+/// frontend cuts the detail at 300 characters, and remote stderr runs to 4 KB —
+/// appended, the one sentence the user cannot reconstruct would be the first
+/// thing thrown away. Stderr is at least still on the screen above.
+fn exit_detail(stderr: &str, undelivered: u64) -> String {
+    if undelivered == 0 {
+        return stderr.to_string();
+    }
+    let lost = format!("입력 {undelivered}바이트가 원격 명령에 전달되지 못했습니다.");
+    if stderr.is_empty() {
+        lost
+    } else {
+        format!("{lost}\n{stderr}")
+    }
 }
 
 /// Why a remote terminal stopped — the answer to [`remote_terminal_end`].
@@ -906,6 +935,28 @@ mod tests {
         assert!(
             store.get(ENDED_CAP as u64 + 9).is_some(),
             "the newest reason — the one somebody is about to ask for — is kept"
+        );
+    }
+
+    /// **A terminal that ate a keystroke has to say so.**
+    ///
+    /// The exit reason is the only place the panel looks, so the count `core`
+    /// hands up has to arrive there — and only when there is one, or every
+    /// ordinary exit grows a sentence about a loss that did not happen.
+    #[test]
+    fn undelivered_input_joins_the_exit_reason_and_nothing_else_does() {
+        assert_eq!(exit_detail("", 0), "", "an ordinary exit says only what the command said");
+        assert_eq!(exit_detail("boom", 0), "boom");
+        assert_eq!(
+            exit_detail("", 12),
+            "입력 12바이트가 원격 명령에 전달되지 못했습니다.",
+            "a silent command that lost input still has to report the loss"
+        );
+        assert_eq!(
+            exit_detail("boom", 12),
+            "입력 12바이트가 원격 명령에 전달되지 못했습니다.\nboom",
+            "the loss leads, because the frontend cuts the detail at 300 chars and \
+             stderr can be 4 KB — appended, it would be the first thing lost"
         );
     }
 
