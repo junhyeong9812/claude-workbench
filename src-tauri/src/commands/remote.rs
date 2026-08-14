@@ -74,8 +74,54 @@ const ENDED_CAP: usize = 32;
 /// silent black box. Recorded state is readable *late*: by a panel mounted
 /// afterwards, by a panel that was closed and reopened, by the second look of a
 /// user who dismissed the first.
+///
+/// ## Nothing leaves this store in silence
+///
+/// A plain FIFO at the cap dropped whichever reason was oldest, read or not.
+/// The panel that owns a terminal polls until it gets an answer, so a reason
+/// evicted before its owner asked left that poll returning `None` forever: the
+/// terminal is over, the screen says nothing, and the question never stops being
+/// asked. Two rules close it — a reason somebody has already read is evicted
+/// **first** (it has done its job), and one that has to go unread leaves a
+/// marker behind so the answer becomes "it was dropped" instead of "still
+/// running". Both lists are bounded; the marker is an id and a host name.
 #[derive(Default)]
-pub struct EndedTerminals(Mutex<VecDeque<RemoteTerminalEnded>>);
+pub struct EndedTerminals(Mutex<Ended>);
+
+#[derive(Default)]
+struct Ended {
+    /// Oldest first.
+    reasons: VecDeque<Recorded>,
+    /// `(id, host)` of every reason dropped before anyone read it.
+    lost: VecDeque<(u64, String)>,
+}
+
+struct Recorded {
+    e: RemoteTerminalEnded,
+    /// Whether [`EndedTerminals::get`] has handed this out. The panel asks once
+    /// and keeps what it got, so a reason that has been read is the right thing
+    /// to drop when room is needed.
+    read: bool,
+}
+
+impl Ended {
+    /// Make room for one more, preferring a reason that has already been read.
+    /// When every one of them is unread, the oldest still goes — but its id is
+    /// remembered, because a poll that gets `None` reads as "still running".
+    fn evict_one(&mut self) {
+        let victim = self.reasons.iter().position(|r| r.read).unwrap_or(0);
+        let Some(gone) = self.reasons.remove(victim) else {
+            return;
+        };
+        if gone.read {
+            return;
+        }
+        self.lost.push_back((gone.e.id, gone.e.host_id));
+        while self.lost.len() > ENDED_CAP {
+            self.lost.pop_front();
+        }
+    }
+}
 
 impl EndedTerminals {
     /// **The first reason is the true one.**
@@ -90,12 +136,12 @@ impl EndedTerminals {
     /// first" rule in the frontend for the rest.
     fn record(&self, e: RemoteTerminalEnded) {
         let mut q = self.0.lock().unwrap_or_else(|p| p.into_inner());
-        if q.iter().any(|prev| prev.id == e.id) {
+        if q.reasons.iter().any(|prev| prev.e.id == e.id) {
             return;
         }
-        q.push_back(e);
-        while q.len() > ENDED_CAP {
-            q.pop_front();
+        q.reasons.push_back(Recorded { e, read: false });
+        while q.reasons.len() > ENDED_CAP {
+            q.evict_one();
         }
     }
 
@@ -113,19 +159,41 @@ impl EndedTerminals {
     /// either relay of that attach exists and therefore before anything can race
     /// it.
     fn opened(&self, id: u64) {
-        self.0
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .retain(|e| e.id != id);
+        let mut q = self.0.lock().unwrap_or_else(|p| p.into_inner());
+        q.reasons.retain(|r| r.e.id != id);
+        // The marker goes with it: "this id's reason was dropped" is a statement
+        // about the terminal that has just been replaced, not about this one.
+        q.lost.retain(|(lost, _)| *lost != id);
     }
 
+    /// Why one terminal stopped, or `None` while it is still running.
+    ///
+    /// Reading marks the reason as delivered, which is what lets the cap fall on
+    /// reasons that have been seen before it falls on ones that have not. A
+    /// reason that *was* dropped unread answers with the fact rather than with
+    /// `None`, because `None` means "still running" to the caller and would
+    /// leave it polling a terminal that ended long ago.
     fn get(&self, id: u64) -> Option<RemoteTerminalEnded> {
-        self.0
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
+        let mut q = self.0.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(r) = q.reasons.iter_mut().find(|r| r.e.id == id) {
+            r.read = true;
+            return Some(r.e.clone());
+        }
+        let host = q
+            .lost
             .iter()
-            .find(|e| e.id == id)
-            .cloned()
+            .find(|(lost, _)| *lost == id)
+            .map(|(_, host)| host.clone())?;
+        Some(RemoteTerminalEnded {
+            id,
+            host_id: host,
+            code: None,
+            signal: None,
+            detail: format!(
+                "이 터미널이 왜 멈췄는지는 더 이상 알 수 없습니다 — 그 뒤로 원격 터미널이 \
+                 너무 많이(보관 한도 {ENDED_CAP}개) 끝나면서 사유가 밀려났습니다."
+            ),
+        })
     }
 }
 
@@ -984,16 +1052,72 @@ mod tests {
     /// reader, so without a cap it is the same unbounded webview-side growth
     /// this project already paid for once, moved to the backend.
     #[test]
-    fn the_store_keeps_the_newest_and_forgets_the_oldest() {
+    fn the_store_is_bounded_and_keeps_the_newest() {
         let store = EndedTerminals::default();
         for id in 0..(ENDED_CAP as u64 + 10) {
             store.record(ended(id, "끝"));
         }
-        assert_eq!(store.0.lock().unwrap().len(), ENDED_CAP);
-        assert!(store.get(0).is_none(), "the oldest reasons are dropped first");
+        {
+            let q = store.0.lock().unwrap();
+            assert_eq!(q.reasons.len(), ENDED_CAP);
+            assert!(q.lost.len() <= ENDED_CAP, "the record of what was dropped is bounded too");
+        }
         assert!(
             store.get(ENDED_CAP as u64 + 9).is_some(),
             "the newest reason — the one somebody is about to ask for — is kept"
+        );
+    }
+
+    /// **A reason nobody has read yet must not be evicted for one that was.**
+    ///
+    /// The panel polls `remote_terminal_end(id)` until it gets an answer, so a
+    /// reason dropped before its owner asked leaves that poll returning `None`
+    /// forever — the terminal ended, the screen says nothing, and the question
+    /// never stops being asked. A plain FIFO dropped by age alone, which meant
+    /// 32 terminals closing after yours took your reason with them however
+    /// recently it was written.
+    #[test]
+    fn a_reason_nobody_has_read_outlives_the_ones_that_were_read() {
+        let store = EndedTerminals::default();
+        store.record(ended(1, "아직 아무도 읽지 않은 사유"));
+        // The cap fills with reasons whose owners each read theirs.
+        for id in 2..=(ENDED_CAP as u64 + 8) {
+            store.record(ended(id, "끝"));
+            store.get(id).expect("its owner reads it");
+        }
+        assert_eq!(
+            store.get(1).expect("the unread reason is still there").detail,
+            "아직 아무도 읽지 않은 사유",
+            "the owner of terminal 1 was still polling; its answer was thrown away for reasons \
+             that had already been delivered"
+        );
+    }
+
+    /// …and when there is nothing read to drop, the drop is **said**.
+    ///
+    /// `None` means "still running" to the caller. A reason that was pushed out
+    /// unread therefore cannot answer with `None`: that is the silent loss this
+    /// whole surface exists to prevent, and it would keep the panel polling a
+    /// terminal that ended long ago.
+    #[test]
+    fn a_reason_that_had_to_be_dropped_says_so_instead_of_reading_as_still_running() {
+        let store = EndedTerminals::default();
+        for id in 1..=(ENDED_CAP as u64 + 1) {
+            store.record(ended(id, "끝"));
+        }
+        let dropped = store
+            .get(1)
+            .expect("a reason pushed out unread must still answer, and say what happened");
+        assert!(
+            dropped.detail.contains("보관 한도"),
+            "the answer has to name the cap that ate it, not describe an ending: {}",
+            dropped.detail
+        );
+        assert_eq!(dropped.host_id, "h1", "…and which host it was on survives the eviction");
+        assert!(
+            store.get(9_999).is_none(),
+            "a terminal that never ended is still `None` — the overflow answer must not become \
+             the answer to everything"
         );
     }
 
