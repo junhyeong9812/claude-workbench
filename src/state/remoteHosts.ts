@@ -20,6 +20,12 @@ import {
   type TokenUsage,
 } from "../hooks/useClaudeTimeline";
 import { errText } from "../utils/error";
+import {
+  shouldAutoFetch,
+  useAutoFetch,
+  type AutoFetch,
+  type Fetched,
+} from "./autoFetch";
 
 /**
  * 원격 세션 id가 시작하는 지점 — `core/src/remote/host.rs`의 `REMOTE_ID_BASE`와
@@ -245,37 +251,27 @@ export function shouldFetchBody(
   return s.body_omitted || s.timeline_len > 0;
 }
 
-/** 자동 회수를 지금 걸어도 되나 — 판정의 축이 **내용이 아니라 시도**다. */
-export interface FetchAttemptState {
-  /** 이 세션에 대해 회수를 **시도한 적이 있나**(성공·빈 응답·실패 전부 포함). */
-  attempted: boolean;
-  /** 지금 나가 있는 회수가 있나. */
-  fetching: boolean;
-  /** 지난 회수가 실패로 끝났나(그 사유는 화면이 이미 말하고 있다). */
-  failed: boolean;
-}
-
 /**
- * 펼쳤을 때 **자동으로** 한 번 가져오나.
+ * 펼쳤을 때 **자동으로** 한 번 가져오나 — 두 질문의 합이다.
  *
- * `shouldFetchBody`(=가져올 수 있나) 만으로 자동 회수를 정하면, 회수가
- * **성공했는데 본문이 비었을 때** 판정이 다시 true 로 돌아온다: `pickTimeline`
- * 이 빈 값을 돌려주고 `fetching` 이 true→false 로 바뀌며 effect 가 재발화한다.
- * 그 한 바퀴가 `remote_timeline` → `Registry::call` → **새 SSH 연결 1회**이고,
- * 백오프도 지연도 없다(실측: 빈 세션 하나에 5초 동안 1,400회 이상).
+ * ① 가져올 것이 있나({@link shouldFetchBody} — 도메인 질문) ② 자동으로 걸어도
+ * 되나({@link shouldAutoFetch} — **자동 회수 원시의 잠금**). 잠금은 여기 없다:
+ * 여기 두면 또 한 벌이 되고, 세 벌이 병렬로 존재하던 것이 정확히 세 번 재발한
+ * 그 사고의 구조다(`autoFetch.ts` 머리말).
+ *
+ * ②가 없으면 회수가 **성공했는데 본문이 비었을 때** 판정이 다시 true 로 돌아온다:
+ * `pickTimeline` 이 빈 값을 돌려주고 `loading` 이 true→false 로 바뀌며 effect 가
+ * 재발화한다. 그 한 바퀴가 `remote_timeline` → `Registry::call` → **새 SSH 연결
+ * 1회**이고 백오프도 지연도 없다(실측: 빈 세션 하나에 5초 동안 1,400회 이상).
  * `body_omitted:true, timeline_len:0`(아무것도 하지 않고 끝난 세션)은 데몬이
  * 정상적으로 내는 조합이라 이 루프는 가정이 아니라 도달 상태다.
- *
- * 그래서 축을 **"이 id 에 대해 회수를 시도했다"** 로 옮긴다. 자동은 세션당 한
- * 번이고, 그 뒤의 재시도는 사용자 버튼에만 남는다 — 화면에는 회수 버튼이 계속
- * 떠 있으므로 조용히 잃는 것은 없다.
  */
 export function shouldAutoFetchBody(
   s: Pick<RemoteSessionMeta, "body_omitted" | "timeline_len">,
   live: RemoteLiveTimeline | undefined,
-  st: FetchAttemptState,
+  body: Fetched<unknown>,
 ): boolean {
-  if (st.attempted || st.fetching || st.failed) return false;
+  if (!shouldAutoFetch(body)) return false;
   return shouldFetchBody(s, live);
 }
 
@@ -313,6 +309,30 @@ function required<T>(v: unknown, field: string, where: string): T[] {
     );
   }
   return v as T[];
+}
+
+/**
+ * 이 응답이 **내가 물어본 자리의 것인가** — 아니면 예외.
+ *
+ * 백엔드가 `subagent` 를 에코하는 목적이 타입 주석에 적혀 있다: *"늦은 응답이
+ * 세션에 잘못 편입되는 것을 막으려고"*. 그런데 소비자가 그것을 보지 않으면
+ * 오배치를 막으려고 만든 필드가 오배치를 안 막는다 — 만들어 두고 부르는 사람이
+ * 0인 표면(R10)의 재발이고, 이번에는 **가장 큰 본문**이 그 위를 지난다.
+ *
+ * 등급은 {@link required} 와 같다: 빈 값으로 축소하지 않고 예외로 드러낸다.
+ * 잘못 편입된 본문은 "틀렸다"고 말해 주는 사람이 아무도 없기 때문이다.
+ */
+export function expectSubagent(
+  r: Pick<RemoteTimelineReply, "subagent">,
+  want: string | null,
+): void {
+  const got = r.subagent ?? null;
+  if (got === want) return;
+  const where = want === null ? "세션 본문" : `서브에이전트 ${want}`;
+  const came = got === null ? "세션 본문" : `서브에이전트 ${got}`;
+  throw new Error(
+    `${where} 를 물었는데 ${came} 의 응답이 왔습니다 — 다른 자리의 것을 여기에 편입하지 않습니다.`,
+  );
 }
 
 /** 회수한 본문 → 라이브 타임라인 (순수). 라이브 payload 와 같은 모양으로 만든다. */
@@ -458,53 +478,51 @@ export interface RemoteSubagentFrame {
   items: TimelineItem[] | null;
 }
 
-/** 회수해 둔 본문 하나 — **어느 서명 아래** 받았는지까지 같이 든다. */
-export interface SubagentBody {
-  sig: string | null;
-  items: TimelineItem[];
+/**
+ * 한 세션 본문의 **주소**. 자동 회수 원시의 잠금 키다.
+ *
+ * 가리키는 대상만 들어간다 — 호스트와 세션. 회수 결과·개수·서명은 들어가지
+ * 않는다(`autoFetch.ts` 계약 1).
+ */
+const SEP = "\u0000";
+export function sessionBodyKey(hostId: string, id: number): string {
+  return `s${SEP}${hostId}${SEP}${id}`;
 }
 
 /**
- * 들고 있는 본문이 이 프레임에 대해 아직 유효한가.
+ * 한 서브에이전트 본문의 **주소** — (호스트·세션·에이전트).
  *
- * 서명(파일 len·mtime)이 정본이다. 로컬이 같은 판단에 `revision` 합 대신 파일
- * 서명을 쓰는 이유가 그대로 여기에도 있다 — 에이전트가 재활성돼 전사가
- * 재구축되면 개수·리비전은 우연히 같아질 수 있어도 서명은 달라진다.
- * 서명이 **없으면** 유효하다고 하지 않는다: 무효화할 수단이 없는 캐시를
- * 신선하다고 부르면, 바뀐 전사를 옛 본문으로 조용히 덮어 보이게 된다.
+ * **서명은 여기 없다.** 앞 판은 `${session}/${agent}#${sig}` 였고 `sig` 는 파일
+ * 서명(`<len>-<mtime_ns>`)이라, **돌고 있는** 에이전트는 델타마다 전사가 자라
+ * 서명이 바뀌었다 → 키가 바뀌어 `attempted` 가 초기화 → 자동 회수 재발화 →
+ * 델타당 SSH 왕복 1회 + 전사 1벌 추가 상주(L2-2). 서명은 이제 값과 함께 보관돼
+ * **신선도 표시**로만 쓰인다({@link isStale}).
  */
-export function subagentBodyIsFresh(
-  cached: SubagentBody | undefined,
-  f: Pick<RemoteSubagentFrame, "sig">,
-): boolean {
-  if (!cached) return false;
-  if (cached.sig === null || f.sig === null) return false;
-  return cached.sig === f.sig;
+export function subagentBodyKey(hostId: string, id: number, agent: string): string {
+  return `a${SEP}${hostId}${SEP}${id}${SEP}${agent}`;
 }
 
 /**
- * 이 에이전트의 본문을 **한 번 시도했나**를 세는 키.
+ * 이 본문 주소가 어느 세션의 것인가 — 모양이 다르면 **null**.
  *
- * R1(빈 성공 응답 → 무한 SSH 루프)이 남긴 규칙 그대로 축은 *시도*다. 다만
- * 서명을 키에 넣는다 — 재활성으로 전사가 실제로 달라졌으면 한 번 더 받아야
- * 하고, 그것은 내용이 아니라 **생산자가 알려 준 사건**이라 루프가 되지 않는다.
- * 서명이 없을 때 키가 매번 달라지면 그 자체가 루프이므로 고정 문자열로 접는다.
+ * 못 읽은 키에 0 을 돌려주면 세션 0 의 본문으로 취급돼 엉뚱한 자리가 지워진다.
  */
-export function subagentAttemptKey(
-  session: number,
-  f: Pick<RemoteSubagentFrame, "id" | "sig">,
-): string {
-  return `${session}/${f.id}#${f.sig ?? "-"}`;
+export function sessionOfBodyKey(key: string): number | null {
+  const part = key.split(SEP)[2];
+  if (!part || !/^\d+$/.test(part)) return null;
+  const n = Number(part);
+  return Number.isSafeInteger(n) ? n : null;
 }
 
-/** 지금 자동으로 한 번 회수해도 되나 — 판정의 축은 **시도**다(R1). */
-export function shouldAutoLoadSubagent(
-  st: FetchAttemptState,
-  fresh: boolean,
-): boolean {
-  if (st.attempted || st.fetching || st.failed) return false;
-  return !fresh;
-}
+/**
+ * 서명이 달라진 본문에 붙는 한 줄 — **자동으로 다시 받지 않는다**.
+ *
+ * 다시 받는 판단이 화면(사람)에 있는 것이 재슬라이스의 요지다: 진행 중인
+ * 에이전트는 델타마다 서명이 바뀌므로, "달라졌으니 다시 받자"를 자동으로 하면
+ * 그것이 곧 델타당 SSH 왕복이다(L2-2).
+ */
+export const SUBAGENT_STALE_NOTE =
+  "이 에이전트의 기록이 그 뒤에 바뀌었습니다 — 보이는 것은 이전 회수본입니다.";
 
 /** 접힌 에이전트 행의 한 줄 — 진행도와 상태. 본문 없이 메타만으로 그린다. */
 export function subagentLabel(f: RemoteSubagentFrame): string {
@@ -841,11 +859,16 @@ export function endedReason(
 export interface RemoteHostsView {
   hosts: RemoteHostSnapshot[];
   live: Map<number, RemoteLiveTimeline>;
-  fetched: Map<number, RemoteLiveTimeline>;
-  fetching: ReadonlySet<number>;
-  /** 회수를 **시도한** id — 자동 회수가 세션당 한 번이라는 사실이 여기 산다. */
-  attempted: ReadonlySet<number>;
-  fetchError: Record<number, string>;
+  /**
+   * 회수해 둔 **세션 본문** — 주소는 {@link sessionBodyKey}.
+   *
+   * 값·오류·진행·시도가 한 칸에 같이 있다. 앞 판은 그 넷이 서로 다른 네 개의
+   * 컬렉션(`fetched`·`fetching`·`attempted`·`fetchError`)에 흩어져 있었고, 정리
+   * 경로가 그중 셋만 치우면 나머지 하나가 조용히 남았다.
+   */
+  bodies: AutoFetch<RemoteLiveTimeline>;
+  /** 회수해 둔 **서브에이전트 본문** — 주소는 {@link subagentBodyKey}. */
+  agentBodies: AutoFetch<TimelineItem[]>;
   /** 호스트 목록 조회가 실패한 사유. 성공하면 지워진다. */
   hostsError: string | null;
   /** 목록이 마지막으로 **성공한** 시각(ms) — 화면이 얼마나 낡았는지. */
@@ -855,17 +878,6 @@ export interface RemoteHostsView {
   /** 지금 상태 seed 조회가 실패한 사유 — 빈 배열로 축소하지 않는다. */
   seedError: string | null;
   fetchBody: (hostId: string, id: number) => void;
-  /**
-   * 회수해 둔 서브에이전트 본문 — 키는 {@link subagentAttemptKey}.
-   *
-   * 세 맵이 전부 같은 키를 쓴다: 서명이 키에 들어 있으니 재활성된 에이전트는
-   * 자동으로 다른 칸이 되고, 옛 본문이 새 전사 자리에 남지 않는다.
-   */
-  subagentBodies: ReadonlyMap<string, SubagentBody>;
-  subagentFetching: ReadonlySet<string>;
-  /** 본문을 **시도한** 키 — 자동 회수가 (세션·에이전트·서명)당 한 번이라는 사실. */
-  subagentAttempted: ReadonlySet<string>;
-  subagentError: Record<string, string>;
   fetchSubagentBody: (hostId: string, id: number, f: RemoteSubagentFrame) => void;
   /** 구독+seed 를 다시 세운다(구독 실패·seed 실패의 재시도). */
   retryStream: () => void;
@@ -875,10 +887,6 @@ export interface RemoteHostsView {
 export function useRemoteHosts(pollMs = 700): RemoteHostsView {
   const [hosts, setHosts] = useState<RemoteHostSnapshot[]>([]);
   const [live, setLive] = useState<Map<number, RemoteLiveTimeline>>(new Map());
-  const [fetched, setFetched] = useState<Map<number, RemoteLiveTimeline>>(new Map());
-  const [fetching, setFetching] = useState<Set<number>>(new Set());
-  const [attempted, setAttempted] = useState<Set<number>>(new Set());
-  const [fetchError, setFetchError] = useState<Record<number, string>>({});
   const [hostsError, setHostsError] = useState<string | null>(null);
   const [hostsAt, setHostsAt] = useState<number | null>(null);
   const [streamError, setStreamError] = useState<string | null>(null);
@@ -886,23 +894,12 @@ export function useRemoteHosts(pollMs = 700): RemoteHostsView {
   const [streamNonce, setStreamNonce] = useState(0);
   /** 이번 마운트에서 **라이브 이벤트가** 채운 id — 늦은 seed 가 덮지 못하게. */
   const livenedRef = useRef<Set<number>>(new Set());
-  /**
-   * 지금 나가 있는 회수 — **상태가 아니라 ref 다**.
-   *
-   * `setFetching` 업데이터 안에서 걸던 가드는 상태에만 걸리고 호출에는 안 걸렸다
-   * (`invoke` 는 그 바깥의 형제 문장이었다). effect·수동 버튼·연속 클릭이 겹치면
-   * 같은 세션에 SSH 회수가 **병렬로** 나갔다. ref 는 렌더를 기다리지 않으므로
-   * 같은 tick 안의 두 번째 호출도 막힌다.
-   */
-  const inFlightRef = useRef<Set<number>>(new Set());
-  /** 회수를 시도한 적 있는 id — 자동 회수의 잠금(R1). */
-  const attemptedRef = useRef<Set<number>>(new Set());
-  const [subagentBodies, setSubagentBodies] = useState<Map<string, SubagentBody>>(new Map());
-  const [subagentFetching, setSubagentFetching] = useState<Set<string>>(new Set());
-  const [subagentAttempted, setSubagentAttempted] = useState<Set<string>>(new Set());
-  const [subagentError, setSubagentError] = useState<Record<string, string>>({});
-  const subInFlightRef = useRef<Set<string>>(new Set());
-  const subAttemptedRef = useRef<Set<string>>(new Set());
+
+  // 회수는 전부 하나의 원시를 지난다(`autoFetch.ts`). 잠금(=시도)·in-flight
+  // 합치기·세대 교체·캐시 교체 규칙이 거기 한 곳에 있고, 여기 남은 것은 **주소를
+  // 어떻게 쓰나**와 **응답을 어떻게 검증하나**뿐이다.
+  const bodies = useAutoFetch<RemoteLiveTimeline>();
+  const agentBodies = useAutoFetch<TimelineItem[]>();
 
   /**
    * 지금 들고 있는 것의 거울 — 정리 판정이 렌더 밖에서 읽는다.
@@ -913,16 +910,30 @@ export function useRemoteHosts(pollMs = 700): RemoteHostsView {
    */
   const liveRef = useRef(live);
   liveRef.current = live;
-  const fetchedRef = useRef(fetched);
-  fetchedRef.current = fetched;
-  const bodiesRef = useRef(subagentBodies);
-  bodiesRef.current = subagentBodies;
+  const bodyMapRef = useRef(bodies.entries);
+  bodyMapRef.current = bodies.entries;
+  const agentMapRef = useRef(agentBodies.entries);
+  agentMapRef.current = agentBodies.entries;
   /** 직전 폴링에서 목록에 없던 id — 연속 두 번이라야 지운다. */
   const missingRef = useRef<Set<number>>(new Set());
 
+  /**
+   * 목록 조회의 **요청 세대** — 늦게 온 낡은 답은 적용하지 않는다.
+   *
+   * 정리 규칙("연속 두 폴링에서 안 보이면 지운다")이 세는 것은 *요청* 순서여야
+   * 한다. 완료 순서로 세면, 세션이 생기기 전에 나간 요청 둘이 늦게 잇달아
+   * 답하는 것만으로 **살아 있는 세션의 payload 가 지워진다**(L2-8). 응답을 요청
+   * 순서로만 적용하면 그 상황 자체가 성립하지 않는다.
+   */
+  const askSeq = useRef(0);
+  const appliedSeq = useRef(0);
+
   const refresh = useCallback(() => {
+    const mine = ++askSeq.current;
     void invoke<RemoteHostSnapshot[]>("remote_hosts")
       .then((v) => {
+        if (mine <= appliedSeq.current) return; // 더 새 답이 이미 적용됐다
+        appliedSeq.current = mine;
         setHosts(v ?? []);
         setHostsAt(Date.now());
         setHostsError(null);
@@ -940,155 +951,97 @@ export function useRemoteHosts(pollMs = 700): RemoteHostsView {
     return () => window.clearInterval(t);
   }, [refresh, pollMs]);
 
+  const forgetBodies = bodies.forget;
+  const forgetAgents = agentBodies.forget;
+
   /**
    * 호스트 목록이 새로 올 때마다, 그 목록에 더는 없는 세션의 자리를 치운다.
    *
    * `hosts` 는 폴링이 **성공**할 때만 새 배열이 된다 — 실패하면 이전 목록이
    * 그대로 남고(그리고 화면이 그 사실을 말한다), 이 effect 도 돌지 않는다.
    * 낡은 목록을 근거로 지우지 않는다는 뜻이다.
+   *
+   * 들고 있는 것(`held`)은 **회수해 둔 본문까지 포함해 매번 다시 센다**. 앞 판은
+   * `live`/`fetched` 만 셌는데, 드롭 시점에 나가 있던 회수가 뒤늦게 본문을 되넣으면
+   * 그 세션 id 는 더 이상 held 가 아니라 **두 번 다시 drop 대상이 안 됐다** —
+   * 가장 큰 payload 가 영구 상주(L2-9). 이제 축은 오직 "`known` 에 없다"이다.
    */
   useEffect(() => {
     const known = knownSessionIds(hosts);
-    const held = new Set<number>([...liveRef.current.keys(), ...fetchedRef.current.keys()]);
-    const { missing, drop } = droppableIds(held, known, missingRef.current);
-    missingRef.current = missing;
-    if (drop.size === 0) return;
-    const keep = <V,>(m: Map<number, V>) => {
-      const next = new Map(m);
-      for (const id of drop) next.delete(id);
-      return next;
-    };
-    setLive(keep);
-    setFetched(keep);
-    for (const id of drop) {
-      livenedRef.current.delete(id);
-      attemptedRef.current.delete(id);
-    }
-    setAttempted(new Set(attemptedRef.current));
-    setFetchError((prev) => {
-      const next = { ...prev };
-      for (const id of drop) delete next[id];
-      return next;
-    });
-    // 서브에이전트 본문도 같은 규칙으로 — 세션이 사라졌으면 그 에이전트의
-    // 전사도 그릴 곳이 없다(가장 큰 payload 가 여기 있다).
-    const goneKeys = (keys: Iterable<string>) => {
-      const out = new Set<string>();
+    const held = new Set<number>(liveRef.current.keys());
+    const owners = (keys: Iterable<string>) => {
+      const out = new Map<number, string[]>();
       for (const k of keys) {
-        const id = sessionOfSubagentKey(k);
-        if (id != null && drop.has(id)) out.add(k);
+        const id = sessionOfBodyKey(k);
+        if (id == null) continue;
+        held.add(id);
+        out.set(id, [...(out.get(id) ?? []), k]);
       }
       return out;
     };
-    const bodyKeys = goneKeys(bodiesRef.current.keys());
-    if (bodyKeys.size > 0) {
-      setSubagentBodies((prev) => {
-        const next = new Map(prev);
-        for (const k of bodyKeys) next.delete(k);
-        return next;
-      });
-    }
-    const attemptKeys = goneKeys(subAttemptedRef.current);
-    if (attemptKeys.size > 0) {
-      for (const k of attemptKeys) subAttemptedRef.current.delete(k);
-      setSubagentAttempted(new Set(subAttemptedRef.current));
-      setSubagentError((prev) => {
-        const next = { ...prev };
-        for (const k of attemptKeys) delete next[k];
-        return next;
-      });
-    }
-  }, [hosts]);
+    const bodyOwners = owners(bodyMapRef.current.keys());
+    const agentOwners = owners(agentMapRef.current.keys());
+    const { missing, drop } = droppableIds(held, known, missingRef.current);
+    missingRef.current = missing;
+    if (drop.size === 0) return;
+    setLive((m) => {
+      const next = new Map(m);
+      for (const id of drop) next.delete(id);
+      return next;
+    });
+    for (const id of drop) livenedRef.current.delete(id);
+    const keysOf = (owned: Map<number, string[]>) =>
+      [...drop].flatMap((id) => owned.get(id) ?? []);
+    // 버리면 세대가 올라가므로, 지금 나가 있는 회수의 늦은 답도 이 자리를 다시
+    // 차지하지 못한다(L2-9).
+    forgetBodies(keysOf(bodyOwners));
+    forgetAgents(keysOf(agentOwners));
+  }, [hosts, forgetAgents, forgetBodies]);
 
   const retryStream = useCallback(() => setStreamNonce((n) => n + 1), []);
 
-  const fetchBody = useCallback((hostId: string, id: number) => {
-    if (inFlightRef.current.has(id)) return; // 호출 자체의 중복 방지(R17)
-    inFlightRef.current.add(id);
-    attemptedRef.current.add(id);
-    setAttempted(new Set(attemptedRef.current));
-    setFetching((prev) => {
-      if (prev.has(id)) return prev;
-      const next = new Set(prev);
-      next.add(id);
-      return next;
-    });
-    void invoke<RemoteTimelineReply>("remote_timeline", { hostId, id })
-      .then((r) => {
-        setFetched((prev) => new Map(prev).set(id, fetchedToLive(r)));
-        setFetchError((prev) => {
-          if (!(id in prev)) return prev;
-          const next = { ...prev };
-          delete next[id];
-          return next;
-        });
-      })
-      .catch((e) => {
-        setFetchError((prev) => ({
-          ...prev,
-          [id]: errText(e, "본문을 가져오지 못했습니다."),
-        }));
-      })
-      .finally(() => {
-        inFlightRef.current.delete(id);
-        setFetching((prev) => {
-          const next = new Set(prev);
-          next.delete(id);
-          return next;
-        });
+  const fetchBody = useCallback(
+    (hostId: string, id: number) => {
+      bodies.run({
+        key: sessionBodyKey(hostId, id),
+        fallback: "본문을 가져오지 못했습니다.",
+        call: async () => {
+          const r = await invoke<RemoteTimelineReply>("remote_timeline", { hostId, id });
+          expectSubagent(r, null);
+          return fetchedToLive(r);
+        },
       });
-  }, []);
+    },
+    [bodies],
+  );
 
   /**
    * 한 서브에이전트의 본문을 회수한다 — deferred hydration 의 당기는 쪽.
    *
-   * `fetchBody` 와 같은 방어선을 그대로 쓴다: 호출 자체에 건 ref 가드(R17)와
-   * **시도** 기준 잠금(R1). 다른 점은 키에 파일 서명이 들어간다는 것뿐이고,
-   * 그건 로컬이 lazy 본문 캐시를 무효화하는 키와 같은 것이다.
+   * 주소는 (호스트·세션·에이전트)뿐이고 **서명은 값에 붙는다**. 그래서 돌고 있는
+   * 에이전트의 델타가 아무리 와도 자동 회수는 한 번이고, 새 서명으로 받아 오면
+   * 옛 벌을 교체한다(누적 0).
    */
   const fetchSubagentBody = useCallback(
     (hostId: string, id: number, f: RemoteSubagentFrame) => {
-      const key = subagentAttemptKey(id, f);
-      if (subInFlightRef.current.has(key)) return;
-      subInFlightRef.current.add(key);
-      subAttemptedRef.current.add(key);
-      setSubagentAttempted(new Set(subAttemptedRef.current));
-      setSubagentFetching((prev) => {
-        if (prev.has(key)) return prev;
-        const next = new Set(prev);
-        next.add(key);
-        return next;
+      agentBodies.run({
+        key: subagentBodyKey(hostId, id, f.id),
+        sig: f.sig,
+        fallback: "서브에이전트 본문을 가져오지 못했습니다.",
+        call: async () => {
+          const r = await invoke<RemoteTimelineReply>("remote_timeline", {
+            hostId,
+            id,
+            subagent: f.id,
+          });
+          expectSubagent(r, f.id);
+          // 여기도 `?? []` 가 아니다(R12): 가장 큰 본문을 나르는 경로에서 계약이
+          // 깨진 것이 "기록이 비어 있습니다"로 도착하면 아무도 모른다.
+          return required<TimelineItem>(r.items, "items", "회수한 서브에이전트 본문");
+        },
       });
-      void invoke<RemoteTimelineReply>("remote_timeline", { hostId, id, subagent: f.id })
-        .then((r) => {
-          // 받아 온 본문에는 **그때의 서명**을 같이 붙인다 — 나중에 프레임의
-          // 서명이 달라지면 이 본문이 낡았다는 것을 알 수 있어야 한다.
-          setSubagentBodies((prev) =>
-            new Map(prev).set(key, { sig: f.sig, items: r.items ?? [] }),
-          );
-          setSubagentError((prev) => {
-            if (!(key in prev)) return prev;
-            const next = { ...prev };
-            delete next[key];
-            return next;
-          });
-        })
-        .catch((e) => {
-          setSubagentError((prev) => ({
-            ...prev,
-            [key]: errText(e, "서브에이전트 본문을 가져오지 못했습니다."),
-          }));
-        })
-        .finally(() => {
-          subInFlightRef.current.delete(key);
-          setSubagentFetching((prev) => {
-            const next = new Set(prev);
-            next.delete(key);
-            return next;
-          });
-        });
     },
-    [],
+    [agentBodies],
   );
 
   useEffect(() => {
@@ -1168,19 +1121,13 @@ export function useRemoteHosts(pollMs = 700): RemoteHostsView {
   return {
     hosts,
     live,
-    fetched,
-    fetching,
-    attempted,
-    fetchError,
+    bodies,
+    agentBodies,
     hostsError,
     hostsAt,
     streamError,
     seedError,
     fetchBody,
-    subagentBodies,
-    subagentFetching,
-    subagentAttempted,
-    subagentError,
     fetchSubagentBody,
     retryStream,
     refresh,

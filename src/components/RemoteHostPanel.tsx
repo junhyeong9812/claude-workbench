@@ -50,19 +50,19 @@ import {
   seenSeqOf,
   sessionCountNote,
   nextRemoteResize,
+  sessionBodyKey,
   shouldAutoFetchBody,
-  shouldAutoLoadSubagent,
   shouldFetchBody,
   spawnRequest,
   staleSeenKeys,
-  subagentAttemptKey,
-  subagentBodyIsFresh,
+  subagentBodyKey,
   subagentLabel,
   turnMetaLabel,
   useRemoteHosts,
   KILL_SIGNAL,
   REMOTE_RESIZE_DEBOUNCE_MS,
   SPAWN_AGENTS,
+  SUBAGENT_STALE_NOTE,
   type ControlGate,
   type RemoteAccount,
   type RemoteHostSnapshot,
@@ -70,9 +70,9 @@ import {
   type RemoteSessionMeta,
   type RemoteSubagentFrame,
   type RemoteTerminalEnded,
-  type SubagentBody,
   type TermSize,
 } from "../state/remoteHosts";
+import { isStale, shouldAutoFetch, type AutoFetch, type Fetched } from "../state/autoFetch";
 import {
   dirCutNote,
   dirHasMore,
@@ -81,11 +81,9 @@ import {
   parentPath,
   relPath,
   rootsCutNote,
-  shouldAutoLoad,
   staleNote,
   useRemoteHostData,
   GIT_ROOTS_CAVEAT,
-  type Loadable,
   type RemoteDataTab,
   type RemoteHostDataView,
 } from "../state/remoteHostData";
@@ -138,19 +136,13 @@ export function RemoteHostPanel() {
   const {
     hosts,
     live,
-    fetched,
-    fetching,
-    attempted,
-    fetchError,
+    bodies,
+    agentBodies,
     hostsError,
     hostsAt,
     streamError,
     seedError,
     fetchBody,
-    subagentBodies,
-    subagentFetching,
-    subagentAttempted,
-    subagentError,
     fetchSubagentBody,
     retryStream,
     refresh,
@@ -233,10 +225,19 @@ export function RemoteHostPanel() {
       window.clearInterval(t);
     };
   }, [termId, ended]);
-  // 패널이 사라질 때 SSH exec 채널을 남기지 않는다. **원격 세션은 죽지 않는다** —
-  // 닫는 것은 이 관찰 창(로컬 세션)뿐이고, 에이전트는 데몬이 계속 소유한다.
+  /**
+   * 패널이 사라질 때 SSH exec 채널을 남기지 않는다. **원격 세션은 죽지 않는다** —
+   * 닫는 것은 이 관찰 창(로컬 세션)뿐이고, 에이전트는 데몬이 계속 소유한다.
+   *
+   * ref 를 닫는 것만으로는 부족하다: `터미널` 을 누르고 **바로** 탭을 옮기면
+   * 여기는 아직 빈 ref 를 보고 지나가고, 뒤늦게 도착한 `remote_attach` 가 ref 를
+   * 채운다 — 닫을 코드는 이미 지나간 뒤라 그 SSH exec 채널과 원격 attach 는
+   * 세션이 끝날 때까지 남는다(데몬 쪽 연결 슬롯도 같이). 그래서 **언마운트도
+   * 세대를 올린다** — 늦게 온 attach 는 자기가 진 것을 알고 스스로 닫는다.
+   */
   useEffect(
     () => () => {
+      attachSeq.current += 1;
       const t = termRef.current;
       if (t) invoke("terminal_close", { id: t.localId }).catch(() => {});
     },
@@ -464,16 +465,10 @@ export function RemoteHostPanel() {
             key={h.host_id}
             host={h}
             live={live}
-            fetched={fetched}
-            fetching={fetching}
-            attempted={attempted}
-            fetchError={fetchError}
+            bodies={bodies}
             onFetch={(id) => fetchBody(h.host_id, id)}
             subs={{
-              bodies: subagentBodies,
-              fetching: subagentFetching,
-              attempted: subagentAttempted,
-              error: subagentError,
+              of: (id, f) => agentBodies.get(subagentBodyKey(h.host_id, id, f.id)),
               fetch: (id, f) => fetchSubagentBody(h.host_id, id, f),
             }}
             seenSeq={seenSeqOf(h, seen)}
@@ -513,10 +508,7 @@ export function RemoteHostPanel() {
 function HostCard({
   host,
   live,
-  fetched,
-  fetching,
-  attempted,
-  fetchError,
+  bodies,
   onFetch,
   subs,
   seenSeq,
@@ -533,10 +525,8 @@ function HostCard({
 }: {
   host: RemoteHostSnapshot;
   live: Map<number, RemoteLiveTimeline>;
-  fetched: Map<number, RemoteLiveTimeline>;
-  fetching: ReadonlySet<number>;
-  attempted: ReadonlySet<number>;
-  fetchError: Record<number, string>;
+  /** 회수해 둔 세션 본문 전체 — 이 카드는 자기 세션의 칸만 꺼내 쓴다. */
+  bodies: AutoFetch<RemoteLiveTimeline>;
   onFetch: (id: number) => void;
   subs: SubagentAccess;
   seenSeq: number;
@@ -671,10 +661,7 @@ function HostCard({
             key={s.id}
             s={s}
             live={live.get(s.id)}
-            fetched={fetched.get(s.id)}
-            fetching={fetching.has(s.id)}
-            attempted={attempted.has(s.id)}
-            fetchError={fetchError[s.id]}
+            body={bodies.get(sessionBodyKey(host.host_id, s.id))}
             onFetch={() => onFetch(s.id)}
             subs={subs}
             open={!!openIds[s.id]}
@@ -694,10 +681,7 @@ function HostCard({
 function SessionRow({
   s,
   live,
-  fetched,
-  fetching,
-  attempted,
-  fetchError,
+  body,
   onFetch,
   subs,
   open,
@@ -710,11 +694,8 @@ function SessionRow({
 }: {
   s: RemoteSessionMeta;
   live: RemoteLiveTimeline | undefined;
-  fetched: RemoteLiveTimeline | undefined;
-  fetching: boolean;
-  /** 이 세션에 대해 회수를 **시도한 적이 있나** — 자동 회수는 한 번뿐이다(R1). */
-  attempted: boolean;
-  fetchError: string | undefined;
+  /** 회수해 둔 이 세션의 본문 한 칸 — 값·오류·진행·시도가 함께 있다. */
+  body: Fetched<RemoteLiveTimeline>;
   onFetch: () => void;
   subs: SubagentAccess;
   open: boolean;
@@ -726,7 +707,9 @@ function SessionRow({
   onKill: () => void;
   onAttach: () => void;
 }) {
-  const shown = pickTimeline(live, fetched);
+  const shown = pickTimeline(live, body.value ?? undefined);
+  const fetching = body.loading;
+  const fetchError = body.error;
   const items = shown?.items ?? [];
   const turns = shown?.turns ?? [];
   // 턴 → 답변. 데몬은 R2b 부터 이것을 실어 보내는데 화면이 버리고 있었다 —
@@ -745,11 +728,7 @@ function SessionRow({
   // 아무것도 하지 않은 세션) `recoverable` 은 계속 true 라, "내용이 비었나"로
   // 재시도를 정하면 effect 가 무한히 재발화하며 매 회차가 새 SSH 연결이 된다.
   // 판정의 축은 내용이 아니라 **시도**다(R1).
-  const autoFetch = shouldAutoFetchBody(s, shown, {
-    attempted,
-    fetching,
-    failed: fetchError !== undefined,
-  });
+  const autoFetch = shouldAutoFetchBody(s, shown, body);
 
   // 펼치면 한 번 가져온다. 데몬은 끝난 세션의 본문을 스냅샷에 싣지 않고
   // (`items_omitted`) 앞으로도 이벤트를 내지 않으므로, 자동 조회가 없으면
@@ -792,7 +771,7 @@ function SessionRow({
       {open ? (
         <div className="remote-timeline">
           {fetching ? <p className="remote-empty">원격에서 본문을 가져오는 중…</p> : null}
-          {fetchError ? (
+          {fetchError !== null ? (
             <p className="remote-empty">
               본문을 가져오지 못했습니다 — {fetchError}
               <button type="button" className="remote-fetch" onClick={onFetch}>
@@ -853,7 +832,7 @@ function SessionRow({
  * 앞 슬라이스가 `hostsError`/`hostsAt` 으로 세운 결 그대로다: 실패를 빈 값으로
  * 축소하면 화면은 "없음"을 정직한 답으로 보이고, 아무도 계약이 깨진 줄 모른다.
  */
-function LoadNote({ of, onRetry }: { of: Loadable<unknown>; onRetry: () => void }) {
+function LoadNote({ of, onRetry }: { of: Fetched<unknown>; onRetry: () => void }) {
   if (!of.error) return null;
   const stale = staleNote(of);
   return (
@@ -895,14 +874,14 @@ function ItemLines({ it }: { it: TimelineItem }) {
 }
 
 /**
- * 서브에이전트 본문에 닿는 길 — 회수해 둔 것, 나가 있는 것, 실패한 것, 그리고
- * 새로 청구하는 함수. 키는 전부 {@link subagentAttemptKey} 다.
+ * 서브에이전트 본문에 닿는 길 — **주소 하나에 칸 하나**({@link subagentBodyKey}).
+ *
+ * 값·오류·진행·시도가 한 칸에 함께 있다(`Fetched`). 앞 판은 그 넷이 서로 다른
+ * 네 컬렉션에 흩어져 있었고 키에는 파일 서명이 들어 있었다 — 그래서 돌고 있는
+ * 에이전트의 델타마다 칸이 통째로 새로 생겼다(L2-2).
  */
 interface SubagentAccess {
-  bodies: ReadonlyMap<string, SubagentBody>;
-  fetching: ReadonlySet<string>;
-  attempted: ReadonlySet<string>;
-  error: Record<string, string>;
+  of: (id: number, f: RemoteSubagentFrame) => Fetched<TimelineItem[]>;
   fetch: (id: number, f: RemoteSubagentFrame) => void;
 }
 
@@ -924,18 +903,14 @@ function SubagentRow({
   subs: SubagentAccess;
 }) {
   const [open, setOpen] = useState(false);
-  const key = subagentAttemptKey(sessionId, f);
-  const body = subs.bodies.get(key);
-  const fresh = subagentBodyIsFresh(body, f);
-  const err = subs.error[key];
-  const auto = shouldAutoLoadSubagent(
-    {
-      attempted: subs.attempted.has(key),
-      fetching: subs.fetching.has(key),
-      failed: err !== undefined,
-    },
-    fresh,
-  );
+  const entry = subs.of(sessionId, f);
+  const items = entry.value;
+  const err = entry.error;
+  // **신선도는 자동 회수의 입력이 아니다.** 돌고 있는 에이전트는 델타마다 전사가
+  // 자라 서명이 바뀌므로, "달라졌으니 다시 받자"를 자동으로 하면 그것이 곧
+  // 델타당 SSH 왕복이다(L2-2). 달라졌다는 사실은 아래에서 **말로** 갚는다.
+  const stale = isStale(entry, f.sig);
+  const auto = shouldAutoFetch(entry);
 
   useEffect(() => {
     if (open && auto) subs.fetch(sessionId, f);
@@ -958,10 +933,10 @@ function SubagentRow({
       </button>
       {open ? (
         <div className="remote-subagent-body">
-          {subs.fetching.has(key) ? (
+          {entry.loading ? (
             <p className="remote-empty">원격에서 이 에이전트의 기록을 가져오는 중…</p>
           ) : null}
-          {err ? (
+          {err !== null ? (
             <p className="remote-empty">
               가져오지 못했습니다 — {err}
               <button
@@ -973,13 +948,13 @@ function SubagentRow({
               </button>
             </p>
           ) : null}
-          {body?.items.map((it) => (
+          {(items ?? []).map((it) => (
             <ItemLines key={it.tool_call_id} it={it} />
           ))}
-          {body && body.items.length === 0 && !err ? (
+          {items && items.length === 0 && err === null ? (
             <p className="remote-empty">이 에이전트의 기록이 비어 있습니다.</p>
           ) : null}
-          {!body && !subs.fetching.has(key) && !err ? (
+          {!items && !entry.loading && err === null ? (
             <p className="remote-empty">
               본문은 펼칠 때 가져옵니다.
               <button
@@ -991,9 +966,18 @@ function SubagentRow({
               </button>
             </p>
           ) : null}
-          {body && !fresh && f.sig !== null ? (
+          {/* 바뀐 것은 **말하고**, 다시 받는 것은 사용자가 누른다 — 여기서 자동으로
+              다시 받으면 진행 중인 에이전트의 델타마다 SSH 왕복이 나간다(L2-2). */}
+          {stale ? (
             <p className="remote-cut" role="status">
-              이 에이전트의 기록이 그 뒤에 바뀌었습니다 — 보이는 것은 이전 회수본입니다.
+              {SUBAGENT_STALE_NOTE}
+              <button
+                type="button"
+                className="remote-fetch"
+                onClick={() => subs.fetch(sessionId, f)}
+              >
+                다시 가져오기
+              </button>
             </p>
           ) : null}
         </div>
@@ -1040,14 +1024,14 @@ function RemoteDataPanel({ hostId }: { hostId: string }) {
   // 사용자가 누르는 버튼에만 남는다 — 화면에 계속 떠 있으므로 잃는 것은 없다.
   useEffect(() => {
     if (!root) return;
-    if (tab === "tree" && shouldAutoLoad(d.dir)) openDir("");
+    if (tab === "tree" && shouldAutoFetch(d.dir)) openDir("");
     if (tab === "git") {
-      if (shouldAutoLoad(d.status)) reloadStatus();
-      if (shouldAutoLoad(d.log)) reloadLog();
+      if (shouldAutoFetch(d.status)) reloadStatus();
+      if (shouldAutoFetch(d.log)) reloadLog();
     }
     if (tab === "worktrees") {
-      if (shouldAutoLoad(d.worktrees)) reloadWorktrees();
-      if (shouldAutoLoad(d.roots)) reloadRoots();
+      if (shouldAutoFetch(d.worktrees)) reloadWorktrees();
+      if (shouldAutoFetch(d.roots)) reloadRoots();
     }
     // 조회 함수는 호출마다 새 클로저라 의존성에서 뺀다(넣으면 매 렌더 재조회).
     // eslint-disable-next-line react-hooks/exhaustive-deps

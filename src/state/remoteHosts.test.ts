@@ -20,17 +20,17 @@ import {
   seenKey,
   seenSeqOf,
   sessionCountNote,
-  sessionOfSubagentKey,
+  expectSubagent,
+  sessionBodyKey,
+  sessionOfBodyKey,
   shouldAutoFetchBody,
   shouldFetchBody,
   nextRemoteResize,
   shouldSendRemoteResize,
   signalLabel,
   spawnRequest,
-  shouldAutoLoadSubagent,
   staleSeenKeys,
-  subagentAttemptKey,
-  subagentBodyIsFresh,
+  subagentBodyKey,
   toLiveTimeline,
   turnMetaLabel,
   unseenNotices,
@@ -41,6 +41,7 @@ import {
   type RemoteSessionMeta,
   type RemoteSubagentFrame,
 } from "./remoteHosts";
+import { idleFetch, isStale, shouldAutoFetch } from "./autoFetch";
 import type { ClaudeTimelineEvent } from "../hooks/useClaudeTimeline";
 import type { TimelineItem } from "../types";
 
@@ -286,7 +287,7 @@ describe("종료된 세션의 본문", () => {
 
   it("자동 회수는 **내용**이 아니라 **시도**로 정해진다 (R1)", () => {
     const empty = live(0, 0);
-    const fresh = { attempted: false, fetching: false, failed: false };
+    const fresh = idleFetch<RemoteLiveTimeline>();
     const s = meta({ body_omitted: true, timeline_len: 0 });
     // 처음 펼쳤을 때는 가져온다.
     expect(shouldAutoFetchBody(s, undefined, fresh)).toBe(true);
@@ -296,9 +297,14 @@ describe("종료된 세션의 본문", () => {
     // 재발화한다 — 실측 1,400회 이상/5초, 매 회차가 새 SSH 연결.
     expect(shouldFetchBody(s, empty)).toBe(true);
     expect(shouldAutoFetchBody(s, empty, { ...fresh, attempted: true })).toBe(false);
-    // 나가 있는 회수가 있거나 지난 회수가 실패로 끝났으면 자동으로 또 걸지 않는다.
-    expect(shouldAutoFetchBody(s, undefined, { ...fresh, fetching: true })).toBe(false);
-    expect(shouldAutoFetchBody(s, undefined, { ...fresh, failed: true })).toBe(false);
+    // 나가 있는 회수가 있거나 지난 회수가 실패로 끝났으면 자동으로 또 걸지 않는다
+    // (원시가 시도 시점에 `attempted` 를 세우므로 그 둘은 언제나 시도 이후다).
+    expect(shouldAutoFetchBody(s, undefined, { ...fresh, attempted: true, loading: true })).toBe(
+      false,
+    );
+    expect(
+      shouldAutoFetchBody(s, undefined, { ...fresh, attempted: true, error: "ssh 실패" }),
+    ).toBe(false);
     // 데몬에도 없는 것은 여전히 가져올 곳이 없다.
     expect(shouldAutoFetchBody(meta({ timeline_len: 0 }), undefined, fresh)).toBe(false);
     // 본문이 실제로 있으면 애초에 회수 대상이 아니다.
@@ -725,42 +731,59 @@ describe("R7 — 서브에이전트 메타는 필수다", () => {
   });
 });
 
-describe("R7 — 회수한 본문의 신선도는 파일 서명이 정한다", () => {
-  it("서명이 같을 때만 유효하고, 서명이 없으면 유효하다고 하지 않는다", () => {
-    const items = [item("s1", 1)];
-    expect(subagentBodyIsFresh({ sig: "42-7", items }, frame())).toBe(true);
+describe("R7·L2-2 — 회수한 본문의 신선도는 파일 서명이 정한다 (그러나 키는 아니다)", () => {
+  const body = (sig: string | null) => ({ ...idleFetch<TimelineItem[]>(), value: [item("s1", 1)], sig });
+
+  it("서명이 다르면 낡았다고 말하고, 서명이 없으면 신선하다고 하지 않는다", () => {
+    expect(isStale(body("42-7"), "42-7")).toBe(false);
     // 에이전트가 재활성되어 전사가 달라지면 들고 있던 본문은 낡은 것이다.
-    expect(subagentBodyIsFresh({ sig: "42-7", items }, frame({ sig: "99-1" }))).toBe(false);
-    expect(subagentBodyIsFresh(undefined, frame())).toBe(false);
-    // 서명이 없으면 무효화할 방법이 없다 — 조용히 옛 본문을 보이지 않는다.
-    expect(subagentBodyIsFresh({ sig: null, items }, frame({ sig: null }))).toBe(false);
+    expect(isStale(body("42-7"), "99-1")).toBe(true);
+    // 무효화할 방법이 없으면 조용히 옛 본문을 신선한 척 보이지 않는다.
+    expect(isStale(body(null), null)).toBe(true);
+    // 들고 있는 게 없으면 낡음도 없다(그때는 "가져오기"가 답이다).
+    expect(isStale(idleFetch<TimelineItem[]>(), "42-7")).toBe(false);
+  });
+
+  /**
+   * **핵심**: 낡음은 자동 회수의 입력이 아니다.
+   *
+   * 앞 판은 서명이 잠금 키 안에 있어서, 낡음이 곧 "새 칸 = 시도 안 함 = 자동
+   * 회수"였다. 진행 중 에이전트는 델타마다 서명이 바뀌므로 그것이 곧 델타당
+   * SSH 왕복 1회 + 전사 1벌 추가 상주였다(L2-2).
+   */
+  it("낡아도 자동 회수는 다시 열리지 않는다 — 열리는 것은 화면의 버튼이다", () => {
+    const stale = { ...body("42-7"), attempted: true };
+    expect(isStale(stale, "99-1")).toBe(true);
+    expect(shouldAutoFetch(stale)).toBe(false);
   });
 });
 
-describe("R7 — 서브에이전트 자동 회수도 축이 **시도**다", () => {
-  it("한 번 시도했으면 다시 자동으로 나가지 않는다 (R1 무한 SSH 루프 재발 방지)", () => {
-    const idle = { attempted: false, fetching: false, failed: false };
-    expect(shouldAutoLoadSubagent(idle, false)).toBe(true);
-    // 시도했으면 — 성공이든 빈 응답이든 — 자동은 끝이다.
-    expect(shouldAutoLoadSubagent({ ...idle, attempted: true }, false)).toBe(false);
-    expect(shouldAutoLoadSubagent({ ...idle, fetching: true }, false)).toBe(false);
-    expect(shouldAutoLoadSubagent({ ...idle, failed: true }, false)).toBe(false);
-    // 이미 신선한 본문이 있으면 나갈 이유가 없다.
-    expect(shouldAutoLoadSubagent(idle, true)).toBe(false);
+describe("L2-2 — 본문의 주소에는 **가변 서명이 없다**", () => {
+  it("같은 (호스트·세션·에이전트)는 서명이 어떻든 같은 칸이다", () => {
+    // 프레임의 서명이 무엇이든 주소는 `f.id` 만 쓴다.
+    expect(frame({ sig: "1-1" }).id).toBe(frame({ sig: "2-2" }).id);
+    const a = subagentBodyKey("h1", REMOTE_ID_BASE, "a7");
+    expect(a).toBe(subagentBodyKey("h1", REMOTE_ID_BASE, "a7"));
+    // 다른 에이전트·다른 세션·다른 호스트는 다른 칸이다.
+    expect(a).not.toBe(subagentBodyKey("h1", REMOTE_ID_BASE, "b8"));
+    expect(a).not.toBe(subagentBodyKey("h1", REMOTE_ID_BASE + 1, "a7"));
+    expect(a).not.toBe(subagentBodyKey("h2", REMOTE_ID_BASE, "a7"));
   });
 
-  it("시도 표시는 **서명별**이라 재활성된 에이전트는 한 번 더 받고 거기서 멈춘다", () => {
-    const a = subagentAttemptKey(REMOTE_ID_BASE, frame());
-    const same = subagentAttemptKey(REMOTE_ID_BASE, frame());
-    const grown = subagentAttemptKey(REMOTE_ID_BASE, frame({ sig: "99-1" }));
-    const other = subagentAttemptKey(REMOTE_ID_BASE + 1, frame());
-    expect(a).toBe(same);
-    expect(a).not.toBe(grown);
-    expect(a).not.toBe(other);
-    // 서명이 없어도 키는 안정적이다 — 없으면 매번 새 키가 되어 루프가 된다.
-    expect(subagentAttemptKey(1, frame({ sig: null }))).toBe(
-      subagentAttemptKey(1, frame({ sig: null })),
-    );
+  it("세션 본문의 주소도 (호스트·세션)뿐이다", () => {
+    expect(sessionBodyKey("h1", 5)).toBe(sessionBodyKey("h1", 5));
+    expect(sessionBodyKey("h1", 5)).not.toBe(sessionBodyKey("h1", 6));
+  });
+});
+
+describe("L2-5 — 에코된 `subagent` 를 소비자가 검증한다", () => {
+  it("물어본 자리와 다른 응답은 예외로 드러난다", () => {
+    expect(() => expectSubagent({ subagent: null }, null)).not.toThrow();
+    expect(() => expectSubagent({ subagent: "a7" }, "a7")).not.toThrow();
+    // 늦은 응답이 세션에 편입되는 것이 이 필드가 막으려던 것이다.
+    expect(() => expectSubagent({ subagent: "a7" }, null)).toThrow(/다른 자리의 것/);
+    expect(() => expectSubagent({ subagent: null }, "a7")).toThrow(/다른 자리의 것/);
+    expect(() => expectSubagent({ subagent: "b8" }, "a7")).toThrow(/다른 자리의 것/);
   });
 });
 
@@ -831,10 +854,12 @@ describe("R14 — 호스트 목록에서 사라진 세션의 자리 치우기", 
     expect(back.missing.size).toBe(0);
   });
 
-  it("서브에이전트 본문의 키에서 세션 id 를 읽는다 — 같은 규칙으로 치우려면", () => {
-    const key = subagentAttemptKey(REMOTE_ID_BASE + 5, { id: "a7", sig: "42-7" });
-    expect(sessionOfSubagentKey(key)).toBe(REMOTE_ID_BASE + 5);
+  it("본문 주소에서 세션 id 를 읽는다 — 같은 규칙으로 치우려면", () => {
+    expect(sessionOfBodyKey(subagentBodyKey("h1", REMOTE_ID_BASE + 5, "a7"))).toBe(
+      REMOTE_ID_BASE + 5,
+    );
+    expect(sessionOfBodyKey(sessionBodyKey("h1", REMOTE_ID_BASE + 5))).toBe(REMOTE_ID_BASE + 5);
     // 모르는 모양이면 **아무 세션도 아니다** — 0 을 돌려주면 id 0 의 본문을 지운다.
-    expect(sessionOfSubagentKey("망가진키")).toBeNull();
+    expect(sessionOfBodyKey("망가진키")).toBeNull();
   });
 });

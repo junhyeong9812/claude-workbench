@@ -1130,7 +1130,7 @@ describe("R14 — 호스트 목록에서 사라진 세션의 자리를 치운다
     });
     await flush(10);
     expect(view!.live.size).toBe(1);
-    expect(view!.subagentBodies.size).toBe(1);
+    expect(view!.agentBodies.entries.size).toBe(1);
 
     // 세션이 끝났을 뿐이면(목록에 남아 있다) 몇 번을 폴링해도 그대로다 —
     // 사용자가 그 카드를 펼쳐 마지막 내용을 읽는다.
@@ -1146,6 +1146,431 @@ describe("R14 — 호스트 목록에서 사라진 세션의 자리를 치운다
 
     await poll(view!);
     expect(view!.live.size, "사라진 세션의 payload 가 패널 수명 내내 남는다").toBe(0);
-    expect(view!.subagentBodies.size, "서브에이전트 전사가 남았다").toBe(0);
+    expect(view!.agentBodies.entries.size, "서브에이전트 전사가 남았다").toBe(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 듀얼 리뷰 loop 2 — **자동 회수 원시**의 계약
+//
+// 여기 있는 것은 개별 결함의 회귀가 아니라 재슬라이스의 계약이다. 같은 결함
+// 클래스가 세 번 재발했고(loop1 R1 → S4 개발 중 → L2-2), 매번 처방은 옳았는데
+// 자리가 달랐다: 자동 회수 기계가 세 벌로 병렬 존재하고 각자 자기 잠금 키를
+// 만들었다. **잠금 키가 가변 데이터에서 파생되면 순수 판정 함수가 옳게 동작하면서도
+// 루프가 선다.** 그래서 키는 정체성(주소)뿐이고, 서명은 신선도 표시로만 쓴다.
+// ---------------------------------------------------------------------------
+
+/** 이 세션의 첫 서브에이전트 행을 펼친다. */
+async function openAgent() {
+  const caret = Array.from(container.querySelectorAll("button")).find((b) =>
+    (b.textContent ?? "").includes("a7c1d2e"),
+  ) as HTMLButtonElement | undefined;
+  expect(caret, "서브에이전트 행이 없다").toBeTruthy();
+  await act(async () => caret!.click());
+  await flush(10);
+}
+
+describe("L2-2 — 돌고 있는 에이전트의 서명 요동이 회수를 재발화시키지 않는다", () => {
+  /**
+   * `sig = <len>-<mtime_ns>` 다. **진행 중** 전사는 델타마다 자라므로 서명이 매번
+   * 바뀐다. 잠금 키에 서명이 들어 있으면 델타마다 키가 바뀌어 `attempted` 가
+   * 초기화되고, 자동 회수가 다시 발화한다 — 100 델타 = SSH 100회 + 전사 100벌.
+   *
+   * 앞의 재발 방지 테스트는 **서명을 고정한 채** 델타를 흘려 그대로 통과했다.
+   * 그린 위장은 "테스트가 있다"가 아니라 "무엇을 고정했느냐"에서도 난다.
+   */
+  it("델타마다 서명이 바뀌어도 `remote_timeline` 은 (세션·에이전트)당 1회다", async () => {
+    routes.remote_hosts = async () => [liveSession()];
+    routes.remote_timeline = async () => ({
+      ...emptyReply,
+      subagent: "a7c1d2e3",
+      items: [tlItem("s1", 1, { content_text: "에이전트가 한 일" })],
+    });
+    await mount();
+    await act(async () =>
+      emitEvent("claude-timeline", liveEvent({ subagents: [agentFrame({ sig: "100-1" })] })),
+    );
+    await openRow();
+    await openAgent();
+    expect(calls("remote_timeline")).toBe(1);
+    expect(text()).toContain("에이전트가 한 일");
+
+    // 에이전트가 계속 돈다 — 전사가 자라 서명이 델타마다 바뀐다.
+    for (let i = 2; i <= 6; i += 1) {
+      // eslint-disable-next-line no-await-in-loop
+      await act(async () =>
+        emitEvent(
+          "claude-timeline",
+          liveEvent({ subagents: [agentFrame({ sig: `${100 + i * 7}-${i}`, completed: i })] }),
+        ),
+      );
+      // eslint-disable-next-line no-await-in-loop
+      await flush(5);
+    }
+    expect(calls("remote_timeline"), "델타마다 SSH 왕복이 나갔다").toBe(1);
+    // 대신 **바뀌었다고 말하고**, 다시 가져오는 것은 사용자 몫이다.
+    expect(text(), "바뀐 사실을 말하지 않는다").toContain("바뀌었습니다");
+    expect(findButton("다시 가져오기"), "다시 가져올 길이 화면에 없다").toBeTruthy();
+  });
+
+  it("본문 캐시는 (세션·에이전트)당 한 벌 — 새 서명은 옛 벌을 **교체**한다", async () => {
+    routes.remote_timeline = async () => ({
+      ...emptyReply,
+      subagent: "a7c1d2e3",
+      items: [tlItem("s1", 1, { content_text: "커다란 전사" })],
+    });
+    let view: RemoteHostsView | undefined;
+    function Probe() {
+      view = useRemoteHosts(100_000);
+      return null;
+    }
+    await act(async () => {
+      root.render(<Probe />);
+    });
+    await flush(5);
+    for (const sig of ["10-1", "20-2", "30-3"]) {
+      // eslint-disable-next-line no-await-in-loop
+      await act(async () => {
+        view!.fetchSubagentBody("h1", SID, agentFrame({ sig }) as never);
+      });
+      // eslint-disable-next-line no-await-in-loop
+      await flush(5);
+    }
+    expect(view!.agentBodies.entries.size, "옛 회수본이 지워지지 않고 쌓였다").toBe(1);
+  });
+});
+
+describe("L2-3 — 조회 중에 다른 프로젝트를 골라도 말없이 삼켜지지 않는다", () => {
+  const PROJECTS2 = {
+    projects: [
+      { path: "/home/jun/p", name: "p", branch: "main", source: "workbench", project_types: [] },
+      { path: "/home/jun/q", name: "q", branch: "main", source: "workbench", project_types: [] },
+    ],
+    scanned: [],
+    notes: [],
+  };
+  const page = (root: string, name: string) => ({
+    root,
+    path: root,
+    entries: [{ name, path: `${root}/${name}`, is_dir: false, project_types: [], is_ignored: false }],
+    from_index: 0,
+    total: 1,
+    truncated: false,
+  });
+
+  /**
+   * in-flight 키에 `root` 가 없으면 A 조회 중의 B 요청이 **조기 반환**으로
+   * 사라진다(상태 갱신 0 · `attempted` 는 이미 true 라 자동 재조회도 없다).
+   * 그리고 늦게 온 A 응답이 B 라벨 아래 그려진다 — 화면이 고른 경로와 데이터
+   * 출처가 다른데 아무 말도 하지 않는다.
+   */
+  it("B 요청이 실제로 나가고, 늦게 온 A 응답이 B 화면에 그려지지 않는다", async () => {
+    routes.remote_projects = async () => PROJECTS2;
+    const pending: { root: string; resolve: (v: unknown) => void }[] = [];
+    routes.remote_tree = (a) =>
+      new Promise((resolve) => pending.push({ root: String(a.root), resolve }));
+    await mount();
+    await openData("/home/jun/p");
+    expect(pending.length, "A 조회가 나가지 않았다").toBe(1);
+
+    const select = container.querySelector(
+      'select[aria-label="원격 프로젝트"]',
+    ) as HTMLSelectElement;
+    await act(async () => {
+      select.value = "/home/jun/q";
+      select.dispatchEvent(new Event("change", { bubbles: true }));
+    });
+    await flush(10);
+    const forB = pending.find((p) => p.root === "/home/jun/q");
+    expect(forB, "B 요청이 조기 반환으로 삼켜졌다").toBeTruthy();
+
+    await act(async () => forB!.resolve(page("/home/jun/q", "bbb")));
+    await flush(10);
+    expect(text()).toContain("bbb");
+
+    await act(async () =>
+      pending.find((p) => p.root === "/home/jun/p")!.resolve(page("/home/jun/p", "aaa")),
+    );
+    await flush(10);
+    expect(text(), "늦게 온 A 응답이 B 라벨 아래 그려졌다").not.toContain("aaa");
+    expect(text()).toContain("bbb");
+  });
+});
+
+describe("L2-3 — 주소는 프로젝트 안에서도 완전하다", () => {
+  /**
+   * 같은 프로젝트 **안에서**도 주소가 완전해야 한다.
+   *
+   * 루트 목록이 아직 오는 중에 폴더를 눌렀다가 「위로」를 누르면, 주소에 경로가
+   * 없을 때 두 요청이 같은 칸으로 접혀 뒤엣것이 in-flight 가드에 삼켜진다 —
+   * 화면은 영원히 "읽는 중"이고 아무도 그 이유를 말하지 않는다.
+   */
+  it("폴더를 읽는 중에 「위로」를 눌러도 그 요청이 삼켜지지 않는다", async () => {
+    routes.remote_projects = async () => PROJECTS;
+    const pending: { path: unknown; resolve: (v: unknown) => void }[] = [];
+    const dirPage = (path: string, name: string, isDir = false) => ({
+      root: "/home/jun/p",
+      path,
+      entries: [{ name, path: `${path}/${name}`, is_dir: isDir, project_types: [], is_ignored: false }],
+      from_index: 0,
+      total: 1,
+      truncated: false,
+    });
+    routes.remote_tree = (a) =>
+      new Promise((resolve) => pending.push({ path: a.path, resolve }));
+    await mount();
+    await openData("/home/jun/p");
+    // 루트 목록이 와서 폴더가 하나 보인다.
+    await act(async () => pending[0].resolve(dirPage("/home/jun/p", "sub", true)));
+    await flush(10);
+    const folder = Array.from(container.querySelectorAll("button.remote-tree-dir")).find((b) =>
+      (b.textContent ?? "").includes("sub"),
+    ) as HTMLButtonElement;
+    expect(folder).toBeTruthy();
+    await act(async () => folder.click());
+    await flush(5);
+    expect(pending.length, "하위 폴더 요청이 나가지 않았다").toBe(2);
+    // …그 답을 기다리는 사이에 「위로」.
+    await act(async () => findButton("위로")!.click());
+    await flush(5);
+    expect(pending.length, "「위로」 요청이 조기 반환으로 삼켜졌다").toBe(3);
+    expect(pending[2].path, "루트 조회가 아니다").toBeNull();
+
+    await act(async () => pending[2].resolve(dirPage("/home/jun/p", "sub", true)));
+    await flush(10);
+    // 늦게 온 하위 폴더의 답이 루트 화면에 그려지지 않는다.
+    await act(async () => pending[1].resolve(dirPage("/home/jun/p/sub", "안쪽파일")));
+    await flush(10);
+    expect(text(), "늦게 온 하위 폴더 응답이 루트 목록에 섞였다").not.toContain("안쪽파일");
+  });
+});
+
+describe("L2-4·L2-5 — 회수한 본문의 계약을 소비자가 검증한다", () => {
+  beforeEach(() => {
+    routes.remote_hosts = async () => [liveSession()];
+  });
+
+  it("`items` 가 없으면 빈 기록이 아니라 계약 위반으로 드러난다 (L2-4)", async () => {
+    routes.remote_timeline = async () => {
+      const r: Record<string, unknown> = { ...emptyReply, subagent: "a7c1d2e3" };
+      delete r.items; // 생산자가 멈췄거나 필드 이름이 바뀌었다
+      return r;
+    };
+    await mount();
+    await act(async () =>
+      emitEvent("claude-timeline", liveEvent({ subagents: [agentFrame()] })),
+    );
+    await openRow();
+    await openAgent();
+    expect(text(), "계약이 깨진 것이 '빈 기록'으로 도착했다").toContain("계약이 깨졌습니다");
+    expect(text()).not.toContain("기록이 비어 있습니다");
+  });
+
+  /**
+   * 백엔드가 `subagent` 를 **에코**하는 목적이 타입 주석에 적혀 있다: "늦은 응답이
+   * 세션에 잘못 편입되는 것을 막으려고". 소비자가 안 보면 오배치를 막으려고 만든
+   * 필드가 오배치를 안 막는다.
+   */
+  it("다른 에이전트의 응답이 이 자리에 편입되지 않는다 (L2-5)", async () => {
+    routes.remote_timeline = async () => ({
+      ...emptyReply,
+      subagent: "다른에이전트",
+      items: [tlItem("s1", 1, { content_text: "남의 기록" })],
+    });
+    await mount();
+    await act(async () =>
+      emitEvent("claude-timeline", liveEvent({ subagents: [agentFrame()] })),
+    );
+    await openRow();
+    await openAgent();
+    expect(text(), "남의 본문이 이 에이전트 자리에 그려졌다").not.toContain("남의 기록");
+    expect(text()).toContain("다른 자리의 것");
+  });
+
+  it("세션 본문 자리에 에이전트 응답이 들어오지 않는다 (L2-5)", async () => {
+    routes.remote_hosts = async () => [snapshot([session()])];
+    routes.remote_timeline = async () => ({
+      ...emptyReply,
+      subagent: "a7c1d2e3",
+      turns: [[1, "엉뚱한 턴"]],
+    });
+    await mount();
+    await openRow();
+    await flush(20);
+    expect(text(), "에이전트 본문이 세션 타임라인으로 들어왔다").not.toContain("엉뚱한 턴");
+    expect(text()).toContain("다른 자리의 것");
+  });
+});
+
+describe("L2-8 — 정리는 완료 순서가 아니라 요청 순서로 판정한다", () => {
+  it("낡은 성공 응답 둘이 늦게 잇달아 와도 살아 있는 세션의 payload 를 지우지 않는다", async () => {
+    // "연속 두 폴링 부재" 를 **완료 순서**로 세면, 세션이 생기기 전에 나간 요청
+    // 둘이 늦게 잇달아 답하는 것만으로 살아 있는 세션의 본문이 지워진다.
+    let gated = false;
+    const gate: ((v: unknown) => void)[] = [];
+    routes.remote_hosts = () =>
+      gated
+        ? new Promise((r) => gate.push(r))
+        : Promise.resolve([snapshot([session()])]);
+    let view: RemoteHostsView | undefined;
+    function Probe() {
+      view = useRemoteHosts(100_000);
+      return null;
+    }
+    await act(async () => {
+      root.render(<Probe />);
+    });
+    await flush(5);
+    await act(async () =>
+      emitEvent(
+        "claude-timeline",
+        liveEvent({ items: [tlItem("c1", 1, { content_text: "커다란 본문" })] }),
+      ),
+    );
+    await flush(5);
+    expect(view!.live.size).toBe(1);
+
+    gated = true;
+    await act(async () => {
+      view!.refresh();
+      view!.refresh();
+      view!.refresh();
+    });
+    expect(gate.length).toBe(3);
+    // 가장 **나중에 나간** 요청이 먼저 답한다 — 그 세션은 살아 있다.
+    await act(async () => gate[2]([snapshot([session()])]));
+    await flush(5);
+    // …그리고 그보다 먼저 나간 두 요청이 늦게, 잇달아 답한다(세션이 없던 시절).
+    await act(async () => gate[0]([snapshot([])]));
+    await flush(5);
+    await act(async () => gate[1]([snapshot([])]));
+    await flush(5);
+    expect(view!.live.size, "낡은 응답 둘이 살아 있는 세션의 payload 를 지웠다").toBe(1);
+  });
+});
+
+describe("L2-9 — 드롭 뒤에 늦게 온 본문이 영구 상주하지 않는다", () => {
+  it("드롭 시점에 나가 있던 회수의 답이 되돌아와도 자리를 차지하지 않는다", async () => {
+    let present = true;
+    routes.remote_hosts = async () => [snapshot(present ? [session()] : [])];
+    let release: ((v: unknown) => void) | undefined;
+    routes.remote_timeline = () =>
+      new Promise((r) => {
+        release = r;
+      });
+    let view: RemoteHostsView | undefined;
+    function Probe() {
+      view = useRemoteHosts(100_000);
+      return null;
+    }
+    await act(async () => {
+      root.render(<Probe />);
+    });
+    await flush(5);
+    const poll = async () => {
+      await act(async () => {
+        view!.refresh();
+      });
+      await flush(5);
+    };
+    await act(async () => {
+      emitEvent("claude-timeline", liveEvent({ items: [tlItem("c1", 1)] }));
+      view!.fetchSubagentBody("h1", SID, agentFrame() as never);
+    });
+    await flush(5);
+    expect(view!.live.size).toBe(1);
+
+    present = false;
+    await poll();
+    await poll();
+    expect(view!.live.size).toBe(0);
+
+    // 드롭 시점에 나가 있던 회수가 이제야 돌아온다 — 가장 큰 payload 다.
+    await act(async () =>
+      release!({
+        ...emptyReply,
+        subagent: "a7c1d2e3",
+        items: [tlItem("s1", 1, { content_text: "커다란 전사" })],
+      }),
+    );
+    await flush(5);
+    await poll();
+    await poll();
+    expect(
+      view!.agentBodies.entries.size,
+      "그 세션은 더 이상 held 가 아니라 두 번 다시 drop 대상이 안 된다",
+    ).toBe(0);
+  });
+});
+
+describe("L2-9 — 정리 축은 `known` 부재 하나다", () => {
+  /**
+   * 정리 축은 **`known` 부재 하나**다.
+   *
+   * `live`/`fetched` 만 훑으면, 라이브 payload 없이 회수만 해 둔 전사는 held 로도
+   * 세어지지 않아 **한 번도 drop 대상이 되지 않는다** — 가장 큰 payload 가 패널
+   * 수명 내내 남는다(L2-9 의 다른 얼굴).
+   */
+  it("라이브 payload 가 없는 세션의 회수본도 치워진다", async () => {
+    let present = true;
+    routes.remote_hosts = async () => [snapshot(present ? [session()] : [])];
+    routes.remote_timeline = async () => ({
+      ...emptyReply,
+      subagent: "a7c1d2e3",
+      items: [tlItem("s1", 1, { content_text: "커다란 전사" })],
+    });
+    let view: RemoteHostsView | undefined;
+    function Probe() {
+      view = useRemoteHosts(100_000);
+      return null;
+    }
+    await act(async () => {
+      root.render(<Probe />);
+    });
+    await flush(5);
+    await act(async () => {
+      view!.fetchSubagentBody("h1", SID, agentFrame() as never);
+    });
+    await flush(5);
+    expect(view!.agentBodies.entries.size).toBe(1);
+    expect(view!.live.size, "이 세션은 라이브 payload 가 없다").toBe(0);
+
+    present = false;
+    const poll = async () => {
+      await act(async () => {
+        view!.refresh();
+      });
+      await flush(5);
+    };
+    await poll();
+    await poll();
+    expect(view!.agentBodies.entries.size, "정리 축이 라이브만 보면 이 전사는 영영 남는다").toBe(0);
+  });
+});
+
+describe("L2-12 — 언마운트도 attach 세대를 올린다 (loop1 R6)", () => {
+  it("탭을 옮긴 뒤 늦게 도착한 attach 는 자기가 연 것을 닫는다", async () => {
+    routes.remote_hosts = async () => [snapshot([session({ state: "running", closed: false })])];
+    let release: ((v: number) => void) | undefined;
+    routes.remote_attach = () =>
+      new Promise((r) => {
+        release = r;
+      });
+    await mount();
+    await act(async () => {
+      findButton("터미널")!.click();
+    });
+    await flush(5);
+    // 사용자가 다른 탭으로 옮긴다 — 패널이 언마운트된다. 닫을 코드는 이미
+    // 지나갔고(ref 는 아직 비어 있다), attach 는 아직 왕복 중이다.
+    await act(async () => {
+      root.render(<div />);
+    });
+    await act(async () => release!(LOCAL_ID));
+    await flush(10);
+    const closed = invoke.mock.calls.filter(
+      (c) => c[0] === "terminal_close" && (c[1] as { id?: number })?.id === LOCAL_ID,
+    ).length;
+    expect(closed, "늦게 온 attach 가 연 SSH exec 채널이 그대로 남는다").toBe(1);
   });
 });
